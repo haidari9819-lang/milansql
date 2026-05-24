@@ -1,0 +1,35 @@
+# Build-Verzeichnis
+build/
+build_direct/
+
+# CMake-Artefakte
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Kompilierte Binärdateien
+*.exe
+*.out
+*.o
+*.obj
+
+# Datenbank-Dateien (Runtime)
+*.milan
+*.milan.wal
+
+# IDE & Editor
+.vscode/
+.idea/
+*.user
+*.suo
+.vs/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# macOS
+.DS_Store

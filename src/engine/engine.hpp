@@ -102,7 +102,7 @@ struct HavingCondition {
 
 // ── JOIN-Klausel (Phase 12) ───────────────────────────────────
 struct JoinClause {
-    std::string joinType;  // "INNER" oder "LEFT"
+    std::string joinType;  // "INNER", "LEFT", "RIGHT", "FULL"
     std::string table;     // Name der rechten Tabelle
     std::string onLeft;    // "tabelle.spalte" linke ON-Seite
     std::string onRight;   // "tabelle.spalte" rechte ON-Seite
@@ -802,33 +802,119 @@ public:
             size_t leftCI  = findQualColIdx(current, resultSide);
             size_t rightCI = findRawColIdx (right,   rightSide);
 
-            for (const auto& lrow : current.rows()) {
-                const std::string& lval =
-                    leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
-                bool matched = false;
+            const size_t leftWidth = current.columns().size();
 
+            if (jc.joinType == "INNER" || jc.joinType == "LEFT") {
+                // ── INNER JOIN / LEFT JOIN ────────────────────────
+                for (const auto& lrow : current.rows()) {
+                    const std::string& lval =
+                        leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                    bool matched = false;
+
+                    for (const auto& rrow : right.rows()) {
+                        const std::string& rval =
+                            rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                        if (lval != rval) continue;
+
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rrow.values.size());
+                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                        next.insert(Row(vals));
+                        matched = true;
+                    }
+
+                    if (!matched && jc.joinType == "LEFT") {
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rightWidth);
+                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                        for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
+                        next.insert(Row(vals));
+                    }
+                }
+
+            } else if (jc.joinType == "RIGHT") {
+                // ── RIGHT JOIN ────────────────────────────────────
+                // Alle rechten Zeilen; linke Seite NULL wenn kein Match
                 for (const auto& rrow : right.rows()) {
                     const std::string& rval =
                         rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
-                    if (lval != rval) continue;
+                    bool matched = false;
 
-                    std::vector<std::string> vals;
-                    vals.reserve(lrow.values.size() + rrow.values.size());
-                    vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                    vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
-                    next.insert(Row(vals));
-                    matched = true;
+                    for (const auto& lrow : current.rows()) {
+                        const std::string& lval =
+                            leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                        if (lval != rval) continue;
+
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rrow.values.size());
+                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                        next.insert(Row(vals));
+                        matched = true;
+                    }
+
+                    if (!matched) {
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rightWidth);
+                        for (size_t k = 0; k < leftWidth;  ++k) vals.push_back("NULL");
+                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                        next.insert(Row(vals));
+                    }
                 }
 
-                // LEFT JOIN: nicht gematchte Zeilen mit NULL auffüllen
-                if (!matched && jc.joinType == "LEFT") {
-                    std::vector<std::string> vals;
-                    vals.reserve(lrow.values.size() + rightWidth);
-                    vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                    for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
-                    next.insert(Row(vals));
+            } else if (jc.joinType == "FULL") {
+                // ── FULL OUTER JOIN ───────────────────────────────
+                // Schritt 1: LEFT JOIN-Teil (alle linken Zeilen)
+                for (const auto& lrow : current.rows()) {
+                    const std::string& lval =
+                        leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                    bool matched = false;
+
+                    for (const auto& rrow : right.rows()) {
+                        const std::string& rval =
+                            rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                        if (lval != rval) continue;
+
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rrow.values.size());
+                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                        next.insert(Row(vals));
+                        matched = true;
+                    }
+
+                    if (!matched) {
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rightWidth);
+                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                        for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
+                        next.insert(Row(vals));
+                    }
+                }
+
+                // Schritt 2: Anti-Right — rechte Zeilen ohne Match links
+                for (const auto& rrow : right.rows()) {
+                    const std::string& rval =
+                        rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                    bool matched = false;
+
+                    for (const auto& lrow : current.rows()) {
+                        const std::string& lval =
+                            leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                        if (lval == rval) { matched = true; break; }
+                    }
+
+                    if (!matched) {
+                        std::vector<std::string> vals;
+                        vals.reserve(leftWidth + rightWidth);
+                        for (size_t k = 0; k < leftWidth;  ++k) vals.push_back("NULL");
+                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                        next.insert(Row(vals));
+                    }
                 }
             }
+
             current = std::move(next);
         }
 

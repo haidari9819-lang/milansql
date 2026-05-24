@@ -16,7 +16,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Foreign Keys** | `FOREIGN KEY … REFERENCES`, `ON DELETE RESTRICT / CASCADE / SET NULL` |
 | **SELECT** | `WHERE`, `ORDER BY [DESC]`, `LIMIT`, `DISTINCT`, `LIKE`, `IS NULL`, `BETWEEN`, `IN`, Subqueries, `EXISTS` |
 | **Aggregation** | `COUNT(*)`, `MIN`, `MAX`, `AVG`, `SUM`, `GROUP BY`, `HAVING` |
-| **JOINs** | `INNER JOIN`, `LEFT JOIN`, mehrfache JOINs |
+| **JOINs** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL [OUTER] JOIN`, mehrfache JOINs |
 | **Indizes** | `CREATE INDEX` / `DROP INDEX` (B-Tree, T=3) |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
@@ -260,6 +260,7 @@ STATUS
 | 26 | README + GitHub |
 | 27 | Multi-row INSERT — `INSERT INTO t VALUES (...),(...),...` |
 | 28 | INSERT INTO ... SELECT — Ergebnis einer Abfrage einfügen |
+| 29 | RIGHT JOIN + FULL OUTER JOIN |
 
 ---
 

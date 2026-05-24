@@ -1138,6 +1138,9 @@ private:
 
             if (u == "LEFT")  { curType = "LEFT";  ++i; continue; }
             if (u == "INNER") { curType = "INNER"; ++i; continue; }
+            if (u == "RIGHT") { curType = "RIGHT"; ++i; continue; }
+            if (u == "FULL")  { curType = "FULL";  ++i; continue; }
+            if (u == "OUTER") {                    ++i; continue; }  // FULL OUTER JOIN
 
             if (u == "JOIN") {
                 // Erwartet: table ON left = right

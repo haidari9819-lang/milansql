@@ -11,8 +11,8 @@
 #include "storage/storage.hpp"
 
 // ============================================================
-// main.cpp — REPL für MilanSQL (Phase 28)
-// Neu: INSERT INTO t SELECT ... FROM ... [WHERE ...]
+// main.cpp — REPL für MilanSQL (Phase 29)
+// Neu: RIGHT JOIN + FULL OUTER JOIN
 // ============================================================
 
 static void printTable(const milansql::Table& tbl, int limit = -1) {
@@ -341,7 +341,9 @@ static void printHelp() {
         << "  SELECT SUM(col) FROM name [WHERE ...]     Summe\n"
         << "  SELECT col,AGG(c) FROM name GROUP BY col  Gruppieren\n"
         << "  ... GROUP BY col HAVING AGG(c) op val     Gruppen filtern\n"
-        << "  SELECT cols FROM t1 [LEFT] JOIN t2 ON t1.c=t2.c  JOIN\n"
+        << "  SELECT cols FROM t1 [INNER|LEFT] JOIN t2 ON t1.c=t2.c\n"
+        << "  SELECT cols FROM t1 RIGHT JOIN t2 ON t1.c=t2.c  Alle rechten Zeilen\n"
+        << "  SELECT cols FROM t1 FULL [OUTER] JOIN t2 ON ..   Alle Zeilen beider Tabellen\n"
         << "  SELECT cols FROM t1 JOIN t2 ON .. JOIN t3 ON ..  Mehrere JOINs\n"
         << "  SELECT * FROM t WHERE col IS NULL                NULL-Prüfung\n"
         << "  SELECT * FROM t WHERE col IS NOT NULL            Nicht-NULL\n"

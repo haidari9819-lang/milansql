@@ -10,7 +10,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | Kategorie | Unterstützte Befehle |
 |-----------|---------------------|
 | **DDL** | `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN) |
-| **DML** | `INSERT INTO`, `SELECT`, `UPDATE SET`, `DELETE FROM`, `TRUNCATE TABLE` |
+| **DML** | `INSERT INTO` (single & multi-row), `SELECT`, `UPDATE SET`, `DELETE FROM`, `TRUNCATE TABLE` |
 | **Views** | `CREATE VIEW … AS SELECT`, `DROP VIEW`, `SELECT * FROM view` |
 | **Constraints** | `NOT NULL`, `UNIQUE`, `DEFAULT`, `PRIMARY KEY`, `AUTO_INCREMENT`, `CHECK` |
 | **Foreign Keys** | `FOREIGN KEY … REFERENCES`, `ON DELETE RESTRICT / CASCADE / SET NULL` |
@@ -258,6 +258,7 @@ STATUS
 | 24 | Views (CREATE VIEW / DROP VIEW / SELECT FROM view) |
 | 25 | SHOW TABLES tabellarisch, STATUS, SHOW CREATE TABLE |
 | 26 | README + GitHub |
+| 27 | Multi-row INSERT — `INSERT INTO t VALUES (...),(...),...` |
 
 ---
 

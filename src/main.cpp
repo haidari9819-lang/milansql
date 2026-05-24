@@ -11,8 +11,8 @@
 #include "storage/storage.hpp"
 
 // ============================================================
-// main.cpp — REPL für MilanSQL (Phase 25)
-// Neu: SHOW TABLES (tabellarisch), STATUS, SHOW CREATE TABLE
+// main.cpp — REPL für MilanSQL (Phase 27)
+// Neu: Multi-row INSERT — INSERT INTO t VALUES (...),(...),...
 // ============================================================
 
 static void printTable(const milansql::Table& tbl, int limit = -1) {
@@ -324,6 +324,7 @@ static void printHelp() {
         << "                                            Tabelle mit Constraints/FK erstellen\n"
         << "  DESCRIBE name                             Spaltendefinition anzeigen\n"
         << "  INSERT INTO name VALUES (v1, v2, ...)     Zeile einfuegen\n"
+        << "  INSERT INTO name VALUES (...),(...),(...)  Mehrere Zeilen einfuegen\n"
         << "  SELECT * FROM name                        Alle Zeilen\n"
         << "  SELECT col1, col2 FROM name               Spaltenauswahl\n"
         << "  SELECT DISTINCT col FROM name             Eindeutige Werte\n"
@@ -552,9 +553,18 @@ int main() {
                 if (cmd.tableName.empty()) {
                     std::cout << "  Fehler: Kein Tabellenname.\n"; break;
                 }
-                engine.insertRow(cmd.tableName, cmd.values);
+                // Phase 27: Multi-row INSERT
+                const auto& rows = cmd.multiValues.empty()
+                    ? std::vector<std::vector<std::string>>{cmd.values}
+                    : cmd.multiValues;
+                for (const auto& vals : rows)
+                    engine.insertRow(cmd.tableName, vals);
                 persist();
-                std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
+                if (rows.size() == 1)
+                    std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
+                else
+                    std::cout << "  " << rows.size() << " Zeilen eingefuegt in '"
+                              << cmd.tableName << "'.\n\n";
                 break;
             }
 

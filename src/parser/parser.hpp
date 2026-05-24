@@ -117,6 +117,9 @@ struct ParsedCommand {
 
     // Phase 24: CREATE VIEW
     std::string viewSql;
+
+    // Phase 27: Multi-row INSERT
+    std::vector<std::vector<std::string>> multiValues;
 };
 
 class Parser {
@@ -272,11 +275,15 @@ public:
             }
 
         // ── INSERT INTO ─────────────────────────────────────────
+        // Phase 27: unterstützt auch Multi-row:
+        //   INSERT INTO t VALUES (v1,v2), (v3,v4), ...
         } else if (kw0 == "INSERT" && kw1 == "INTO") {
             cmd.type = CommandType::INSERT;
             if (tokens.size() >= 3) {
-                cmd.tableName = tokens[2];
-                cmd.values    = splitTrim(parenContent, ',');
+                cmd.tableName   = tokens[2];
+                cmd.multiValues = parseValueGroups(input);
+                if (!cmd.multiValues.empty())
+                    cmd.values = cmd.multiValues[0];   // Backward-Compat
             } else { cmd.type = CommandType::UNKNOWN; }
 
         // ── CREATE INDEX ─────────────────────────────────────────
@@ -1397,6 +1404,40 @@ private:
         }
         if (!cur.empty()) tokens.push_back(cur);
         return tokens;
+    }
+
+    // Phase 27: alle (...)-Gruppen nach VALUES extrahieren
+    // Unterstützt: VALUES (a,b), (c,d), (e,f)
+    static std::vector<std::vector<std::string>> parseValueGroups(const std::string& input) {
+        // "VALUES" (case-insensitive) suchen
+        std::string up = input;
+        for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        auto vpos = up.find("VALUES");
+        if (vpos == std::string::npos) return {};
+
+        std::vector<std::vector<std::string>> groups;
+        size_t pos = vpos + 6;  // nach "VALUES"
+
+        while (pos < input.size()) {
+            // Leerzeichen und Kommas zwischen Gruppen überspringen
+            while (pos < input.size() &&
+                   (input[pos] == ' ' || input[pos] == '\t' ||
+                    input[pos] == '\r' || input[pos] == '\n' ||
+                    input[pos] == ','))
+                ++pos;
+
+            if (pos >= input.size() || input[pos] != '(') break;
+            ++pos;  // '(' überspringen
+
+            // Inhalt bis zum schließenden ')' lesen (keine Verschachtelung)
+            size_t start = pos;
+            while (pos < input.size() && input[pos] != ')') ++pos;
+            std::string content = input.substr(start, pos - start);
+            if (pos < input.size()) ++pos;  // ')' überspringen
+
+            groups.push_back(splitTrim(content, ','));
+        }
+        return groups;
     }
 
     static std::vector<std::string> splitTrim(const std::string& s, char delim) {

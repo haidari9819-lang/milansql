@@ -120,6 +120,10 @@ struct ParsedCommand {
 
     // Phase 27: Multi-row INSERT
     std::vector<std::vector<std::string>> multiValues;
+
+    // Phase 28: INSERT INTO ... SELECT ...
+    bool        isInsertSelect  = false;
+    std::string insertSelectSql;
 };
 
 class Parser {
@@ -275,15 +279,35 @@ public:
             }
 
         // ── INSERT INTO ─────────────────────────────────────────
-        // Phase 27: unterstützt auch Multi-row:
-        //   INSERT INTO t VALUES (v1,v2), (v3,v4), ...
+        // Phase 27: Multi-row VALUES  — INSERT INTO t VALUES (...),(...),...
+        // Phase 28: INSERT-SELECT     — INSERT INTO t SELECT ... FROM ...
         } else if (kw0 == "INSERT" && kw1 == "INTO") {
             cmd.type = CommandType::INSERT;
-            if (tokens.size() >= 3) {
+            if (tokens.size() >= 4) {
+                cmd.tableName = tokens[2];
+                if (toUpper(tokens[3]) == "SELECT") {
+                    // INSERT INTO name SELECT ...
+                    cmd.isInsertSelect = true;
+                    // SELECT-Teil aus Original-Input extrahieren
+                    std::string inputUp = input;
+                    for (char& c : inputUp)
+                        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    auto selPos = inputUp.find("SELECT");
+                    if (selPos != std::string::npos)
+                        cmd.insertSelectSql = trim(input.substr(selPos));
+                    else
+                        cmd.type = CommandType::UNKNOWN;
+                } else {
+                    // INSERT INTO name VALUES (...),...
+                    cmd.multiValues = parseValueGroups(input);
+                    if (!cmd.multiValues.empty())
+                        cmd.values = cmd.multiValues[0];  // Backward-Compat
+                }
+            } else if (tokens.size() == 3) {
                 cmd.tableName   = tokens[2];
                 cmd.multiValues = parseValueGroups(input);
                 if (!cmd.multiValues.empty())
-                    cmd.values = cmd.multiValues[0];   // Backward-Compat
+                    cmd.values = cmd.multiValues[0];
             } else { cmd.type = CommandType::UNKNOWN; }
 
         // ── CREATE INDEX ─────────────────────────────────────────

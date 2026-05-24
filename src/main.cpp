@@ -11,8 +11,8 @@
 #include "storage/storage.hpp"
 
 // ============================================================
-// main.cpp — REPL für MilanSQL (Phase 27)
-// Neu: Multi-row INSERT — INSERT INTO t VALUES (...),(...),...
+// main.cpp — REPL für MilanSQL (Phase 28)
+// Neu: INSERT INTO t SELECT ... FROM ... [WHERE ...]
 // ============================================================
 
 static void printTable(const milansql::Table& tbl, int limit = -1) {
@@ -325,6 +325,7 @@ static void printHelp() {
         << "  DESCRIBE name                             Spaltendefinition anzeigen\n"
         << "  INSERT INTO name VALUES (v1, v2, ...)     Zeile einfuegen\n"
         << "  INSERT INTO name VALUES (...),(...),(...)  Mehrere Zeilen einfuegen\n"
+        << "  INSERT INTO name SELECT ... FROM name2    Aus Abfrage einfuegen\n"
         << "  SELECT * FROM name                        Alle Zeilen\n"
         << "  SELECT col1, col2 FROM name               Spaltenauswahl\n"
         << "  SELECT DISTINCT col FROM name             Eindeutige Werte\n"
@@ -553,7 +554,45 @@ int main() {
                 if (cmd.tableName.empty()) {
                     std::cout << "  Fehler: Kein Tabellenname.\n"; break;
                 }
-                // Phase 27: Multi-row INSERT
+
+                // Phase 28: INSERT INTO name SELECT ...
+                if (cmd.isInsertSelect) {
+                    if (cmd.insertSelectSql.empty()) {
+                        std::cout << "  Fehler: INSERT INTO name SELECT ...\n"; break;
+                    }
+                    milansql::ParsedCommand sc = parser.parse(cmd.insertSelectSql);
+                    // Subqueries im SELECT-Teil auflösen
+                    for (const auto& sq : sc.subqueries) {
+                        if (sq.condIdx < sc.whereConds.size()) {
+                            sc.whereConds[sq.condIdx].inList =
+                                engine.subqueryValues(sq.subTable, sq.subCol,
+                                                      sq.subWhere, sq.subWhereLogic);
+                        }
+                    }
+                    // SELECT ausführen
+                    milansql::Table result;
+                    if (!sc.whereConds.empty()) {
+                        auto qr = engine.selectWhere(sc.tableName,
+                                                     sc.whereConds, sc.whereLogic);
+                        result = std::move(qr.table);
+                    } else {
+                        result = engine.selectAll(sc.tableName).clone();
+                    }
+                    if (!sc.selectColumns.empty())
+                        result = result.project(sc.selectColumns);
+                    // Jede Zeile einfügen
+                    size_t count = 0;
+                    for (const auto& row : result.rows()) {
+                        engine.insertRow(cmd.tableName, row.values);
+                        ++count;
+                    }
+                    persist();
+                    std::cout << "  " << count << " Zeile(n) eingefuegt in '"
+                              << cmd.tableName << "' (INSERT INTO SELECT).\n\n";
+                    break;
+                }
+
+                // Phase 27: Multi-row VALUES
                 const auto& rows = cmd.multiValues.empty()
                     ? std::vector<std::vector<std::string>>{cmd.values}
                     : cmd.multiValues;

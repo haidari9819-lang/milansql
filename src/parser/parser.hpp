@@ -124,6 +124,11 @@ struct ParsedCommand {
     // Phase 28: INSERT INTO ... SELECT ...
     bool        isInsertSelect  = false;
     std::string insertSelectSql;
+
+    // Phase 30: Mengenoperationen (UNION / UNION ALL / INTERSECT / EXCEPT)
+    bool        isSetOp  = false;
+    std::string setOp;       // "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
+    std::string rightSql;    // rechte SELECT-Seite als Rohtext
 };
 
 class Parser {
@@ -150,6 +155,18 @@ public:
                 toUpper(st[0]) == "ALTER" && toUpper(st[1]) == "TABLE") {
                 parseAlterTableCmd(st, cmd);
                 return cmd;
+            }
+        }
+
+        // ── Phase 30: Mengenoperationen (UNION/INTERSECT/EXCEPT) ──
+        {
+            auto st = tokenize(input);
+            for (size_t i = 0; i < st.size(); ++i) {
+                std::string u = toUpper(st[i]);
+                if (u == "UNION" || u == "INTERSECT" || u == "EXCEPT") {
+                    parseSetOp(input, cmd);
+                    return cmd;
+                }
             }
         }
 
@@ -1080,6 +1097,79 @@ private:
         if (limitPos != N && limitPos + 1 < N) {
             try { cmd.limit = std::stoi(ft[limitPos + 1]); } catch (...) {}
         }
+    }
+
+    // ── Phase 30: Set-Operation Parser ───────────────────────────
+    // Syntax: SELECT ... UNION [ALL] SELECT ...
+    //         SELECT ... INTERSECT SELECT ...
+    //         SELECT ... EXCEPT SELECT ...
+    // Sucht das erste UNION/INTERSECT/EXCEPT auf Top-Level (nicht in
+    // Klammern) und spaltet den Input in linke + rechte Seite.
+    static void parseSetOp(const std::string& raw, ParsedCommand& cmd) {
+        cmd.type    = CommandType::SELECT;
+        cmd.isSetOp = true;
+
+        // Tokenize + Set-Op-Position finden
+        auto ft = tokenizeFull(raw);
+        const size_t N = ft.size();
+        size_t opPos = N;
+        std::string opName;
+
+        int depth = 0;
+        for (size_t i = 0; i < N; ++i) {
+            if (ft[i] == "(") { ++depth; continue; }
+            if (ft[i] == ")") { --depth; continue; }
+            if (depth > 0) continue;
+
+            std::string u = toUpper(ft[i]);
+            if ((u == "UNION" || u == "INTERSECT" || u == "EXCEPT") && opPos == N) {
+                opName = u;
+                opPos  = i;
+                // UNION ALL? — nächstes Token prüfen
+                if (u == "UNION" && i + 1 < N && toUpper(ft[i + 1]) == "ALL") {
+                    opName = "UNION ALL";
+                    ++i;  // "ALL" überspringen
+                    opPos = i;  // opPos zeigt jetzt auf "ALL" — egal, splitten nach Rohtext
+                }
+                break;
+            }
+        }
+
+        if (opPos == N) { cmd.type = CommandType::UNKNOWN; return; }
+
+        // Rohtext splitten: links alles vor dem Keyword, rechts alles danach
+        // Suche im Originaltext nach dem Operator (case-insensitive)
+        std::string rawUp = raw;
+        for (char& c : rawUp)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+        size_t splitPos = std::string::npos;
+        if (opName == "UNION ALL") {
+            // Suche "UNION ALL" als Substring
+            splitPos = rawUp.find("UNION ALL");
+            if (splitPos != std::string::npos)
+                cmd.rightSql = trim(raw.substr(splitPos + 9));  // len("UNION ALL")=9
+        } else {
+            splitPos = rawUp.find(opName);
+            if (splitPos != std::string::npos)
+                cmd.rightSql = trim(raw.substr(splitPos + opName.size()));
+        }
+
+        if (splitPos == std::string::npos) { cmd.type = CommandType::UNKNOWN; return; }
+
+        cmd.setOp = opName;
+
+        // Linke Seite als normales SELECT parsen
+        std::string leftSql = trim(raw.substr(0, splitPos));
+        // Parsed the left SELECT inline (recycled parseSelectFull)
+        parseSelectFull(leftSql, cmd);   // befüllt tableName, whereConds, selectColumns usw.
+        cmd.isSetOp  = true;             // parseSelectFull setzt isSetOp nicht — wiederherstellen
+        cmd.setOp    = opName;
+        cmd.rightSql = (splitPos != std::string::npos)
+            ? (opName == "UNION ALL"
+               ? trim(raw.substr(rawUp.find("UNION ALL") + 9))
+               : trim(raw.substr(rawUp.find(opName) + opName.size())))
+            : "";
     }
 
     // ── Phase 12: JOIN-Parser (INNER + LEFT, mehrere JOINs) ──────

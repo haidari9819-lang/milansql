@@ -1168,6 +1168,78 @@ public:
 
     bool tableExists(const std::string& n) const { return tables_.count(n) > 0; }
 
+    // ── Phase 30: Mengenoperationen ───────────────────────────
+    // op: "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
+    // Spaltenbreite beider Seiten muss übereinstimmen.
+    // Spaltenname kommt aus linker Tabelle.
+    Table executeSetOp(const Table& left,
+                       const std::string& op,
+                       const Table& right) const {
+        if (left.columns().size() != right.columns().size())
+            throw std::runtime_error(
+                "Mengenoperation: Spaltenanzahl muss übereinstimmen ("
+                + std::to_string(left.columns().size()) + " vs "
+                + std::to_string(right.columns().size()) + ")");
+
+        // Ergebnis-Schema = Spalten der linken Seite
+        Table result("", left.columns());
+
+        if (op == "UNION ALL") {
+            // Alle linken + alle rechten Zeilen (Duplikate erlaubt)
+            for (const auto& r : left.rows())  result.insert(r);
+            for (const auto& r : right.rows()) result.insert(r);
+
+        } else if (op == "UNION") {
+            // Vereinigung ohne Duplikate
+            std::vector<std::vector<std::string>> seen;
+            auto isDup = [&](const Row& r) {
+                for (const auto& s : seen) if (s == r.values) return true;
+                return false;
+            };
+            for (const auto& r : left.rows())
+                if (!isDup(r)) { result.insert(r); seen.push_back(r.values); }
+            for (const auto& r : right.rows())
+                if (!isDup(r)) { result.insert(r); seen.push_back(r.values); }
+
+        } else if (op == "INTERSECT") {
+            // Nur Zeilen, die in beiden vorkommen (ohne Duplikate)
+            std::vector<std::vector<std::string>> seen;
+            auto isDup = [&](const Row& r) {
+                for (const auto& s : seen) if (s == r.values) return true;
+                return false;
+            };
+            for (const auto& lr : left.rows()) {
+                if (isDup(lr)) continue;
+                for (const auto& rr : right.rows()) {
+                    if (lr.values == rr.values) {
+                        result.insert(lr);
+                        seen.push_back(lr.values);
+                        break;
+                    }
+                }
+            }
+
+        } else if (op == "EXCEPT") {
+            // Zeilen aus links, die NICHT in rechts vorkommen (ohne Duplikate)
+            std::vector<std::vector<std::string>> seen;
+            auto isDup = [&](const Row& r) {
+                for (const auto& s : seen) if (s == r.values) return true;
+                return false;
+            };
+            for (const auto& lr : left.rows()) {
+                if (isDup(lr)) continue;
+                bool inRight = false;
+                for (const auto& rr : right.rows())
+                    if (lr.values == rr.values) { inRight = true; break; }
+                if (!inRight) { result.insert(lr); seen.push_back(lr.values); }
+            }
+        } else {
+            throw std::runtime_error("Unbekannte Mengenoperation: " + op);
+        }
+
+        return result;
+    }
+
     // ── Phase 24: Views ───────────────────────────────────────
 
     void createView(const std::string& name, const std::string& sql) {

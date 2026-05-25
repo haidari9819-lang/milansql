@@ -11,8 +11,8 @@
 #include "storage/storage.hpp"
 
 // ============================================================
-// main.cpp — REPL für MilanSQL (Phase 29)
-// Neu: RIGHT JOIN + FULL OUTER JOIN
+// main.cpp — REPL für MilanSQL (Phase 30)
+// Neu: UNION / UNION ALL / INTERSECT / EXCEPT
 // ============================================================
 
 static void printTable(const milansql::Table& tbl, int limit = -1) {
@@ -341,6 +341,9 @@ static void printHelp() {
         << "  SELECT SUM(col) FROM name [WHERE ...]     Summe\n"
         << "  SELECT col,AGG(c) FROM name GROUP BY col  Gruppieren\n"
         << "  ... GROUP BY col HAVING AGG(c) op val     Gruppen filtern\n"
+        << "  SELECT ... UNION [ALL] SELECT ...            Vereinigung\n"
+        << "  SELECT ... INTERSECT SELECT ...             Schnittmenge\n"
+        << "  SELECT ... EXCEPT SELECT ...                Differenz\n"
         << "  SELECT cols FROM t1 [INNER|LEFT] JOIN t2 ON t1.c=t2.c\n"
         << "  SELECT cols FROM t1 RIGHT JOIN t2 ON t1.c=t2.c  Alle rechten Zeilen\n"
         << "  SELECT cols FROM t1 FULL [OUTER] JOIN t2 ON ..   Alle Zeilen beider Tabellen\n"
@@ -613,6 +616,50 @@ int main() {
             case milansql::CommandType::SELECT: {
                 if (cmd.tableName.empty()) {
                     std::cout << "  Fehler: Kein Tabellenname.\n"; break;
+                }
+
+                // ── Phase 30: Mengenoperationen ──────────────────
+                if (cmd.isSetOp) {
+                    if (cmd.rightSql.empty()) {
+                        std::cout << "  Fehler: " << cmd.setOp << " braucht rechte SELECT-Seite.\n\n";
+                        break;
+                    }
+                    // Linke Seite — aus cmd bereits geparst
+                    milansql::Table leftResult;
+                    if (!cmd.whereConds.empty()) {
+                        auto qr = engine.selectWhere(cmd.tableName,
+                                                     cmd.whereConds, cmd.whereLogic);
+                        leftResult = std::move(qr.table);
+                    } else {
+                        leftResult = engine.selectAll(cmd.tableName).clone();
+                    }
+                    if (!cmd.selectColumns.empty())
+                        leftResult = leftResult.project(cmd.selectColumns);
+
+                    // Rechte Seite — rightSql neu parsen + ausführen
+                    milansql::ParsedCommand rc = parser.parse(cmd.rightSql);
+                    for (const auto& sq : rc.subqueries) {
+                        if (sq.condIdx < rc.whereConds.size())
+                            rc.whereConds[sq.condIdx].inList =
+                                engine.subqueryValues(sq.subTable, sq.subCol,
+                                                      sq.subWhere, sq.subWhereLogic);
+                    }
+                    milansql::Table rightResult;
+                    if (!rc.whereConds.empty()) {
+                        auto qr = engine.selectWhere(rc.tableName,
+                                                     rc.whereConds, rc.whereLogic);
+                        rightResult = std::move(qr.table);
+                    } else {
+                        rightResult = engine.selectAll(rc.tableName).clone();
+                    }
+                    if (!rc.selectColumns.empty())
+                        rightResult = rightResult.project(rc.selectColumns);
+
+                    milansql::Table result =
+                        engine.executeSetOp(leftResult, cmd.setOp, rightResult);
+                    std::cout << "\n";
+                    printTable(result, cmd.limit);
+                    break;
                 }
 
                 // ── Phase 24: View-Auflösung ─────────────────────

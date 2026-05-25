@@ -129,6 +129,9 @@ struct ParsedCommand {
     bool        isSetOp  = false;
     std::string setOp;       // "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
     std::string rightSql;    // rechte SELECT-Seite als Rohtext
+
+    // Phase 31: CASE WHEN THEN ELSE END in SELECT-Liste
+    bool hasCaseItems = false;
 };
 
 class Parser {
@@ -202,6 +205,19 @@ public:
                 if (toUpper(st[i]) == "GROUP" && toUpper(st[i + 1]) == "BY") {
                     parseGroupByQuery(input, cmd);
                     return cmd;
+                }
+            }
+        }
+
+        // ── Phase 31: CASE WHEN-Erkennung ────────────────────────
+        {
+            auto st = tokenize(input);
+            if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                for (const auto& tok : st) {
+                    if (toUpper(tok) == "CASE") {
+                        parseSelectFull(input, cmd);
+                        return cmd;
+                    }
                 }
             }
         }
@@ -1070,14 +1086,23 @@ private:
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
         }
-        std::string colList;
-        for (size_t i = selStart; i < fromPos; ++i) {
-            if (ft[i] == "," || ft[i] == "(" || ft[i] == ")") continue;
-            if (!colList.empty()) colList += ",";
-            colList += ft[i];
+        // Phase 31: CASE WHEN im Spaltenbereich? → parseCaseSelectItems nutzen
+        bool hasCase = false;
+        for (size_t i = selStart; i < fromPos; ++i)
+            if (toUpper(ft[i]) == "CASE") { hasCase = true; break; }
+
+        if (hasCase) {
+            parseCaseSelectItems(ft, selStart, fromPos, cmd);
+        } else {
+            std::string colList;
+            for (size_t i = selStart; i < fromPos; ++i) {
+                if (ft[i] == "," || ft[i] == "(" || ft[i] == ")") continue;
+                if (!colList.empty()) colList += ",";
+                colList += ft[i];
+            }
+            for (const auto& c : splitTrim(colList, ','))
+                if (c != "*" && !c.empty()) cmd.selectColumns.push_back(c);
         }
-        for (const auto& c : splitTrim(colList, ','))
-            if (c != "*" && !c.empty()) cmd.selectColumns.push_back(c);
 
         // WHERE (mit IN-Unterstützung)
         if (wherePos != N) {
@@ -1097,6 +1122,85 @@ private:
         if (limitPos != N && limitPos + 1 < N) {
             try { cmd.limit = std::stoi(ft[limitPos + 1]); } catch (...) {}
         }
+    }
+
+    // ── Phase 31: SELECT-Liste mit CASE WHEN parsen ──────────────
+    // Verarbeitet normale Spalten UND CASE-Ausdrücke in der SELECT-Liste.
+    // Ergebnis geht in cmd.selectItems; cmd.hasCaseItems wird gesetzt.
+    static void parseCaseSelectItems(const std::vector<std::string>& ft,
+                                     size_t start, size_t end,
+                                     ParsedCommand& cmd) {
+        size_t i = start;
+        while (i < end) {
+            if (ft[i] == "," || ft[i] == "(" || ft[i] == ")") { ++i; continue; }
+
+            std::string u = toUpper(ft[i]);
+
+            if (u == "CASE") {
+                // ── CASE WHEN col op val THEN res ... [ELSE res] END [AS alias]
+                SelectItem item;
+                item.isCaseExpr = true;
+                ++i;  // skip CASE
+
+                while (i < end) {
+                    std::string wu = toUpper(ft[i]);
+
+                    if (wu == "WHEN") {
+                        ++i;  // skip WHEN
+                        // col  op  val  THEN  result
+                        if (i + 4 < end && toUpper(ft[i + 3]) == "THEN") {
+                            SelectItem::WhenClause wh;
+                            wh.col    = ft[i];
+                            wh.op     = ft[i + 1];
+                            wh.val    = ft[i + 2];
+                            wh.result = ft[i + 4];
+                            i += 5;
+                            item.caseWhen.push_back(wh);
+                        } else if (i + 2 < end) {
+                            // Kein THEN gefunden — trotzdem partiell lesen
+                            SelectItem::WhenClause wh;
+                            wh.col = ft[i]; wh.op = ft[i+1]; wh.val = ft[i+2];
+                            i += 3;
+                            item.caseWhen.push_back(wh);
+                        }
+
+                    } else if (wu == "ELSE") {
+                        ++i;  // skip ELSE
+                        if (i < end && toUpper(ft[i]) != "END")
+                        { item.caseElse = ft[i]; ++i; }
+
+                    } else if (wu == "END") {
+                        ++i;  // skip END
+                        // optionales AS alias
+                        if (i < end && toUpper(ft[i]) == "AS") {
+                            ++i;
+                            if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                        }
+                        break;
+                    } else {
+                        ++i;
+                    }
+                }
+                cmd.selectItems.push_back(item);
+
+            } else if (u == "*") {
+                // SELECT * bleibt als Wildcard erhalten
+                SelectItem item; item.colName = "*";
+                cmd.selectItems.push_back(item);
+                ++i;
+
+            } else {
+                // Normale Spalte, optional mit AS alias
+                SelectItem item;
+                item.colName = ft[i]; ++i;
+                if (i < end && toUpper(ft[i]) == "AS") {
+                    ++i;
+                    if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                }
+                cmd.selectItems.push_back(item);
+            }
+        }
+        cmd.hasCaseItems = true;
     }
 
     // ── Phase 30: Set-Operation Parser ───────────────────────────

@@ -84,12 +84,24 @@ struct WhereCondition {
     ExistsSpec               existsSpec;   // für EXISTS / NOT EXISTS
 };
 
-// ── SELECT-Listen-Eintrag (Phase 10) ─────────────────────────
+// ── SELECT-Listen-Eintrag (Phase 10 / Phase 31) ──────────────
 struct SelectItem {
     bool        isAgg   = false;
     std::string aggFunc;   // COUNT, MIN, MAX, AVG, SUM
     std::string aggCol;    // * oder Spaltenname
     std::string colName;   // für normale Spalten
+    std::string alias;     // Phase 31: AS alias
+
+    // Phase 31: CASE WHEN THEN ELSE END
+    bool isCaseExpr = false;
+    struct WhenClause {
+        std::string col;     // linke Seite der Bedingung
+        std::string op;      // =, !=, <, >, <=, >=
+        std::string val;     // rechte Seite
+        std::string result;  // THEN-Wert
+    };
+    std::vector<WhenClause> caseWhen;
+    std::string             caseElse = "NULL";
 };
 
 // ── HAVING-Bedingung (Phase 10) ───────────────────────────────
@@ -1168,6 +1180,45 @@ public:
 
     bool tableExists(const std::string& n) const { return tables_.count(n) > 0; }
 
+    // ── Phase 31: CASE WHEN — Projektion mit Ausdrücken ──────
+    Table projectWithItems(const Table& src,
+                           const std::vector<SelectItem>& items) const {
+        // Ergebnis-Schema aufbauen
+        std::vector<Column> newCols;
+        for (const auto& item : items) {
+            if (item.isCaseExpr) {
+                std::string cname = item.alias.empty() ? "case" : item.alias;
+                newCols.emplace_back(cname, "TEXT");
+            } else {
+                int ci = findColIdx(src, item.colName);
+                if (ci < 0)
+                    throw std::runtime_error(
+                        "CASE SELECT: Spalte '" + item.colName + "' nicht gefunden.");
+                std::string cname = item.alias.empty()
+                    ? src.columns()[static_cast<size_t>(ci)].name
+                    : item.alias;
+                newCols.emplace_back(cname, src.columns()[static_cast<size_t>(ci)].type);
+            }
+        }
+
+        Table result("", newCols);
+        for (const auto& row : src.rows()) {
+            std::vector<std::string> vals;
+            vals.reserve(items.size());
+            for (const auto& item : items) {
+                if (item.isCaseExpr) {
+                    vals.push_back(evalCase(item, src, row));
+                } else {
+                    int ci = findColIdx(src, item.colName);
+                    vals.push_back(ci >= 0 && static_cast<size_t>(ci) < row.values.size()
+                                   ? row.values[static_cast<size_t>(ci)] : "");
+                }
+            }
+            result.insert(Row(vals));
+        }
+        return result;
+    }
+
     // ── Phase 30: Mengenoperationen ───────────────────────────
     // op: "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
     // Spaltenbreite beider Seiten muss übereinstimmen.
@@ -1308,6 +1359,55 @@ private:
     }
 
     // Spalte im Ergebnis suchen (qualifizierte Namen "t.col").
+    // Phase 31: Spaltenindex nach Name (auch qualifiziert), gibt -1 zurück
+    static int findColIdx(const Table& t, const std::string& name) {
+        const auto& cols = t.columns();
+        for (size_t i = 0; i < cols.size(); ++i)
+            if (cols[i].name == name) return static_cast<int>(i);
+        // Suffix-Match: "t.col" passt auf "col"
+        auto dot = name.find('.');
+        std::string raw = dot != std::string::npos ? name.substr(dot + 1) : name;
+        for (size_t i = 0; i < cols.size(); ++i) {
+            auto d2 = cols[i].name.find('.');
+            std::string suf = d2 != std::string::npos
+                              ? cols[i].name.substr(d2 + 1) : cols[i].name;
+            if (suf == raw) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    // Phase 31: CASE WHEN-Ausdruck für eine Zeile auswerten
+    static std::string evalCase(const SelectItem& item,
+                                const Table& tbl, const Row& row) {
+        for (const auto& wh : item.caseWhen) {
+            int ci = findColIdx(tbl, wh.col);
+            if (ci < 0) continue;
+            const std::string& rv =
+                static_cast<size_t>(ci) < row.values.size()
+                ? row.values[static_cast<size_t>(ci)] : "";
+            // Numerischer Vergleich, fallback auf String
+            bool match = false;
+            try {
+                double da = std::stod(rv), db = std::stod(wh.val);
+                if      (wh.op == "=")  match = (da == db);
+                else if (wh.op == "!=") match = (da != db);
+                else if (wh.op == "<")  match = (da <  db);
+                else if (wh.op == ">")  match = (da >  db);
+                else if (wh.op == "<=") match = (da <= db);
+                else if (wh.op == ">=") match = (da >= db);
+            } catch (...) {
+                if      (wh.op == "=")  match = (rv == wh.val);
+                else if (wh.op == "!=") match = (rv != wh.val);
+                else if (wh.op == "<")  match = (rv <  wh.val);
+                else if (wh.op == ">")  match = (rv >  wh.val);
+                else if (wh.op == "<=") match = (rv <= wh.val);
+                else if (wh.op == ">=") match = (rv >= wh.val);
+            }
+            if (match) return wh.result;
+        }
+        return item.caseElse;
+    }
+
     // Exakter Match, dann Suffix-Match.
     static size_t findQualColIdx(const Table& t, const std::string& qual) {
         for (size_t i = 0; i < t.columns().size(); ++i)

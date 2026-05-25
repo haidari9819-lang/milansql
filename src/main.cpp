@@ -11,8 +11,8 @@
 #include "storage/storage.hpp"
 
 // ============================================================
-// main.cpp — REPL für MilanSQL (Phase 30)
-// Neu: UNION / UNION ALL / INTERSECT / EXCEPT
+// main.cpp — REPL für MilanSQL (Phase 31)
+// Neu: CASE WHEN THEN ELSE END in SELECT
 // ============================================================
 
 static void printTable(const milansql::Table& tbl, int limit = -1) {
@@ -341,6 +341,7 @@ static void printHelp() {
         << "  SELECT SUM(col) FROM name [WHERE ...]     Summe\n"
         << "  SELECT col,AGG(c) FROM name GROUP BY col  Gruppieren\n"
         << "  ... GROUP BY col HAVING AGG(c) op val     Gruppen filtern\n"
+        << "  SELECT CASE WHEN col op val THEN x ... END AS alias FROM t\n"
         << "  SELECT ... UNION [ALL] SELECT ...            Vereinigung\n"
         << "  SELECT ... INTERSECT SELECT ...             Schnittmenge\n"
         << "  SELECT ... EXCEPT SELECT ...                Differenz\n"
@@ -765,7 +766,10 @@ int main() {
                 // ORDER BY → Projektion → DISTINCT → LIMIT
                 if (!cmd.orderByColumn.empty())
                     result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
-                if (!cmd.selectColumns.empty())
+                // Phase 31: CASE-Projektion hat Vorrang
+                if (cmd.hasCaseItems && !cmd.selectItems.empty())
+                    result = engine.projectWithItems(result, cmd.selectItems);
+                else if (!cmd.selectColumns.empty())
                     result = result.project(cmd.selectColumns);
                 if (cmd.isDistinct)
                     result.makeDistinct();

@@ -263,6 +263,7 @@ STATUS
 | 28 | INSERT INTO ... SELECT — Ergebnis einer Abfrage einfügen |
 | 29 | RIGHT JOIN + FULL OUTER JOIN |
 | 30 | UNION / UNION ALL / INTERSECT / EXCEPT |
+| 31 | CASE WHEN THEN ELSE END in SELECT (mit AS alias) |
 
 ---
 

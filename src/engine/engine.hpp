@@ -57,7 +57,7 @@ struct Row {
 
 struct IndexInfo {
     std::string indexName;
-    std::string colName;
+    std::string colName;   // Phase 35: alle Spalten als ", "-getrennte Liste
     std::string type;
 };
 
@@ -132,8 +132,9 @@ struct JoinClause {
 class Table {
 public:
     struct IndexEntry {
-        std::string            name;
-        std::unique_ptr<BTree> tree;
+        std::string              name;  // Index-Name (= Map-Schlüssel)
+        std::vector<std::string> cols;  // alle Spalten; cols[0] = führende Spalte
+        std::unique_ptr<BTree>   tree;  // BTree, nach cols[0]-Wert indiziert
     };
 
     Table() = default;
@@ -173,8 +174,9 @@ public:
 
         rows_.push_back(std::move(row));
         size_t ni = rows_.size() - 1;
-        for (auto& [col, entry] : indices_) {
-            int ci = colOf(col);
+        for (auto& [idxName, entry] : indices_) {
+            if (entry.cols.empty()) continue;
+            int ci = colOf(entry.cols[0]);
             if (ci >= 0 && static_cast<size_t>(ci) < rows_[ni].values.size())
                 entry.tree->insert(rows_[ni].values[ci], ni);
         }
@@ -260,7 +262,13 @@ public:
         for (auto& row : rows_)
             if (static_cast<size_t>(ci) < row.values.size())
                 row.values.erase(row.values.begin() + ci);
-        indices_.erase(colName);
+        // Indizes entfernen, die die gelöschte Spalte enthalten
+        for (auto it = indices_.begin(); it != indices_.end(); ) {
+            const auto& c = it->second.cols;
+            if (std::find(c.begin(), c.end(), colName) != c.end())
+                it = indices_.erase(it);
+            else ++it;
+        }
         rebuildAll();
     }
 
@@ -272,48 +280,60 @@ public:
         if (colOf(newName) >= 0)
             throw std::runtime_error("ALTER TABLE: Spalte '" + newName + "' existiert bereits.");
         columns_[ci].name = newName;
-        // Index-Eintrag umbenennen falls vorhanden
-        auto it = indices_.find(oldName);
-        if (it != indices_.end()) {
-            indices_[newName] = std::move(it->second);
-            indices_.erase(it);
-        }
+        // Spaltennamen in allen Index-Einträgen aktualisieren
+        for (auto& [idxName, entry] : indices_)
+            for (auto& c : entry.cols)
+                if (c == oldName) c = newName;
     }
 
     // ── Index-Operationen ─────────────────────────────────────
 
-    void createIndex(const std::string& colName, const std::string& idxName) {
-        int ci = colOf(colName);
+    void createIndex(const std::vector<std::string>& cols, const std::string& idxName) {
+        if (cols.empty())
+            throw std::runtime_error("CREATE INDEX: Keine Spalten angegeben.");
+        int ci = colOf(cols[0]);
         if (ci < 0)
-            throw std::runtime_error("Spalte '" + colName + "' nicht gefunden.");
+            throw std::runtime_error("Spalte '" + cols[0] + "' nicht gefunden.");
+        // Prüfen ob Index-Name bereits vergeben
+        if (indices_.count(idxName))
+            throw std::runtime_error("Index '" + idxName + "' existiert bereits.");
         auto tree = std::make_unique<BTree>();
         for (size_t ri = 0; ri < rows_.size(); ++ri)
             if (static_cast<size_t>(ci) < rows_[ri].values.size())
                 tree->insert(rows_[ri].values[ci], ri);
-        indices_[colName] = IndexEntry{idxName, std::move(tree)};
+        indices_[idxName] = IndexEntry{idxName, cols, std::move(tree)};
     }
 
     void dropIndex(const std::string& idxName) {
-        for (auto it = indices_.begin(); it != indices_.end(); ++it)
-            if (it->second.name == idxName) { indices_.erase(it); return; }
-        throw std::runtime_error("Index '" + idxName + "' nicht gefunden.");
+        if (!indices_.erase(idxName))
+            throw std::runtime_error("Index '" + idxName + "' nicht gefunden.");
     }
 
     bool hasIndex(const std::string& colName) const {
-        return indices_.count(colName) > 0;
+        for (const auto& [idxName, entry] : indices_)
+            if (!entry.cols.empty() && entry.cols[0] == colName) return true;
+        return false;
     }
 
     std::vector<size_t> indexSearch(const std::string& colName,
                                     const std::string& val) const {
-        auto it = indices_.find(colName);
-        return it != indices_.end() ? it->second.tree->search(val)
-                                    : std::vector<size_t>{};
+        for (const auto& [idxName, entry] : indices_)
+            if (!entry.cols.empty() && entry.cols[0] == colName)
+                return entry.tree->search(val);
+        return {};
     }
 
     std::vector<IndexInfo> getIndexes() const {
         std::vector<IndexInfo> result;
-        for (const auto& [col, entry] : indices_)
-            result.push_back({entry.name, col, "BTREE"});
+        for (const auto& [idxName, entry] : indices_) {
+            // Alle Spalten als ", "-getrennte Liste anzeigen
+            std::string colList;
+            for (size_t i = 0; i < entry.cols.size(); ++i) {
+                if (i > 0) colList += ", ";
+                colList += entry.cols[i];
+            }
+            result.push_back({entry.name, colList, "BTREE"});
+        }
         return result;
     }
 
@@ -441,8 +461,9 @@ private:
     std::vector<ForeignKeyDef>         foreignKeys_;     // FK-Definitionen
 
     void rebuildAll() {
-        for (auto& [colName, entry] : indices_) {
-            int ci = colOf(colName);
+        for (auto& [idxName, entry] : indices_) {
+            if (entry.cols.empty()) continue;
+            int ci = colOf(entry.cols[0]);
             if (ci < 0) continue;
             entry.tree->clear();
             for (size_t ri = 0; ri < rows_.size(); ++ri)
@@ -495,9 +516,10 @@ public:
             tables_.at(name).addForeignKey(fk);
     }
 
-    void createIndex(const std::string& tbl, const std::string& col,
+    void createIndex(const std::string& tbl,
+                     const std::vector<std::string>& cols,
                      const std::string& idxName) {
-        getTable(tbl).createIndex(col, idxName);
+        getTable(tbl).createIndex(cols, idxName);
     }
 
     void dropIndex(const std::string& tbl, const std::string& idxName) {

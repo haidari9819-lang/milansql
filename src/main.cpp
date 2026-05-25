@@ -811,12 +811,17 @@ int main() {
 
             // ── CREATE INDEX ─────────────────────────────────────
             case milansql::CommandType::CREATE_INDEX: {
-                if (cmd.tableName.empty() || cmd.indexColumn.empty()) {
-                    std::cout << "  Fehler: CREATE INDEX name ON tabelle (spalte)\n"; break;
+                if (cmd.tableName.empty() || cmd.indexColumns.empty()) {
+                    std::cout << "  Fehler: CREATE INDEX name ON tabelle (spalte [, ...])\n"; break;
                 }
-                engine.createIndex(cmd.tableName, cmd.indexColumn, cmd.indexName);
+                engine.createIndex(cmd.tableName, cmd.indexColumns, cmd.indexName);
+                std::string colList;
+                for (size_t i = 0; i < cmd.indexColumns.size(); ++i) {
+                    if (i > 0) colList += ", ";
+                    colList += cmd.indexColumns[i];
+                }
                 std::cout << "  Index '" << cmd.indexName << "' auf "
-                          << cmd.tableName << "(" << cmd.indexColumn << ") erstellt"
+                          << cmd.tableName << "(" << colList << ") erstellt"
                           << " [B-Tree T=" << milansql::BTree::T << "].\n\n";
                 break;
             }

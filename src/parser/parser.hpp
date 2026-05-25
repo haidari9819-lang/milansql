@@ -4,6 +4,7 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
+#include <sstream>
 #include <stdexcept>
 
 #include "engine/engine.hpp"  // Column, Row, WhereCondition, SelectItem, HavingCondition
@@ -67,7 +68,7 @@ struct ParsedCommand {
 
     // Indizes
     std::string              indexName;
-    std::string              indexColumn;
+    std::vector<std::string> indexColumns;  // Phase 35: ein oder mehrere Spalten
 
     // SELECT-Optionen (Phase 8)
     bool                     isCount       = false;
@@ -370,9 +371,16 @@ public:
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
             cmd.type = CommandType::CREATE_INDEX;
             if (tokens.size() >= 5 && toUpper(tokens[3]) == "ON") {
-                cmd.indexName   = tokens[2];
-                cmd.tableName   = tokens[4];
-                cmd.indexColumn = trim(parenContent);
+                cmd.indexName = tokens[2];
+                cmd.tableName = tokens[4];
+                // Phase 35: parenContent kann "col1, col2, ..." sein
+                std::string content = trim(parenContent);
+                std::stringstream ss(content);
+                std::string part;
+                while (std::getline(ss, part, ',')) {
+                    std::string col = trim(part);
+                    if (!col.empty()) cmd.indexColumns.push_back(col);
+                }
             } else { cmd.type = CommandType::UNKNOWN; }
 
         // ── CREATE TABLE ─────────────────────────────────────────

@@ -21,7 +21,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Aggregation** | `COUNT(*)`, `MIN`, `MAX`, `AVG`, `SUM`, `GROUP BY`, `HAVING` |
 | **JOINs** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL [OUTER] JOIN`, mehrfache JOINs |
 | **Mengen** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` |
-| **Indizes** | `CREATE INDEX` / `DROP INDEX` (B-Tree, T=3) |
+| **Indizes** | `CREATE INDEX` / `DROP INDEX` (B-Tree, T=3), mehrspaltige Indizes |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
 | **Persistenz** | Eigenes Binärformat (`database.milan`, Format v7) mit Checksumme |
@@ -270,6 +270,7 @@ STATUS
 | 32 | String-Funktionen: UPPER, LOWER, LENGTH, CONCAT, SUBSTR, TRIM, REPLACE |
 | 33 | Math-Funktionen: ABS, ROUND, MOD, POWER, SQRT, CEIL, FLOOR |
 | 34 | NULL-Funktionen: COALESCE, IFNULL |
+| 35 | Composite Indexes: `CREATE INDEX name ON tabelle (col1, col2, ...)`, `SHOW INDEXES` zeigt alle Spalten |
 
 ---
 

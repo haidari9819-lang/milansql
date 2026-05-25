@@ -9,6 +9,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cstdint>
+#include <cmath>
 
 #include "btree.hpp"
 
@@ -1498,6 +1499,86 @@ private:
                 pos = found + old.size();
             }
             return res;
+        }
+        // ── Phase 33: Math-Funktionen ────────────────────────────
+        if (fn == "ABS") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                return formatNum(std::abs(v));
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "ROUND") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                if (args.size() >= 2) {
+                    int dec = 0;
+                    try { dec = std::stoi(resolveArg(args[1])); } catch (...) {}
+                    double factor = std::pow(10.0, dec);
+                    double rounded = std::round(v * factor) / factor;
+                    if (dec <= 0) return formatNum(rounded);
+                    // Dezimalstellen formatieren
+                    std::string s = std::to_string(rounded);
+                    // Auf dec Stellen nach dem Punkt kürzen
+                    auto dot = s.find('.');
+                    if (dot != std::string::npos && s.size() > dot + 1 + static_cast<size_t>(dec))
+                        s = s.substr(0, dot + 1 + static_cast<size_t>(dec));
+                    // Trailing zeros entfernen bis auf dec Stellen
+                    return s;
+                }
+                return formatNum(std::round(v));
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "MOD") {
+            if (args.size() < 2) return "0";
+            try {
+                double a = std::stod(resolveArg(args[0]));
+                double b = std::stod(resolveArg(args[1]));
+                if (b == 0.0) return "NaN";
+                return formatNum(std::fmod(a, b));
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "POWER") {
+            if (args.size() < 2) return "0";
+            try {
+                double base = std::stod(resolveArg(args[0]));
+                double exp  = std::stod(resolveArg(args[1]));
+                return formatNum(std::pow(base, exp));
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "SQRT") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                if (v < 0.0) return "NaN";
+                double r = std::sqrt(v);
+                // Ganzzahl falls exakt, sonst mit Dezimalstellen
+                long long iv = static_cast<long long>(r);
+                if (static_cast<double>(iv) == r) return std::to_string(iv);
+                std::string s = std::to_string(r);
+                auto dot = s.find('.');
+                if (dot != std::string::npos) {
+                    size_t last = s.find_last_not_of('0');
+                    if (last == dot) return s.substr(0, dot);
+                    return s.substr(0, last + 1);
+                }
+                return s;
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "CEIL") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                return formatNum(std::ceil(v));
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "FLOOR") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                return formatNum(std::floor(v));
+            } catch (...) { return "NaN"; }
         }
         return "";
     }

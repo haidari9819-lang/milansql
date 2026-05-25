@@ -225,7 +225,8 @@ public:
         // ── Phase 32: String-Funktionen-Erkennung ────────────────
         {
             static const std::vector<std::string> SFUNCS =
-                {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE"};
+                {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
+                 "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -1109,7 +1110,8 @@ private:
         }
         // Phase 31/32: CASE oder String-Funktion im Spaltenbereich?
         static const std::vector<std::string> SFUNCS32 =
-            {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE"};
+            {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
+                 "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -1218,7 +1220,8 @@ private:
             } else {
                 // Phase 32: String-Funktion? FUNC ( args... ) [AS alias]
                 static const std::vector<std::string> SFUNCS32 =
-                    {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE"};
+                    {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
+                 "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 

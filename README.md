@@ -11,6 +11,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 |-----------|---------------------|
 | **DDL** | `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN) |
 | **DML** | `INSERT INTO` (single, multi-row, SELECT), `SELECT`, `UPDATE SET`, `DELETE FROM`, `TRUNCATE TABLE` |
+| **String-Funktionen** | `UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTR`, `TRIM`, `REPLACE` in SELECT mit AS alias |
 | **Views** | `CREATE VIEW … AS SELECT`, `DROP VIEW`, `SELECT * FROM view` |
 | **Constraints** | `NOT NULL`, `UNIQUE`, `DEFAULT`, `PRIMARY KEY`, `AUTO_INCREMENT`, `CHECK` |
 | **Foreign Keys** | `FOREIGN KEY … REFERENCES`, `ON DELETE RESTRICT / CASCADE / SET NULL` |
@@ -264,6 +265,7 @@ STATUS
 | 29 | RIGHT JOIN + FULL OUTER JOIN |
 | 30 | UNION / UNION ALL / INTERSECT / EXCEPT |
 | 31 | CASE WHEN THEN ELSE END in SELECT (mit AS alias) |
+| 32 | String-Funktionen: UPPER, LOWER, LENGTH, CONCAT, SUBSTR, TRIM, REPLACE |
 
 ---
 

@@ -11,8 +11,8 @@
 #include "storage/storage.hpp"
 
 // ============================================================
-// main.cpp — REPL für MilanSQL (Phase 31)
-// Neu: CASE WHEN THEN ELSE END in SELECT
+// main.cpp — REPL für MilanSQL (Phase 32)
+// Neu: String-Funktionen in SELECT (UPPER/LOWER/LENGTH/CONCAT/SUBSTR/TRIM/REPLACE)
 // ============================================================
 
 static void printTable(const milansql::Table& tbl, int limit = -1) {
@@ -763,14 +763,17 @@ int main() {
                     break;
                 }
 
-                // ORDER BY → Projektion → DISTINCT → LIMIT
-                if (!cmd.orderByColumn.empty())
-                    result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
-                // Phase 31: CASE-Projektion hat Vorrang
-                if (cmd.hasCaseItems && !cmd.selectItems.empty())
+                // Phase 31/32: CASE/Func-Projektion ZUERST (Aliase für ORDER BY)
+                if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
                     result = engine.projectWithItems(result, cmd.selectItems);
-                else if (!cmd.selectColumns.empty())
-                    result = result.project(cmd.selectColumns);
+                    if (!cmd.orderByColumn.empty())
+                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
+                } else {
+                    if (!cmd.orderByColumn.empty())
+                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
+                    if (!cmd.selectColumns.empty())
+                        result = result.project(cmd.selectColumns);
+                }
                 if (cmd.isDistinct)
                     result.makeDistinct();
 

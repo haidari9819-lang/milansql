@@ -222,6 +222,27 @@ public:
             }
         }
 
+        // ── Phase 32: String-Funktionen-Erkennung ────────────────
+        {
+            static const std::vector<std::string> SFUNCS =
+                {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE"};
+            auto st = tokenize(input);
+            if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                for (const auto& tok : st) {
+                    std::string u = toUpper(tok);
+                    for (const auto& f : SFUNCS) {
+                        size_t fl = f.size();
+                        if (u == f ||
+                            (u.size() >= fl + 1 &&
+                             u.substr(0, fl) == f && u[fl] == '(')) {
+                            parseSelectFull(input, cmd);
+                            return cmd;
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Standard-Parsing (Phasen 1–9) ─────────────────────
 
         std::string parenContent;
@@ -1086,12 +1107,17 @@ private:
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
         }
-        // Phase 31: CASE WHEN im Spaltenbereich? → parseCaseSelectItems nutzen
-        bool hasCase = false;
-        for (size_t i = selStart; i < fromPos; ++i)
-            if (toUpper(ft[i]) == "CASE") { hasCase = true; break; }
+        // Phase 31/32: CASE oder String-Funktion im Spaltenbereich?
+        static const std::vector<std::string> SFUNCS32 =
+            {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE"};
+        bool hasCase = false, hasFunc = false;
+        for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
+            std::string u = toUpper(ft[i]);
+            if (u == "CASE") { hasCase = true; continue; }
+            for (const auto& f : SFUNCS32) if (u == f) { hasFunc = true; break; }
+        }
 
-        if (hasCase) {
+        if (hasCase || hasFunc) {
             parseCaseSelectItems(ft, selStart, fromPos, cmd);
         } else {
             std::string colList;
@@ -1190,14 +1216,39 @@ private:
                 ++i;
 
             } else {
-                // Normale Spalte, optional mit AS alias
-                SelectItem item;
-                item.colName = ft[i]; ++i;
-                if (i < end && toUpper(ft[i]) == "AS") {
-                    ++i;
-                    if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                // Phase 32: String-Funktion? FUNC ( args... ) [AS alias]
+                static const std::vector<std::string> SFUNCS32 =
+                    {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE"};
+                bool isStrFunc = false;
+                for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
+
+                if (isStrFunc && i + 1 < end && ft[i + 1] == "(") {
+                    SelectItem item;
+                    item.isFuncExpr = true;
+                    item.funcName   = u;
+                    i += 2;  // Funktionsname + "(" überspringen
+                    // Argumente bis ")" sammeln
+                    while (i < end && ft[i] != ")") {
+                        if (ft[i] != ",") item.funcArgs.push_back(ft[i]);
+                        ++i;
+                    }
+                    if (i < end && ft[i] == ")") ++i;
+                    // optionales AS alias
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(item);
+                } else {
+                    // Normale Spalte, optional mit AS alias
+                    SelectItem item;
+                    item.colName = ft[i]; ++i;
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(item);
                 }
-                cmd.selectItems.push_back(item);
             }
         }
         cmd.hasCaseItems = true;
@@ -1404,12 +1455,21 @@ private:
 
     // ── Phase 10: GROUP BY-Parser ─────────────────────────────
 
-    // tokenizeFull: wie tokenize, aber (, ), , werden als eigene Tokens ausgegeben
+    // tokenizeFull: wie tokenize, aber (, ), , werden als eigene Tokens ausgegeben.
+    // Phase 32: 'literal'-Strings (Single-Quotes) bleiben als ein Token erhalten.
     static std::vector<std::string> tokenizeFull(const std::string& s) {
         std::vector<std::string> tokens;
         std::string cur;
+        bool inQuote = false;
         for (char c : s) {
-            if (c == ' ' || c == '\t' || c == '\r') {
+            if (inQuote) {
+                cur += c;
+                if (c == '\'') { inQuote = false; tokens.push_back(cur); cur.clear(); }
+            } else if (c == '\'') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                cur += c;
+                inQuote = true;
+            } else if (c == ' ' || c == '\t' || c == '\r') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
             } else if (c == '(' || c == ')' || c == ',') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }

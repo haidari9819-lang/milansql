@@ -84,7 +84,7 @@ struct WhereCondition {
     ExistsSpec               existsSpec;   // für EXISTS / NOT EXISTS
 };
 
-// ── SELECT-Listen-Eintrag (Phase 10 / Phase 31) ──────────────
+// ── SELECT-Listen-Eintrag (Phase 10 / Phase 31 / Phase 32) ───
 struct SelectItem {
     bool        isAgg   = false;
     std::string aggFunc;   // COUNT, MIN, MAX, AVG, SUM
@@ -102,6 +102,11 @@ struct SelectItem {
     };
     std::vector<WhenClause> caseWhen;
     std::string             caseElse = "NULL";
+
+    // Phase 32: String-Funktionen (UPPER/LOWER/LENGTH/CONCAT/SUBSTR/TRIM/REPLACE)
+    bool                     isFuncExpr = false;
+    std::string              funcName;
+    std::vector<std::string> funcArgs;   // Spaltenname ODER String-Literal
 };
 
 // ── HAVING-Bedingung (Phase 10) ───────────────────────────────
@@ -1180,20 +1185,34 @@ public:
 
     bool tableExists(const std::string& n) const { return tables_.count(n) > 0; }
 
-    // ── Phase 31: CASE WHEN — Projektion mit Ausdrücken ──────
+    // ── Phase 31/32: CASE/Func — Projektion mit Ausdrücken ──────
     Table projectWithItems(const Table& src,
                            const std::vector<SelectItem>& items) const {
         // Ergebnis-Schema aufbauen
         std::vector<Column> newCols;
         for (const auto& item : items) {
-            if (item.isCaseExpr) {
+            if (item.isFuncExpr) {
+                // Phase 32: String-Funktionen
+                std::string cname;
+                if (!item.alias.empty()) {
+                    cname = item.alias;
+                } else {
+                    cname = item.funcName + "(";
+                    for (size_t k = 0; k < item.funcArgs.size(); ++k) {
+                        if (k > 0) cname += ",";
+                        cname += item.funcArgs[k];
+                    }
+                    cname += ")";
+                }
+                newCols.emplace_back(cname, "TEXT");
+            } else if (item.isCaseExpr) {
                 std::string cname = item.alias.empty() ? "case" : item.alias;
                 newCols.emplace_back(cname, "TEXT");
             } else {
                 int ci = findColIdx(src, item.colName);
                 if (ci < 0)
                     throw std::runtime_error(
-                        "CASE SELECT: Spalte '" + item.colName + "' nicht gefunden.");
+                        "SELECT: Spalte '" + item.colName + "' nicht gefunden.");
                 std::string cname = item.alias.empty()
                     ? src.columns()[static_cast<size_t>(ci)].name
                     : item.alias;
@@ -1206,7 +1225,9 @@ public:
             std::vector<std::string> vals;
             vals.reserve(items.size());
             for (const auto& item : items) {
-                if (item.isCaseExpr) {
+                if (item.isFuncExpr) {
+                    vals.push_back(evaluateFunc(item.funcName, item.funcArgs, src, row));
+                } else if (item.isCaseExpr) {
                     vals.push_back(evalCase(item, src, row));
                 } else {
                     int ci = findColIdx(src, item.colName);
@@ -1406,6 +1427,79 @@ private:
             if (match) return wh.result;
         }
         return item.caseElse;
+    }
+
+    // Phase 32: String-Funktion auswerten
+    // Argumente: Spaltenname → Zellwert; 'literal' oder literal → direkt
+    static std::string evaluateFunc(const std::string& fn,
+                                     const std::vector<std::string>& args,
+                                     const Table& tbl, const Row& row) {
+        // Argument auflösen: Spalte → Wert, 'literal' → literal, sonst direkt
+        auto resolveArg = [&](const std::string& a) -> std::string {
+            if (a.size() >= 2 && a.front() == '\'' && a.back() == '\'')
+                return a.substr(1, a.size() - 2);  // 'text' → text
+            int ci = findColIdx(tbl, a);
+            if (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
+                return row.values[static_cast<size_t>(ci)];
+            return a;  // unquoted literal
+        };
+
+        if (fn == "UPPER") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            for (char& c : v) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return v;
+        }
+        if (fn == "LOWER") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return v;
+        }
+        if (fn == "LENGTH") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            return std::to_string(v.size());
+        }
+        if (fn == "CONCAT") {
+            std::string result;
+            for (const auto& a : args) result += resolveArg(a);
+            return result;
+        }
+        if (fn == "SUBSTR") {
+            if (args.size() < 3) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v = resolveArg(args[0]);
+            int pos = 1, len = -1;
+            try { pos = std::stoi(resolveArg(args[1])); } catch (...) {}
+            try { len = std::stoi(resolveArg(args[2])); } catch (...) {}
+            if (pos < 1) pos = 1;
+            size_t start = static_cast<size_t>(pos - 1);
+            if (start >= v.size()) return "";
+            return len < 0 ? v.substr(start)
+                           : v.substr(start, static_cast<size_t>(len));
+        }
+        if (fn == "TRIM") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            size_t a = v.find_first_not_of(" \t");
+            if (a == std::string::npos) return "";
+            size_t b = v.find_last_not_of(" \t");
+            return v.substr(a, b - a + 1);
+        }
+        if (fn == "REPLACE") {
+            if (args.size() < 3) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v   = resolveArg(args[0]);
+            std::string old = resolveArg(args[1]);
+            std::string neu = resolveArg(args[2]);
+            if (old.empty()) return v;
+            std::string res;
+            size_t pos = 0;
+            while (pos <= v.size()) {
+                auto found = v.find(old, pos);
+                if (found == std::string::npos) { res += v.substr(pos); break; }
+                res += v.substr(pos, found - pos);
+                res += neu;
+                pos = found + old.size();
+            }
+            return res;
+        }
+        return "";
     }
 
     // Exakter Match, dann Suffix-Match.

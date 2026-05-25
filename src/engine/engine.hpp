@@ -1580,6 +1580,21 @@ private:
                 return formatNum(std::floor(v));
             } catch (...) { return "NaN"; }
         }
+        // ── Phase 34: NULL-Behandlung ────────────────────────────
+        if (fn == "IFNULL") {
+            // IFNULL(val, default) — val wenn nicht NULL, sonst default
+            if (args.size() < 2) return args.empty() ? "NULL" : resolveArg(args[0]);
+            std::string v = resolveArg(args[0]);
+            return (v == "NULL") ? resolveArg(args[1]) : v;
+        }
+        if (fn == "COALESCE") {
+            // COALESCE(v1, v2, ...) — erstes nicht-NULL Argument
+            for (const auto& a : args) {
+                std::string v = resolveArg(a);
+                if (v != "NULL") return v;
+            }
+            return "NULL";
+        }
         return "";
     }
 

@@ -142,6 +142,10 @@ struct ParsedCommand {
 
     // Phase 37: Alias der Haupttabelle (z.B. "m" in FROM mitarbeiter m)
     std::string tableAlias;
+
+    // Phase 41: WITH / CTE — Common Table Expressions
+    // Jeder Eintrag: {cte_name, inner_sql}
+    std::vector<std::pair<std::string,std::string>> cteList;
 };
 
 class Parser {
@@ -149,6 +153,60 @@ public:
     ParsedCommand parse(const std::string& input) {
         ParsedCommand cmd;
         cmd.raw = input;
+
+        // ── Phase 41: WITH / CTE erkennen ────────────────────────
+        {
+            auto ftFull = tokenizeFull(input);
+            if (!ftFull.empty() && toUpper(ftFull[0]) == "WITH") {
+                std::vector<std::pair<std::string,std::string>> ctes;
+                size_t i = 1; // skip "WITH"
+                while (i < ftFull.size()) {
+                    // skip commas between CTEs
+                    while (i < ftFull.size() && ftFull[i] == ",") ++i;
+                    if (i >= ftFull.size()) break;
+                    // check if this is the start of the main SELECT/UNION/etc.
+                    std::string kw = toUpper(ftFull[i]);
+                    if (kw == "SELECT" || kw == "INSERT" ||
+                        kw == "UPDATE" || kw == "DELETE") break;
+                    // expect: name AS ( ... )
+                    std::string cteName = ftFull[i++];
+                    if (i >= ftFull.size() || toUpper(ftFull[i]) != "AS") break;
+                    ++i; // skip AS
+                    if (i >= ftFull.size() || ftFull[i] != "(") break;
+                    ++i; // skip opening (
+                    // collect inner SQL tokens (depth-balanced)
+                    int depth = 1;
+                    std::vector<std::string> innerToks;
+                    while (i < ftFull.size() && depth > 0) {
+                        if (ftFull[i] == "(") ++depth;
+                        else if (ftFull[i] == ")") {
+                            --depth;
+                            if (depth == 0) { ++i; break; }
+                        }
+                        if (depth > 0) innerToks.push_back(ftFull[i]);
+                        ++i;
+                    }
+                    std::string innerSql;
+                    for (size_t j = 0; j < innerToks.size(); ++j) {
+                        if (j > 0) innerSql += " ";
+                        innerSql += innerToks[j];
+                    }
+                    ctes.push_back({cteName, innerSql});
+                }
+                // remaining tokens form the main query
+                std::string mainSql;
+                for (size_t j = i; j < ftFull.size(); ++j) {
+                    if (j > i) mainSql += " ";
+                    mainSql += ftFull[j];
+                }
+                if (!ctes.empty() && !mainSql.empty()) {
+                    ParsedCommand result = parse(mainSql);
+                    result.cteList = ctes;
+                    result.raw = input;
+                    return result;
+                }
+            }
+        }
 
         // ── Phase 36: EXPLAIN-Prefix erkennen ────────────────────
         {

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <memory>
 #include <algorithm>
 #include <stdexcept>
@@ -1548,6 +1549,23 @@ public:
         return result;
     }
 
+    // ── Phase 41: WITH / CTE — temporäre Tabellen ────────────────
+
+    // Registriert eine Tabelle unter name als temporäre CTE-Tabelle.
+    void registerTempTable(const std::string& name, Table tbl) {
+        tempTableNames_.insert(name);
+        // Move into tables_ under the CTE name (clone with new name)
+        Table named(name, tbl.columns());
+        for (const auto& row : tbl.rows()) named.insert(row);
+        tables_[name] = std::move(named);
+    }
+
+    // Entfernt alle registrierten CTE-Tabellen aus tables_.
+    void cleanupTempTables() {
+        for (const auto& n : tempTableNames_) tables_.erase(n);
+        tempTableNames_.clear();
+    }
+
 private:
     // ── Tabellen-Zugriff ──────────────────────────────────────
 
@@ -2698,6 +2716,7 @@ public:
 
     std::map<std::string, Table>  tables_;
     std::map<std::string, std::string> views_;   // Phase 24: name → SQL
+    std::set<std::string> tempTableNames_;        // Phase 41: CTE-Tabellennamen
 
     // Transaktionszustand
     bool                     inTransaction_ = false;

@@ -427,6 +427,101 @@ static void printHelp() {
         << "  ──────────────────────────────────────────────────────────────────\n\n";
 }
 
+// ── Phase 41: CTE-Hilfs-Funktion — SELECT → Table (ohne Ausgabe) ──
+// Führt ein geparste SELECT-Abfrage aus und gibt das Ergebnis als Table zurück.
+// Unterstützt: einfaches SELECT, SET-Operationen (UNION/INTERSECT/EXCEPT), JOIN, GROUP BY.
+static milansql::Table executeSelectToTable(
+        milansql::Engine& engine,
+        milansql::Parser& parser,
+        milansql::ParsedCommand cmd)
+{
+    // Subqueries auflösen
+    for (const auto& sq : cmd.subqueries) {
+        if (sq.condIdx < cmd.whereConds.size()) {
+            cmd.whereConds[sq.condIdx].inList =
+                engine.subqueryValues(sq.subTable, sq.subCol,
+                                      sq.subWhere, sq.subWhereLogic);
+        }
+    }
+
+    // SET-Operationen (UNION / INTERSECT / EXCEPT)
+    if (cmd.isSetOp) {
+        milansql::Table leftResult;
+        if (!cmd.whereConds.empty()) {
+            auto qr = engine.selectWhere(cmd.tableName, cmd.whereConds, cmd.whereLogic);
+            leftResult = std::move(qr.table);
+        } else {
+            leftResult = engine.selectAll(cmd.tableName).clone();
+        }
+        if (!cmd.selectColumns.empty())
+            leftResult = leftResult.project(cmd.selectColumns);
+
+        milansql::ParsedCommand rc = parser.parse(cmd.rightSql);
+        for (const auto& sq : rc.subqueries) {
+            if (sq.condIdx < rc.whereConds.size())
+                rc.whereConds[sq.condIdx].inList =
+                    engine.subqueryValues(sq.subTable, sq.subCol,
+                                          sq.subWhere, sq.subWhereLogic);
+        }
+        milansql::Table rightResult;
+        if (!rc.whereConds.empty()) {
+            auto qr = engine.selectWhere(rc.tableName, rc.whereConds, rc.whereLogic);
+            rightResult = std::move(qr.table);
+        } else {
+            rightResult = engine.selectAll(rc.tableName).clone();
+        }
+        if (!rc.selectColumns.empty())
+            rightResult = rightResult.project(rc.selectColumns);
+
+        milansql::Table result = engine.executeSetOp(leftResult, cmd.setOp, rightResult);
+        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        return result;
+    }
+
+    // JOIN
+    if (cmd.isJoin) {
+        auto result = engine.executeJoins(
+            cmd.tableName, cmd.joinClauses,
+            cmd.whereConds, cmd.whereLogic);
+        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        if (!cmd.selectColumns.empty())
+            result = result.project(cmd.selectColumns);
+        return result;
+    }
+
+    // GROUP BY
+    if (cmd.isGroupBy) {
+        auto result = engine.groupBy(
+            cmd.tableName,
+            cmd.whereConds, cmd.whereLogic,
+            cmd.groupByCols,
+            cmd.selectItems,
+            cmd.havingConds, cmd.havingLogic);
+        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        return result;
+    }
+
+    // Einfaches SELECT (mit oder ohne WHERE)
+    milansql::Table result;
+    if (!cmd.whereConds.empty()) {
+        auto qr = engine.selectWhere(cmd.tableName, cmd.whereConds, cmd.whereLogic);
+        result = std::move(qr.table);
+    } else {
+        result = engine.selectAll(cmd.tableName).clone();
+    }
+
+    if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
+        result = engine.projectWithItems(result, cmd.selectItems);
+        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+    } else {
+        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        if (!cmd.selectColumns.empty())
+            result = result.project(cmd.selectColumns);
+    }
+    if (cmd.isDistinct) result.makeDistinct();
+    return result;
+}
+
 static void printBanner() {
     std::cout << "\n"
               << "  ╔══════════════════════════════════════════╗\n"
@@ -698,6 +793,32 @@ int main() {
             case milansql::CommandType::SELECT: {
                 if (cmd.tableName.empty()) {
                     std::cout << "  Fehler: Kein Tabellenname.\n"; break;
+                }
+
+                // ── Phase 41: WITH / CTE ──────────────────────────
+                if (!cmd.cteList.empty()) {
+                    try {
+                        // Jeden CTE auswerten und als temporäre Tabelle registrieren
+                        for (auto& [cteName, cteInnerSql] : cmd.cteList) {
+                            milansql::ParsedCommand cteParsed = parser.parse(cteInnerSql);
+                            milansql::Table cteResult =
+                                executeSelectToTable(engine, parser, cteParsed);
+                            engine.registerTempTable(cteName, std::move(cteResult));
+                        }
+                        // Hauptabfrage wie ein normales SELECT ausführen
+                        // (temp-Tabellen sind jetzt in tables_ sichtbar)
+                        milansql::Table mainResult =
+                            executeSelectToTable(engine, parser, cmd);
+                        engine.cleanupTempTables();
+                        std::cout << "\n";
+                        if (!cmd.orderByCols.empty())
+                            mainResult.sortByMulti(cmd.orderByCols);
+                        printTable(mainResult, cmd.limit, cmd.limitOffset);
+                    } catch (...) {
+                        engine.cleanupTempTables();
+                        throw;
+                    }
+                    break;
                 }
 
                 // ── Phase 36: EXPLAIN ─────────────────────────────

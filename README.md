@@ -25,6 +25,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Indizes** | `CREATE INDEX` / `DROP INDEX` (B-Tree, T=3), mehrspaltige Indizes |
 | **EXPLAIN** | `EXPLAIN SELECT ...` — Query-Plan (SCAN/INDEX/FILTER/JOIN/GROUP/AGGREGATE/SORT/LIMIT/PROJECT) |
 | **Correlated Subqueries** | `WHERE col > (SELECT AVG(...) WHERE col = alias.col)`, `(SELECT COUNT(*) FROM ...) AS alias` in SELECT, `EXISTS` mit mehreren Bedingungen |
+| **WITH / CTE** | `WITH name AS (SELECT ...), ... SELECT ...` (Common Table Expressions, mehrere CTEs) |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
 | **Persistenz** | Eigenes Binärformat (`database.milan`, Format v7) mit Checksumme |
@@ -282,6 +283,7 @@ STATUS
 | 38 | Multi-Column ORDER BY: `ORDER BY col1 ASC, col2 DESC`; LIMIT mit OFFSET: `LIMIT n OFFSET m` |
 | 39 | UPSERT: `INSERT OR REPLACE INTO t VALUES (...)` — Konflikt→löschen+einfügen; `INSERT OR IGNORE INTO t VALUES (...)` — Konflikt→ignorieren; `ON CONFLICT DO NOTHING` |
 | 40 | CAST: `CAST(expr AS INT\|REAL\|TEXT)` in SELECT und WHERE |
+| 41 | WITH / CTE: `WITH name AS (SELECT ...)` — Common Table Expressions, mehrere CTEs, UNION |
 
 ---
 

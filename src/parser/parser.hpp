@@ -43,6 +43,11 @@ enum class CommandType {
     CREATE_TRIGGER,
     DROP_TRIGGER,
     SHOW_TRIGGERS,
+    // Phase 44: Stored Procedures
+    CREATE_PROCEDURE,
+    DROP_PROCEDURE,
+    SHOW_PROCEDURES,
+    CALL_PROCEDURE,
     UNKNOWN
 };
 
@@ -158,6 +163,12 @@ struct ParsedCommand {
     std::string triggerTable;         // table name the trigger is on
     std::string triggerBody;          // raw body text (between BEGIN and END)
     std::string showTriggersTable;    // for "SHOW TRIGGERS ON tablename"
+
+    // Phase 44: Stored Procedure fields
+    std::string procedureName;
+    std::vector<std::pair<std::string,std::string>> procedureParams; // {name, type}
+    std::string procedureBody;
+    std::vector<std::string> callArgs; // arguments for CALL
 };
 
 class Parser {
@@ -587,6 +598,108 @@ public:
             }
             cmd.triggerBody = body;
 
+        // ── Phase 44: CREATE PROCEDURE ───────────────────────────
+        // Syntax: CREATE PROCEDURE name(p1 TYPE1, ...) BEGIN body END
+        } else if (kw0 == "CREATE" && kw1 == "PROCEDURE") {
+            cmd.type = CommandType::CREATE_PROCEDURE;
+            {
+                auto toks = tokenizeFull(input);
+                size_t i = 2; // skip CREATE PROCEDURE
+                // procedure name might have '(' attached (e.g. "erhoehe_gehalt(")
+                if (i < toks.size()) {
+                    std::string nameTok = toks[i++];
+                    if (!nameTok.empty() && nameTok.back() == '(') {
+                        cmd.procedureName = nameTok.substr(0, nameTok.size() - 1);
+                        // treat as if '(' was next token
+                        // parse params until ')'
+                        while (i < toks.size() && toks[i] != ")") {
+                            if (toks[i] == ",") { ++i; continue; }
+                            std::string pname = toks[i++];
+                            std::string ptype = (i < toks.size() &&
+                                toks[i] != "," && toks[i] != ")") ? toks[i++] : "TEXT";
+                            cmd.procedureParams.push_back({pname, ptype});
+                        }
+                        if (i < toks.size() && toks[i] == ")") ++i; // skip )
+                    } else {
+                        cmd.procedureName = nameTok;
+                        // next token should be '('
+                        if (i < toks.size() && toks[i] == "(") {
+                            ++i; // skip (
+                            while (i < toks.size() && toks[i] != ")") {
+                                if (toks[i] == ",") { ++i; continue; }
+                                std::string pname = toks[i++];
+                                std::string ptype = (i < toks.size() &&
+                                    toks[i] != "," && toks[i] != ")") ? toks[i++] : "TEXT";
+                                cmd.procedureParams.push_back({pname, ptype});
+                            }
+                            if (i < toks.size()) ++i; // skip )
+                        }
+                    }
+                }
+                // skip to BEGIN
+                while (i < toks.size() && toUpper(toks[i]) != "BEGIN") ++i;
+                if (i < toks.size()) ++i; // skip BEGIN
+                // collect body until standalone END
+                std::string body;
+                while (i < toks.size() && toUpper(toks[i]) != "END") {
+                    if (!body.empty()) body += " ";
+                    body += toks[i++];
+                }
+                cmd.procedureBody = body;
+            }
+
+        // ── Phase 44: CALL ────────────────────────────────────────
+        // Syntax: CALL name(arg1, arg2, ...)
+        } else if (kw0 == "CALL") {
+            cmd.type = CommandType::CALL_PROCEDURE;
+            {
+                // Find procedure name and args from raw input
+                std::string rest = input;
+                // Skip leading whitespace and "CALL"
+                size_t s = 0;
+                while (s < rest.size() && (rest[s]==' '||rest[s]=='\t')) ++s;
+                // skip CALL keyword
+                s += 4; // length of "CALL"
+                while (s < rest.size() && (rest[s]==' '||rest[s]=='\t')) ++s;
+                rest = rest.substr(s);
+                // Find '('
+                size_t parenP = rest.find('(');
+                if (parenP == std::string::npos) {
+                    cmd.procedureName = rest;
+                    // trim
+                    while (!cmd.procedureName.empty() && cmd.procedureName.back() == ' ')
+                        cmd.procedureName.pop_back();
+                } else {
+                    cmd.procedureName = rest.substr(0, parenP);
+                    while (!cmd.procedureName.empty() && cmd.procedureName.back() == ' ')
+                        cmd.procedureName.pop_back();
+                    // parse args between ( and )
+                    size_t closeP = rest.rfind(')');
+                    std::string argsStr = rest.substr(parenP + 1,
+                        closeP != std::string::npos ?
+                            closeP - parenP - 1 : std::string::npos);
+                    // split by commas
+                    std::string cur;
+                    for (char c : argsStr) {
+                        if (c == ',') {
+                            while (!cur.empty() && cur.front() == ' ') cur = cur.substr(1);
+                            while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
+                            if (!cur.empty()) cmd.callArgs.push_back(cur);
+                            cur = "";
+                        } else cur += c;
+                    }
+                    while (!cur.empty() && cur.front() == ' ') cur = cur.substr(1);
+                    while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
+                    if (!cur.empty()) cmd.callArgs.push_back(cur);
+                }
+            }
+
+        // ── Phase 44: DROP PROCEDURE ──────────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "PROCEDURE") {
+            cmd.type = CommandType::DROP_PROCEDURE;
+            if (tokens.size() >= 3) cmd.procedureName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
             cmd.type = CommandType::CREATE_INDEX;
@@ -747,6 +860,9 @@ public:
                 cmd.type = CommandType::SHOW_TRIGGERS;
                 if (tokens.size() >= 4 && toUpper(tokens[2]) == "ON")
                     cmd.showTriggersTable = tokens[3];
+            // Phase 44: SHOW PROCEDURES
+            } else if (kw1 == "PROCEDURES") {
+                cmd.type = CommandType::SHOW_PROCEDURES;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -814,12 +930,29 @@ private:
                 cmd.updateVals.push_back(val);
                 ++i;
             } else if (i + 2 < end && tokens[i + 1] == "=") {
-                // "col = val" in drei Tokens
-                std::string v = tokens[i + 2];
+                // "col = val [op val2 ...]" — collect until next col=val or end
+                // Collect multi-token value expression (e.g. "gehalt + 1000")
+                i += 2;  // skip col and =
+                std::string v;
+                // Collect tokens until next ',' or a token that looks like col=val or end
+                while (i < end && tokens[i] != ",") {
+                    // Check if this looks like the start of next assignment: col =
+                    // (i.e., next token is '=' or current token contains '=' as non-first char)
+                    if (i + 1 < end && tokens[i + 1] == "=") break;
+                    // single-token col=val
+                    {
+                        std::string c2, o2, v2;
+                        if (extractColOpVal(tokens[i], c2, o2, v2) && o2 == "=") break;
+                    }
+                    if (!v.empty()) v += " ";
+                    std::string vt = tokens[i];
+                    if (!vt.empty() && vt.back() == ',') { v += vt.substr(0, vt.size()-1); ++i; break; }
+                    v += vt;
+                    ++i;
+                }
                 if (!v.empty() && v.back() == ',') v.pop_back();
                 cmd.updateCols.push_back(tok);
                 cmd.updateVals.push_back(v);
-                i += 3;
                 // Optional nachfolgendes Komma-Token überspringen
                 if (i < end && tokens[i] == ",") ++i;
             } else {

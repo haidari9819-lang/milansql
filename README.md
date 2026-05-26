@@ -28,6 +28,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **WITH / CTE** | `WITH name AS (SELECT ...), ... SELECT ...` (Common Table Expressions, mehrere CTEs) |
 | **Window Functions** | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM/AVG/COUNT/MIN/MAX() OVER (PARTITION BY col ORDER BY col)` |
 | **Trigger** | `CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl FOR EACH ROW BEGIN ... END`, `DROP TRIGGER`, `SHOW TRIGGERS [ON tbl]` |
+| **Stored Procedures** | `CREATE PROCEDURE name(params) BEGIN...END`, `CALL name(args)`, `DROP PROCEDURE`, `SHOW PROCEDURES` |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
 | **Persistenz** | Eigenes Binärformat (`database.milan`, Format v7) mit Checksumme |
@@ -288,6 +289,7 @@ STATUS
 | 41 | WITH / CTE: `WITH name AS (SELECT ...)` — Common Table Expressions, mehrere CTEs, UNION |
 | 42 | Window Functions: `ROW_NUMBER/RANK/DENSE_RANK/SUM/AVG/COUNT/MIN/MAX OVER (PARTITION BY ... ORDER BY ...)` |
 | 43 | Trigger: `CREATE TRIGGER BEFORE/AFTER INSERT/UPDATE/DELETE`, SIGNAL, NEW/OLD, `DROP TRIGGER`, `SHOW TRIGGERS` |
+| 44 | Stored Procedures: `CREATE PROCEDURE / CALL / DROP PROCEDURE / SHOW PROCEDURES` |
 
 ---
 

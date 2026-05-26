@@ -596,6 +596,61 @@ int main() {
         }
     }
 
+    // Phase 44: Load procedures from separate file
+    {
+        std::ifstream pf("database.procedures");
+        if (pf) {
+            std::string line;
+            while (std::getline(pf, line)) {
+                if (line.empty()) continue;
+                milansql::ProcedureDef def;
+                size_t tabPos = line.find('\t');
+                if (tabPos == std::string::npos) continue;
+                def.name = line.substr(0, tabPos);
+                int paramCount = 0;
+                try { paramCount = std::stoi(line.substr(tabPos + 1)); }
+                catch (...) { continue; }
+                for (int pi = 0; pi < paramCount; ++pi) {
+                    std::string pline;
+                    if (!std::getline(pf, pline)) break;
+                    size_t pt = pline.find('\t');
+                    if (pt != std::string::npos)
+                        def.params.push_back({pline.substr(0, pt), pline.substr(pt + 1)});
+                }
+                std::string bodyLine;
+                if (!std::getline(pf, bodyLine)) { engine.createProcedure(def); continue; }
+                // decode \n back to spaces
+                std::string decoded;
+                for (size_t bi = 0; bi < bodyLine.size(); ++bi) {
+                    if (bi + 1 < bodyLine.size() &&
+                        bodyLine[bi] == '\\' && bodyLine[bi+1] == 'n') {
+                        decoded += ' '; ++bi;
+                    } else decoded += bodyLine[bi];
+                }
+                def.body = decoded;
+                engine.createProcedure(def);
+            }
+        }
+    }
+
+    // Helper lambda: save procedures to file
+    auto saveProcedures = [&]() {
+        std::ofstream pf("database.procedures");
+        if (!pf) return;
+        for (const auto& [n, p] : engine.getAllProcedures()) {
+            pf << p.name << "\t" << p.params.size() << "\n";
+            for (const auto& param : p.params)
+                pf << param.first << "\t" << param.second << "\n";
+            // encode body: replace newlines with \n literal
+            std::string enc;
+            for (char c : p.body) {
+                if (c == '\n') enc += "\\n";
+                else enc += c;
+            }
+            pf << enc << "\n";
+        }
+    };
+
     auto persist = [&]() {
         if (engine.isInTransaction()) return;  // Während Transaktion nicht persistieren
         try { storage.save(engine); }
@@ -700,6 +755,85 @@ int main() {
                             ep = upNext.find("END", ep + 1);
                         }
                         if (foundEnd) break;
+                    }
+                }
+            }
+        }
+
+        // Phase 44: Multi-line CREATE PROCEDURE — buffer lines until END
+        {
+            std::string upLine = eingabe;
+            for (char& c : upLine)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            size_t s44 = 0;
+            while (s44 < upLine.size() && (upLine[s44]==' '||upLine[s44]=='\t')) ++s44;
+            std::string trimmedUp44 = upLine.substr(s44);
+            if (trimmedUp44.size() >= 16 &&
+                trimmedUp44.substr(0, 16) == "CREATE PROCEDURE") {
+                bool hasBegin = (upLine.find("BEGIN") != std::string::npos);
+                bool hasEnd   = false;
+                if (hasBegin) {
+                    size_t beginPos = upLine.find("BEGIN");
+                    std::string afterBegin = upLine.substr(beginPos + 5);
+                    size_t endPos = afterBegin.find("END");
+                    while (endPos != std::string::npos) {
+                        size_t nxtChar = endPos + 3;
+                        while (nxtChar < afterBegin.size() && afterBegin[nxtChar] == ' ') ++nxtChar;
+                        if (nxtChar >= afterBegin.size()) { hasEnd = true; break; }
+                        hasEnd = true; break;
+                    }
+                }
+                if (hasBegin && !hasEnd) {
+                    // Keep reading lines until standalone END
+                    while (true) {
+                        std::string nextLine;
+                        if (!std::getline(std::cin, nextLine)) break;
+                        eingabe += " " + nextLine;
+                        std::string upNext = nextLine;
+                        for (char& c : upNext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        // trim
+                        size_t nt = 0;
+                        while (nt < upNext.size() && (upNext[nt]==' '||upNext[nt]=='\t')) ++nt;
+                        std::string trimNext = upNext.substr(nt);
+                        if (trimNext == "END" || trimNext.substr(0,4) == "END ") break;
+                        if (upNext.find("END") != std::string::npos) {
+                            // check it's at end of line
+                            size_t ep = upNext.rfind("END");
+                            size_t nc = ep + 3;
+                            while (nc < upNext.size() && upNext[nc] == ' ') ++nc;
+                            if (nc >= upNext.size()) break;
+                        }
+                    }
+                } else if (!hasBegin) {
+                    // Read until BEGIN
+                    while (true) {
+                        std::string nextLine;
+                        if (!std::getline(std::cin, nextLine)) break;
+                        eingabe += " " + nextLine;
+                        std::string upNext = nextLine;
+                        for (char& c : upNext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        if (upNext.find("BEGIN") != std::string::npos) break;
+                    }
+                    // Now read until END
+                    while (true) {
+                        std::string nextLine;
+                        if (!std::getline(std::cin, nextLine)) break;
+                        eingabe += " " + nextLine;
+                        std::string upNext = nextLine;
+                        for (char& c : upNext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        size_t nt = 0;
+                        while (nt < upNext.size() && (upNext[nt]==' '||upNext[nt]=='\t')) ++nt;
+                        std::string trimNext = upNext.substr(nt);
+                        if (trimNext == "END" || trimNext.substr(0,4) == "END ") break;
+                        if (upNext.find("END") != std::string::npos) {
+                            size_t ep = upNext.rfind("END");
+                            size_t nc = ep + 3;
+                            while (nc < upNext.size() && upNext[nc] == ' ') ++nc;
+                            if (nc >= upNext.size()) break;
+                        }
                     }
                 }
             }
@@ -1488,6 +1622,152 @@ int main() {
                                   << " " << t.event << " ON " << t.tableName << "\n";
                     }
                     std::cout << "\n  " << triggers.size() << " Trigger\n\n";
+                }
+                break;
+            }
+
+            // ── Phase 44: CREATE PROCEDURE ────────────────────────
+            case milansql::CommandType::CREATE_PROCEDURE: {
+                if (cmd.procedureName.empty()) {
+                    std::cout << "  Fehler: CREATE PROCEDURE name(params) BEGIN...END\n";
+                    break;
+                }
+                milansql::ProcedureDef def;
+                def.name   = cmd.procedureName;
+                def.params = cmd.procedureParams;
+                def.body   = cmd.procedureBody;
+                engine.createProcedure(def);
+                saveProcedures();
+                std::cout << "  Procedure '" << def.name << "' erstellt.\n\n";
+                break;
+            }
+
+            // ── Phase 44: DROP PROCEDURE ──────────────────────────
+            case milansql::CommandType::DROP_PROCEDURE: {
+                if (cmd.procedureName.empty()) {
+                    std::cout << "  Fehler: DROP PROCEDURE name\n"; break;
+                }
+                engine.dropProcedure(cmd.procedureName);
+                saveProcedures();
+                std::cout << "  Procedure '" << cmd.procedureName << "' geloescht.\n\n";
+                break;
+            }
+
+            // ── Phase 44: SHOW PROCEDURES ─────────────────────────
+            case milansql::CommandType::SHOW_PROCEDURES: {
+                auto procs = engine.showProcedures();
+                if (procs.empty()) {
+                    std::cout << "  Keine Procedures.\n\n";
+                } else {
+                    std::cout << "\n";
+                    for (const auto& p : procs) {
+                        std::string paramStr;
+                        for (size_t pi = 0; pi < p.params.size(); ++pi) {
+                            if (pi > 0) paramStr += ", ";
+                            paramStr += p.params[pi].first + " " + p.params[pi].second;
+                        }
+                        std::cout << "  " << p.name << "(" << paramStr << ")\n";
+                    }
+                    std::cout << "\n  " << procs.size() << " Procedure(n)\n\n";
+                }
+                break;
+            }
+
+            // ── Phase 44: CALL PROCEDURE ──────────────────────────
+            case milansql::CommandType::CALL_PROCEDURE: {
+                if (cmd.procedureName.empty()) {
+                    std::cout << "  Fehler: CALL name(args)\n"; break;
+                }
+                std::string body = engine.getProcedureBody(
+                    cmd.procedureName, cmd.callArgs);
+                // Split body by semicolons, execute each statement
+                std::vector<std::string> stmts;
+                std::string cur;
+                for (char c : body) {
+                    if (c == ';') {
+                        while (!cur.empty() &&
+                               (cur.front()==' '||cur.front()=='\n'||cur.front()=='\t'))
+                            cur = cur.substr(1);
+                        while (!cur.empty() &&
+                               (cur.back()==' '||cur.back()=='\n'||cur.back()=='\t'))
+                            cur.pop_back();
+                        if (!cur.empty()) stmts.push_back(cur);
+                        cur = "";
+                    } else cur += c;
+                }
+                while (!cur.empty() &&
+                       (cur.front()==' '||cur.front()=='\n'||cur.front()=='\t'))
+                    cur = cur.substr(1);
+                while (!cur.empty() &&
+                       (cur.back()==' '||cur.back()=='\n'||cur.back()=='\t'))
+                    cur.pop_back();
+                if (!cur.empty()) stmts.push_back(cur);
+
+                for (const auto& stmt : stmts) {
+                    if (stmt.empty()) continue;
+                    milansql::Parser stmtParser;
+                    milansql::ParsedCommand sc = stmtParser.parse(stmt);
+                    // Resolve subqueries
+                    for (const auto& sq : sc.subqueries) {
+                        if (sq.condIdx < sc.whereConds.size()) {
+                            sc.whereConds[sq.condIdx].inList =
+                                engine.subqueryValues(sq.subTable, sq.subCol,
+                                                      sq.subWhere, sq.subWhereLogic);
+                        }
+                    }
+                    try {
+                        if (sc.type == milansql::CommandType::SELECT) {
+                            milansql::Table result;
+                            if (!sc.whereConds.empty()) {
+                                auto qr = engine.selectWhere(sc.tableName,
+                                    sc.whereConds, sc.whereLogic);
+                                result = std::move(qr.table);
+                            } else {
+                                result = engine.selectAll(sc.tableName).clone();
+                            }
+                            if (!sc.selectColumns.empty())
+                                result = result.project(sc.selectColumns);
+                            if (!sc.orderByCols.empty())
+                                result.sortByMulti(sc.orderByCols);
+                            printTable(result, sc.limit, sc.limitOffset);
+                        } else if (sc.type == milansql::CommandType::UPDATE) {
+                            std::size_t n = 0;
+                            if (sc.whereColumn.empty()) {
+                                n = engine.updateAll(sc.tableName,
+                                    sc.updateCols, sc.updateVals);
+                            } else {
+                                n = engine.updateWhere(sc.tableName,
+                                    sc.updateCols, sc.updateVals,
+                                    sc.whereColumn, sc.whereValue);
+                            }
+                            std::cout << "  " << n << " Zeile(n) aktualisiert.\n\n";
+                            persist();
+                        } else if (sc.type == milansql::CommandType::INSERT) {
+                            const auto& rows44 = sc.multiValues.empty()
+                                ? std::vector<std::vector<std::string>>{sc.values}
+                                : sc.multiValues;
+                            for (const auto& vals : rows44)
+                                engine.insertRow(sc.tableName, vals);
+                            persist();
+                            std::cout << "  " << rows44.size()
+                                      << " Zeile(n) eingefuegt.\n\n";
+                        } else if (sc.type == milansql::CommandType::DELETE) {
+                            std::size_t n = 0;
+                            if (sc.whereColumn.empty()) {
+                                n = engine.deleteAll(sc.tableName);
+                            } else {
+                                n = engine.deleteWhere(sc.tableName,
+                                    sc.whereColumn, sc.whereValue);
+                            }
+                            std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
+                            persist();
+                        } else {
+                            std::cout << "  [CALL] Unbekannter Befehl in Procedure: '"
+                                      << stmt << "'\n\n";
+                        }
+                    } catch (const std::exception& ex2) {
+                        std::cout << "  FEHLER in Procedure: " << ex2.what() << "\n\n";
+                    }
                 }
                 break;
             }

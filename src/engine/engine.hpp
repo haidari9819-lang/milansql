@@ -194,6 +194,13 @@ struct TriggerDef {
     std::string body;       // raw SQL body text (between BEGIN and END)
 };
 
+// ── Phase 44: Stored Procedure Definition ────────────────────
+struct ProcedureDef {
+    std::string name;
+    std::vector<std::pair<std::string,std::string>> params; // {paramName, type}
+    std::string body; // raw SQL body between BEGIN and END
+};
+
 // ── Phase 36: EXPLAIN — Übergabe-Struct (alle engine.hpp-Typen verfügbar) ──
 struct ExplainRequest {
     std::string tableName;
@@ -604,6 +611,10 @@ public:
             if (columns_[i].name == col) return static_cast<int>(i);
         return -1;
     }
+
+    // Phase 44: Mutable row access and index rebuild for expression-based updates
+    std::vector<Row>& mutableRows() { return rows_; }
+    void rebuildIndexes() { rebuildAll(); }
 
 private:
     std::string         name_;
@@ -1321,6 +1332,40 @@ public:
                             const std::vector<std::string>& setCols,
                             const std::vector<std::string>& setVals,
                             const std::string& wCol, const std::string& wVal) {
+        // Phase 44: Check if any setVal contains an expression (col op num)
+        // If so, do per-row evaluation
+        bool hasExpr = false;
+        Table& tblRef = getTable(tbl);
+        for (const auto& val : setVals) {
+            std::vector<std::string> vtoks;
+            std::istringstream vss(val);
+            std::string vt;
+            while (vss >> vt) vtoks.push_back(vt);
+            if (vtoks.size() >= 2) { hasExpr = true; break; }
+        }
+
+        if (hasExpr) {
+            // Per-row update with expression evaluation
+            size_t wCI = colIdx(tblRef, wCol);
+            std::vector<std::size_t> setCIs;
+            for (const auto& col : setCols)
+                setCIs.push_back(colIdx(tblRef, col));
+            std::size_t n = 0;
+            for (auto& row : tblRef.mutableRows()) {
+                if (wCI < row.values.size() && row.values[wCI] == wVal) {
+                    for (size_t k = 0; k < setCIs.size() && k < setVals.size(); ++k) {
+                        if (setCIs[k] < row.values.size()) {
+                            std::string resolved = evalSetExpr(setVals[k], tblRef.columns(), row);
+                            row.values[setCIs[k]] = resolved;
+                        }
+                    }
+                    ++n;
+                }
+            }
+            if (n) tblRef.rebuildIndexes();
+            return n;
+        }
+
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
 
         if (inTransaction_) {
@@ -1330,16 +1375,15 @@ public:
             return 0;
         }
 
-        Table& t = getTable(tbl);
-        size_t wCI = colIdx(t, wCol);
+        size_t wCI = colIdx(tblRef, wCol);
 
         // Phase 43: collect old rows and compute new rows for BEFORE UPDATE triggers
         std::vector<std::size_t> setCIs2;
         for (const auto& col : setCols)
-            setCIs2.push_back(colIdx(t, col));
+            setCIs2.push_back(colIdx(tblRef, col));
 
         std::vector<std::vector<std::string>> oldRows;
-        for (const auto& row : t.rows())
+        for (const auto& row : tblRef.rows())
             if (wCI < row.values.size() && row.values[wCI] == wVal)
                 oldRows.push_back(row.values);
 
@@ -1356,7 +1400,7 @@ public:
                 throw std::runtime_error(signalMsg);
         }
 
-        std::size_t n = t.updateWhere(setCIs2, setVals, wCI, wVal);
+        std::size_t n = tblRef.updateWhere(setCIs2, setVals, wCI, wVal);
 
         // Phase 43: AFTER UPDATE triggers
         for (auto& oldVals : oldRows) {
@@ -1930,6 +1974,119 @@ public:
         return triggers_;
     }
 
+    // ── Phase 44: Stored Procedure Management ────────────────────
+
+    void createProcedure(const ProcedureDef& def) {
+        procedures_[def.name] = def;
+    }
+
+    void dropProcedure(const std::string& name) {
+        if (!procedures_.erase(name))
+            throw std::runtime_error("Procedure '" + name + "' nicht gefunden.");
+    }
+
+    std::vector<ProcedureDef> showProcedures() const {
+        std::vector<ProcedureDef> result;
+        for (const auto& [n, p] : procedures_)
+            result.push_back(p);
+        return result;
+    }
+
+    const std::map<std::string, ProcedureDef>& getAllProcedures() const {
+        return procedures_;
+    }
+
+    // ── Phase 44: Arithmetic Expression Evaluation for SET values ──
+    // Evaluates a simple expression like "col + num", "col - num",
+    // "col * num", "col / num" given a row context.
+    // Returns the string result, or the original expr if not an arithmetic expr.
+    static std::string evalSetExpr(const std::string& expr,
+                                    const std::vector<Column>& cols,
+                                    const Row& row) {
+        // Tokenize on spaces
+        std::vector<std::string> toks;
+        {
+            std::istringstream iss(expr);
+            std::string t;
+            while (iss >> t) toks.push_back(t);
+        }
+        // Pattern: col op num  (3 tokens)
+        if (toks.size() == 3) {
+            const std::string& op = toks[1];
+            if (op == "+" || op == "-" || op == "*" || op == "/") {
+                // Resolve lhs (column or numeric literal)
+                std::string lhsStr = toks[0];
+                for (size_t i = 0; i < cols.size(); ++i)
+                    if (cols[i].name == toks[0] && i < row.values.size()) {
+                        lhsStr = row.values[i]; break;
+                    }
+                // Resolve rhs (column or numeric literal)
+                std::string rhsStr = toks[2];
+                for (size_t i = 0; i < cols.size(); ++i)
+                    if (cols[i].name == toks[2] && i < row.values.size()) {
+                        rhsStr = row.values[i]; break;
+                    }
+                try {
+                    double lv = std::stod(lhsStr);
+                    double rv = std::stod(rhsStr);
+                    double res = 0;
+                    if (op == "+") res = lv + rv;
+                    else if (op == "-") res = lv - rv;
+                    else if (op == "*") res = lv * rv;
+                    else if (op == "/" && rv != 0) res = lv / rv;
+                    else return expr;
+                    // Return as integer if possible
+                    if (res == std::floor(res))
+                        return std::to_string(static_cast<long long>(res));
+                    return std::to_string(res);
+                } catch (...) {}
+            }
+        }
+        // Single token: column lookup or literal
+        if (toks.size() == 1) {
+            for (size_t i = 0; i < cols.size(); ++i)
+                if (cols[i].name == toks[0] && i < row.values.size())
+                    return row.values[i];
+        }
+        return expr;
+    }
+
+    // Returns body with parameter substitution applied (whole-word matching)
+    std::string getProcedureBody(const std::string& name,
+                                  const std::vector<std::string>& args) const {
+        auto it = procedures_.find(name);
+        if (it == procedures_.end())
+            throw std::runtime_error("Procedure '" + name + "' nicht gefunden");
+        const auto& proc = it->second;
+        std::string body = proc.body;
+        for (size_t i = 0; i < proc.params.size() && i < args.size(); ++i) {
+            const std::string& paramName = proc.params[i].first;
+            const std::string& argVal    = args[i];
+            std::string result;
+            size_t pos = 0;
+            while (pos < body.size()) {
+                size_t found = body.find(paramName, pos);
+                if (found == std::string::npos) { result += body.substr(pos); break; }
+                bool leftOk  = (found == 0 ||
+                    (!std::isalnum(static_cast<unsigned char>(body[found-1])) &&
+                      body[found-1] != '_'));
+                bool rightOk = (found + paramName.size() >= body.size() ||
+                    (!std::isalnum(static_cast<unsigned char>(
+                        body[found + paramName.size()])) &&
+                      body[found + paramName.size()] != '_'));
+                if (leftOk && rightOk) {
+                    result += body.substr(pos, found - pos) + argVal;
+                    pos = found + paramName.size();
+                } else {
+                    result += body.substr(pos, found - pos + 1);
+                    pos = found + 1;
+                }
+            }
+            body = result;
+        }
+        return body;
+    }
+
     // ── Phase 41: WITH / CTE — temporäre Tabellen ────────────────
 
     // Registriert eine Tabelle unter name als temporäre CTE-Tabelle.
@@ -1948,7 +2105,8 @@ public:
     }
 
 private:
-    std::map<std::string, TriggerDef> triggers_;  // trigger name → def
+    std::map<std::string, TriggerDef>   triggers_;   // trigger name → def
+    std::map<std::string, ProcedureDef> procedures_; // procedure name → def
 
     // ── Phase 43: Trigger Execution Engine ───────────────────────
 

@@ -126,6 +126,9 @@ struct ParsedCommand {
     bool        isInsertSelect  = false;
     std::string insertSelectSql;
 
+    // Phase 39: UPSERT-Modus ("" = normal, "REPLACE", "IGNORE")
+    std::string upsertMode;
+
     // Phase 30: Mengenoperationen (UNION / UNION ALL / INTERSECT / EXCEPT)
     bool        isSetOp  = false;
     std::string setOp;       // "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
@@ -310,6 +313,8 @@ public:
 
         std::string kw0 = toUpper(tokens[0]);
         std::string kw1 = tokens.size() > 1 ? toUpper(tokens[1]) : "";
+        std::string kw2 = tokens.size() > 2 ? toUpper(tokens[2]) : "";
+        std::string kw3 = tokens.size() > 3 ? toUpper(tokens[3]) : "";
 
         // ── SELECT ──────────────────────────────────────────────
         if (kw0 == "SELECT") {
@@ -377,11 +382,50 @@ public:
                 parseLimit(tokens, rest, cmd);
             }
 
+        // ── Phase 39: INSERT OR REPLACE / INSERT OR IGNORE ──────
+        // Syntax: INSERT OR REPLACE INTO tbl VALUES (...)
+        //         INSERT OR IGNORE  INTO tbl VALUES (...)
+        } else if (kw0 == "INSERT" && kw1 == "OR" &&
+                   (kw2 == "REPLACE" || kw2 == "IGNORE") && kw3 == "INTO") {
+            cmd.type       = CommandType::INSERT;
+            cmd.upsertMode = kw2;  // "REPLACE" or "IGNORE"
+            // Rebuild a synthetic "INSERT INTO ..." string for parseValueGroups
+            // by removing "OR REPLACE/IGNORE " from the input
+            {
+                std::string synth = input;
+                // Replace first "OR REPLACE" / "OR IGNORE" (case-insensitive) with ""
+                std::string upper = synth;
+                for (char& c : upper)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                std::string needle = std::string("OR ") + kw2 + " ";
+                auto pos = upper.find(needle);
+                if (pos != std::string::npos)
+                    synth.erase(pos, needle.size());
+                // Parse tableName and values from the cleaned-up string
+                auto rt = tokenize(synth);
+                if (rt.size() >= 3) {
+                    cmd.tableName   = rt[2];
+                    cmd.multiValues = parseValueGroups(synth);
+                    if (!cmd.multiValues.empty())
+                        cmd.values = cmd.multiValues[0];
+                } else {
+                    cmd.type = CommandType::UNKNOWN;
+                }
+            }
+
         // ── INSERT INTO ─────────────────────────────────────────
         // Phase 27: Multi-row VALUES  — INSERT INTO t VALUES (...),(...),...
         // Phase 28: INSERT-SELECT     — INSERT INTO t SELECT ... FROM ...
         } else if (kw0 == "INSERT" && kw1 == "INTO") {
             cmd.type = CommandType::INSERT;
+            // Phase 39: ON CONFLICT DO NOTHING suffix → treat as INSERT OR IGNORE
+            {
+                std::string ap = afterParen;
+                for (char& c : ap)
+                    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                auto ocp = ap.find("ON CONFLICT");
+                if (ocp != std::string::npos) cmd.upsertMode = "IGNORE";
+            }
             if (tokens.size() >= 4) {
                 cmd.tableName = tokens[2];
                 if (toUpper(tokens[3]) == "SELECT") {

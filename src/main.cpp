@@ -646,18 +646,51 @@ int main() {
                     break;
                 }
 
-                // Phase 27: Multi-row VALUES
+                // Phase 27/39: Multi-row VALUES (normal + UPSERT)
                 const auto& rows = cmd.multiValues.empty()
                     ? std::vector<std::vector<std::string>>{cmd.values}
                     : cmd.multiValues;
-                for (const auto& vals : rows)
-                    engine.insertRow(cmd.tableName, vals);
-                persist();
-                if (rows.size() == 1)
-                    std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
-                else
-                    std::cout << "  " << rows.size() << " Zeilen eingefuegt in '"
-                              << cmd.tableName << "'.\n\n";
+
+                if (cmd.upsertMode == "REPLACE") {
+                    size_t replaced = 0, inserted = 0;
+                    for (const auto& vals : rows)
+                        engine.insertOrReplace(cmd.tableName, vals) ? ++replaced : ++inserted;
+                    persist();
+                    if (replaced > 0 && inserted > 0)
+                        std::cout << "  " << replaced << " Zeile(n) ersetzt, "
+                                  << inserted << " eingefuegt in '"
+                                  << cmd.tableName << "'.\n\n";
+                    else if (replaced > 0)
+                        std::cout << "  " << replaced << " Zeile(n) ersetzt in '"
+                                  << cmd.tableName << "'.\n\n";
+                    else
+                        std::cout << "  " << inserted << " Zeile(n) eingefuegt in '"
+                                  << cmd.tableName << "'.\n\n";
+                } else if (cmd.upsertMode == "IGNORE") {
+                    size_t inserted = 0, ignored = 0;
+                    for (const auto& vals : rows)
+                        engine.insertOrIgnore(cmd.tableName, vals) ? ++inserted : ++ignored;
+                    persist();
+                    if (ignored > 0 && inserted > 0)
+                        std::cout << "  " << inserted << " Zeile(n) eingefuegt, "
+                                  << ignored << " ignoriert (Konflikt) in '"
+                                  << cmd.tableName << "'.\n\n";
+                    else if (ignored > 0)
+                        std::cout << "  " << ignored << " Zeile(n) ignoriert (Konflikt) in '"
+                                  << cmd.tableName << "'.\n\n";
+                    else
+                        std::cout << "  " << inserted << " Zeile(n) eingefuegt in '"
+                                  << cmd.tableName << "'.\n\n";
+                } else {
+                    for (const auto& vals : rows)
+                        engine.insertRow(cmd.tableName, vals);
+                    persist();
+                    if (rows.size() == 1)
+                        std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
+                    else
+                        std::cout << "  " << rows.size() << " Zeilen eingefuegt in '"
+                                  << cmd.tableName << "'.\n\n";
+                }
                 break;
             }
 

@@ -305,6 +305,33 @@ public:
         return n;
     }
 
+    // ── Phase 39: UPSERT-Hilfsmethoden ───────────────────────
+
+    // Gibt Indices aller Zeilen zurück, die mit vals auf UNIQUE/PK-Spalten kollidieren
+    std::vector<size_t> conflictRows(const std::vector<std::string>& vals) const {
+        std::vector<bool> flag(rows_.size(), false);
+        for (size_t i = 0; i < columns_.size() && i < vals.size(); ++i) {
+            if (!columns_[i].isUnique) continue;
+            if (vals[i] == "NULL")     continue;  // NULL kollidiert nicht
+            for (size_t r = 0; r < rows_.size(); ++r)
+                if (i < rows_[r].values.size() && rows_[r].values[i] == vals[i])
+                    flag[r] = true;
+        }
+        std::vector<size_t> result;
+        for (size_t r = 0; r < flag.size(); ++r)
+            if (flag[r]) result.push_back(r);
+        return result;
+    }
+
+    // Löscht Zeilen anhand von Indices (absteigende Reihenfolge, dann rebuildAll)
+    void eraseByIndices(std::vector<size_t> idxs) {
+        std::sort(idxs.begin(), idxs.end(), std::greater<size_t>());
+        for (size_t idx : idxs)
+            if (idx < rows_.size())
+                rows_.erase(rows_.begin() + static_cast<std::ptrdiff_t>(idx));
+        if (!idxs.empty()) rebuildAll();
+    }
+
     // ── Phase 16: ALTER TABLE ─────────────────────────────────
 
     // ADD COLUMN: Schema erweitern, bestehende Zeilen mit DEFAULT oder NULL füllen
@@ -663,6 +690,40 @@ public:
             return;
         }
         t.insert(Row(std::move(vals)));
+    }
+
+    // ── Phase 39: UPSERT ──────────────────────────────────────
+
+    // INSERT OR REPLACE: löscht kollidierte Zeilen, fügt neue ein.
+    // Gibt true zurück wenn mind. eine Zeile ersetzt wurde, false bei normalem Insert.
+    bool insertOrReplace(const std::string& tbl, std::vector<std::string> vals) {
+        if (inTransaction_)
+            throw std::runtime_error("INSERT OR REPLACE nicht innerhalb einer Transaktion.");
+        Table& t = getTable(tbl);
+        applyDefaults(t, vals);
+        applyAutoInc(t, vals);
+        checkInsertFK(tbl, vals);
+        checkAllConstraints(tbl, vals);
+        auto conflicts = t.conflictRows(vals);
+        bool replaced = !conflicts.empty();
+        if (replaced) t.eraseByIndices(conflicts);
+        t.insert(Row(vals));   // UNIQUE-Check nach Löschung sauber
+        return replaced;
+    }
+
+    // INSERT OR IGNORE: ignoriert den Insert bei PK/UNIQUE-Konflikt (kein Fehler).
+    // Gibt true zurück wenn eingefügt, false wenn ignoriert.
+    bool insertOrIgnore(const std::string& tbl, std::vector<std::string> vals) {
+        if (inTransaction_)
+            throw std::runtime_error("INSERT OR IGNORE nicht innerhalb einer Transaktion.");
+        Table& t = getTable(tbl);
+        applyDefaults(t, vals);
+        applyAutoInc(t, vals);
+        checkInsertFK(tbl, vals);
+        checkAllConstraints(tbl, vals);
+        if (!t.conflictRows(vals).empty()) return false;  // ignorieren
+        t.insert(Row(vals));
+        return true;
     }
 
     struct WhereResult {

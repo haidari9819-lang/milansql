@@ -74,13 +74,34 @@ struct ExplainPlan {
     std::vector<ExplainStep> steps;
 };
 
-// ── EXISTS-Subquery-Spec (Phase 15) ──────────────────────────
-// Speichert die korrelierte Bedingung einer EXISTS-Subquery.
+// ── Phase 37: Korrelierte Subquery-Strukturen ─────────────────
+// Eine Bedingung in der WHERE-Klausel einer Subquery.
+// val kann ein Literal ODER ein korrelierter Verweis (alias.col) sein —
+// zur Laufzeit wird geprüft, ob val in der äußeren Tabelle liegt.
+struct SubCond {
+    std::string col;  // Spalte der Sub-Tabelle (ggf. mit Alias-Prefix: b.kunden_id)
+    std::string op;   // Operator (=, !=, <, >, <=, >=)
+    std::string val;  // Literal oder äußerer Verweis (z.B. k.id)
+};
+
+// Spec für eine skalare Subquery: SELECT aggfunc(col) FROM tbl WHERE ...
+struct ScalarSubSpec {
+    std::string subTable;           // Sub-Tabelle
+    std::string aggFunc;            // COUNT, AVG, SUM, MIN, MAX (oder "" für Rohwert)
+    std::string aggCol;             // * oder Spaltenname
+    std::vector<SubCond> conds;     // WHERE-Bedingungen
+    std::string whereLogic = "AND"; // AND oder OR
+};
+
+// ── EXISTS-Subquery-Spec (Phase 15 / Phase 37 erweitert) ──────
 struct ExistsSpec {
     std::string subTable;   // Tabelle der Subquery
-    std::string condLeft;   // linke Seite der WHERE-Bedingung
-    std::string condOp;     // Operator (=, !=, ...)
-    std::string condRight;  // rechte Seite (Outer-Referenz oder Literal)
+    std::string condLeft;   // Legacy: linke Seite (Phase 15)
+    std::string condOp;     // Legacy: Operator
+    std::string condRight;  // Legacy: rechte Seite
+    // Phase 37: Multi-Bedingung
+    std::vector<SubCond> subConds;
+    std::string subWhereLogic = "AND";
 };
 
 // ── WHERE-Bedingung (Phase 9 / 13 / 14 / 15) ─────────────────
@@ -96,6 +117,9 @@ struct WhereCondition {
     std::string              betweenLow;   // für BETWEEN / NOT BETWEEN
     std::string              betweenHigh;
     ExistsSpec               existsSpec;   // für EXISTS / NOT EXISTS
+    // Phase 37: Korrelierte Scalar Subquery auf rechter Seite
+    bool          isScalarSub = false;
+    ScalarSubSpec scalarSub;
 };
 
 // ── SELECT-Listen-Eintrag (Phase 10 / Phase 31 / Phase 32) ───
@@ -121,6 +145,9 @@ struct SelectItem {
     bool                     isFuncExpr = false;
     std::string              funcName;
     std::vector<std::string> funcArgs;   // Spaltenname ODER String-Literal
+    // Phase 37: Skalare Subquery in SELECT-Liste
+    bool          isScalarSubquery = false;
+    ScalarSubSpec scalarSub;
 };
 
 // ── HAVING-Bedingung (Phase 10) ───────────────────────────────
@@ -632,13 +659,14 @@ public:
             return {std::move(result), usedIndex};
         }
 
-        // EXISTS/NOT EXISTS benötigen rowMatches (mit Engine-Kontext)
-        bool hasExists = false;
-        for (const auto& cond : conds)
-            if (cond.op == "EXISTS" || cond.op == "NOT EXISTS")
-                { hasExists = true; break; }
+        // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries brauchen rowMatches
+        bool hasCorrelated = false;
+        for (const auto& cond : conds) {
+            if (cond.op == "EXISTS" || cond.op == "NOT EXISTS") { hasCorrelated = true; break; }
+            if (cond.isScalarSub) { hasCorrelated = true; break; }
+        }
 
-        if (hasExists) {
+        if (hasCorrelated) {
             for (const auto& row : src.rows())
                 if (rowMatches(src, row, conds, logic)) result.insert(row);
             return {std::move(result), false};
@@ -1266,6 +1294,9 @@ public:
             } else if (item.isCaseExpr) {
                 std::string cname = item.alias.empty() ? "case" : item.alias;
                 newCols.emplace_back(cname, "TEXT");
+            } else if (item.isScalarSubquery) {
+                std::string cname = item.alias.empty() ? "subquery" : item.alias;
+                newCols.emplace_back(cname, "TEXT");
             } else {
                 int ci = findColIdx(src, item.colName);
                 if (ci < 0)
@@ -1287,6 +1318,8 @@ public:
                     vals.push_back(evaluateFunc(item.funcName, item.funcArgs, src, row));
                 } else if (item.isCaseExpr) {
                     vals.push_back(evalCase(item, src, row));
+                } else if (item.isScalarSubquery) {
+                    vals.push_back(evalScalarSub(item.scalarSub, src.columns(), row));
                 } else {
                     int ci = findColIdx(src, item.colName);
                     vals.push_back(ci >= 0 && static_cast<size_t>(ci) < row.values.size()
@@ -1682,6 +1715,103 @@ private:
             "JOIN ON: Spalte '" + qual + "' in rechter Tabelle nicht gefunden.");
     }
 
+    // ── Phase 37: Skalare Subquery auswerten ─────────────────────
+    std::string evalScalarSub(const ScalarSubSpec& spec,
+                              const std::vector<Column>& outerCols,
+                              const Row& outerRow) const {
+        if (!tables_.count(spec.subTable)) return "NULL";
+        const Table& sub = tables_.at(spec.subTable);
+
+        auto findCI = [](const Table& t, const std::string& ref) -> int {
+            for (size_t i = 0; i < t.columns().size(); ++i)
+                if (t.columns()[i].name == ref) return (int)i;
+            auto dot = ref.find('.');
+            if (dot != std::string::npos) {
+                std::string bare = ref.substr(dot + 1);
+                for (size_t i = 0; i < t.columns().size(); ++i)
+                    if (t.columns()[i].name == bare) return (int)i;
+            }
+            return -1;
+        };
+
+        auto findOuterCI = [&](const std::string& ref) -> int {
+            for (size_t i = 0; i < outerCols.size(); ++i)
+                if (outerCols[i].name == ref) return (int)i;
+            auto dot = ref.find('.');
+            if (dot != std::string::npos) {
+                std::string bare = ref.substr(dot + 1);
+                for (size_t i = 0; i < outerCols.size(); ++i)
+                    if (outerCols[i].name == bare) return (int)i;
+            }
+            return -1;
+        };
+
+        int aggCI = -1;
+        if (spec.aggFunc != "COUNT" && !spec.aggFunc.empty())
+            aggCI = findCI(sub, spec.aggCol);
+
+        std::vector<std::string> matchVals;
+        for (const auto& subRow : sub.rows()) {
+            bool match = true;
+            if (!spec.conds.empty()) {
+                if (spec.whereLogic == "OR") {
+                    match = false;
+                    for (const auto& cond : spec.conds) {
+                        int ci = findCI(sub, cond.col);
+                        if (ci < 0) continue;
+                        std::string val = cond.val;
+                        int oci = findOuterCI(cond.val);
+                        if (oci >= 0 && static_cast<size_t>(oci) < outerRow.values.size())
+                            val = outerRow.values[static_cast<size_t>(oci)];
+                        if (static_cast<size_t>(ci) < subRow.values.size() &&
+                            compareValues(subRow.values[static_cast<size_t>(ci)], cond.op, val)) {
+                            match = true; break;
+                        }
+                    }
+                } else {  // AND
+                    for (const auto& cond : spec.conds) {
+                        int ci = findCI(sub, cond.col);
+                        if (ci < 0) { match = false; break; }
+                        std::string val = cond.val;
+                        int oci = findOuterCI(cond.val);
+                        if (oci >= 0 && static_cast<size_t>(oci) < outerRow.values.size())
+                            val = outerRow.values[static_cast<size_t>(oci)];
+                        if (!(static_cast<size_t>(ci) < subRow.values.size() &&
+                              compareValues(subRow.values[static_cast<size_t>(ci)], cond.op, val))) {
+                            match = false; break;
+                        }
+                    }
+                }
+            }
+            if (!match) continue;
+
+            if (spec.aggFunc == "COUNT") {
+                matchVals.push_back("1");
+            } else if (aggCI >= 0 && static_cast<size_t>(aggCI) < subRow.values.size()) {
+                matchVals.push_back(subRow.values[static_cast<size_t>(aggCI)]);
+            }
+        }
+
+        if (spec.aggFunc == "COUNT") return std::to_string(matchVals.size());
+        if (matchVals.empty()) return "NULL";
+
+        std::vector<double> nums;
+        for (const auto& v : matchVals)
+            try { nums.push_back(std::stod(v)); } catch (...) {}
+        if (nums.empty()) return "NULL";
+
+        if (spec.aggFunc == "SUM") {
+            double s = 0; for (double v : nums) s += v; return formatNum(s);
+        }
+        if (spec.aggFunc == "AVG") {
+            double s = 0; for (double v : nums) s += v;
+            return formatNum(s / static_cast<double>(nums.size()));
+        }
+        if (spec.aggFunc == "MIN") return formatNum(*std::min_element(nums.begin(), nums.end()));
+        if (spec.aggFunc == "MAX") return formatNum(*std::max_element(nums.begin(), nums.end()));
+        return matchVals[0];
+    }
+
     // ── WHERE-Auswertung ──────────────────────────────────────
 
     // Einzelbedingung auswerten (IN / NOT IN / BETWEEN / NOT BETWEEN)
@@ -1725,6 +1855,30 @@ private:
             }
             return -1;
         };
+
+        // Phase 37: Multi-Bedingung path (subConds gesetzt)
+        if (!spec.subConds.empty()) {
+            for (const auto& subRow : sub.rows()) {
+                bool rowMatch = (spec.subWhereLogic == "OR") ? false : true;
+                for (const auto& sc : spec.subConds) {
+                    int ci = findCI(sub, sc.col);
+                    if (ci < 0) { rowMatch = (spec.subWhereLogic == "OR") ? rowMatch : false; continue; }
+                    std::string val = sc.val;
+                    int outerCI = findCI(outer, sc.val);
+                    if (outerCI >= 0 && static_cast<size_t>(outerCI) < outerRow.values.size())
+                        val = outerRow.values[static_cast<size_t>(outerCI)];
+                    bool condMatch = static_cast<size_t>(ci) < subRow.values.size() &&
+                                     compareValues(subRow.values[static_cast<size_t>(ci)], sc.op, val);
+                    if (spec.subWhereLogic == "OR") {
+                        if (condMatch) { rowMatch = true; break; }
+                    } else {
+                        if (!condMatch) { rowMatch = false; break; }
+                    }
+                }
+                if (rowMatch) return c.op == "EXISTS";
+            }
+            return c.op == "NOT EXISTS";
+        }
 
         // Bestimmen: welche Seite ist im Sub-Table, welche im Outer-Table?
         int subLeft  = findCI(sub,   spec.condLeft);
@@ -1772,6 +1926,12 @@ private:
         auto evalOne = [&](const WhereCondition& c) -> bool {
             if (c.op == "EXISTS" || c.op == "NOT EXISTS")
                 return evalExists(src, row, c);
+            if (c.isScalarSub) {
+                std::string subVal = evalScalarSub(c.scalarSub, src.columns(), row);
+                size_t ci = colIdx(src, c.col);
+                if (ci >= row.values.size()) return false;
+                return compareValues(row.values[ci], c.op, subVal);
+            }
             size_t ci = colIdx(src, c.col);
             return ci < row.values.size() && evalCond(row.values[ci], c);
         };

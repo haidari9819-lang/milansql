@@ -136,6 +136,9 @@ struct ParsedCommand {
 
     // Phase 36: EXPLAIN-Modus (kein echtes Ausführen, nur Plan anzeigen)
     bool isExplain = false;
+
+    // Phase 37: Alias der Haupttabelle (z.B. "m" in FROM mitarbeiter m)
+    std::string tableAlias;
 };
 
 class Parser {
@@ -238,6 +241,23 @@ public:
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
                     if (toUpper(tok) == "CASE") {
+                        parseSelectFull(input, cmd);
+                        return cmd;
+                    }
+                }
+            }
+        }
+
+        // ── Phase 37: Scalar Subquery in SELECT oder WHERE ───────
+        {
+            auto st37 = tokenize(input);
+            if (!st37.empty() && toUpper(st37[0]) == "SELECT") {
+                for (const auto& tok : st37) {
+                    std::string u;
+                    for (char c : tok) u += static_cast<char>(
+                        std::toupper(static_cast<unsigned char>(c)));
+                    // Token beginnt mit '(' und enthält SELECT
+                    if (u.size() >= 7 && u.substr(0, 7) == "(SELECT") {
                         parseSelectFull(input, cmd);
                         return cmd;
                     }
@@ -997,8 +1017,19 @@ private:
                 for (const auto& o :
                      std::vector<std::string>{">=", "<=", "!=", "=", "<", ">"}) {
                     if (opStr == o) {
-                        cond = {ft[i], o, ft[i+2]};
-                        i += 3; parsed = true;
+                        // Phase 37: col op (SELECT ...) — skalare korrelierte Subquery
+                        if (ft[i+2] == "(" && i + 3 < end && toUpper(ft[i+3]) == "SELECT") {
+                            cond.col = ft[i];
+                            cond.op  = o;
+                            cond.isScalarSub = true;
+                            i += 2;  // skip col and op, now at (
+                            ++i;     // skip (
+                            parseScalarSubFromFull(ft, i, end, cond.scalarSub);
+                            parsed = true;
+                        } else {
+                            cond = {ft[i], o, ft[i+2]};
+                            i += 3; parsed = true;
+                        }
                         break;
                     }
                 }
@@ -1027,6 +1058,68 @@ private:
             cmd.whereOp     = cmd.whereConds[0].op;
             cmd.whereValue  = cmd.whereConds[0].val;
         }
+    }
+
+    // ── Phase 37: Scalar Subquery aus tokenizeFull-Tokens lesen ──
+    // i zeigt auf SELECT (das ( wurde bereits konsumiert).
+    // Format: SELECT aggfunc(col) FROM tbl [alias] [WHERE cond [AND cond ...]] )
+    static void parseScalarSubFromFull(const std::vector<std::string>& ft,
+                                        size_t& i, size_t end,
+                                        ScalarSubSpec& spec) {
+        // SELECT überspringen
+        if (i < end && toUpper(ft[i]) == "SELECT") ++i;
+
+        // SELECT-Ausdruck: aggfunc(col) oder col oder *
+        static const std::vector<std::string> AGG = {"COUNT","AVG","SUM","MIN","MAX"};
+        if (i < end) {
+            std::string u = toUpper(ft[i]);
+            bool isAgg = false;
+            for (const auto& f : AGG) if (u == f) { isAgg = true; break; }
+            if (isAgg) {
+                spec.aggFunc = u; ++i;
+                if (i < end && ft[i] == "(") ++i;        // skip (
+                if (i < end && ft[i] != ")") { spec.aggCol = ft[i]; ++i; }
+                if (i < end && ft[i] == ")") ++i;        // skip )
+            } else if (u != "FROM") {
+                spec.aggFunc = ""; spec.aggCol = ft[i]; ++i;
+            }
+        }
+
+        // FROM
+        if (i < end && toUpper(ft[i]) == "FROM") ++i;
+
+        // Tabellenname
+        if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE") {
+            spec.subTable = ft[i++];
+            // Optional: Sub-Tabellen-Alias überspringen
+            if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE" &&
+                ft[i] != "," && ft[i] != "ORDER" && ft[i] != "LIMIT")
+                ++i;
+        }
+
+        // WHERE
+        if (i < end && toUpper(ft[i]) == "WHERE") {
+            ++i;
+            while (i < end && ft[i] != ")") {
+                std::string u = toUpper(ft[i]);
+                if (u == "AND") { spec.whereLogic = "AND"; ++i; continue; }
+                if (u == "OR")  { spec.whereLogic = "OR";  ++i; continue; }
+                if (i + 2 < end && ft[i] != ")" &&
+                    toUpper(ft[i+1]) != "AND" && toUpper(ft[i+1]) != "OR" &&
+                    ft[i+1] != ")") {
+                    SubCond cond;
+                    cond.col = ft[i];
+                    cond.op  = ft[i+1];
+                    cond.val = ft[i+2];
+                    i += 3;
+                    spec.conds.push_back(std::move(cond));
+                } else { break; }
+            }
+        }
+
+        // Schließendes ) überspringen
+        while (i < end && ft[i] != ")") ++i;
+        if (i < end && ft[i] == ")") ++i;
     }
 
     // IN-Liste oder Subquery aus tokenizeFull-Tokens lesen.
@@ -1082,28 +1175,46 @@ private:
     }
 
     // EXISTS-Subquery aus tokenizeFull-Tokens lesen.
-    // Erwartet: ( SELECT col FROM tbl [WHERE left op right] )
-    // Speichert die Korrelationsbedingung in cond.existsSpec.
+    // Phase 37: Unterstützt mehrere WHERE-Bedingungen und Sub-Tabellen-Alias.
     static void parseExistsFromFull(const std::vector<std::string>& ft,
                                      size_t& i, size_t end,
                                      WhereCondition& cond) {
         if (i < end && ft[i] == "(") ++i;
         if (i < end && toUpper(ft[i]) == "SELECT") ++i;
-        // SELECT-Ausdruck überspringen (typisch "1" oder "*")
-        if (i < end && ft[i] != ")" && toUpper(ft[i]) != "FROM") ++i;
+        // SELECT-Ausdruck überspringen (typisch "1", "*" oder Spaltenname)
+        while (i < end && ft[i] != ")" && toUpper(ft[i]) != "FROM") ++i;
         // FROM
         if (i < end && toUpper(ft[i]) == "FROM") ++i;
         // Tabellenname
-        if (i < end && ft[i] != ")" && ft[i] != "WHERE")
+        if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE")
             cond.existsSpec.subTable = ft[i++];
-        // WHERE — genau EINE korrelierte Bedingung (left op right)
+        // Optionaler Sub-Tabellen-Alias überspringen
+        if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE")
+            ++i;
+
+        // WHERE: mehrere Bedingungen (Phase 37)
         if (i < end && toUpper(ft[i]) == "WHERE") {
             ++i;
-            if (i + 2 < end && ft[i] != ")") {
-                cond.existsSpec.condLeft  = ft[i];
-                cond.existsSpec.condOp    = ft[i + 1];
-                cond.existsSpec.condRight = ft[i + 2];
-                i += 3;
+            while (i < end && ft[i] != ")") {
+                std::string u = toUpper(ft[i]);
+                if (u == "AND") { cond.existsSpec.subWhereLogic = "AND"; ++i; continue; }
+                if (u == "OR")  { cond.existsSpec.subWhereLogic = "OR";  ++i; continue; }
+                if (i + 2 < end && ft[i] != ")" &&
+                    toUpper(ft[i+1]) != "AND" && toUpper(ft[i+1]) != "OR" &&
+                    ft[i+1] != ")") {
+                    SubCond sc;
+                    sc.col = ft[i];
+                    sc.op  = ft[i+1];
+                    sc.val = ft[i+2];
+                    i += 3;
+                    cond.existsSpec.subConds.push_back(std::move(sc));
+                } else { break; }
+            }
+            // Legacy-Kompatibilität: erste Bedingung auch in alten Feldern
+            if (!cond.existsSpec.subConds.empty()) {
+                cond.existsSpec.condLeft  = cond.existsSpec.subConds[0].col;
+                cond.existsSpec.condOp    = cond.existsSpec.subConds[0].op;
+                cond.existsSpec.condRight = cond.existsSpec.subConds[0].val;
             }
         }
         // Schließende ")" überspringen
@@ -1121,18 +1232,39 @@ private:
 
         size_t fromPos  = N, wherePos = N;
         size_t orderPos = N, limitPos = N;
-        for (size_t i = 0; i < N; ++i) {
-            std::string u = toUpper(ft[i]);
-            if (u == "FROM"  && fromPos  == N) fromPos  = i;
-            if (u == "WHERE" && wherePos == N) wherePos = i;
-            if (u == "ORDER" && orderPos == N) orderPos = i;
-            if (u == "LIMIT" && limitPos == N) limitPos = i;
+        // Phase 37: Paren-Tiefe verfolgen, damit FROM/WHERE in Subqueries ignoriert werden
+        {
+            int depth = 0;
+            for (size_t i = 1; i < N; ++i) {  // i=1: SELECT überspringen
+                if (ft[i] == "(") { ++depth; continue; }
+                if (ft[i] == ")") { if (depth > 0) --depth; continue; }
+                if (depth > 0) continue;  // innerhalb Subquery → ignorieren
+                std::string u = toUpper(ft[i]);
+                if (u == "FROM"  && fromPos  == N) fromPos  = i;
+                if (u == "WHERE" && wherePos == N) wherePos = i;
+                if (u == "ORDER" && orderPos == N) orderPos = i;
+                if (u == "LIMIT" && limitPos == N) limitPos = i;
+            }
         }
 
         if (fromPos == N || fromPos + 1 >= N) {
             cmd.type = CommandType::UNKNOWN; return;
         }
         cmd.tableName = ft[fromPos + 1];
+
+        // Phase 37: Alias nach Tabellenname erkennen (FROM tbl alias)
+        if (fromPos + 2 < N) {
+            std::string next = toUpper(ft[fromPos + 2]);
+            if (next != "WHERE" && next != "ORDER" && next != "LIMIT" &&
+                next != "GROUP" && next != "HAVING" && next != "INNER" &&
+                next != "LEFT" && next != "RIGHT" && next != "FULL" &&
+                next != "JOIN" && next != "ON" && next != "UNION" &&
+                next != "INTERSECT" && next != "EXCEPT" &&
+                ft[fromPos + 2] != "," && ft[fromPos + 2] != "(" &&
+                ft[fromPos + 2] != ")") {
+                cmd.tableAlias = ft[fromPos + 2];
+            }
+        }
 
         // SELECT-Spalten
         size_t selStart = 1;
@@ -1151,7 +1283,15 @@ private:
             for (const auto& f : SFUNCS32) if (u == f) { hasFunc = true; break; }
         }
 
-        if (hasCase || hasFunc) {
+        // Phase 37: Scalar Subquery in SELECT-Liste?
+        bool hasScalarSub37 = false;
+        for (size_t i = selStart; i < fromPos; ++i) {
+            if (ft[i] == "(" && i + 1 < fromPos && toUpper(ft[i+1]) == "SELECT") {
+                hasScalarSub37 = true; break;
+            }
+        }
+
+        if (hasCase || hasFunc || hasScalarSub37) {
             parseCaseSelectItems(ft, selStart, fromPos, cmd);
         } else {
             std::string colList;
@@ -1192,7 +1332,25 @@ private:
                                      ParsedCommand& cmd) {
         size_t i = start;
         while (i < end) {
-            if (ft[i] == "," || ft[i] == "(" || ft[i] == ")") { ++i; continue; }
+            // Phase 37: (SELECT ...) → Skalare Subquery
+            if (ft[i] == "(") {
+                if (i + 1 < end && toUpper(ft[i+1]) == "SELECT") {
+                    ++i;  // skip (
+                    SelectItem item;
+                    item.isScalarSubquery = true;
+                    parseScalarSubFromFull(ft, i, end, item.scalarSub);
+                    // optionales AS alias
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end) { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(std::move(item));
+                    cmd.hasCaseItems = true;
+                    continue;
+                }
+                ++i; continue;  // gewöhnliche ( überspringen
+            }
+            if (ft[i] == "," || ft[i] == ")") { ++i; continue; }
 
             std::string u = toUpper(ft[i]);
 

@@ -133,6 +133,9 @@ struct ParsedCommand {
 
     // Phase 31: CASE WHEN THEN ELSE END in SELECT-Liste
     bool hasCaseItems = false;
+
+    // Phase 36: EXPLAIN-Modus (kein echtes Ausführen, nur Plan anzeigen)
+    bool isExplain = false;
 };
 
 class Parser {
@@ -140,6 +143,25 @@ public:
     ParsedCommand parse(const std::string& input) {
         ParsedCommand cmd;
         cmd.raw = input;
+
+        // ── Phase 36: EXPLAIN-Prefix erkennen ────────────────────
+        {
+            std::string up;
+            size_t s = 0;
+            while (s < input.size() && (input[s] == ' ' || input[s] == '\t')) ++s;
+            for (size_t i = s; i < input.size(); ++i)
+                up += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
+            if (up.size() >= 7 && up.substr(0, 7) == "EXPLAIN" &&
+                (up.size() == 7 || up[7] == ' ' || up[7] == '\t')) {
+                // Rest nach EXPLAIN extrahieren
+                size_t rest = s + 7;
+                while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
+                    ++rest;
+                ParsedCommand inner = parse(input.substr(rest));
+                inner.isExplain = true;
+                return inner;
+            }
+        }
 
         // ── Transaktions-Befehle ──────────────────────────────────
         {

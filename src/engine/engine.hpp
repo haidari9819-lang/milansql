@@ -61,6 +61,19 @@ struct IndexInfo {
     std::string type;
 };
 
+// ── Phase 36: EXPLAIN ─────────────────────────────────────────
+struct ExplainStep {
+    int         nr;
+    std::string op;       // SCAN, INDEX, FILTER, JOIN, GROUP, AGGREGATE, SORT, LIMIT, PROJECT, SET_OP
+    std::string table;    // Tabellenname oder "-"
+    std::string details;  // Bedingung / Spalten / Typ
+    std::string index;    // Index-Name oder "-"
+};
+
+struct ExplainPlan {
+    std::vector<ExplainStep> steps;
+};
+
 // ── EXISTS-Subquery-Spec (Phase 15) ──────────────────────────
 // Speichert die korrelierte Bedingung einer EXISTS-Subquery.
 struct ExistsSpec {
@@ -124,6 +137,28 @@ struct JoinClause {
     std::string table;     // Name der rechten Tabelle
     std::string onLeft;    // "tabelle.spalte" linke ON-Seite
     std::string onRight;   // "tabelle.spalte" rechte ON-Seite
+};
+
+// ── Phase 36: EXPLAIN — Übergabe-Struct (alle engine.hpp-Typen verfügbar) ──
+struct ExplainRequest {
+    std::string tableName;
+    bool isJoin = false;
+    std::vector<JoinClause> joinClauses;
+    std::vector<WhereCondition> whereConds;
+    std::string whereLogic = "AND";
+    bool isGroupBy = false;
+    std::vector<std::string> groupByCols;
+    std::vector<HavingCondition> havingConds;
+    bool isAggregate = false;
+    std::string aggFunc, aggCol;
+    std::vector<SelectItem> selectItems;
+    bool hasCaseItems = false;
+    std::vector<std::string> selectColumns;
+    std::string orderByColumn;
+    bool orderByDesc = false;
+    int limit = -1;
+    bool isSetOp = false;
+    std::string setOp;
 };
 
 // ------------------------------------------------------------
@@ -2092,6 +2127,158 @@ private:
                 break;
             }
         }
+    }
+
+public:
+    // ── Phase 36: EXPLAIN ─────────────────────────────────────
+    ExplainPlan buildExplain(const ExplainRequest& req) const {
+        ExplainPlan plan;
+        int nr = 1;
+        auto addStep = [&](const std::string& op, const std::string& tbl,
+                           const std::string& det, const std::string& idx = "-") {
+            plan.steps.push_back({nr++, op, tbl, det, idx});
+        };
+
+        // SET_OP (UNION / INTERSECT / EXCEPT)
+        if (req.isSetOp) {
+            addStep("SET_OP", "-", req.setOp, "-");
+            addStep("PROJECT", "-", "* (alle Spalten)", "-");
+            return plan;
+        }
+
+        if (req.isJoin) {
+            // JOIN: Haupt-Tabelle scannen, dann jede JOIN-Tabelle
+            addStep("SCAN", req.tableName, "FULL SCAN", "-");
+            for (const auto& jc : req.joinClauses) {
+                std::string det = jc.joinType + " JOIN ON " +
+                                  jc.onLeft + " = " + jc.onRight;
+                addStep("JOIN", jc.table, det, "-");
+            }
+            // WHERE nach dem JOIN
+            if (!req.whereConds.empty()) {
+                std::string det;
+                for (size_t i = 0; i < req.whereConds.size(); ++i) {
+                    if (i > 0) det += " " + req.whereLogic + " ";
+                    det += req.whereConds[i].col + " " +
+                           req.whereConds[i].op  + " " + req.whereConds[i].val;
+                }
+                addStep("FILTER", "-", det, "-");
+            }
+        } else {
+            // Einzelne Tabelle: Index-Check
+            bool useIndex = false;
+            std::string idxName = "-";
+            if (!req.whereConds.empty() && req.whereConds[0].op == "=" &&
+                tables_.count(req.tableName)) {
+                const Table& t = tables_.at(req.tableName);
+                if (t.hasIndex(req.whereConds[0].col)) {
+                    useIndex = true;
+                    // Index-Namen heraussuchen (führende Spalte)
+                    for (const auto& info : t.getIndexes()) {
+                        std::string leading = info.colName;
+                        size_t comma = leading.find(',');
+                        if (comma != std::string::npos)
+                            leading = leading.substr(0, comma);
+                        while (!leading.empty() && leading[0]  == ' ') leading.erase(0, 1);
+                        while (!leading.empty() && leading.back() == ' ') leading.pop_back();
+                        if (leading == req.whereConds[0].col) {
+                            idxName = info.indexName; break;
+                        }
+                    }
+                }
+            }
+
+            if (useIndex) {
+                std::string det = "WHERE " + req.whereConds[0].col +
+                                  " = " + req.whereConds[0].val;
+                addStep("INDEX", req.tableName, det, idxName);
+                // Weitere WHERE-Bedingungen als FILTER
+                if (req.whereConds.size() > 1) {
+                    std::string fdet;
+                    for (size_t i = 1; i < req.whereConds.size(); ++i) {
+                        if (i > 1) fdet += " " + req.whereLogic + " ";
+                        fdet += req.whereConds[i].col + " " +
+                                req.whereConds[i].op  + " " + req.whereConds[i].val;
+                    }
+                    addStep("FILTER", "-", fdet, "-");
+                }
+            } else {
+                addStep("SCAN", req.tableName, "FULL SCAN", "-");
+                if (!req.whereConds.empty()) {
+                    std::string det;
+                    for (size_t i = 0; i < req.whereConds.size(); ++i) {
+                        if (i > 0) det += " " + req.whereLogic + " ";
+                        det += req.whereConds[i].col + " " +
+                               req.whereConds[i].op  + " " + req.whereConds[i].val;
+                    }
+                    addStep("FILTER", "-", det, "-");
+                }
+            }
+        }
+
+        // GROUP BY
+        if (req.isGroupBy) {
+            std::string det = "BY ";
+            for (size_t i = 0; i < req.groupByCols.size(); ++i) {
+                if (i > 0) det += ", ";
+                det += req.groupByCols[i];
+            }
+            addStep("GROUP", "-", det, "-");
+
+            // HAVING
+            if (!req.havingConds.empty()) {
+                const auto& hv = req.havingConds[0];
+                addStep("FILTER", "-",
+                        "HAVING " + hv.aggFunc + "(" + hv.aggCol + ") " +
+                        hv.op + " " + hv.val, "-");
+            }
+
+            // AGGREGATE aus selectItems
+            for (const auto& si : req.selectItems) {
+                if (si.isAgg) {
+                    addStep("AGGREGATE", "-",
+                            si.aggFunc + "(" + si.aggCol + ")", "-");
+                    break;
+                }
+            }
+        }
+
+        // Einfaches AGGREGATE (ohne GROUP BY)
+        if (req.isAggregate) {
+            addStep("AGGREGATE", "-", req.aggFunc + "(" + req.aggCol + ")", "-");
+        }
+
+        // SORT
+        if (!req.orderByColumn.empty())
+            addStep("SORT", "-",
+                    req.orderByColumn + (req.orderByDesc ? " DESC" : " ASC"), "-");
+
+        // LIMIT
+        if (req.limit >= 0)
+            addStep("LIMIT", "-", std::to_string(req.limit), "-");
+
+        // PROJECT — Spalten aus selectItems, selectColumns oder "*"
+        std::string projDet;
+        if (!req.selectItems.empty()) {
+            for (size_t i = 0; i < req.selectItems.size(); ++i) {
+                if (i > 0) projDet += ", ";
+                const auto& si = req.selectItems[i];
+                if      (!si.alias.empty())   projDet += si.alias;
+                else if (!si.colName.empty()) projDet += si.colName;
+                else if (si.isAgg)            projDet += si.aggFunc + "(" + si.aggCol + ")";
+                else if (si.isFuncExpr)       projDet += si.funcName + "(...)";
+            }
+        } else if (!req.selectColumns.empty()) {
+            for (size_t i = 0; i < req.selectColumns.size(); ++i) {
+                if (i > 0) projDet += ", ";
+                projDet += req.selectColumns[i];
+            }
+        } else {
+            projDet = "* (alle Spalten)";
+        }
+        addStep("PROJECT", "-", projDet, "-");
+
+        return plan;
     }
 
     std::map<std::string, Table>  tables_;

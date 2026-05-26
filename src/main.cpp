@@ -123,6 +123,48 @@ static void printIndexes(const std::vector<milansql::IndexInfo>& indexes,
     std::cout << "  " << indexes.size() << " Index(e) auf '" << tableName << "'\n\n";
 }
 
+// Phase 36: EXPLAIN-Plan als formatierte Tabelle ausgeben
+static void printExplain(const milansql::ExplainPlan& plan) {
+    if (plan.steps.empty()) {
+        std::cout << "  (Kein Plan verfuegbar)\n\n"; return;
+    }
+    std::vector<std::string> hdr = {"Schritt", "Operation", "Tabelle", "Details", "Index"};
+    std::vector<size_t> w(5);
+    for (size_t i = 0; i < 5; ++i) w[i] = hdr[i].size();
+    for (const auto& s : plan.steps) {
+        w[0] = std::max(w[0], std::to_string(s.nr).size());
+        w[1] = std::max(w[1], s.op.size());
+        w[2] = std::max(w[2], s.table.size());
+        w[3] = std::max(w[3], s.details.size());
+        w[4] = std::max(w[4], s.index.size());
+    }
+    auto hline = [&](const std::string& l, const std::string& m,
+                     const std::string& r, const std::string& f) {
+        std::cout << l;
+        for (size_t i = 0; i < 5; ++i) {
+            for (size_t j = 0; j < w[i] + 2; ++j) std::cout << f;
+            if (i + 1 < 5) std::cout << m;
+        }
+        std::cout << r << "\n";
+    };
+    auto printRow = [&](const std::vector<std::string>& cells) {
+        std::cout << "\u2502";
+        for (size_t i = 0; i < 5; ++i) {
+            std::cout << " " << cells[i];
+            for (size_t j = cells[i].size(); j < w[i]; ++j) std::cout << " ";
+            std::cout << " \u2502";
+        }
+        std::cout << "\n";
+    };
+    hline("\u250c", "\u252c", "\u2510", "\u2500");
+    printRow(hdr);
+    hline("\u251c", "\u253c", "\u2524", "\u2500");
+    for (const auto& s : plan.steps)
+        printRow({std::to_string(s.nr), s.op, s.table, s.details, s.index});
+    hline("\u2514", "\u2534", "\u2518", "\u2500");
+    std::cout << "  EXPLAIN: " << plan.steps.size() << " Schritt(e)\n\n";
+}
+
 // WHERE-Bedingungen als lesbaren String zusammenbauen
 static std::string whereDesc(const milansql::ParsedCommand& cmd) {
     std::string s;
@@ -617,6 +659,32 @@ int main() {
             case milansql::CommandType::SELECT: {
                 if (cmd.tableName.empty()) {
                     std::cout << "  Fehler: Kein Tabellenname.\n"; break;
+                }
+
+                // ── Phase 36: EXPLAIN ─────────────────────────────
+                if (cmd.isExplain) {
+                    milansql::ExplainRequest req;
+                    req.tableName     = cmd.tableName;
+                    req.isJoin        = cmd.isJoin;
+                    req.joinClauses   = cmd.joinClauses;
+                    req.whereConds    = cmd.whereConds;
+                    req.whereLogic    = cmd.whereLogic;
+                    req.isGroupBy     = cmd.isGroupBy;
+                    req.groupByCols   = cmd.groupByCols;
+                    req.havingConds   = cmd.havingConds;
+                    req.isAggregate   = cmd.isAggregate;
+                    req.aggFunc       = cmd.aggFunc;
+                    req.aggCol        = cmd.aggCol;
+                    req.selectItems   = cmd.selectItems;
+                    req.hasCaseItems  = cmd.hasCaseItems;
+                    req.selectColumns = cmd.selectColumns;
+                    req.orderByColumn = cmd.orderByColumn;
+                    req.orderByDesc   = cmd.orderByDesc;
+                    req.limit         = cmd.limit;
+                    req.isSetOp       = cmd.isSetOp;
+                    req.setOp         = cmd.setOp;
+                    printExplain(engine.buildExplain(req));
+                    break;
                 }
 
                 // ── Phase 30: Mengenoperationen ──────────────────

@@ -511,7 +511,13 @@ static milansql::Table executeSelectToTable(
     }
 
     if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
-        result = engine.projectWithItems(result, cmd.selectItems);
+        bool hasWin = false;
+        for (const auto& si : cmd.selectItems)
+            if (si.isWindowFunc) { hasWin = true; break; }
+        if (hasWin)
+            result = engine.projectWithWindowItems(result, cmd.selectItems);
+        else
+            result = engine.projectWithItems(result, cmd.selectItems);
         if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
     } else {
         if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
@@ -993,8 +999,16 @@ int main() {
                 }
 
                 // Phase 31/32: CASE/Func-Projektion ZUERST (Aliase für ORDER BY)
+                // Phase 42: Window Functions verwenden projectWithWindowItems
                 if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
-                    result = engine.projectWithItems(result, cmd.selectItems);
+                    // Check for window functions
+                    bool hasWin = false;
+                    for (const auto& si : cmd.selectItems)
+                        if (si.isWindowFunc) { hasWin = true; break; }
+                    if (hasWin)
+                        result = engine.projectWithWindowItems(result, cmd.selectItems);
+                    else
+                        result = engine.projectWithItems(result, cmd.selectItems);
                     if (!cmd.orderByCols.empty())
                         result.sortByMulti(cmd.orderByCols);
                 } else {

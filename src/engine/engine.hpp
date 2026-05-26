@@ -159,6 +159,14 @@ struct SelectItem {
     // Phase 37: Skalare Subquery in SELECT-Liste
     bool          isScalarSubquery = false;
     ScalarSubSpec scalarSub;
+
+    // Phase 42: Window Functions
+    bool        isWindowFunc     = false;
+    std::string windowFunc;          // ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX
+    std::string windowFuncArg;       // argument for SUM/AVG/MIN/MAX (column name), or "*" for COUNT
+    std::string windowPartitionBy;   // column name for PARTITION BY, empty = no partition
+    std::string windowOrderBy;       // column name for ORDER BY inside OVER
+    bool        windowOrderDesc = false;  // true = DESC
 };
 
 // ── HAVING-Bedingung (Phase 10) ───────────────────────────────
@@ -1440,6 +1448,115 @@ public:
         return result;
     }
 
+    // ── Phase 42: Project with window functions ──────────────────
+    // If selectItems contain window functions, applies them and then
+    // projects the result. Returns a new Table with all columns.
+    Table projectWithWindowItems(const Table& src,
+                                  const std::vector<SelectItem>& items) const {
+        // Separate window items from non-window items
+        std::vector<SelectItem> windowItems, normalItems;
+        for (const auto& item : items) {
+            if (item.isWindowFunc) windowItems.push_back(item);
+            else normalItems.push_back(item);
+        }
+
+        if (windowItems.empty())
+            return projectWithItems(src, items);
+
+        // Copy rows mutably so we can append window values
+        std::vector<Row> rows(src.rows().begin(), src.rows().end());
+
+        // Build extended column names (src columns + window aliases)
+        std::vector<std::string> extColNames;
+        for (const auto& c : src.columns()) extColNames.push_back(c.name);
+
+        // Apply window functions (appends to each row, extends extColNames)
+        applyWindowFunctions(rows, windowItems, src.columns(), extColNames);
+
+        // Build extended columns vector for result table schema
+        std::vector<Column> extCols = src.columns();
+        for (size_t i = src.columns().size(); i < extColNames.size(); ++i)
+            extCols.emplace_back(extColNames[i], "TEXT");
+
+        // Build a temporary extended table
+        Table extTable("", extCols);
+        for (auto& r : rows) extTable.insert(r);
+
+        // Now project the requested items from the extended table
+        // For each item in the original items list:
+        //   - if isWindowFunc: look up by alias in extTable columns
+        //   - otherwise: use normal projectWithItems logic
+        std::vector<Column> resultCols;
+        for (const auto& item : items) {
+            if (item.isWindowFunc) {
+                std::string cname = item.alias.empty() ? item.windowFunc : item.alias;
+                resultCols.emplace_back(cname, "TEXT");
+            } else if (item.isFuncExpr) {
+                std::string cname;
+                if (!item.alias.empty()) {
+                    cname = item.alias;
+                } else {
+                    cname = item.funcName + "(";
+                    for (size_t k = 0; k < item.funcArgs.size(); ++k) {
+                        if (k > 0) cname += ",";
+                        cname += item.funcArgs[k];
+                    }
+                    cname += ")";
+                }
+                resultCols.emplace_back(cname, "TEXT");
+            } else if (item.isCaseExpr) {
+                std::string cname = item.alias.empty() ? "case" : item.alias;
+                resultCols.emplace_back(cname, "TEXT");
+            } else if (item.isScalarSubquery) {
+                std::string cname = item.alias.empty() ? "subquery" : item.alias;
+                resultCols.emplace_back(cname, "TEXT");
+            } else if (item.colName == "*") {
+                // Wildcard: include all src columns
+                for (const auto& c : src.columns())
+                    resultCols.emplace_back(item.alias.empty() ? c.name : item.alias, c.type);
+            } else {
+                int ci = findColIdx(extTable, item.colName);
+                if (ci < 0)
+                    throw std::runtime_error(
+                        "SELECT: Spalte '" + item.colName + "' nicht gefunden.");
+                std::string cname = item.alias.empty()
+                    ? extTable.columns()[static_cast<size_t>(ci)].name
+                    : item.alias;
+                resultCols.emplace_back(cname, extTable.columns()[static_cast<size_t>(ci)].type);
+            }
+        }
+
+        Table result("", resultCols);
+        for (const auto& row : extTable.rows()) {
+            std::vector<std::string> vals;
+            vals.reserve(items.size());
+            for (const auto& item : items) {
+                if (item.isWindowFunc) {
+                    std::string cname = item.alias.empty() ? item.windowFunc : item.alias;
+                    int ci = findColIdx(extTable, cname);
+                    vals.push_back(ci >= 0 && static_cast<size_t>(ci) < row.values.size()
+                                   ? row.values[static_cast<size_t>(ci)] : "");
+                } else if (item.isFuncExpr) {
+                    vals.push_back(evaluateFunc(item.funcName, item.funcArgs, extTable, row));
+                } else if (item.isCaseExpr) {
+                    vals.push_back(evalCase(item, extTable, row));
+                } else if (item.isScalarSubquery) {
+                    vals.push_back(evalScalarSub(item.scalarSub, extTable.columns(), row));
+                } else if (item.colName == "*") {
+                    // Wildcard: include all src columns (not the appended window cols)
+                    for (size_t ci = 0; ci < src.columns().size(); ++ci)
+                        vals.push_back(ci < row.values.size() ? row.values[ci] : "");
+                } else {
+                    int ci = findColIdx(extTable, item.colName);
+                    vals.push_back(ci >= 0 && static_cast<size_t>(ci) < row.values.size()
+                                   ? row.values[static_cast<size_t>(ci)] : "");
+                }
+            }
+            result.insert(Row(vals));
+        }
+        return result;
+    }
+
     // ── Phase 30: Mengenoperationen ───────────────────────────
     // op: "UNION", "UNION ALL", "INTERSECT", "EXCEPT"
     // Spaltenbreite beider Seiten muss übereinstimmen.
@@ -1553,6 +1670,151 @@ public:
             if (rowMatches(src, row, conds, logic))
                 result.insert(row);
         return result;
+    }
+
+    // ── Phase 42: Window Functions ───────────────────────────────
+    // Applies window functions to rows in-place.
+    // windowItems: SelectItems with isWindowFunc==true.
+    // The computed value is appended to each row's values vector.
+    // colNames: extended with the alias (or function name) for each window item.
+    static void applyWindowFunctions(
+            std::vector<Row>& rows,
+            const std::vector<SelectItem>& windowItems,
+            const std::vector<Column>& columns,
+            std::vector<std::string>& colNames) {
+
+        // Helper: get value of a named column from a row
+        auto getColValue = [&](const Row& row, const std::string& colName) -> std::string {
+            for (size_t i = 0; i < columns.size(); ++i)
+                if (columns[i].name == colName && i < row.values.size())
+                    return row.values[i];
+            // Also check colNames (already-appended window columns)
+            for (size_t i = 0; i < colNames.size(); ++i)
+                if (colNames[i] == colName && (columns.size() + i) < row.values.size())
+                    return row.values[columns.size() + i];
+            return "";
+        };
+
+        // Numeric-aware comparator for sorting
+        auto numCmp = [](const std::string& a, const std::string& b, bool desc) -> bool {
+            try {
+                size_t ea = 0, eb = 0;
+                double da = std::stod(a, &ea);
+                double db = std::stod(b, &eb);
+                if (ea == a.size() && eb == b.size())
+                    return desc ? da > db : da < db;
+            } catch (...) {}
+            return desc ? a > b : a < b;
+        };
+
+        for (const auto& item : windowItems) {
+            const std::string& wfunc = item.windowFunc;
+            std::string alias = item.alias.empty() ? wfunc : item.alias;
+
+            // Group row indices by partition key
+            std::map<std::string, std::vector<size_t>> partitions;
+            std::vector<std::string> partOrder;  // insertion order
+
+            for (size_t i = 0; i < rows.size(); ++i) {
+                std::string key = "";
+                if (!item.windowPartitionBy.empty())
+                    key = getColValue(rows[i], item.windowPartitionBy);
+                if (!partitions.count(key)) partOrder.push_back(key);
+                partitions[key].push_back(i);
+            }
+
+            // For each row, we'll store the window value
+            std::vector<std::string> windowVals(rows.size(), "");
+
+            for (const auto& key : partOrder) {
+                auto& idxList = partitions[key];
+
+                if (wfunc == "ROW_NUMBER" || wfunc == "RANK" || wfunc == "DENSE_RANK") {
+                    // Sort partition by ORDER BY column
+                    std::vector<size_t> sorted = idxList;
+                    if (!item.windowOrderBy.empty()) {
+                        bool desc = item.windowOrderDesc;
+                        std::stable_sort(sorted.begin(), sorted.end(),
+                            [&](size_t a, size_t b) {
+                                return numCmp(
+                                    getColValue(rows[a], item.windowOrderBy),
+                                    getColValue(rows[b], item.windowOrderBy),
+                                    desc);
+                            });
+                    }
+
+                    if (wfunc == "ROW_NUMBER") {
+                        for (size_t r = 0; r < sorted.size(); ++r)
+                            windowVals[sorted[r]] = std::to_string(r + 1);
+                    } else if (wfunc == "RANK") {
+                        int rank = 1;
+                        for (size_t r = 0; r < sorted.size(); ) {
+                            // Find group of equal values
+                            size_t j = r + 1;
+                            while (j < sorted.size() &&
+                                   !item.windowOrderBy.empty() &&
+                                   getColValue(rows[sorted[j]], item.windowOrderBy) ==
+                                   getColValue(rows[sorted[r]], item.windowOrderBy))
+                                ++j;
+                            for (size_t k = r; k < j; ++k)
+                                windowVals[sorted[k]] = std::to_string(rank);
+                            rank += static_cast<int>(j - r);
+                            r = j;
+                        }
+                    } else {  // DENSE_RANK
+                        int rank = 1;
+                        for (size_t r = 0; r < sorted.size(); ) {
+                            size_t j = r + 1;
+                            while (j < sorted.size() &&
+                                   !item.windowOrderBy.empty() &&
+                                   getColValue(rows[sorted[j]], item.windowOrderBy) ==
+                                   getColValue(rows[sorted[r]], item.windowOrderBy))
+                                ++j;
+                            for (size_t k = r; k < j; ++k)
+                                windowVals[sorted[k]] = std::to_string(rank);
+                            ++rank;
+                            r = j;
+                        }
+                    }
+
+                } else {
+                    // Aggregate over entire partition: SUM, AVG, COUNT, MIN, MAX
+                    if (wfunc == "COUNT") {
+                        std::string cnt = std::to_string(idxList.size());
+                        for (size_t idx : idxList)
+                            windowVals[idx] = cnt;
+                    } else {
+                        // Get column index for the aggregate argument
+                        std::vector<double> nums;
+                        for (size_t idx : idxList) {
+                            std::string v = getColValue(rows[idx], item.windowFuncArg);
+                            try { nums.push_back(std::stod(v)); } catch (...) {}
+                        }
+                        std::string aggResult = "NULL";
+                        if (!nums.empty()) {
+                            if (wfunc == "SUM") {
+                                double s = 0; for (double v : nums) s += v;
+                                aggResult = formatNum(s);
+                            } else if (wfunc == "AVG") {
+                                double s = 0; for (double v : nums) s += v;
+                                aggResult = formatNum(s / static_cast<double>(nums.size()));
+                            } else if (wfunc == "MIN") {
+                                aggResult = formatNum(*std::min_element(nums.begin(), nums.end()));
+                            } else if (wfunc == "MAX") {
+                                aggResult = formatNum(*std::max_element(nums.begin(), nums.end()));
+                            }
+                        }
+                        for (size_t idx : idxList)
+                            windowVals[idx] = aggResult;
+                    }
+                }
+            }
+
+            // Append window values to each row
+            for (size_t i = 0; i < rows.size(); ++i)
+                rows[i].values.push_back(windowVals[i]);
+            colNames.push_back(alias);
+        }
     }
 
     // ── Phase 41: WITH / CTE — temporäre Tabellen ────────────────

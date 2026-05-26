@@ -349,6 +349,23 @@ public:
             }
         }
 
+        // ── Phase 42: Window Functions-Erkennung ─────────────────
+        {
+            static const std::vector<std::string> WFUNCS =
+                {"ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "COUNT", "MIN", "MAX"};
+            auto st = tokenize(input);
+            if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                // Check for OVER keyword (indicates window function)
+                for (const auto& tok : st) {
+                    if (toUpper(tok) == "OVER") {
+                        parseSelectFull(input, cmd);
+                        return cmd;
+                    }
+                }
+            }
+            (void)WFUNCS;  // suppress unused warning
+        }
+
         // ── Standard-Parsing (Phasen 1–9) ─────────────────────
 
         std::string parenContent;
@@ -1455,7 +1472,13 @@ private:
             }
         }
 
-        if (hasCase || hasFunc || hasScalarSub37) {
+        // Phase 42: Window function (OVER keyword) in SELECT-Liste?
+        bool hasWindowFunc = false;
+        for (size_t i = selStart; i < fromPos; ++i) {
+            if (toUpper(ft[i]) == "OVER") { hasWindowFunc = true; break; }
+        }
+
+        if (hasCase || hasFunc || hasScalarSub37 || hasWindowFunc) {
             parseCaseSelectItems(ft, selStart, fromPos, cmd);
         } else {
             std::string colList;
@@ -1581,7 +1604,115 @@ private:
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
-                if (isStrFunc && i + 1 < end && ft[i + 1] == "(") {
+                // Phase 42: Window functions
+                static const std::vector<std::string> WFUNCS42 =
+                    {"ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "COUNT", "MIN", "MAX"};
+                bool isWinFunc = false;
+                for (const auto& f : WFUNCS42) if (u == f) { isWinFunc = true; break; }
+
+                // Peek ahead: if this function is followed by "(" and then "OVER" after closing ")",
+                // treat as window function.
+                // Check: is this a window function call? Look for OVER after the argument list.
+                bool treatAsWindow = false;
+                if (isWinFunc && i + 1 < end && ft[i + 1] == "(") {
+                    // Scan ahead to find closing ")" and check if next token is "OVER"
+                    int scanDepth = 0;
+                    size_t scanI = i + 1;
+                    while (scanI < end) {
+                        if (ft[scanI] == "(") ++scanDepth;
+                        else if (ft[scanI] == ")") {
+                            --scanDepth;
+                            if (scanDepth == 0) { ++scanI; break; }
+                        }
+                        ++scanI;
+                    }
+                    if (scanI < end && toUpper(ft[scanI]) == "OVER")
+                        treatAsWindow = true;
+                }
+                // Also: SUM/AVG/COUNT/MIN/MAX can appear without OVER (in GROUP BY context)
+                // so only treat as window if OVER follows.
+
+                if (treatAsWindow) {
+                    // Parse window function: FUNC ( [arg] ) OVER ( [PARTITION BY col] [ORDER BY col [DESC]] )
+                    SelectItem item;
+                    item.isWindowFunc = true;
+                    item.windowFunc   = u;  // already uppercase
+                    ++i;  // skip function name
+
+                    // Parse function arguments (between parens)
+                    if (i < end && ft[i] == "(") {
+                        ++i;  // skip "("
+                        // Collect args until matching ")"
+                        std::string argStr;
+                        int depth = 0;
+                        while (i < end) {
+                            if (ft[i] == "(") { depth++; argStr += ft[i] + " "; ++i; continue; }
+                            if (ft[i] == ")") {
+                                if (depth == 0) { ++i; break; }
+                                depth--; argStr += ft[i] + " "; ++i; continue;
+                            }
+                            if (depth == 0 && ft[i] == ",") { ++i; continue; }
+                            argStr += ft[i];
+                            ++i;
+                        }
+                        // Trim
+                        while (!argStr.empty() && argStr.back() == ' ') argStr.pop_back();
+                        item.windowFuncArg = argStr;  // e.g. "gehalt" or "*" or ""
+                    }
+
+                    // Skip OVER
+                    if (i < end && toUpper(ft[i]) == "OVER") ++i;
+
+                    // Parse OVER ( ... )
+                    if (i < end && ft[i] == "(") {
+                        ++i;  // skip "("
+                        // Collect inner tokens until matching ")"
+                        std::vector<std::string> overToks;
+                        int depth = 0;
+                        while (i < end) {
+                            if (ft[i] == "(") { depth++; overToks.push_back(ft[i]); ++i; continue; }
+                            if (ft[i] == ")") {
+                                if (depth == 0) { ++i; break; }
+                                depth--; overToks.push_back(ft[i]); ++i; continue;
+                            }
+                            overToks.push_back(ft[i]);
+                            ++i;
+                        }
+                        // Parse OVER clause tokens
+                        size_t oi = 0;
+                        while (oi < overToks.size()) {
+                            std::string ou = toUpper(overToks[oi]);
+                            if (ou == "PARTITION" && oi + 2 < overToks.size() &&
+                                toUpper(overToks[oi + 1]) == "BY") {
+                                oi += 2;
+                                if (oi < overToks.size()) {
+                                    item.windowPartitionBy = overToks[oi]; ++oi;
+                                }
+                            } else if (ou == "ORDER" && oi + 2 < overToks.size() &&
+                                       toUpper(overToks[oi + 1]) == "BY") {
+                                oi += 2;
+                                if (oi < overToks.size()) {
+                                    item.windowOrderBy = overToks[oi]; ++oi;
+                                    if (oi < overToks.size() && toUpper(overToks[oi]) == "DESC") {
+                                        item.windowOrderDesc = true; ++oi;
+                                    } else if (oi < overToks.size() && toUpper(overToks[oi]) == "ASC") {
+                                        item.windowOrderDesc = false; ++oi;
+                                    }
+                                }
+                            } else {
+                                ++oi;
+                            }
+                        }
+                    }
+
+                    // Optional AS alias
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(item);
+
+                } else if (isStrFunc && i + 1 < end && ft[i + 1] == "(") {
                     SelectItem item;
                     item.isFuncExpr = true;
                     item.funcName   = u;

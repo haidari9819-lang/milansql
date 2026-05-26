@@ -185,6 +185,15 @@ struct JoinClause {
     std::string onRight;   // "tabelle.spalte" rechte ON-Seite
 };
 
+// ── Phase 43: Trigger-Definition ─────────────────────────────
+struct TriggerDef {
+    std::string name;
+    std::string timing;     // "BEFORE" or "AFTER"
+    std::string event;      // "INSERT", "UPDATE", "DELETE"
+    std::string tableName;
+    std::string body;       // raw SQL body text (between BEGIN and END)
+};
+
 // ── Phase 36: EXPLAIN — Übergabe-Struct (alle engine.hpp-Typen verfügbar) ──
 struct ExplainRequest {
     std::string tableName;
@@ -695,6 +704,14 @@ public:
         checkInsertFK(tbl, vals);       // FOREIGN KEY prüfen
         checkAllConstraints(tbl, vals); // Phase 23: CHECK constraints prüfen
 
+        // Phase 43: BEFORE INSERT triggers
+        {
+            std::string signalMsg;
+            std::vector<std::string> emptyOld;
+            if (!fireAllTriggers("BEFORE", "INSERT", tbl, vals, emptyOld, signalMsg))
+                throw std::runtime_error(signalMsg);
+        }
+
         if (inTransaction_) {
             if (vals.size() != t.columns().size())
                 throw std::invalid_argument(
@@ -708,7 +725,14 @@ public:
             txBuffer_.push_back(std::move(op));
             return;
         }
-        t.insert(Row(std::move(vals)));
+        t.insert(Row(vals));
+
+        // Phase 43: AFTER INSERT triggers
+        {
+            std::string signalMsg;
+            std::vector<std::string> emptyOld;
+            fireAllTriggers("AFTER", "INSERT", tbl, vals, emptyOld, signalMsg);
+        }
     }
 
     // ── Phase 39: UPSERT ──────────────────────────────────────
@@ -1251,6 +1275,25 @@ public:
             for (const auto& row : matched)
                 cascadeDelete(tbl, row);
         }
+
+        // Phase 43: Collect matched rows for BEFORE/AFTER DELETE triggers
+        std::vector<std::vector<std::string>> matchedRows;
+        {
+            const Table& t = getTable(tbl);
+            size_t wCI = colIdx(t, wCol);
+            for (const auto& row : t.rows())
+                if (wCI < row.values.size() && row.values[wCI] == wVal)
+                    matchedRows.push_back(row.values);
+        }
+
+        // Phase 43: BEFORE DELETE triggers
+        for (auto& rowVals : matchedRows) {
+            std::string signalMsg;
+            std::vector<std::string> emptyNew;
+            if (!fireAllTriggers("BEFORE", "DELETE", tbl, emptyNew, rowVals, signalMsg))
+                throw std::runtime_error(signalMsg);
+        }
+
         if (inTransaction_) {
             BufferedOp op;
             op.opType    = BufferedOp::Type::DELETE_WHERE;
@@ -1261,7 +1304,16 @@ public:
             return 0;
         }
         Table& t = getTable(tbl);
-        return t.deleteWhere(colIdx(t, wCol), wVal);
+        std::size_t deleted = t.deleteWhere(colIdx(t, wCol), wVal);
+
+        // Phase 43: AFTER DELETE triggers
+        for (auto& rowVals : matchedRows) {
+            std::string signalMsg;
+            std::vector<std::string> emptyNew;
+            fireAllTriggers("AFTER", "DELETE", tbl, emptyNew, rowVals, signalMsg);
+        }
+
+        return deleted;
     }
 
     // Phase 22: Multi-Column UPDATE WHERE
@@ -1270,17 +1322,54 @@ public:
                             const std::vector<std::string>& setVals,
                             const std::string& wCol, const std::string& wVal) {
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
+
         if (inTransaction_) {
             // In Transaktion: als mehrere Einzel-Ops puffern
             for (size_t k = 0; k < setCols.size() && k < setVals.size(); ++k)
                 updateWhere(tbl, setCols[k], setVals[k], wCol, wVal);
             return 0;
         }
+
         Table& t = getTable(tbl);
-        std::vector<std::size_t> setCIs;
+        size_t wCI = colIdx(t, wCol);
+
+        // Phase 43: collect old rows and compute new rows for BEFORE UPDATE triggers
+        std::vector<std::size_t> setCIs2;
         for (const auto& col : setCols)
-            setCIs.push_back(colIdx(t, col));
-        return t.updateWhere(setCIs, setVals, colIdx(t, wCol), wVal);
+            setCIs2.push_back(colIdx(t, col));
+
+        std::vector<std::vector<std::string>> oldRows;
+        for (const auto& row : t.rows())
+            if (wCI < row.values.size() && row.values[wCI] == wVal)
+                oldRows.push_back(row.values);
+
+        // Fire BEFORE UPDATE triggers
+        for (auto& oldVals : oldRows) {
+            // Compute proposed newRow
+            std::vector<std::string> newVals = oldVals;
+            for (size_t k = 0; k < setCIs2.size() && k < setVals.size(); ++k)
+                if (setCIs2[k] < newVals.size())
+                    newVals[setCIs2[k]] = setVals[k];
+
+            std::string signalMsg;
+            if (!fireAllTriggers("BEFORE", "UPDATE", tbl, newVals, oldVals, signalMsg))
+                throw std::runtime_error(signalMsg);
+        }
+
+        std::size_t n = t.updateWhere(setCIs2, setVals, wCI, wVal);
+
+        // Phase 43: AFTER UPDATE triggers
+        for (auto& oldVals : oldRows) {
+            std::vector<std::string> newVals = oldVals;
+            for (size_t k = 0; k < setCIs2.size() && k < setVals.size(); ++k)
+                if (setCIs2[k] < newVals.size())
+                    newVals[setCIs2[k]] = setVals[k];
+
+            std::string signalMsg;
+            fireAllTriggers("AFTER", "UPDATE", tbl, newVals, oldVals, signalMsg);
+        }
+
+        return n;
     }
 
     // Phase 22: Multi-Column UPDATE ALL
@@ -1817,6 +1906,30 @@ public:
         }
     }
 
+    // ── Phase 43: Trigger Management ─────────────────────────────
+
+    void createTrigger(const TriggerDef& def) {
+        triggers_[def.name] = def;
+    }
+
+    void dropTrigger(const std::string& name) {
+        if (!triggers_.erase(name))
+            throw std::runtime_error("Trigger '" + name + "' nicht gefunden.");
+    }
+
+    std::vector<TriggerDef> showTriggers(const std::string& tableName = "") const {
+        std::vector<TriggerDef> result;
+        for (const auto& [n, t] : triggers_) {
+            if (tableName.empty() || t.tableName == tableName)
+                result.push_back(t);
+        }
+        return result;
+    }
+
+    const std::map<std::string, TriggerDef>& getAllTriggers() const {
+        return triggers_;
+    }
+
     // ── Phase 41: WITH / CTE — temporäre Tabellen ────────────────
 
     // Registriert eine Tabelle unter name als temporäre CTE-Tabelle.
@@ -1835,6 +1948,365 @@ public:
     }
 
 private:
+    std::map<std::string, TriggerDef> triggers_;  // trigger name → def
+
+    // ── Phase 43: Trigger Execution Engine ───────────────────────
+
+    // Helper: to-uppercase
+    static std::string trgUpper(std::string s) {
+        for (char& c : s)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    // Helper: trim whitespace
+    static std::string trgTrim(const std::string& s) {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return "";
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return s.substr(a, b - a + 1);
+    }
+
+    // Helper: find column index in a columns vector (case-sensitive)
+    static int trgFindCol(const std::vector<Column>& cols, const std::string& name) {
+        for (size_t i = 0; i < cols.size(); ++i)
+            if (cols[i].name == name) return static_cast<int>(i);
+        return -1;
+    }
+
+    // Compare two values with an operator (for trigger IF conditions)
+    static bool trgCompare(const std::string& a, const std::string& op, const std::string& b) {
+        // Try numeric
+        try {
+            size_t ea = 0, eb = 0;
+            double da = std::stod(a, &ea);
+            double db = std::stod(b, &eb);
+            if (ea == a.size() && eb == b.size()) {
+                if (op == "=")  return da == db;
+                if (op == "!=") return da != db;
+                if (op == "<")  return da <  db;
+                if (op == ">")  return da >  db;
+                if (op == "<=") return da <= db;
+                if (op == ">=") return da >= db;
+            }
+        } catch (...) {}
+        // String fallback
+        if (op == "=")  return a == b;
+        if (op == "!=") return a != b;
+        if (op == "<")  return a <  b;
+        if (op == ">")  return a >  b;
+        if (op == "<=") return a <= b;
+        if (op == ">=") return a >= b;
+        return false;
+    }
+
+    // Substitute OLD.col and NEW.col references with actual values.
+    // Also strips surrounding single quotes from literal values in the substitution.
+    static std::string trgSubstituteRefs(
+            const std::string& text,
+            const std::vector<std::string>& newRow,
+            const std::vector<std::string>& oldRow,
+            const std::vector<Column>& cols)
+    {
+        std::string result = text;
+        // Replace OLD.colname and NEW.colname
+        // We do a simple scan for "OLD." and "NEW." prefixes
+        // Process character by character
+        std::string out;
+        size_t i = 0;
+        while (i < result.size()) {
+            // Check for NEW. or OLD.
+            bool matchedNew = false, matchedOld = false;
+            if (i + 4 <= result.size()) {
+                std::string pfx4 = trgUpper(result.substr(i, 4));
+                if (pfx4 == "NEW.") matchedNew = true;
+                if (pfx4 == "OLD.") matchedOld = true;
+            }
+            if (matchedNew || matchedOld) {
+                // Read column name after prefix
+                size_t j = i + 4;
+                while (j < result.size() &&
+                       (std::isalnum(static_cast<unsigned char>(result[j])) || result[j] == '_'))
+                    ++j;
+                std::string colName = result.substr(i + 4, j - (i + 4));
+                int ci = trgFindCol(cols, colName);
+                if (ci >= 0) {
+                    const std::vector<std::string>& row = matchedNew ? newRow : oldRow;
+                    if (static_cast<size_t>(ci) < row.size())
+                        out += row[static_cast<size_t>(ci)];
+                    else
+                        out += "NULL";
+                } else {
+                    // Unknown column — keep original
+                    out += result.substr(i, j - i);
+                }
+                i = j;
+            } else {
+                out += result[i++];
+            }
+        }
+        return out;
+    }
+
+    // Parse and execute a SIGNAL statement, extracting the message.
+    // Returns the message (text between single quotes, or bare word after SIGNAL).
+    static std::string trgParseSignal(const std::string& stmt) {
+        // Find 'message' or just the rest after SIGNAL
+        std::string upper = trgUpper(stmt);
+        size_t sigPos = upper.find("SIGNAL");
+        if (sigPos == std::string::npos) return stmt;
+        std::string rest = trgTrim(stmt.substr(sigPos + 6));
+        if (!rest.empty() && rest.front() == '\'') {
+            // Strip surrounding single quotes
+            if (rest.size() >= 2 && rest.back() == '\'')
+                return rest.substr(1, rest.size() - 2);
+            return rest.substr(1);
+        }
+        return rest;
+    }
+
+    // Execute trigger body statements.
+    // Returns false (aborted) if a SIGNAL is encountered.
+    // signalMsg is set to the SIGNAL message on abort.
+    // noRecurse: flag to prevent recursive trigger firing during INSERT inside trigger
+    bool executeTriggerBody(
+            const std::string& body,
+            std::vector<std::string>& newRow,
+            const std::vector<std::string>& oldRow,
+            const std::vector<Column>& cols,
+            std::string& signalMsg,
+            bool noRecurse = false)
+    {
+        // Split body by semicolons
+        std::vector<std::string> stmts;
+        {
+            std::string cur;
+            bool inQ = false;
+            for (char c : body) {
+                if (c == '\'' && !inQ) { inQ = true; cur += c; continue; }
+                if (c == '\'' && inQ)  { inQ = false; cur += c; continue; }
+                if (inQ)               { cur += c; continue; }
+                if (c == ';')          { stmts.push_back(trgTrim(cur)); cur.clear(); }
+                else                   { cur += c; }
+            }
+            if (!trgTrim(cur).empty()) stmts.push_back(trgTrim(cur));
+        }
+
+        size_t i = 0;
+        while (i < stmts.size()) {
+            std::string stmt = trgTrim(stmts[i]);
+            if (stmt.empty()) { ++i; continue; }
+
+            std::string upper = trgUpper(stmt);
+
+            // Skip END IF / END
+            if (upper == "END IF" || upper == "END") { ++i; continue; }
+
+            if (upper.size() >= 2 && upper.substr(0, 2) == "IF") {
+                // Parse: IF NEW/OLD.col op val THEN ... [END IF]
+                // Find THEN
+                size_t thenPos = upper.find("THEN");
+                if (thenPos == std::string::npos) { ++i; continue; }
+
+                std::string condPart = trgTrim(stmt.substr(2, thenPos - 2));
+                std::string thenPart = trgTrim(stmt.substr(thenPos + 4));
+
+                // Evaluate condition: expect  NEW.col op val  or  OLD.col op val
+                bool condResult = false;
+                {
+                    // Tokenize condPart
+                    // Split on whitespace
+                    std::vector<std::string> ctoks;
+                    {
+                        std::istringstream iss(condPart);
+                        std::string t;
+                        while (iss >> t) ctoks.push_back(t);
+                    }
+                    if (ctoks.size() >= 3) {
+                        std::string lhs  = ctoks[0];   // NEW.col or OLD.col or literal
+                        std::string op   = ctoks[1];
+                        std::string rhs  = ctoks[2];
+                        // Strip quotes from rhs if quoted
+                        if (rhs.size() >= 2 && rhs.front() == '\'' && rhs.back() == '\'')
+                            rhs = rhs.substr(1, rhs.size() - 2);
+
+                        // Resolve lhs
+                        std::string lhsVal = lhs;
+                        std::string lhsUp  = trgUpper(lhs);
+                        if (lhsUp.size() > 4 && lhsUp.substr(0, 4) == "NEW.") {
+                            std::string colName = lhs.substr(4);
+                            int ci = trgFindCol(cols, colName);
+                            if (ci >= 0 && static_cast<size_t>(ci) < newRow.size())
+                                lhsVal = newRow[static_cast<size_t>(ci)];
+                        } else if (lhsUp.size() > 4 && lhsUp.substr(0, 4) == "OLD.") {
+                            std::string colName = lhs.substr(4);
+                            int ci = trgFindCol(cols, colName);
+                            if (ci >= 0 && static_cast<size_t>(ci) < oldRow.size())
+                                lhsVal = oldRow[static_cast<size_t>(ci)];
+                        }
+
+                        // Resolve rhs (may also be NEW.col/OLD.col)
+                        std::string rhsVal = rhs;
+                        std::string rhsUp  = trgUpper(rhs);
+                        if (rhsUp.size() > 4 && rhsUp.substr(0, 4) == "NEW.") {
+                            std::string colName = rhs.substr(4);
+                            int ci = trgFindCol(cols, colName);
+                            if (ci >= 0 && static_cast<size_t>(ci) < newRow.size())
+                                rhsVal = newRow[static_cast<size_t>(ci)];
+                        } else if (rhsUp.size() > 4 && rhsUp.substr(0, 4) == "OLD.") {
+                            std::string colName = rhs.substr(4);
+                            int ci = trgFindCol(cols, colName);
+                            if (ci >= 0 && static_cast<size_t>(ci) < oldRow.size())
+                                rhsVal = oldRow[static_cast<size_t>(ci)];
+                        }
+
+                        condResult = trgCompare(lhsVal, op, rhsVal);
+                    }
+                }
+
+                if (condResult) {
+                    // Execute the then-body inline if it's non-empty
+                    if (!thenPart.empty()) {
+                        // thenPart is the remaining text after THEN (before END IF)
+                        // It may be a single statement or multiple
+                        std::string innerBody = thenPart;
+                        // We need to re-add a semicolon if it's not there
+                        // and then call recursively
+                        if (!innerBody.empty() && innerBody.back() != ';')
+                            innerBody += ";";
+                        if (!executeTriggerBody(innerBody, newRow, oldRow, cols, signalMsg, noRecurse))
+                            return false;
+                    }
+                }
+
+                ++i; continue;
+            }
+
+            if (upper.size() >= 6 && upper.substr(0, 6) == "SIGNAL") {
+                signalMsg = trgParseSignal(stmt);
+                return false;
+            }
+
+            if (upper.size() >= 6 && upper.substr(0, 6) == "INSERT") {
+                // Substitute OLD.col and NEW.col references
+                std::string resolved = trgSubstituteRefs(stmt, newRow, oldRow, cols);
+                // Execute as INSERT (use the engine's internal insert without trigger firing)
+                // Parse: INSERT INTO tblname VALUES (v1, v2, ...)
+                if (!noRecurse) {
+                    try {
+                        executeTriggerInsert(resolved);
+                    } catch (const std::exception& ex) {
+                        // INSERT inside trigger failed — ignore silently or rethrow?
+                        // For now rethrow
+                        throw;
+                    }
+                }
+                ++i; continue;
+            }
+
+            if (upper.size() >= 8 && upper.substr(0, 8) == "SET NEW.") {
+                // Parse: SET NEW.col = val
+                std::string rest = trgTrim(stmt.substr(8));  // after "SET NEW."
+                // find '='
+                size_t eqPos = rest.find('=');
+                if (eqPos != std::string::npos) {
+                    std::string colName = trgTrim(rest.substr(0, eqPos));
+                    std::string val     = trgTrim(rest.substr(eqPos + 1));
+                    // Strip single quotes from val
+                    if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'')
+                        val = val.substr(1, val.size() - 2);
+                    int ci = trgFindCol(cols, colName);
+                    if (ci >= 0 && static_cast<size_t>(ci) < newRow.size())
+                        newRow[static_cast<size_t>(ci)] = val;
+                }
+                ++i; continue;
+            }
+
+            ++i;
+        }
+        return true;
+    }
+
+    // Execute an INSERT statement inside a trigger body (no recursive trigger firing)
+    void executeTriggerInsert(const std::string& sql) {
+        // Simple parse: INSERT INTO tblname VALUES (v1, v2, ...)
+        // Tokenize
+        std::vector<std::string> tokens;
+        {
+            std::string cur;
+            bool inQ = false;
+            for (char c : sql) {
+                if (c == '\'' && !inQ) { inQ = true; cur += c; continue; }
+                if (c == '\'' && inQ)  { inQ = false; cur += c; continue; }
+                if (inQ)               { cur += c; continue; }
+                if (c == ' ' || c == '\t') {
+                    if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                } else if (c == '(' || c == ')' || c == ',') {
+                    if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                    tokens.push_back(std::string(1, c));
+                } else {
+                    cur += c;
+                }
+            }
+            if (!cur.empty()) tokens.push_back(cur);
+        }
+
+        // Find INSERT INTO tblname VALUES (...)
+        // tokens[0]=INSERT, [1]=INTO, [2]=tblname, [3]=VALUES, [4]=(, ...values..., )
+        if (tokens.size() < 5) return;
+        if (trgUpper(tokens[0]) != "INSERT") return;
+        if (trgUpper(tokens[1]) != "INTO") return;
+        std::string tblName = tokens[2];
+        // Skip VALUES keyword
+        size_t i = 3;
+        if (i < tokens.size() && trgUpper(tokens[i]) == "VALUES") ++i;
+        // Skip opening (
+        if (i < tokens.size() && tokens[i] == "(") ++i;
+
+        std::vector<std::string> vals;
+        while (i < tokens.size() && tokens[i] != ")") {
+            if (tokens[i] != ",") {
+                std::string v = tokens[i];
+                // Strip single quotes
+                if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'')
+                    v = v.substr(1, v.size() - 2);
+                vals.push_back(v);
+            }
+            ++i;
+        }
+
+        // Insert directly into table (bypass trigger firing)
+        if (!tables_.count(tblName)) return;
+        Table& tbl = tables_.at(tblName);
+        applyDefaults(tbl, vals);
+        applyAutoInc(tbl, vals);
+        tbl.insert(Row(vals));
+    }
+
+    // Fire all triggers of the given timing/event for a table.
+    // Returns true if operation should proceed, false if SIGNAL aborted.
+    bool fireAllTriggers(
+            const std::string& timing,
+            const std::string& event,
+            const std::string& tableName,
+            std::vector<std::string>& newRow,
+            const std::vector<std::string>& oldRow,
+            std::string& signalMsg)
+    {
+        if (!tables_.count(tableName)) return true;
+        const std::vector<Column>& cols = tables_.at(tableName).columns();
+
+        for (auto& [trgName, trg] : triggers_) {
+            if (trgUpper(trg.timing)   != trgUpper(timing))   continue;
+            if (trgUpper(trg.event)    != trgUpper(event))    continue;
+            if (trg.tableName != tableName)                    continue;
+
+            if (!executeTriggerBody(trg.body, newRow, oldRow, cols, signalMsg, false))
+                return false;
+        }
+        return true;
+    }
+
     // ── Tabellen-Zugriff ──────────────────────────────────────
 
     Table& getTable(const std::string& n) {

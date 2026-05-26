@@ -39,6 +39,10 @@ enum class CommandType {
     STATUS,
     HELP,
     EXIT,
+    // Phase 43: Triggers
+    CREATE_TRIGGER,
+    DROP_TRIGGER,
+    SHOW_TRIGGERS,
     UNKNOWN
 };
 
@@ -146,6 +150,14 @@ struct ParsedCommand {
     // Phase 41: WITH / CTE — Common Table Expressions
     // Jeder Eintrag: {cte_name, inner_sql}
     std::vector<std::pair<std::string,std::string>> cteList;
+
+    // Phase 43: Trigger fields
+    std::string triggerName;
+    std::string triggerTiming;        // BEFORE / AFTER
+    std::string triggerEvent;         // INSERT / UPDATE / DELETE
+    std::string triggerTable;         // table name the trigger is on
+    std::string triggerBody;          // raw body text (between BEGIN and END)
+    std::string showTriggersTable;    // for "SHOW TRIGGERS ON tablename"
 };
 
 class Parser {
@@ -528,6 +540,53 @@ public:
                     cmd.values = cmd.multiValues[0];
             } else { cmd.type = CommandType::UNKNOWN; }
 
+        // ── Phase 43: CREATE TRIGGER ─────────────────────────────
+        // Syntax: CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl
+        //         FOR EACH ROW BEGIN body END
+        } else if (kw0 == "CREATE" && kw1 == "TRIGGER") {
+            cmd.type = CommandType::CREATE_TRIGGER;
+            // Use tokenizeFull on the full original input to properly handle quoted strings
+            auto ftTrig = tokenizeFull(input);
+            // ftTrig[0]=CREATE, [1]=TRIGGER, [2]=name, [3]=BEFORE/AFTER,
+            // [4]=INSERT/UPDATE/DELETE, [5]=ON (skip), [6]=tableName,
+            // [7]=FOR, [8]=EACH, [9]=ROW, [10]=BEGIN, body..., END
+            size_t ti = 2;
+            if (ti < ftTrig.size()) cmd.triggerName    = ftTrig[ti++];
+            if (ti < ftTrig.size()) cmd.triggerTiming  = toUpper(ftTrig[ti++]);
+            if (ti < ftTrig.size()) cmd.triggerEvent   = toUpper(ftTrig[ti++]);
+            // skip ON
+            if (ti < ftTrig.size() && toUpper(ftTrig[ti]) == "ON") ++ti;
+            if (ti < ftTrig.size()) cmd.triggerTable   = ftTrig[ti++];
+            // skip FOR EACH ROW
+            while (ti < ftTrig.size() && toUpper(ftTrig[ti]) != "BEGIN") ++ti;
+            if (ti < ftTrig.size()) ++ti;  // skip BEGIN
+            // collect body until final END (not END IF)
+            std::string body;
+            // We need to find the final standalone END
+            // Collect tokens until we hit END that is NOT followed by IF
+            while (ti < ftTrig.size()) {
+                std::string utok = toUpper(ftTrig[ti]);
+                // Check for standalone END (not END IF)
+                if (utok == "END") {
+                    // Check next token — if it's IF, keep going
+                    size_t nxt = ti + 1;
+                    if (nxt < ftTrig.size() && toUpper(ftTrig[nxt]) == "IF") {
+                        // This is END IF — include it in body
+                        if (!body.empty()) body += " ";
+                        body += ftTrig[ti++];
+                        body += " ";
+                        body += ftTrig[ti++];
+                    } else {
+                        // Standalone END — stop
+                        break;
+                    }
+                } else {
+                    if (!body.empty()) body += " ";
+                    body += ftTrig[ti++];
+                }
+            }
+            cmd.triggerBody = body;
+
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
             cmd.type = CommandType::CREATE_INDEX;
@@ -651,6 +710,12 @@ public:
                 parseWhere(tokens, 3, cmd);
             } else { cmd.type = CommandType::UNKNOWN; }
 
+        // ── Phase 43: DROP TRIGGER ───────────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "TRIGGER") {
+            cmd.type = CommandType::DROP_TRIGGER;
+            if (tokens.size() >= 3) cmd.triggerName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
         // ── DROP TABLE ───────────────────────────────────────────
         } else if (kw0 == "DROP" && kw1 == "TABLE") {
             cmd.type = CommandType::DROP_TABLE;
@@ -677,6 +742,11 @@ public:
                 // SHOW CREATE TABLE name
                 cmd.type      = CommandType::SHOW_CREATE_TABLE;
                 cmd.tableName = tokens[3];
+            // Phase 43: SHOW TRIGGERS [ON tablename]
+            } else if (kw1 == "TRIGGERS") {
+                cmd.type = CommandType::SHOW_TRIGGERS;
+                if (tokens.size() >= 4 && toUpper(tokens[2]) == "ON")
+                    cmd.showTriggersTable = tokens[3];
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }

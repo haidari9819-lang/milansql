@@ -27,6 +27,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Correlated Subqueries** | `WHERE col > (SELECT AVG(...) WHERE col = alias.col)`, `(SELECT COUNT(*) FROM ...) AS alias` in SELECT, `EXISTS` mit mehreren Bedingungen |
 | **WITH / CTE** | `WITH name AS (SELECT ...), ... SELECT ...` (Common Table Expressions, mehrere CTEs) |
 | **Window Functions** | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM/AVG/COUNT/MIN/MAX() OVER (PARTITION BY col ORDER BY col)` |
+| **Trigger** | `CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl FOR EACH ROW BEGIN ... END`, `DROP TRIGGER`, `SHOW TRIGGERS [ON tbl]` |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
 | **Persistenz** | Eigenes Binärformat (`database.milan`, Format v7) mit Checksumme |
@@ -286,6 +287,7 @@ STATUS
 | 40 | CAST: `CAST(expr AS INT\|REAL\|TEXT)` in SELECT und WHERE |
 | 41 | WITH / CTE: `WITH name AS (SELECT ...)` — Common Table Expressions, mehrere CTEs, UNION |
 | 42 | Window Functions: `ROW_NUMBER/RANK/DENSE_RANK/SUM/AVG/COUNT/MIN/MAX OVER (PARTITION BY ... ORDER BY ...)` |
+| 43 | Trigger: `CREATE TRIGGER BEFORE/AFTER INSERT/UPDATE/DELETE`, SIGNAL, NEW/OLD, `DROP TRIGGER`, `SHOW TRIGGERS` |
 
 ---
 

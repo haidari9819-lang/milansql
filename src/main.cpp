@@ -566,6 +566,36 @@ int main() {
                   << "\n  Starte mit leerer Datenbank.\n\n";
     }
 
+    // Phase 43: Load triggers from separate file
+    {
+        std::ifstream tf("database.triggers");
+        if (tf) {
+            std::string line;
+            while (std::getline(tf, line)) {
+                if (line.empty()) continue;
+                // Format: name\ttiming\tevent\ttableName\tbody
+                std::vector<std::string> parts;
+                size_t pos = 0;
+                for (int field = 0; field < 4; ++field) {
+                    size_t tab = line.find('\t', pos);
+                    if (tab == std::string::npos) { pos = line.size(); break; }
+                    parts.push_back(line.substr(pos, tab - pos));
+                    pos = tab + 1;
+                }
+                parts.push_back(line.substr(pos));  // body (rest of line)
+                if (parts.size() == 5) {
+                    milansql::TriggerDef def;
+                    def.name      = parts[0];
+                    def.timing    = parts[1];
+                    def.event     = parts[2];
+                    def.tableName = parts[3];
+                    def.body      = parts[4];
+                    engine.createTrigger(def);
+                }
+            }
+        }
+    }
+
     auto persist = [&]() {
         if (engine.isInTransaction()) return;  // Während Transaktion nicht persistieren
         try { storage.save(engine); }
@@ -580,6 +610,100 @@ int main() {
             std::cout << "\nAuf Wiedersehen!\n"; break;
         }
         if (eingabe.empty()) continue;
+
+        // Phase 43: Multi-line CREATE TRIGGER — buffer lines until END
+        {
+            // Check if line starts with CREATE TRIGGER (case-insensitive)
+            std::string upLine = eingabe;
+            for (char& c : upLine)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            // Trim leading whitespace for check
+            size_t s43 = 0;
+            while (s43 < upLine.size() && (upLine[s43]==' ' || upLine[s43]=='\t')) ++s43;
+            std::string trimmedUp = upLine.substr(s43);
+            if (trimmedUp.size() >= 14 && trimmedUp.substr(0, 14) == "CREATE TRIGGER") {
+                // Check if BEGIN is already present in the current line
+                bool hasBegin = (upLine.find("BEGIN") != std::string::npos);
+                bool hasEnd   = false;
+                if (hasBegin) {
+                    // Check for standalone END (not END IF) after BEGIN
+                    size_t beginPos = upLine.find("BEGIN");
+                    std::string afterBegin = upLine.substr(beginPos + 5);
+                    // Simple check: does "END" appear as a standalone token after BEGIN?
+                    // We look for " END" or "END" followed by non-alpha
+                    size_t endPos = afterBegin.find("END");
+                    while (endPos != std::string::npos) {
+                        // Check it's not END IF
+                        size_t nxtChar = endPos + 3;
+                        while (nxtChar < afterBegin.size() && afterBegin[nxtChar] == ' ') ++nxtChar;
+                        if (nxtChar >= afterBegin.size() ||
+                            (afterBegin.substr(nxtChar, 2) != "IF" &&
+                             afterBegin.substr(nxtChar, 2) != "if")) {
+                            hasEnd = true; break;
+                        }
+                        endPos = afterBegin.find("END", endPos + 1);
+                    }
+                }
+                if (hasBegin && !hasEnd) {
+                    // Keep reading lines until we find a standalone END
+                    while (true) {
+                        std::string nextLine;
+                        if (!std::getline(std::cin, nextLine)) break;
+                        eingabe += " " + nextLine;
+                        std::string upNext = nextLine;
+                        for (char& c : upNext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        // Check if standalone END present
+                        size_t ep = upNext.find("END");
+                        bool foundEnd = false;
+                        while (ep != std::string::npos) {
+                            size_t nc = ep + 3;
+                            while (nc < upNext.size() && upNext[nc] == ' ') ++nc;
+                            if (nc >= upNext.size() ||
+                                (upNext.substr(nc, 2) != "IF" &&
+                                 upNext.substr(nc, 2) != "if")) {
+                                foundEnd = true; break;
+                            }
+                            ep = upNext.find("END", ep + 1);
+                        }
+                        if (foundEnd) break;
+                    }
+                } else if (!hasBegin) {
+                    // No BEGIN yet — read lines until BEGIN then until END
+                    while (true) {
+                        std::string nextLine;
+                        if (!std::getline(std::cin, nextLine)) break;
+                        eingabe += " " + nextLine;
+                        std::string upNext = nextLine;
+                        for (char& c : upNext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        if (upNext.find("BEGIN") != std::string::npos) break;
+                    }
+                    // Now read until END
+                    while (true) {
+                        std::string nextLine;
+                        if (!std::getline(std::cin, nextLine)) break;
+                        eingabe += " " + nextLine;
+                        std::string upNext = nextLine;
+                        for (char& c : upNext)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        size_t ep = upNext.find("END");
+                        bool foundEnd = false;
+                        while (ep != std::string::npos) {
+                            size_t nc = ep + 3;
+                            while (nc < upNext.size() && upNext[nc] == ' ') ++nc;
+                            if (nc >= upNext.size() ||
+                                (upNext.substr(nc, 2) != "IF" &&
+                                 upNext.substr(nc, 2) != "if")) {
+                                foundEnd = true; break;
+                            }
+                            ep = upNext.find("END", ep + 1);
+                        }
+                        if (foundEnd) break;
+                    }
+                }
+            }
+        }
 
         milansql::ParsedCommand cmd = parser.parse(eingabe);
 
@@ -1300,6 +1424,73 @@ int main() {
                 engine.rollbackTransaction();
                 std::cout << "  Transaktion abgebrochen (ROLLBACK).\n\n";
                 break;
+
+            // ── Phase 43: CREATE TRIGGER ─────────────────────────
+            case milansql::CommandType::CREATE_TRIGGER: {
+                if (cmd.triggerName.empty() || cmd.triggerTiming.empty() ||
+                    cmd.triggerEvent.empty() || cmd.triggerTable.empty()) {
+                    std::cout << "  Fehler: CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl FOR EACH ROW BEGIN ... END\n";
+                    break;
+                }
+                milansql::TriggerDef def;
+                def.name      = cmd.triggerName;
+                def.timing    = cmd.triggerTiming;
+                def.event     = cmd.triggerEvent;
+                def.tableName = cmd.triggerTable;
+                def.body      = cmd.triggerBody;
+                engine.createTrigger(def);
+                // Persist triggers
+                {
+                    std::ofstream tf("database.triggers");
+                    if (tf) {
+                        for (const auto& [n, t] : engine.getAllTriggers()) {
+                            tf << t.name << "\t" << t.timing << "\t" << t.event
+                               << "\t" << t.tableName << "\t" << t.body << "\n";
+                        }
+                    }
+                }
+                std::cout << "  Trigger '" << def.name << "' erstellt.\n\n";
+                break;
+            }
+
+            // ── Phase 43: DROP TRIGGER ────────────────────────────
+            case milansql::CommandType::DROP_TRIGGER: {
+                if (cmd.triggerName.empty()) {
+                    std::cout << "  Fehler: DROP TRIGGER triggername\n"; break;
+                }
+                engine.dropTrigger(cmd.triggerName);
+                // Persist triggers
+                {
+                    std::ofstream tf("database.triggers");
+                    if (tf) {
+                        for (const auto& [n, t] : engine.getAllTriggers()) {
+                            tf << t.name << "\t" << t.timing << "\t" << t.event
+                               << "\t" << t.tableName << "\t" << t.body << "\n";
+                        }
+                    }
+                }
+                std::cout << "  Trigger '" << cmd.triggerName << "' geloescht.\n\n";
+                break;
+            }
+
+            // ── Phase 43: SHOW TRIGGERS ───────────────────────────
+            case milansql::CommandType::SHOW_TRIGGERS: {
+                auto triggers = engine.showTriggers(cmd.showTriggersTable);
+                if (triggers.empty()) {
+                    std::cout << "  Keine Trigger";
+                    if (!cmd.showTriggersTable.empty())
+                        std::cout << " auf '" << cmd.showTriggersTable << "'";
+                    std::cout << ".\n\n";
+                } else {
+                    std::cout << "\n";
+                    for (const auto& t : triggers) {
+                        std::cout << "  " << t.name << " | " << t.timing
+                                  << " " << t.event << " ON " << t.tableName << "\n";
+                    }
+                    std::cout << "\n  " << triggers.size() << " Trigger\n\n";
+                }
+                break;
+            }
 
             case milansql::CommandType::UNKNOWN:
             default:

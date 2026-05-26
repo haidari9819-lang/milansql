@@ -125,6 +125,12 @@ struct WhereCondition {
     // Phase 40: LHS ist eine Funktion wie CAST(...)
     bool          isFuncLhs   = false;
     std::string   funcLhsExpr;  // space-separated token string: "CAST ( col AS INT )"
+
+    // Default constructor (all fields zero-/empty-initialized)
+    WhereCondition() = default;
+    // Convenience constructor used in parser for simple conditions
+    WhereCondition(std::string c, std::string o, std::string v)
+        : col(std::move(c)), op(std::move(o)), val(std::move(v)) {}
 };
 
 // ── SELECT-Listen-Eintrag (Phase 10 / Phase 31 / Phase 32) ───

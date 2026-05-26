@@ -13,18 +13,40 @@ set(SOURCES
     src/main.cpp
 )
 
-# Executable definieren
+# ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-
-# Include-Verzeichnisse hinzufügen
 target_include_directories(milansql PRIVATE src)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)
     target_compile_options(milansql PRIVATE /W4)
 else()
-    target_compile_options(milansql PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(milansql PRIVATE -Wall -Wextra -Wpedantic -Wmissing-field-initializers)
 endif()
+
+# ── Test-Suite (Phase 39.5) ──────────────────────────────────
+add_executable(milansql_tests src/tests/milansql_tests.cpp)
+target_compile_features(milansql_tests PRIVATE cxx_std_17)
+target_include_directories(milansql_tests PRIVATE src)
+if(MSVC)
+    target_compile_options(milansql_tests PRIVATE /W4)
+else()
+    target_compile_options(milansql_tests PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+
+# ── Benchmark (Phase 39.5) ───────────────────────────────────
+add_executable(milansql_bench src/tests/benchmark.cpp)
+target_compile_features(milansql_bench PRIVATE cxx_std_17)
+target_include_directories(milansql_bench PRIVATE src)
+if(MSVC)
+    target_compile_options(milansql_bench PRIVATE /W4)
+else()
+    target_compile_options(milansql_bench PRIVATE -Wall -Wextra)
+endif()
+
+# ── CTest Integration ────────────────────────────────────────
+enable_testing()
+add_test(NAME milansql_tests COMMAND milansql_tests)
 
 # Ausgabe-Info
 message(STATUS "MilanSQL v${PROJECT_VERSION} — Build konfiguriert")

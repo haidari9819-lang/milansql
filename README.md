@@ -287,6 +287,45 @@ STATUS
 
 ---
 
+## Testing (Phase 39.5)
+
+### Test-Suite ausführen
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/milansql_tests        # Linux/macOS
+build\milansql_tests.exe      # Windows
+```
+
+Die Test-Suite enthält **41 automatisierte Tests** in 10 Gruppen, die alle Kern-Features abdecken:
+DDL/DML, Aggregation, JOINs, Transaktionen, Constraints, Foreign Keys + CASCADE,
+Mengenoperationen (UNION/INTERSECT/EXCEPT), CASE WHEN, WITH/CTE und B-Tree Indizes.
+Alle Tests laufen in-memory — keine Datenbankdatei wird angelegt.
+
+### Benchmark ausführen
+
+```bash
+./build/milansql_bench        # Linux/macOS
+build\milansql_bench.exe      # Windows
+```
+
+Typische Ergebnisse auf Entwicklungshardware:
+
+| Messung | Zeit |
+|---------|------|
+| 10.000 INSERTs | ~120ms |
+| SELECT ohne Index (Full Scan) | ~2ms |
+| SELECT mit B-Tree Index | <1ms |
+| 10.000 Index-SELECTs | ~8ms |
+
+### CI/CD
+
+GitHub Actions führt Build und Tests automatisch auf **Ubuntu** und **Windows** aus
+bei jedem Push und Pull Request auf `main` (`.github/workflows/ci.yml`).
+
+---
+
 ## Lizenz
 
 MIT License — frei verwendbar für Lern- und Demozwecke.

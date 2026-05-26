@@ -17,7 +17,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Views** | `CREATE VIEW … AS SELECT`, `DROP VIEW`, `SELECT * FROM view` |
 | **Constraints** | `NOT NULL`, `UNIQUE`, `DEFAULT`, `PRIMARY KEY`, `AUTO_INCREMENT`, `CHECK` |
 | **Foreign Keys** | `FOREIGN KEY … REFERENCES`, `ON DELETE RESTRICT / CASCADE / SET NULL` |
-| **SELECT** | `WHERE`, `ORDER BY [DESC]`, `LIMIT`, `DISTINCT`, `LIKE`, `IS NULL`, `BETWEEN`, `IN`, Subqueries, `EXISTS` |
+| **SELECT** | `WHERE`, `ORDER BY col1 [ASC\|DESC], col2 [ASC\|DESC]`, `LIMIT n [OFFSET m]`, `DISTINCT`, `LIKE`, `IS NULL`, `BETWEEN`, `IN`, Subqueries, `EXISTS` |
 | **Aggregation** | `COUNT(*)`, `MIN`, `MAX`, `AVG`, `SUM`, `GROUP BY`, `HAVING` |
 | **JOINs** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL [OUTER] JOIN`, mehrfache JOINs |
 | **Mengen** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` |
@@ -197,8 +197,8 @@ SHOW CREATE TABLE name
 INSERT INTO name VALUES (v1, v2, ...)
 SELECT [DISTINCT] * | col,... FROM name
   [WHERE col op val [AND|OR ...]]
-  [ORDER BY col [DESC]]
-  [LIMIT n]
+  [ORDER BY col1 [ASC|DESC] [, col2 [ASC|DESC] ...]]
+  [LIMIT n [OFFSET m]]
 SELECT COUNT(*) | MIN(col) | MAX(col) | AVG(col) | SUM(col) FROM name [WHERE ...]
 SELECT col, AGG(col) FROM name GROUP BY col [HAVING AGG(col) op val]
 SELECT * FROM t1 [LEFT] JOIN t2 ON t1.col = t2.col
@@ -275,6 +275,7 @@ STATUS
 | 35 | Composite Indexes: `CREATE INDEX name ON tabelle (col1, col2, ...)`, `SHOW INDEXES` zeigt alle Spalten |
 | 36 | EXPLAIN: `EXPLAIN SELECT ...` zeigt Query-Plan (Schritt, Operation, Tabelle, Details, Index) |
 | 37 | Correlated Subqueries: `WHERE col > (SELECT AVG(...) WHERE col = alias.col)`, Scalar Subquery in SELECT `(SELECT COUNT(*) FROM ...) AS alias`, EXISTS mit mehreren Bedingungen |
+| 38 | Multi-Column ORDER BY: `ORDER BY col1 ASC, col2 DESC`; LIMIT mit OFFSET: `LIMIT n OFFSET m` |
 
 ---
 

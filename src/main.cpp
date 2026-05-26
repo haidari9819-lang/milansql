@@ -15,20 +15,23 @@
 // Neu: String-Funktionen in SELECT (UPPER/LOWER/LENGTH/CONCAT/SUBSTR/TRIM/REPLACE)
 // ============================================================
 
-static void printTable(const milansql::Table& tbl, int limit = -1) {
+static void printTable(const milansql::Table& tbl, int limit = -1, int offset = 0) {
     const auto& cols = tbl.columns();
     const auto& rows = tbl.rows();
 
     if (cols.empty()) { std::cout << "  (Tabelle hat keine Spalten)\n"; return; }
 
-    size_t total     = rows.size();
-    size_t printRows = (limit >= 0 && static_cast<size_t>(limit) < total)
-                       ? static_cast<size_t>(limit) : total;
+    size_t total      = rows.size();
+    size_t startRow   = (offset > 0 && static_cast<size_t>(offset) < total)
+                        ? static_cast<size_t>(offset) : 0;
+    size_t remaining  = total - startRow;
+    size_t printRows  = (limit >= 0 && static_cast<size_t>(limit) < remaining)
+                        ? static_cast<size_t>(limit) : remaining;
 
     std::vector<size_t> widths;
     widths.reserve(cols.size());
     for (const auto& col : cols) widths.push_back(col.name.size());
-    for (size_t r = 0; r < printRows; ++r)
+    for (size_t r = startRow; r < startRow + printRows; ++r)
         for (size_t i = 0; i < rows[r].values.size() && i < widths.size(); ++i)
             widths[i] = std::max(widths[i], rows[r].values[i].size());
 
@@ -58,7 +61,7 @@ static void printTable(const milansql::Table& tbl, int limit = -1) {
             std::cout << "  " << std::string(widths[i], ' ') << "│";
         std::cout << "\n";
     } else {
-        for (size_t r = 0; r < printRows; ++r) {
+        for (size_t r = startRow; r < startRow + printRows; ++r) {
             std::cout << "│";
             for (size_t i = 0; i < cols.size(); ++i) {
                 const std::string& val =
@@ -72,11 +75,14 @@ static void printTable(const milansql::Table& tbl, int limit = -1) {
     }
     hline("└", "┴", "┘", "─");
 
-    if (limit >= 0 && static_cast<size_t>(limit) < total)
-        std::cout << "  " << printRows << " von " << total
-                  << " Zeile(n) (LIMIT " << limit << ")\n\n";
-    else
+    if (limit >= 0 || offset > 0) {
+        std::cout << "  " << printRows << " von " << total << " Zeile(n)";
+        if (offset > 0) std::cout << " (OFFSET " << startRow << ")";
+        if (limit >= 0) std::cout << " (LIMIT " << limit << ")";
+        std::cout << "\n\n";
+    } else {
         std::cout << "  " << printRows << " Zeile(n)\n\n";
+    }
 }
 
 static void printIndexes(const std::vector<milansql::IndexInfo>& indexes,
@@ -678,9 +684,9 @@ int main() {
                     req.selectItems   = cmd.selectItems;
                     req.hasCaseItems  = cmd.hasCaseItems;
                     req.selectColumns = cmd.selectColumns;
-                    req.orderByColumn = cmd.orderByColumn;
-                    req.orderByDesc   = cmd.orderByDesc;
+                    req.orderByCols   = cmd.orderByCols;
                     req.limit         = cmd.limit;
+                    req.limitOffset   = cmd.limitOffset;
                     req.isSetOp       = cmd.isSetOp;
                     req.setOp         = cmd.setOp;
                     printExplain(engine.buildExplain(req));
@@ -727,7 +733,8 @@ int main() {
                     milansql::Table result =
                         engine.executeSetOp(leftResult, cmd.setOp, rightResult);
                     std::cout << "\n";
-                    printTable(result, cmd.limit);
+                    if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+                    printTable(result, cmd.limit, cmd.limitOffset);
                     break;
                 }
 
@@ -735,13 +742,13 @@ int main() {
                 if (engine.viewExists(cmd.tableName)) {
                     milansql::Table result = materializeView(engine, parser, cmd.tableName, cmd);
                     std::cout << "\n";
-                    if (!cmd.orderByColumn.empty())
-                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
+                    if (!cmd.orderByCols.empty())
+                        result.sortByMulti(cmd.orderByCols);
                     if (!cmd.selectColumns.empty())
                         result = result.project(cmd.selectColumns);
                     if (cmd.isDistinct)
                         result.makeDistinct();
-                    printTable(result, cmd.limit);
+                    printTable(result, cmd.limit, cmd.limitOffset);
                     break;
                 }
 
@@ -756,11 +763,11 @@ int main() {
                         cmd.tableName, cmd.joinClauses,
                         cmd.whereConds, cmd.whereLogic);
                     std::cout << "\n";
-                    if (!cmd.orderByColumn.empty())
-                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
+                    if (!cmd.orderByCols.empty())
+                        result.sortByMulti(cmd.orderByCols);
                     if (!cmd.selectColumns.empty())
                         result = result.project(cmd.selectColumns);
-                    printTable(result, cmd.limit);
+                    printTable(result, cmd.limit, cmd.limitOffset);
                     break;
                 }
 
@@ -776,9 +783,9 @@ int main() {
                         cmd.selectItems,
                         cmd.havingConds, cmd.havingLogic);
                     std::cout << "\n";
-                    if (!cmd.orderByColumn.empty())
-                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
-                    printTable(result, cmd.limit);
+                    if (!cmd.orderByCols.empty())
+                        result.sortByMulti(cmd.orderByCols);
+                    printTable(result, cmd.limit, cmd.limitOffset);
                     break;
                 }
 
@@ -834,18 +841,18 @@ int main() {
                 // Phase 31/32: CASE/Func-Projektion ZUERST (Aliase für ORDER BY)
                 if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
                     result = engine.projectWithItems(result, cmd.selectItems);
-                    if (!cmd.orderByColumn.empty())
-                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
+                    if (!cmd.orderByCols.empty())
+                        result.sortByMulti(cmd.orderByCols);
                 } else {
-                    if (!cmd.orderByColumn.empty())
-                        result.sortBy(cmd.orderByColumn, cmd.orderByDesc);
+                    if (!cmd.orderByCols.empty())
+                        result.sortByMulti(cmd.orderByCols);
                     if (!cmd.selectColumns.empty())
                         result = result.project(cmd.selectColumns);
                 }
                 if (cmd.isDistinct)
                     result.makeDistinct();
 
-                printTable(result, cmd.limit);
+                printTable(result, cmd.limit, cmd.limitOffset);
 
                 if (!cmd.whereConds.empty()) {
                     std::string lbl = usedIndex ? "[INDEX SCAN]" : "[FULL SCAN] ";

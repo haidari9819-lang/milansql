@@ -70,13 +70,13 @@ struct ParsedCommand {
     std::string              indexName;
     std::vector<std::string> indexColumns;  // Phase 35: ein oder mehrere Spalten
 
-    // SELECT-Optionen (Phase 8)
+    // SELECT-Optionen (Phase 8 / Phase 38)
     bool                     isCount       = false;
     int                      limit         = -1;
+    int                      limitOffset   = 0;   // Phase 38: OFFSET
     std::vector<std::string> selectColumns;
     bool                     isDistinct    = false;
-    std::string              orderByColumn;
-    bool                     orderByDesc   = false;
+    std::vector<std::pair<std::string,bool>> orderByCols;  // Phase 38: {col, desc}
 
     // Aggregatfunktionen (Phase 9)
     bool                     isAggregate   = false;
@@ -844,7 +844,36 @@ private:
         }
     }
 
-    // ── ORDER BY col [ASC|DESC] ───────────────────────────────
+    // ── Phase 38: ORDER BY col1 [ASC|DESC], col2 [ASC|DESC], ... ──
+
+    // Helper: strip trailing comma from a token
+    static std::string stripComma(const std::string& s) {
+        if (!s.empty() && s.back() == ',') return s.substr(0, s.size() - 1);
+        return s;
+    }
+
+    // Helper: parse comma-separated "col [ASC|DESC]" pairs from ft[start..end)
+    // Works with both tokenizeFull (explicit "," tokens) and tokenize (trailing commas)
+    static void parseOrderByCols(const std::vector<std::string>& ft,
+                                  size_t start, size_t end,
+                                  std::vector<std::pair<std::string,bool>>& out) {
+        size_t i = start;
+        while (i < end) {
+            if (ft[i] == ",") { ++i; continue; }
+            std::string col = stripComma(ft[i++]);
+            if (col.empty()) continue;
+            // col itself might be "ASC" or "DESC" (when prior col had trailing comma)
+            std::string cu = toUpper(col);
+            if (cu == "ASC" || cu == "DESC") continue;  // skip orphaned direction keywords
+            bool desc = false;
+            if (i < end) {
+                std::string d = toUpper(stripComma(ft[i]));
+                if (d == "DESC") { desc = true; ++i; }
+                else if (d == "ASC") { ++i; }
+            }
+            out.push_back({col, desc});
+        }
+    }
 
     static void parseOrderBy(const std::vector<std::string>& tokens,
                               size_t startIdx, ParsedCommand& cmd) {
@@ -852,15 +881,19 @@ private:
             if (toUpper(tokens[i]) == "ORDER" &&
                 i + 2 < tokens.size() &&
                 toUpper(tokens[i + 1]) == "BY") {
-                cmd.orderByColumn = tokens[i + 2];
-                if (i + 3 < tokens.size() && toUpper(tokens[i + 3]) == "DESC")
-                    cmd.orderByDesc = true;
+                // Collect tokens until LIMIT or end
+                size_t j = i + 2;
+                size_t end = tokens.size();
+                for (size_t k = j; k < tokens.size(); ++k) {
+                    if (toUpper(tokens[k]) == "LIMIT") { end = k; break; }
+                }
+                parseOrderByCols(tokens, j, end, cmd.orderByCols);
                 return;
             }
         }
     }
 
-    // ── LIMIT N ───────────────────────────────────────────────
+    // ── LIMIT N [OFFSET M] ────────────────────────────────────
 
     static void parseLimit(const std::vector<std::string>& tokens,
                            size_t startIdx, ParsedCommand& cmd) {
@@ -868,6 +901,11 @@ private:
             if (toUpper(tokens[i]) == "LIMIT" && i + 1 < tokens.size()) {
                 try { cmd.limit = std::stoi(tokens[i + 1]); }
                 catch (...) { cmd.limit = -1; }
+                // Phase 38: OFFSET
+                if (i + 3 < tokens.size() && toUpper(tokens[i + 2]) == "OFFSET") {
+                    try { cmd.limitOffset = std::stoi(tokens[i + 3]); }
+                    catch (...) { cmd.limitOffset = 0; }
+                }
                 return;
             }
         }
@@ -1310,17 +1348,18 @@ private:
             parseWhereFromFull(ft, wherePos, whereEnd, cmd);
         }
 
-        // ORDER BY
+        // ORDER BY (Phase 38: multi-column)
         if (orderPos != N && orderPos + 2 < N &&
             toUpper(ft[orderPos + 1]) == "BY") {
-            cmd.orderByColumn = ft[orderPos + 2];
-            if (orderPos + 3 < N && toUpper(ft[orderPos + 3]) == "DESC")
-                cmd.orderByDesc = true;
+            parseOrderByCols(ft, orderPos + 2, limitPos < N ? limitPos : N, cmd.orderByCols);
         }
 
-        // LIMIT
+        // LIMIT [OFFSET] (Phase 38)
         if (limitPos != N && limitPos + 1 < N) {
             try { cmd.limit = std::stoi(ft[limitPos + 1]); } catch (...) {}
+            if (limitPos + 3 < N && toUpper(ft[limitPos + 2]) == "OFFSET") {
+                try { cmd.limitOffset = std::stoi(ft[limitPos + 3]); } catch (...) {}
+            }
         }
     }
 
@@ -1632,18 +1671,19 @@ private:
             if (!wt.empty()) parseWhere(wt, 0, cmd);
         }
 
-        // ORDER BY
+        // ORDER BY (Phase 38: multi-column)
         if (orderPos != N && orderPos + 2 < N &&
             toUpper(ft[orderPos + 1]) == "BY") {
-            cmd.orderByColumn = ft[orderPos + 2];
-            if (orderPos + 3 < N && toUpper(ft[orderPos + 3]) == "DESC")
-                cmd.orderByDesc = true;
+            parseOrderByCols(ft, orderPos + 2, limitPos < N ? limitPos : N, cmd.orderByCols);
         }
 
-        // LIMIT
+        // LIMIT [OFFSET] (Phase 38)
         if (limitPos != N && limitPos + 1 < N) {
             try { cmd.limit = std::stoi(ft[limitPos + 1]); }
             catch (...) {}
+            if (limitPos + 3 < N && toUpper(ft[limitPos + 2]) == "OFFSET") {
+                try { cmd.limitOffset = std::stoi(ft[limitPos + 3]); } catch (...) {}
+            }
         }
     }
 
@@ -1744,37 +1784,39 @@ private:
             parseHavingFromFull(ft, havingPos + 1, hEnd, cmd);
         }
 
-        // ORDER BY (kann auf Aggregate wie COUNT(*) verweisen)
+        // ORDER BY (Phase 38: multi-column; supports aggregate column names like COUNT(*))
         if (orderPos != N && orderPos + 2 < N &&
             toUpper(ft[orderPos + 1]) == "BY") {
             size_t obStart = orderPos + 2;
             size_t obEnd   = std::min(limitPos, N);
-            if (obStart < obEnd) {
-                std::string u = toUpper(ft[obStart]);
-                static const std::vector<std::string> AGGF =
+            // Rebuild obStart..obEnd into logical "col [ASC|DESC]" tokens,
+            // collapsing FUNC ( col ) into a single "FUNC(col)" token.
+            std::vector<std::string> obTokens;
+            for (size_t i = obStart; i < obEnd; ) {
+                std::string u = toUpper(ft[i]);
+                static const std::vector<std::string> AGGF2 =
                     {"COUNT", "MIN", "MAX", "AVG", "SUM"};
-                bool isAgg = false;
-                for (const auto& f : AGGF) if (u == f) { isAgg = true; break; }
-
-                if (isAgg && obStart + 3 < obEnd && ft[obStart + 1] == "(") {
-                    // Aggregat-Spaltenname: "FUNC(col)"
-                    std::string col = ft[obStart + 2];  // ft[obStart+3] = ")"
-                    cmd.orderByColumn = u + "(" + col + ")";
-                    size_t after = obStart + 4;
-                    if (after < obEnd && toUpper(ft[after]) == "DESC")
-                        cmd.orderByDesc = true;
+                bool isAgg2 = false;
+                for (const auto& f : AGGF2) if (u == f) { isAgg2 = true; break; }
+                if (isAgg2 && i + 3 < obEnd && ft[i + 1] == "(") {
+                    obTokens.push_back(u + "(" + ft[i + 2] + ")");
+                    i += 4;  // skip FUNC ( col )
+                } else if (ft[i] == "," || ft[i] == "(" || ft[i] == ")") {
+                    obTokens.push_back(ft[i]); ++i;
                 } else {
-                    cmd.orderByColumn = ft[obStart];
-                    if (obStart + 1 < obEnd && toUpper(ft[obStart + 1]) == "DESC")
-                        cmd.orderByDesc = true;
+                    obTokens.push_back(ft[i]); ++i;
                 }
             }
+            parseOrderByCols(obTokens, 0, obTokens.size(), cmd.orderByCols);
         }
 
-        // LIMIT
+        // LIMIT [OFFSET] (Phase 38)
         if (limitPos != N && limitPos + 1 < N) {
             try { cmd.limit = std::stoi(ft[limitPos + 1]); }
             catch (...) { cmd.limit = -1; }
+            if (limitPos + 3 < N && toUpper(ft[limitPos + 2]) == "OFFSET") {
+                try { cmd.limitOffset = std::stoi(ft[limitPos + 3]); } catch (...) {}
+            }
         }
     }
 

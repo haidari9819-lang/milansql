@@ -181,9 +181,9 @@ struct ExplainRequest {
     std::vector<SelectItem> selectItems;
     bool hasCaseItems = false;
     std::vector<std::string> selectColumns;
-    std::string orderByColumn;
-    bool orderByDesc = false;
+    std::vector<std::pair<std::string,bool>> orderByCols;  // Phase 38
     int limit = -1;
+    int limitOffset = 0;  // Phase 38
     bool isSetOp = false;
     std::string setOp;
 };
@@ -454,6 +454,42 @@ public:
                         return desc ? da > db : da < db;
                 } catch (...) {}
                 return desc ? va > vb : va < vb;
+            });
+    }
+
+    // Phase 38: Multi-Column ORDER BY
+    void sortByMulti(const std::vector<std::pair<std::string,bool>>& cols) {
+        if (cols.empty()) return;
+        // Resolve column indices (ignore unknown columns)
+        std::vector<std::pair<int,bool>> idxCols;
+        for (const auto& p : cols) {
+            int ci = colOf(p.first);
+            if (ci >= 0) idxCols.push_back({ci, p.second});
+        }
+        if (idxCols.empty()) return;
+        std::sort(rows_.begin(), rows_.end(),
+            [&idxCols](const Row& a, const Row& b) {
+                for (const auto& ic : idxCols) {
+                    int ci     = ic.first;
+                    bool desc  = ic.second;
+                    const std::string& va =
+                        static_cast<size_t>(ci) < a.values.size() ? a.values[ci] : "";
+                    const std::string& vb =
+                        static_cast<size_t>(ci) < b.values.size() ? b.values[ci] : "";
+                    // Try numeric comparison
+                    try {
+                        size_t ea = 0, eb = 0;
+                        double da = std::stod(va, &ea);
+                        double db = std::stod(vb, &eb);
+                        if (ea == va.size() && eb == vb.size()) {
+                            if (da != db) return desc ? da > db : da < db;
+                            continue;  // equal — try next column
+                        }
+                    } catch (...) {}
+                    // String comparison
+                    if (va != vb) return desc ? va > vb : va < vb;
+                }
+                return false;  // all columns equal
             });
     }
 
@@ -2408,14 +2444,23 @@ public:
             addStep("AGGREGATE", "-", req.aggFunc + "(" + req.aggCol + ")", "-");
         }
 
-        // SORT
-        if (!req.orderByColumn.empty())
-            addStep("SORT", "-",
-                    req.orderByColumn + (req.orderByDesc ? " DESC" : " ASC"), "-");
+        // SORT (Phase 38: multi-column)
+        if (!req.orderByCols.empty()) {
+            std::string sortDetail;
+            for (size_t i = 0; i < req.orderByCols.size(); ++i) {
+                if (i > 0) sortDetail += ", ";
+                sortDetail += req.orderByCols[i].first;
+                sortDetail += req.orderByCols[i].second ? " DESC" : " ASC";
+            }
+            addStep("SORT", "-", sortDetail, "-");
+        }
 
-        // LIMIT
-        if (req.limit >= 0)
-            addStep("LIMIT", "-", std::to_string(req.limit), "-");
+        // LIMIT / OFFSET (Phase 38)
+        if (req.limit >= 0) {
+            std::string limDetail = std::to_string(req.limit);
+            if (req.limitOffset > 0) limDetail += " OFFSET " + std::to_string(req.limitOffset);
+            addStep("LIMIT", "-", limDetail, "-");
+        }
 
         // PROJECT — Spalten aus selectItems, selectColumns oder "*"
         std::string projDet;

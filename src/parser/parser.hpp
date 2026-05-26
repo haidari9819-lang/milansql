@@ -273,7 +273,7 @@ public:
             static const std::vector<std::string> SFUNCS =
                 {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE"};
+                 "IFNULL", "COALESCE", "CAST"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -1010,8 +1010,32 @@ private:
             WhereCondition cond;
             bool parsed = false;
 
+            // Phase 40: CAST ( expr AS TYPE ) op val
+            if (u == "CAST" && i + 1 < end && ft[i+1] == "(") {
+                // Collect all tokens from CAST through the matching ) to build funcLhsExpr
+                std::string funcExpr = "CAST";
+                size_t j = i + 1;
+                int depth = 0;
+                while (j < end) {
+                    funcExpr += " " + ft[j];
+                    if (ft[j] == "(") ++depth;
+                    else if (ft[j] == ")") { --depth; if (depth == 0) { ++j; break; } }
+                    ++j;
+                }
+                // j now points to op token
+                cond.isFuncLhs   = true;
+                cond.funcLhsExpr = funcExpr;
+                cond.col         = "";  // no column name
+                // Read op and val
+                if (j < end) {
+                    cond.op = ft[j]; ++j;
+                    if (j < end) { cond.val = ft[j]; ++j; }
+                }
+                i = j;
+                parsed = true;
+
             // IS NULL / IS NOT NULL
-            if (i + 2 < end && toUpper(ft[i+1]) == "IS" && toUpper(ft[i+2]) == "NULL") {
+            } else if (i + 2 < end && toUpper(ft[i+1]) == "IS" && toUpper(ft[i+2]) == "NULL") {
                 cond = {ft[i], "IS NULL", ""};
                 i += 3; parsed = true;
             } else if (i + 3 < end && toUpper(ft[i+1]) == "IS" &&
@@ -1357,7 +1381,7 @@ private:
         static const std::vector<std::string> SFUNCS32 =
             {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE"};
+                 "IFNULL", "COALESCE", "CAST"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -1491,11 +1515,11 @@ private:
                 ++i;
 
             } else {
-                // Phase 32: String-Funktion? FUNC ( args... ) [AS alias]
+                // Phase 32/40: String-Funktion oder CAST? FUNC ( args... ) [AS alias]
                 static const std::vector<std::string> SFUNCS32 =
                     {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE"};
+                 "IFNULL", "COALESCE", "CAST"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
@@ -1504,10 +1528,48 @@ private:
                     item.isFuncExpr = true;
                     item.funcName   = u;
                     i += 2;  // Funktionsname + "(" überspringen
-                    // Argumente bis ")" sammeln
-                    while (i < end && ft[i] != ")") {
-                        if (ft[i] != ",") item.funcArgs.push_back(ft[i]);
-                        ++i;
+                    // Phase 40: Depth-aware arg collection
+                    // For CAST: split on AS at depth 0
+                    // For others: split on , at depth 0
+                    {
+                        bool isCast = (u == "CAST");
+                        int depth = 0;
+                        std::string currentArg;
+                        while (i < end) {
+                            if (ft[i] == "(") {
+                                depth++;
+                                currentArg += ft[i] + " ";
+                                i++; continue;
+                            }
+                            if (ft[i] == ")") {
+                                if (depth == 0) break;  // end of our function
+                                depth--;
+                                currentArg += ft[i] + " ";
+                                i++; continue;
+                            }
+                            if (depth == 0 && ft[i] == ",") {
+                                std::string a = currentArg;
+                                while (!a.empty() && a.back() == ' ') a.pop_back();
+                                if (!a.empty()) item.funcArgs.push_back(a);
+                                currentArg = "";
+                                i++; continue;
+                            }
+                            if (depth == 0 && isCast && toUpper(ft[i]) == "AS") {
+                                std::string a = currentArg;
+                                while (!a.empty() && a.back() == ' ') a.pop_back();
+                                if (!a.empty()) item.funcArgs.push_back(a);
+                                currentArg = "";
+                                i++; continue;
+                            }
+                            currentArg += ft[i] + " ";
+                            i++;
+                        }
+                        // push final arg
+                        {
+                            std::string a = currentArg;
+                            while (!a.empty() && a.back() == ' ') a.pop_back();
+                            if (!a.empty()) item.funcArgs.push_back(a);
+                        }
                     }
                     if (i < end && ft[i] == ")") ++i;
                     // optionales AS alias

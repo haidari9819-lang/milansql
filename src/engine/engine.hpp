@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <sstream>
 
 #include "btree.hpp"
 
@@ -120,6 +121,9 @@ struct WhereCondition {
     // Phase 37: Korrelierte Scalar Subquery auf rechter Seite
     bool          isScalarSub = false;
     ScalarSubSpec scalarSub;
+    // Phase 40: LHS ist eine Funktion wie CAST(...)
+    bool          isFuncLhs   = false;
+    std::string   funcLhsExpr;  // space-separated token string: "CAST ( col AS INT )"
 };
 
 // ── SELECT-Listen-Eintrag (Phase 10 / Phase 31 / Phase 32) ───
@@ -756,11 +760,12 @@ public:
             return {std::move(result), usedIndex};
         }
 
-        // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries brauchen rowMatches
+        // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries + CAST-LHS brauchen rowMatches
         bool hasCorrelated = false;
         for (const auto& cond : conds) {
             if (cond.op == "EXISTS" || cond.op == "NOT EXISTS") { hasCorrelated = true; break; }
             if (cond.isScalarSub) { hasCorrelated = true; break; }
+            if (cond.isFuncLhs)   { hasCorrelated = true; break; }
         }
 
         if (hasCorrelated) {
@@ -1617,15 +1622,30 @@ private:
         return item.caseElse;
     }
 
+    // Phase 40: toUpper helper (used by static methods in Engine)
+    static std::string toUpperStatic(std::string s) {
+        for (char& c : s)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    }
+
     // Phase 32: String-Funktion auswerten
     // Argumente: Spaltenname → Zellwert; 'literal' oder literal → direkt
     static std::string evaluateFunc(const std::string& fn,
                                      const std::vector<std::string>& args,
                                      const Table& tbl, const Row& row) {
         // Argument auflösen: Spalte → Wert, 'literal' → literal, sonst direkt
+        // Phase 40: wenn arg mehrere Tokens enthält (z.B. "CAST ( id AS TEXT )"),
+        // via evalExprStr auswerten.
         auto resolveArg = [&](const std::string& a) -> std::string {
             if (a.size() >= 2 && a.front() == '\'' && a.back() == '\'')
                 return a.substr(1, a.size() - 2);  // 'text' → text
+            // Multi-token: delegate to evalExprStr (handles nested CAST, ROUND, etc.)
+            {
+                bool hasSpace = false;
+                for (char c : a) if (c == ' ') { hasSpace = true; break; }
+                if (hasSpace) return evalExprStr(a, tbl.columns(), row);
+            }
             int ci = findColIdx(tbl, a);
             if (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
                 return row.values[static_cast<size_t>(ci)];
@@ -1782,7 +1802,131 @@ private:
             }
             return "NULL";
         }
+        // ── Phase 40: CAST ───────────────────────────────────────
+        if (fn == "CAST") {
+            if (args.size() < 2) return "";
+            // args[0] = inner expression (token string), args[1] = target type
+            std::string inner = evalExprStr(args[0], tbl.columns(), row);
+            std::string type  = toUpperStatic(args[1]);
+            if (type == "INT") {
+                try { return std::to_string((long long)std::stold(inner)); }
+                catch (...) { return "0"; }
+            } else if (type == "REAL") {
+                try {
+                    double d = std::stod(inner);
+                    std::ostringstream oss;
+                    oss << d;
+                    return oss.str();
+                } catch (...) { return "0.0"; }
+            } else {  // TEXT
+                return inner;
+            }
+        }
         return "";
+    }
+
+    // ── Phase 40: evalExprStr ────────────────────────────────────
+    // Evaluates a space-separated token string like "CAST ( id AS TEXT )"
+    // or "ROUND ( komma , 1 )" given a row and column list.
+    static std::string evalExprStr(const std::string& expr,
+                                    const std::vector<Column>& cols,
+                                    const Row& row) {
+        if (expr.empty()) return "";
+
+        // Tokenize on spaces
+        std::vector<std::string> toks;
+        {
+            std::istringstream iss(expr);
+            std::string t;
+            while (iss >> t) toks.push_back(t);
+        }
+        if (toks.empty()) return "";
+
+        // Single token: column lookup or literal
+        if (toks.size() == 1) {
+            const std::string& tok = toks[0];
+            // Strip single quotes
+            if (tok.size() >= 2 && tok.front() == '\'' && tok.back() == '\'')
+                return tok.substr(1, tok.size() - 2);
+            // Column lookup
+            for (size_t i = 0; i < cols.size(); ++i)
+                if (cols[i].name == tok && i < row.values.size())
+                    return row.values[i];
+            return tok;  // literal
+        }
+
+        // Multi-token: check if first token is a known function followed by (
+        static const std::vector<std::string> KNOWN_FUNCS =
+            {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
+             "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
+             "IFNULL", "COALESCE", "CAST"};
+
+        std::string fn = toUpperStatic(toks[0]);
+        bool isFunc = false;
+        for (const auto& f : KNOWN_FUNCS) if (fn == f) { isFunc = true; break; }
+
+        if (isFunc && toks.size() >= 2 && toks[1] == "(") {
+            // Find matching closing paren
+            int depth = 0;
+            size_t closePos = toks.size();
+            for (size_t k = 1; k < toks.size(); ++k) {
+                if (toks[k] == "(") ++depth;
+                else if (toks[k] == ")") {
+                    --depth;
+                    if (depth == 0) { closePos = k; break; }
+                }
+            }
+            // Extract tokens between ( and )
+            // toks[2 .. closePos-1] are the argument tokens
+            std::vector<std::string> argToks(toks.begin() + 2,
+                                              closePos < toks.size()
+                                              ? toks.begin() + static_cast<std::ptrdiff_t>(closePos)
+                                              : toks.end());
+
+            // Split into args: for CAST split on AS at depth 0, otherwise on , at depth 0
+            std::vector<std::string> funcArgs;
+            bool isCast = (fn == "CAST");
+            int d = 0;
+            std::string current;
+            for (size_t k = 0; k < argToks.size(); ++k) {
+                const std::string& at = argToks[k];
+                if (at == "(") { d++; current += at + " "; continue; }
+                if (at == ")") { d--; current += at + " "; continue; }
+                if (d == 0 && at == ",") {
+                    std::string a = current;
+                    while (!a.empty() && a.back() == ' ') a.pop_back();
+                    if (!a.empty()) funcArgs.push_back(a);
+                    current = "";
+                    continue;
+                }
+                if (d == 0 && isCast && toUpperStatic(at) == "AS") {
+                    std::string a = current;
+                    while (!a.empty() && a.back() == ' ') a.pop_back();
+                    if (!a.empty()) funcArgs.push_back(a);
+                    current = "";
+                    continue;
+                }
+                current += at + " ";
+            }
+            // push final arg
+            {
+                std::string a = current;
+                while (!a.empty() && a.back() == ' ') a.pop_back();
+                if (!a.empty()) funcArgs.push_back(a);
+            }
+
+            // Build a dummy Table for evaluateFunc (only needs columns)
+            // We pass cols as a temporary Table wrapper via a trick:
+            // evaluateFunc needs (fn, args, tbl, row) — build a temp table
+            // Actually we can build a minimal Table with just columns
+            Table tmpTbl("", cols);
+            return evaluateFunc(fn, funcArgs, tmpTbl, row);
+        }
+
+        // Fallback: treat as literal (rejoin)
+        std::string result;
+        for (const auto& t : toks) result += t;
+        return result;
     }
 
     // Exakter Match, dann Suffix-Match.
@@ -2028,6 +2172,11 @@ private:
                 size_t ci = colIdx(src, c.col);
                 if (ci >= row.values.size()) return false;
                 return compareValues(row.values[ci], c.op, subVal);
+            }
+            // Phase 40: LHS is a function expression (e.g. CAST(...))
+            if (c.isFuncLhs) {
+                std::string lhsVal = evalExprStr(c.funcLhsExpr, src.columns(), row);
+                return evalCond(lhsVal, c);
             }
             size_t ci = colIdx(src, c.col);
             return ci < row.values.size() && evalCond(row.values[ci], c);

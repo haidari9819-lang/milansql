@@ -12,6 +12,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **DDL** | `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN) |
 | **DML** | `INSERT INTO` (single, multi-row, SELECT), `INSERT OR REPLACE`, `INSERT OR IGNORE`, `SELECT`, `UPDATE SET`, `DELETE FROM`, `TRUNCATE TABLE` |
 | **String-Funktionen** | `UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTR`, `TRIM`, `REPLACE` in SELECT mit AS alias |
+| **Typumwandlung** | `CAST(expr AS INT\|REAL\|TEXT)` in SELECT und WHERE (kombinierbar mit anderen Funktionen) |
 | **Math-Funktionen** | `ABS`, `ROUND`, `MOD`, `POWER`, `SQRT`, `CEIL`, `FLOOR` in SELECT mit AS alias |
 | **NULL-Funktionen** | `COALESCE(v1, v2, ...)`, `IFNULL(col, default)` in SELECT |
 | **Views** | `CREATE VIEW … AS SELECT`, `DROP VIEW`, `SELECT * FROM view` |
@@ -280,6 +281,7 @@ STATUS
 | 37 | Correlated Subqueries: `WHERE col > (SELECT AVG(...) WHERE col = alias.col)`, Scalar Subquery in SELECT `(SELECT COUNT(*) FROM ...) AS alias`, EXISTS mit mehreren Bedingungen |
 | 38 | Multi-Column ORDER BY: `ORDER BY col1 ASC, col2 DESC`; LIMIT mit OFFSET: `LIMIT n OFFSET m` |
 | 39 | UPSERT: `INSERT OR REPLACE INTO t VALUES (...)` — Konflikt→löschen+einfügen; `INSERT OR IGNORE INTO t VALUES (...)` — Konflikt→ignorieren; `ON CONFLICT DO NOTHING` |
+| 40 | CAST: `CAST(expr AS INT\|REAL\|TEXT)` in SELECT und WHERE |
 
 ---
 

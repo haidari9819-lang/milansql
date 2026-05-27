@@ -19,6 +19,7 @@ cmake_install.cmake
 # Datenbank-Dateien (Runtime)
 *.milan
 *.milan.wal
+database.*
 
 # IDE & Editor
 .vscode/

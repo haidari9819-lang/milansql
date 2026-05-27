@@ -580,7 +580,7 @@ inline std::string MilanHttpServer::handleStatus() {
     auto schemas = engine_.showSchemas();
 
     std::string json = "{\"success\":true,\"status\":{";
-    json += "\"version\":\"MilanSQL v0.9.0\",";
+    json += "\"version\":\"MilanSQL v1.0.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tableCount\":" + std::to_string(tables.size()) + ",";
     json += "\"schemaCount\":" + std::to_string(schemas.size());

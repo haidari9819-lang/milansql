@@ -302,6 +302,7 @@ STATUS
 | 47 | TCP/IP Server: `--server/--client --port N`, Multi-Thread, Winsock2/POSIX |
 | 48 | Cost-Based Query Optimizer: Join-Reihenfolge, Index-Auswahl, EXPLAIN-Integration |
 | 52 | REST API: HTTP/JSON Interface (`--http --port 8080`), `GET/POST /query`, `/tables`, `/schemas`, `/status` |
+| 53 | Client Libraries: Python Package (DB-API 2.0 / PEP 249, TCP + HTTP) und Node.js Client (HTTP, keine Dependencies) |
 
 ---
 

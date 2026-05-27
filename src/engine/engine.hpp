@@ -15,6 +15,7 @@
 #include <iomanip>
 
 #include "btree.hpp"
+#include "../cache/query_cache.hpp"
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -4285,6 +4286,19 @@ public:
     // Phase 46: User management
     std::map<std::string, UserDef> users_;
     std::string currentUser_ = "root";
+
+public:
+    // ── Phase 54A: Query Cache ────────────────────────────────
+    QueryCache& getQueryCache() { return queryCache_; }
+    const QueryCache& getQueryCache() const { return queryCache_; }
+
+    void invalidateCache(const std::string& tableName) {
+        queryCache_.invalidate(tableName);
+    }
+
+private:
+    // Phase 54A: Query Cache instance
+    QueryCache queryCache_;
 };
 
 } // namespace milansql

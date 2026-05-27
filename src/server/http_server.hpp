@@ -366,6 +366,7 @@ private:
     std::string handleDescribeTable(const std::string& tableName);
     std::string handleListSchemas();
     std::string handleStatus();
+    std::string handleDashboard();   // Phase 54C
 
     void initEngine();
     static void sendResponse(sock_t sock, const std::string& response);
@@ -588,6 +589,141 @@ inline std::string MilanHttpServer::handleStatus() {
     return json;
 }
 
+// ── MilanHttpServer::handleDashboard (Phase 54C) ──────────────
+
+inline std::string MilanHttpServer::handleDashboard() {
+    return R"HTML(<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1e1e2e;color:#cdd6f4;font-family:'Courier New',monospace;font-size:14px;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.header{background:#313244;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #45475a;flex-shrink:0}
+.logo{font-size:17px;font-weight:bold;color:#89dceb}
+.status-bar{font-size:12px;color:#a6adc8;display:flex;gap:18px}
+.badge{color:#a6e3a1}
+.main{display:flex;flex:1;overflow:hidden}
+.sidebar{width:220px;background:#181825;border-right:1px solid #313244;overflow-y:auto;padding:10px;flex-shrink:0}
+.sidebar h3{color:#89dceb;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin:10px 0 6px}
+.sidebar h3:first-child{margin-top:0}
+.tbl-item{padding:5px 8px;border-radius:4px;cursor:pointer;color:#cdd6f4;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tbl-item:hover{background:#313244;color:#89b4fa}
+.tbl-item::before{content:"\25A3  ";font-size:10px;color:#585b70}
+.sch-item{padding:3px 8px;color:#a6adc8;font-size:11px}
+.empty{color:#45475a;font-size:11px;font-style:italic;padding:4px 8px}
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden;padding:14px;gap:10px}
+.editor-box{background:#181825;border:1px solid #313244;border-radius:8px;padding:12px;flex-shrink:0}
+.lbl{color:#a6adc8;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:7px}
+textarea{width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:4px;padding:9px;font-family:'Courier New',monospace;font-size:13px;resize:vertical;min-height:72px;outline:none}
+textarea:focus{border-color:#89b4fa}
+.btn-row{display:flex;gap:8px;margin-top:8px;align-items:center}
+.btn{padding:7px 18px;border:none;border-radius:4px;cursor:pointer;font-family:inherit;font-size:13px;font-weight:bold}
+.btn-p{background:#89b4fa;color:#11111b}.btn-p:hover{background:#b4d0ff}
+.btn-s{background:#313244;color:#cdd6f4}.btn-s:hover{background:#45475a}
+.etime{color:#a6adc8;font-size:12px}
+.result-box{flex:1;overflow:auto;background:#181825;border:1px solid #313244;border-radius:8px;padding:12px}
+.ok{color:#a6e3a1;font-size:12px;margin-bottom:7px}
+.err{color:#f38ba8;font-size:13px;padding:7px 10px;background:#2a1a1a;border-radius:4px;border-left:3px solid #f38ba8}
+.msg{color:#a6e3a1;font-size:13px;padding:7px 10px;background:#1a2a1a;border-radius:4px;border-left:3px solid #a6e3a1}
+.emp{color:#45475a;font-style:italic;padding:8px}
+.loading{color:#f9e2af;font-size:13px;padding:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#313244;color:#89dceb;padding:7px 11px;text-align:left;border-bottom:2px solid #45475a;position:sticky;top:0;font-weight:bold}
+td{padding:5px 11px;border-bottom:1px solid #1e1e2e;color:#cdd6f4}
+tr:hover td{background:#2d2d44}
+tr:nth-child(even) td{background:rgba(49,50,68,.35)}
+tr:nth-child(even):hover td{background:#2d2d44}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:#181825}
+::-webkit-scrollbar-thumb{background:#45475a;border-radius:3px}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">&#128449; MilanSQL v1.0.0 Dashboard</div>
+  <div class="status-bar">
+    <span id="sv">v1.0.0</span>
+    <span>Uptime: <span class="badge" id="su">-</span>s</span>
+    <span>Tables: <span class="badge" id="st">-</span></span>
+    <span>Port: <span class="badge" id="sp">8080</span></span>
+  </div>
+</div>
+<div class="main">
+  <div class="sidebar">
+    <h3>Tables</h3>
+    <div id="tbl-list"><div class="empty">Loading...</div></div>
+    <h3>Schemas</h3>
+    <div id="sch-list"><div class="empty">Loading...</div></div>
+  </div>
+  <div class="content">
+    <div class="editor-box">
+      <div class="lbl">SQL Query <span style="color:#585b70;font-size:10px">(Ctrl+Enter)</span></div>
+      <textarea id="sql" rows="4" spellcheck="false" placeholder="SELECT * FROM ...">SELECT * FROM users</textarea>
+      <div class="btn-row">
+        <button class="btn btn-p" onclick="run()">&#9654; Execute</button>
+        <button class="btn btn-s" onclick="clr()">Clear</button>
+        <span class="etime" id="et"></span>
+      </div>
+    </div>
+    <div class="result-box">
+      <div class="lbl">Results</div>
+      <div id="out"><div class="emp">Execute a query to see results</div></div>
+    </div>
+  </div>
+</div>
+<script>
+const B=window.location.origin;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+async function loadSidebar(){
+  try{
+    const[tr,sr,str]=await Promise.all([fetch(B+'/tables'),fetch(B+'/schemas'),fetch(B+'/status')]);
+    const td=await tr.json(),sd=await sr.json(),std=await str.json();
+    const tl=document.getElementById('tbl-list');
+    tl.innerHTML=(td.tables&&td.tables.length)?td.tables.map(t=>`<div class="tbl-item" onclick="qt('${esc(t)}')" title="SELECT * FROM ${esc(t)}">${esc(t)}</div>`).join(''):'<div class="empty">No tables</div>';
+    const sl=document.getElementById('sch-list');
+    sl.innerHTML=(sd.schemas&&sd.schemas.length)?sd.schemas.map(s=>`<div class="sch-item">&#128193; ${esc(s)}</div>`).join(''):'<div class="empty">No schemas</div>';
+    if(std.status){const s=std.status;document.getElementById('sv').textContent=s.version||'v1.0.0';document.getElementById('su').textContent=s.uptime;document.getElementById('st').textContent=s.tableCount;document.getElementById('sp').textContent=s.port||'8080';}
+  }catch(e){document.getElementById('tbl-list').innerHTML='<div class="empty">Connection error</div>';}
+}
+function qt(n){document.getElementById('sql').value='SELECT * FROM '+n;run();}
+async function run(){
+  const sql=document.getElementById('sql').value.trim();if(!sql)return;
+  const o=document.getElementById('out');o.innerHTML='<div class="loading">Executing&#8230;</div>';
+  document.getElementById('et').textContent='';
+  const t0=Date.now();
+  try{
+    const r=await fetch(B+'/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
+    const d=await r.json();
+    document.getElementById('et').textContent=(Date.now()-t0)+'ms';
+    if(!d.success){o.innerHTML=`<div class="err">&#10005; ${esc(d.error||'Unknown error')}</div>`;return;}
+    if(d.columns&&d.columns.length){
+      const info=`${d.rowCount||d.rows.length} row(s)${d.executionTime?' &middot; '+d.executionTime:''}`;
+      o.innerHTML=`<div class="ok">${info}</div>`+mkTable(d.columns,d.rows);
+    }else{
+      const m=d.message||'Query executed successfully';
+      const af=d.rowsAffected>0?` (${d.rowsAffected} rows affected)`:'';
+      o.innerHTML=`<div class="msg">&#10003; ${esc(m)}${esc(af)}</div>`;
+      loadSidebar();
+    }
+  }catch(e){o.innerHTML=`<div class="err">Network error: ${esc(e.message)}</div>`;}
+}
+function mkTable(cols,rows){
+  if(!rows||!rows.length)return'<div class="emp">No rows returned</div>';
+  const th=cols.map(c=>`<th>${esc(String(c))}</th>`).join('');
+  const tr=rows.map(r=>'<tr>'+r.map(c=>`<td>${c===null?'<span style="color:#45475a">NULL</span>':esc(String(c))}</td>`).join('')+'</tr>').join('');
+  return`<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+}
+function clr(){document.getElementById('out').innerHTML='<div class="emp">Results cleared</div>';document.getElementById('et').textContent='';}
+document.getElementById('sql').addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter')run();});
+loadSidebar();
+</script>
+</body>
+</html>)HTML";
+}
+
 // ── MilanHttpServer::handleRequest ────────────────────────────
 
 inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
@@ -622,6 +758,16 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
 
     if (req.path == "/status") {
         return buildHttpResponse(200, handleStatus());
+    }
+
+    if (req.path == "/dashboard" || req.path == "/") {
+        std::string html = handleDashboard();
+        return "HTTP/1.1 200 OK\r\n"
+               "Content-Type: text/html; charset=utf-8\r\n"
+               "Content-Length: " + std::to_string(html.size()) + "\r\n"
+               "Access-Control-Allow-Origin: *\r\n"
+               "Connection: close\r\n"
+               "\r\n" + html;
     }
 
     return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");

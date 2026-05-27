@@ -35,11 +35,24 @@
 #include <sstream>
 #include <iostream>
 #include <fstream>
+#include <map>
+#include <chrono>
+#include <atomic>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+
+// ── Phase 54D: Process tracking ──────────────────────────────
+struct ProcessInfo {
+    int         id;
+    std::string user;
+    std::string host;
+    std::string db;
+    std::string currentQuery;
+    std::chrono::steady_clock::time_point connectedAt;
+};
 
 class MilanServer {
 public:
@@ -55,8 +68,15 @@ private:
     milansql::MilanBinaryStorage storage_;
     std::mutex engineMutex_;
 
+    // Phase 54D: Process list
+    std::map<int, ProcessInfo> processList_;
+    std::mutex processListMutex_;
+    std::atomic<int> nextPid_{1};
+
     void handleClient(sock_t clientSock);
-    std::string executeQuery(const std::string& sql);
+    std::string executeQuery(const std::string& sql, int pid);
+
+    std::string getProcessListStr();
 
     static std::string recvAll(sock_t sock);
     static void sendAll(sock_t sock, const std::string& data);
@@ -169,8 +189,55 @@ inline void MilanServer::sendAll(sock_t sock, const std::string& data) {
     }
 }
 
+// ── MilanServer::getProcessListStr ───────────────────────────
+inline std::string MilanServer::getProcessListStr() {
+    std::lock_guard<std::mutex> lk(processListMutex_);
+    if (processList_.empty()) {
+        return "\n  (Keine aktiven Verbindungen)\n\n";
+    }
+    // Column widths
+    size_t wId = 2, wUser = 4, wHost = 9, wDb = 6, wQuery = 25;
+    for (const auto& [id, p] : processList_) {
+        wId    = std::max(wId,    std::to_string(p.id).size());
+        wUser  = std::max(wUser,  p.user.size());
+        wHost  = std::max(wHost,  p.host.size());
+        wDb    = std::max(wDb,    p.db.size());
+        wQuery = std::max(wQuery, p.currentQuery.size());
+    }
+    wQuery = std::min(wQuery, size_t(50));
+
+    auto cell = [](const std::string& s, size_t w) {
+        std::string r = " " + (s.size() > w ? s.substr(0, w-3) + "..." : s);
+        while (r.size() < w + 2) r += ' ';
+        r += "\u2502";
+        return r;
+    };
+    std::vector<size_t> ws = {wId, wUser, wHost, wDb, wQuery};
+    auto hline = [&](const std::string& l, const std::string& m, const std::string& r) {
+        std::string s = "  " + l;
+        for (size_t i = 0; i < ws.size(); ++i) {
+            for (size_t j = 0; j < ws[i] + 2; ++j) s += "\u2500";
+            if (i + 1 < ws.size()) s += m;
+        }
+        return s + r + "\n";
+    };
+    std::string out = "\n";
+    out += hline("\u250c", "\u252c", "\u2510");
+    out += "  \u2502" + cell("ID", wId) + cell("User", wUser)
+                      + cell("Host", wHost) + cell("DB", wDb) + cell("Query", wQuery) + "\n";
+    out += hline("\u251c", "\u253c", "\u2524");
+    for (const auto& [id, p] : processList_) {
+        out += "  \u2502" + cell(std::to_string(p.id), wId)
+                          + cell(p.user, wUser) + cell(p.host, wHost)
+                          + cell(p.db, wDb) + cell(p.currentQuery, wQuery) + "\n";
+    }
+    out += hline("\u2514", "\u2534", "\u2518");
+    out += "  " + std::to_string(processList_.size()) + " aktive Verbindung(en)\n\n";
+    return out;
+}
+
 // ── MilanServer::executeQuery ─────────────────────────────────
-inline std::string MilanServer::executeQuery(const std::string& sql) {
+inline std::string MilanServer::executeQuery(const std::string& sql, int /*pid*/) {
     std::lock_guard<std::mutex> lock(engineMutex_);
 
     // Redirect cout to capture output
@@ -224,8 +291,13 @@ inline std::string MilanServer::executeQuery(const std::string& sql) {
             }
         }
 
+        auto getProcessListFn = [this]() -> std::string {
+            return this->getProcessListStr();
+        };
+
         milansql::dispatchCommand(cmd, engine_, parser, sql,
-                                  persistFn, saveProceduresFn, saveTriggFn);
+                                  persistFn, saveProceduresFn, saveTriggFn,
+                                  getProcessListFn);
 
         std::cout.rdbuf(oldBuf);
         return "OK\n" + captured.str() + "END\n";
@@ -240,12 +312,25 @@ inline std::string MilanServer::executeQuery(const std::string& sql) {
 
 // ── MilanServer::handleClient ─────────────────────────────────
 inline void MilanServer::handleClient(sock_t clientSock) {
+    // Phase 54D: Register process
+    int pid = nextPid_++;
+    {
+        std::lock_guard<std::mutex> lk(processListMutex_);
+        ProcessInfo pi;
+        pi.id           = pid;
+        pi.user         = engine_.getCurrentUser();
+        pi.host         = "localhost";
+        pi.db           = engine_.getCurrentSchema();
+        pi.currentQuery = "(idle)";
+        pi.connectedAt  = std::chrono::steady_clock::now();
+        processList_[pid] = pi;
+    }
+
     while (true) {
         std::string message = recvAll(clientSock);
         if (message.empty()) break;  // client disconnected
 
         // Parse protocol: SQL_QUERY\n<sql>\nEND\n
-        // Verify it starts with "SQL_QUERY\n"
         const std::string prefix = "SQL_QUERY\n";
         const std::string suffix = "\nEND\n";
 
@@ -256,12 +341,11 @@ inline void MilanServer::handleClient(sock_t clientSock) {
             continue;
         }
 
-        // Extract SQL: strip prefix "SQL_QUERY\n" and suffix "\nEND\n"
         size_t sqlStart = prefix.size();
         size_t sqlEnd   = message.size() - suffix.size();
         std::string sql = message.substr(sqlStart, sqlEnd - sqlStart);
 
-        // Handle EXIT command specially — don't terminate the server
+        // Handle EXIT command specially
         {
             std::string up = sql;
             for (char& c : up) c = (char)std::toupper((unsigned char)c);
@@ -273,8 +357,29 @@ inline void MilanServer::handleClient(sock_t clientSock) {
             }
         }
 
-        std::string response = executeQuery(sql);
+        // Phase 54D: Update current query
+        {
+            std::lock_guard<std::mutex> lk(processListMutex_);
+            auto it = processList_.find(pid);
+            if (it != processList_.end()) it->second.currentQuery = sql;
+        }
+
+        std::string response = executeQuery(sql, pid);
+
+        // Phase 54D: Mark as idle after query
+        {
+            std::lock_guard<std::mutex> lk(processListMutex_);
+            auto it = processList_.find(pid);
+            if (it != processList_.end()) it->second.currentQuery = "(idle)";
+        }
+
         sendAll(clientSock, response);
+    }
+
+    // Phase 54D: Remove process on disconnect
+    {
+        std::lock_guard<std::mutex> lk(processListMutex_);
+        processList_.erase(pid);
     }
     closesocket(clientSock);
 }

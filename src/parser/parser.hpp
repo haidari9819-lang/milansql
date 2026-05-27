@@ -71,6 +71,13 @@ enum class CommandType {
     SHOW_SCHEMAS,
     USE_SCHEMA,
     SHOW_TABLES_IN,
+    // Phase 54A: Query Cache
+    SHOW_CACHE,
+    CLEAR_CACHE,
+    SET_CACHE,
+    // Phase 54B: EXPLAIN ANALYZE (flag on ParsedCommand, no separate type)
+    // Phase 54D: SHOW PROCESSLIST
+    SHOW_PROCESSLIST,
     UNKNOWN
 };
 
@@ -171,6 +178,10 @@ struct ParsedCommand {
 
     // Phase 36: EXPLAIN-Modus (kein echtes Ausführen, nur Plan anzeigen)
     bool isExplain = false;
+    // Phase 54B: EXPLAIN ANALYZE — echte Ausführung mit Zeitmessung
+    bool isExplainAnalyze = false;
+    // Phase 54A: SET CACHE ON/OFF
+    std::string cacheEnabled;  // "ON" or "OFF"
 
     // Phase 37: Alias der Haupttabelle (z.B. "m" in FROM mitarbeiter m)
     std::string tableAlias;
@@ -278,7 +289,7 @@ public:
             }
         }
 
-        // ── Phase 36: EXPLAIN-Prefix erkennen ────────────────────
+        // ── Phase 36/54B: EXPLAIN [ANALYZE] Prefix erkennen ─────
         {
             std::string up;
             size_t s = 0;
@@ -287,12 +298,24 @@ public:
                 up += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
             if (up.size() >= 7 && up.substr(0, 7) == "EXPLAIN" &&
                 (up.size() == 7 || up[7] == ' ' || up[7] == '\t')) {
-                // Rest nach EXPLAIN extrahieren
                 size_t rest = s + 7;
                 while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
                     ++rest;
+                // Phase 54B: check for ANALYZE keyword
+                bool isAnalyze = false;
+                std::string upRest;
+                for (size_t i = rest; i < input.size(); ++i)
+                    upRest += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
+                if (upRest.size() >= 7 && upRest.substr(0, 7) == "ANALYZE" &&
+                    (upRest.size() == 7 || upRest[7] == ' ' || upRest[7] == '\t')) {
+                    isAnalyze = true;
+                    rest += 7;
+                    while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
+                        ++rest;
+                }
                 ParsedCommand inner = parse(input.substr(rest));
                 inner.isExplain = true;
+                if (isAnalyze) inner.isExplainAnalyze = true;
                 return inner;
             }
         }
@@ -995,6 +1018,12 @@ public:
                 cmd.type = CommandType::SHOW_GRANTS;
                 if (tokens.size() >= 4 && toUpper(tokens[2]) == "FOR")
                     cmd.grantTargetUser = tokens[3];
+            // Phase 54A: SHOW CACHE
+            } else if (kw1 == "CACHE") {
+                cmd.type = CommandType::SHOW_CACHE;
+            // Phase 54D: SHOW PROCESSLIST
+            } else if (kw1 == "PROCESSLIST") {
+                cmd.type = CommandType::SHOW_PROCESSLIST;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -1028,6 +1057,16 @@ public:
         } else if (kw0 == "TRUNCATE" && kw1 == "TABLE") {
             cmd.type = CommandType::TRUNCATE;
             if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 54A: CLEAR CACHE ───────────────────────────────
+        } else if (kw0 == "CLEAR" && kw1 == "CACHE") {
+            cmd.type = CommandType::CLEAR_CACHE;
+
+        // ── Phase 54A: SET CACHE ON / SET CACHE OFF ──────────────
+        } else if (kw0 == "SET" && kw1 == "CACHE") {
+            cmd.type = CommandType::SET_CACHE;
+            if (tokens.size() >= 3) cmd.cacheEnabled = toUpper(tokens[2]);
             else cmd.type = CommandType::UNKNOWN;
 
         // ── Phase 45: PREPARE name AS sql ────────────────────────

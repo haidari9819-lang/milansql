@@ -6,10 +6,13 @@
 // ============================================================
 
 #include <iostream>
+#include <sstream>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <iomanip>
 
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
@@ -481,7 +484,8 @@ inline bool dispatchCommand(
     const std::string& eingabe,
     std::function<void()> persistFn,
     std::function<void()> saveProceduresFn,
-    std::function<void()> saveTriggFn)
+    std::function<void()> saveTriggFn,
+    std::function<std::string()> getProcessListFn = nullptr)
 {
     switch (cmd.type) {
 
@@ -604,6 +608,7 @@ inline bool dispatchCommand(
             }
         }
         persistFn();
+        engine.invalidateCache(cmd.tableName);
         std::cout << "  Tabelle '" << cmd.tableName << "' erstellt ("
                   << cmd.columns.size() << " Spalten";
         if (!cmd.foreignKeys.empty())
@@ -643,6 +648,7 @@ inline bool dispatchCommand(
                 ++count;
             }
             persistFn();
+            engine.invalidateCache(cmd.tableName);
             std::cout << "  " << count << " Zeile(n) eingefuegt in '"
                       << cmd.tableName << "' (INSERT INTO SELECT).\n\n";
             break;
@@ -686,6 +692,7 @@ inline bool dispatchCommand(
             for (const auto& vals : rows)
                 engine.insertRow(cmd.tableName, vals);
             persistFn();
+            engine.invalidateCache(cmd.tableName);
             if (rows.size() == 1)
                 std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
             else
@@ -722,6 +729,121 @@ inline bool dispatchCommand(
                 engine.cleanupTempTables();
                 throw;
             }
+            break;
+        }
+
+        // ── Phase 54B: EXPLAIN ANALYZE ────────────────────────────
+        if (cmd.isExplainAnalyze) {
+            using clk = std::chrono::high_resolution_clock;
+            using fms = std::chrono::duration<double, std::milli>;
+            struct AStep {
+                int step; std::string op, tbl, detail;
+                size_t rows; double ms;
+            };
+            std::vector<AStep> steps;
+            int sno = 1;
+            double totalMs = 0.0;
+
+            // Step 1: SCAN / FILTER
+            auto t0 = clk::now();
+            milansql::Table result;
+            bool usedIdx = false;
+            if (!cmd.whereConds.empty()) {
+                auto qr = engine.selectWhere(cmd.tableName, cmd.whereConds, cmd.whereLogic);
+                usedIdx = qr.usedIndex;
+                result  = std::move(qr.table);
+            } else {
+                result = engine.selectAll(cmd.tableName).clone();
+            }
+            auto t1 = clk::now();
+            double scanMs = fms(t1 - t0).count();
+            totalMs += scanMs;
+            std::string scanOp  = usedIdx ? "INDEX SCAN" : "SCAN";
+            std::string scanDet = cmd.whereConds.empty() ? "full table" : "WHERE " + dispatch_whereDesc(cmd);
+            steps.push_back({sno++, scanOp, cmd.tableName, scanDet, result.rowCount(), scanMs});
+
+            // Step 2: SORT (if ORDER BY)
+            if (!cmd.orderByCols.empty()) {
+                auto t2 = clk::now();
+                result.sortByMulti(cmd.orderByCols);
+                auto t3 = clk::now();
+                double ms2 = fms(t3 - t2).count();
+                totalMs += ms2;
+                steps.push_back({sno++, "SORT", "-", "ORDER BY", result.rowCount(), ms2});
+            }
+
+            // Step 3: PROJECT
+            {
+                auto t4 = clk::now();
+                if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
+                    bool hasWin = false;
+                    for (const auto& si : cmd.selectItems)
+                        if (si.isWindowFunc) { hasWin = true; break; }
+                    result = hasWin
+                        ? engine.projectWithWindowItems(result, cmd.selectItems)
+                        : engine.projectWithItems(result, cmd.selectItems);
+                } else if (!cmd.selectColumns.empty()) {
+                    result = result.project(cmd.selectColumns);
+                }
+                if (cmd.isDistinct) result.makeDistinct();
+                auto t5 = clk::now();
+                double ms3 = fms(t5 - t4).count();
+                totalMs += ms3;
+                std::string projDet = cmd.selectColumns.empty() ? "*"
+                    : std::to_string(cmd.selectColumns.size()) + " Spalten";
+                steps.push_back({sno++, "PROJECT", "-", projDet, result.rowCount(), ms3});
+            }
+
+            // Print analyze table
+            auto fmtMs = [](double v) {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(3) << v << "ms";
+                return ss.str();
+            };
+            struct Col { std::string h; size_t w; };
+            std::vector<Col> hdr = {{"Schritt",8},{"Operation",10},{"Tabelle",12},{"Details",20},{"Zeilen",7},{"Zeit",9}};
+            for (const auto& s : steps) {
+                hdr[0].w = std::max(hdr[0].w, std::to_string(s.step).size());
+                hdr[1].w = std::max(hdr[1].w, s.op.size());
+                hdr[2].w = std::max(hdr[2].w, s.tbl.size());
+                hdr[3].w = std::max(hdr[3].w, s.detail.size());
+                hdr[4].w = std::max(hdr[4].w, std::to_string(s.rows).size());
+                hdr[5].w = std::max(hdr[5].w, fmtMs(s.ms).size());
+            }
+            hdr[5].w = std::max(hdr[5].w, fmtMs(totalMs).size());
+            auto printCols = [&](const std::vector<std::string>& vals) {
+                std::cout << "\u2502";
+                for (size_t i = 0; i < hdr.size(); ++i) {
+                    std::cout << " " << vals[i];
+                    for (size_t j = vals[i].size(); j < hdr[i].w; ++j) std::cout << " ";
+                    std::cout << " \u2502";
+                }
+                std::cout << "\n";
+            };
+            auto hlineA = [&](const std::string& l, const std::string& m, const std::string& r) {
+                std::cout << l;
+                for (size_t i = 0; i < hdr.size(); ++i) {
+                    for (size_t j = 0; j < hdr[i].w + 2; ++j) std::cout << "\u2500";
+                    if (i + 1 < hdr.size()) std::cout << m;
+                }
+                std::cout << r << "\n";
+            };
+            std::cout << "\n";
+            hlineA("\u250c", "\u252c", "\u2510");
+            std::vector<std::string> hdrvec;
+            for (const auto& c : hdr) hdrvec.push_back(c.h);
+            printCols(hdrvec);
+            hlineA("\u251c", "\u253c", "\u2524");
+            for (const auto& s : steps) {
+                printCols({std::to_string(s.step), s.op, s.tbl, s.detail,
+                           std::to_string(s.rows), fmtMs(s.ms)});
+            }
+            hlineA("\u251c", "\u253c", "\u2524");
+            printCols({"TOTAL", "", "", "", std::to_string(result.rowCount()), fmtMs(totalMs)});
+            hlineA("\u2514", "\u2534", "\u2518");
+            std::cout << "\n";
+            // Also print actual result
+            dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             break;
         }
 
@@ -885,54 +1007,84 @@ inline bool dispatchCommand(
             break;
         }
 
-        std::cout << "\n";
-
-        milansql::Table result;
-        bool usedIndex = false;
-
-        if (!cmd.whereConds.empty()) {
-            auto qr = engine.selectWhere(
-                cmd.tableName, cmd.whereConds, cmd.whereLogic);
-            usedIndex = qr.usedIndex;
-            result    = std::move(qr.table);
-        } else {
-            result = engine.selectAll(cmd.tableName).clone();
+        // ── Phase 54A: Query Cache check ──────────────────────────
+        {
+            auto& qc = engine.getQueryCache();
+            if (qc.isEnabled()) {
+                auto cached = qc.get(eingabe);
+                if (cached) {
+                    std::cout << *cached << "  [CACHE HIT]\n\n";
+                    break;
+                }
+            }
         }
 
-        std::size_t totalFound = result.rowCount();
+        // Execute and optionally capture for caching
+        {
+            auto& qc = engine.getQueryCache();
+            // Redirect cout to ostringstream when cache is active
+            std::ostringstream captureStream;
+            std::streambuf* oldBuf = nullptr;
+            if (qc.isEnabled()) {
+                oldBuf = std::cout.rdbuf(captureStream.rdbuf());
+            }
 
-        if (totalFound == 0 && !cmd.whereConds.empty()) {
-            std::string lbl = usedIndex ? "[INDEX SCAN]" : "[FULL SCAN] ";
-            std::cout << "  " << lbl << " 0 Zeilen gefunden (WHERE "
-                      << dispatch_whereDesc(cmd) << ")\n\n";
-            break;
-        }
+            std::cout << "\n";
+            milansql::Table result;
+            bool usedIndex = false;
 
-        if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
-            bool hasWin = false;
-            for (const auto& si : cmd.selectItems)
-                if (si.isWindowFunc) { hasWin = true; break; }
-            if (hasWin)
-                result = engine.projectWithWindowItems(result, cmd.selectItems);
-            else
-                result = engine.projectWithItems(result, cmd.selectItems);
-            if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
-        } else {
-            if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
-            if (!cmd.selectColumns.empty())
-                result = result.project(cmd.selectColumns);
-        }
-        if (cmd.isDistinct)
-            result.makeDistinct();
+            if (!cmd.whereConds.empty()) {
+                auto qr = engine.selectWhere(
+                    cmd.tableName, cmd.whereConds, cmd.whereLogic);
+                usedIndex = qr.usedIndex;
+                result    = std::move(qr.table);
+            } else {
+                result = engine.selectAll(cmd.tableName).clone();
+            }
 
-        dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+            std::size_t totalFound = result.rowCount();
 
-        if (!cmd.whereConds.empty()) {
-            std::string lbl = usedIndex ? "[INDEX SCAN]" : "[FULL SCAN] ";
-            std::cout << "  " << lbl << " " << totalFound
-                      << " Zeile(n) (WHERE " << dispatch_whereDesc(cmd) << ")\n\n";
+            if (totalFound == 0 && !cmd.whereConds.empty()) {
+                std::string lbl = usedIndex ? "[INDEX SCAN]" : "[FULL SCAN] ";
+                std::cout << "  " << lbl << " 0 Zeilen gefunden (WHERE "
+                          << dispatch_whereDesc(cmd) << ")\n\n";
+                if (oldBuf) { std::cout.rdbuf(oldBuf); std::cout << captureStream.str(); }
+                break;
+            }
+
+            if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
+                bool hasWin = false;
+                for (const auto& si : cmd.selectItems)
+                    if (si.isWindowFunc) { hasWin = true; break; }
+                if (hasWin)
+                    result = engine.projectWithWindowItems(result, cmd.selectItems);
+                else
+                    result = engine.projectWithItems(result, cmd.selectItems);
+                if (!cmd.orderByCols.empty())
+                    result.sortByMulti(cmd.orderByCols);
+            } else {
+                if (!cmd.orderByCols.empty())
+                    result.sortByMulti(cmd.orderByCols);
+                if (!cmd.selectColumns.empty())
+                    result = result.project(cmd.selectColumns);
+            }
+            if (cmd.isDistinct)
+                result.makeDistinct();
+
+            dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+
+            if (!cmd.whereConds.empty()) {
+                std::string lbl = usedIndex ? "[INDEX SCAN]" : "[FULL SCAN] ";
+                std::cout << "  " << lbl << " " << totalFound
+                          << " Zeile(n) (WHERE " << dispatch_whereDesc(cmd) << ")\n\n";
+            }
+
+            if (oldBuf) {
+                std::cout.rdbuf(oldBuf);
+                std::string captured = captureStream.str();
+                qc.put(eingabe, captured, cmd.tableName);
+                std::cout << captured;
+            }
         }
         break;
     }
@@ -996,6 +1148,7 @@ inline bool dispatchCommand(
             std::size_t n = engine.updateAll(
                 cmd.tableName, cmd.updateCols, cmd.updateVals);
             persistFn();
+            engine.invalidateCache(cmd.tableName);
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc << ")\n\n";
         } else {
@@ -1003,7 +1156,7 @@ inline bool dispatchCommand(
                 cmd.tableName,
                 cmd.updateCols, cmd.updateVals,
                 cmd.whereColumn, cmd.whereValue);
-            if (n > 0) persistFn();
+            if (n > 0) { persistFn(); engine.invalidateCache(cmd.tableName); }
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc
                       << " WHERE " << cmd.whereColumn
@@ -1018,6 +1171,7 @@ inline bool dispatchCommand(
         }
         engine.truncateTable(cmd.tableName);
         persistFn();
+        engine.invalidateCache(cmd.tableName);
         std::cout << "  Tabelle '" << cmd.tableName
                   << "' geleert (Schema + Constraints behalten,"
                   << " AUTO_INCREMENT = 1).\n\n";
@@ -1031,11 +1185,12 @@ inline bool dispatchCommand(
         if (cmd.whereColumn.empty()) {
             std::size_t n = engine.deleteAll(cmd.tableName);
             persistFn();
+            engine.invalidateCache(cmd.tableName);
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
         } else {
             std::size_t n = engine.deleteWhere(
                 cmd.tableName, cmd.whereColumn, cmd.whereValue);
-            if (n > 0) persistFn();
+            if (n > 0) { persistFn(); engine.invalidateCache(cmd.tableName); }
             std::cout << "  " << n << " Zeile(n) geloescht"
                       << " (WHERE " << cmd.whereColumn
                       << " = " << cmd.whereValue << ")\n\n";
@@ -1101,6 +1256,38 @@ inline bool dispatchCommand(
         }
         hline("\u2514", "\u2518");
         std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 54A: Query Cache commands ──────────────────────────
+    case milansql::CommandType::SHOW_CACHE:
+        engine.getQueryCache().showStats();
+        break;
+
+    case milansql::CommandType::CLEAR_CACHE:
+        engine.getQueryCache().clear();
+        std::cout << "  Query Cache geleert.\n\n";
+        break;
+
+    case milansql::CommandType::SET_CACHE:
+        if (cmd.cacheEnabled == "ON") {
+            engine.getQueryCache().setEnabled(true);
+            std::cout << "  Query Cache aktiviert.\n\n";
+        } else if (cmd.cacheEnabled == "OFF") {
+            engine.getQueryCache().setEnabled(false);
+            std::cout << "  Query Cache deaktiviert.\n\n";
+        } else {
+            std::cout << "  Fehler: SET CACHE ON oder SET CACHE OFF\n";
+        }
+        break;
+
+    // ── Phase 54D: SHOW PROCESSLIST ───────────────────────────
+    case milansql::CommandType::SHOW_PROCESSLIST: {
+        if (getProcessListFn) {
+            std::cout << getProcessListFn();
+        } else {
+            std::cout << "\n  SHOW PROCESSLIST ist nur im Server-Modus verfuegbar.\n\n";
+        }
         break;
     }
 

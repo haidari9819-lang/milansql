@@ -24,7 +24,7 @@ else()
     target_compile_options(milansql PRIVATE -Wall -Wextra -Wpedantic -Wmissing-field-initializers)
 endif()
 
-# Phase 47: Link ws2_32 on Windows for TCP/IP support
+# Phase 47: Link ws2_32 on Windows (both MSVC and MinGW/MSYS2 use Winsock2)
 if(WIN32)
     target_link_libraries(milansql PRIVATE ws2_32)
 endif()

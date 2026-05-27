@@ -3,15 +3,14 @@
 // server.hpp — MilanSQL TCP Server (Phase 47)
 // ============================================================
 
-#ifdef _WIN32
-  // Winsock2 must be included BEFORE windows.h / any other Windows headers
+#if defined(_WIN32)
+  // Windows (MSVC and MSYS2/MinGW): use Winsock2
+  // Note: #pragma comment not used — ws2_32 is linked via CMakeLists.txt
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
-  #pragma comment(lib, "ws2_32.lib")
-  // Windows.h defines DELETE as a macro — undefine it so our enum works
   #ifdef DELETE
     #undef DELETE
   #endif

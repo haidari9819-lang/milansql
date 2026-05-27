@@ -3,14 +3,13 @@
 // client.hpp — MilanSQL TCP Client (Phase 47)
 // ============================================================
 
-#ifdef _WIN32
+#if defined(_WIN32)
+  // Windows (MSVC and MSYS2/MinGW): use Winsock2
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
-  #pragma comment(lib, "ws2_32.lib")
-  // Windows.h defines DELETE as a macro — undefine it
   #ifdef DELETE
     #undef DELETE
   #endif

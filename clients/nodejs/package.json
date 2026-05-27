@@ -1,0 +1,20 @@
+{
+  "name": "milansql",
+  "version": "0.9.0",
+  "description": "Node.js client for MilanSQL database (HTTP REST API)",
+  "main": "index.js",
+  "scripts": {
+    "test": "node examples/basic.js"
+  },
+  "keywords": ["milansql", "database", "sql", "client"],
+  "author": "Mirwais Haidari",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/haidari9819-lang/milansql.git"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "dependencies": {}
+}

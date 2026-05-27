@@ -2,6 +2,7 @@
 // before windows.h, and to undefine the DELETE macro conflict.
 #include "server/server.hpp"
 #include "server/client.hpp"
+#include "server/http_server.hpp"
 
 #include <iostream>
 #include <fstream>
@@ -33,16 +34,28 @@ static void printBanner() {
 }
 
 int main(int argc, char* argv[]) {
-    // ── Phase 47: Parse command-line arguments ────────────────
+    // ── Phase 47/52: Parse command-line arguments ─────────────
     bool serverMode = false;
     bool clientMode = false;
+    bool httpMode   = false;
     int  port       = 4406;
+    int  httpPort   = 8080;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--server") serverMode = true;
+        if      (arg == "--server") serverMode = true;
         else if (arg == "--client") clientMode = true;
-        else if (arg == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
+        else if (arg == "--http")   httpMode   = true;
+        else if (arg == "--port"      && i + 1 < argc) port     = std::stoi(argv[++i]);
+        else if (arg == "--http-port" && i + 1 < argc) httpPort = std::stoi(argv[++i]);
+    }
+
+    // ── HTTP mode (Phase 52) ──────────────────────────────────
+    if (httpMode) {
+        std::cout << "MilanSQL HTTP Server startet auf Port " << httpPort << "...\n";
+        MilanHttpServer httpServer(httpPort, "database.milan");
+        httpServer.run();
+        return 0;
     }
 
     // ── Server mode ───────────────────────────────────────────

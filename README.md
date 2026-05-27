@@ -32,6 +32,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Prepared Statements** | `PREPARE name AS sql`, `EXECUTE name(args)`, `DEALLOCATE PREPARE name`, `SHOW PREPARED` |
 | **Benutzerverwaltung** | `CREATE USER`, `DROP USER`, `SHOW USERS`, `GRANT/REVOKE priv ON tbl TO/FROM user`, `SHOW GRANTS FOR user`, `CONNECT user pwd`, `DISCONNECT` |
 | **Server-Modus** | `--server --port N`: TCP-Server, Multi-Client, Thread-Safe; `--client --port N`: Netzwerk-REPL |
+| **REST API** | `--http --port 8080`: HTTP/JSON Interface, `GET/POST /query`, `GET /tables`, `GET /schemas`, `GET /status` |
 | **Query Optimizer** | Cost-based Join-Reihenfolge, Index-Auswahl, Predicate Pushdown; `EXPLAIN` zeigt Optimizer-Entscheidungen |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
@@ -298,6 +299,7 @@ STATUS
 | 46 | Benutzerverwaltung: `CREATE USER / DROP USER / GRANT / REVOKE / CONNECT / DISCONNECT` |
 | 47 | TCP/IP Server: `--server/--client --port N`, Multi-Thread, Winsock2/POSIX |
 | 48 | Cost-Based Query Optimizer: Join-Reihenfolge, Index-Auswahl, EXPLAIN-Integration |
+| 52 | REST API: HTTP/JSON Interface (`--http --port 8080`), `GET/POST /query`, `/tables`, `/schemas`, `/status` |
 
 ---
 

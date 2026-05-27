@@ -1772,6 +1772,117 @@ int main() {
                 break;
             }
 
+            // ── Phase 45: PREPARE ─────────────────────────────────
+            case milansql::CommandType::PREPARE_STMT: {
+                if (cmd.preparedName.empty() || cmd.preparedSql.empty()) {
+                    std::cout << "  Fehler: PREPARE name AS sql\n\n"; break;
+                }
+                engine.prepareStmt(cmd.preparedName, cmd.preparedSql);
+                std::cout << "  Statement '" << cmd.preparedName << "' vorbereitet ("
+                          << std::count(cmd.preparedSql.begin(), cmd.preparedSql.end(), '?')
+                          << " Parameter).\n\n";
+                break;
+            }
+
+            // ── Phase 45: EXECUTE ─────────────────────────────────
+            case milansql::CommandType::EXECUTE_STMT: {
+                if (cmd.preparedName.empty()) {
+                    std::cout << "  Fehler: EXECUTE name(args)\n\n"; break;
+                }
+                try {
+                    std::string boundSql = engine.bindPrepared(
+                        cmd.preparedName, cmd.execArgs);
+                    milansql::Parser innerParser;
+                    milansql::ParsedCommand sc = innerParser.parse(boundSql);
+                    // Resolve subqueries
+                    for (const auto& sq : sc.subqueries) {
+                        if (sq.condIdx < sc.whereConds.size()) {
+                            sc.whereConds[sq.condIdx].inList =
+                                engine.subqueryValues(sq.subTable, sq.subCol,
+                                                      sq.subWhere, sq.subWhereLogic);
+                        }
+                    }
+                    if (sc.type == milansql::CommandType::SELECT) {
+                        milansql::Table result;
+                        if (!sc.whereConds.empty()) {
+                            auto qr = engine.selectWhere(sc.tableName,
+                                sc.whereConds, sc.whereLogic);
+                            result = std::move(qr.table);
+                        } else {
+                            result = engine.selectAll(sc.tableName).clone();
+                        }
+                        if (!sc.selectColumns.empty())
+                            result = result.project(sc.selectColumns);
+                        if (!sc.orderByCols.empty())
+                            result.sortByMulti(sc.orderByCols);
+                        printTable(result, sc.limit, sc.limitOffset);
+                    } else if (sc.type == milansql::CommandType::UPDATE) {
+                        std::size_t n = 0;
+                        if (sc.whereColumn.empty()) {
+                            n = engine.updateAll(sc.tableName,
+                                sc.updateCols, sc.updateVals);
+                        } else {
+                            n = engine.updateWhere(sc.tableName,
+                                sc.updateCols, sc.updateVals,
+                                sc.whereColumn, sc.whereValue);
+                        }
+                        std::cout << "  " << n << " Zeile(n) aktualisiert.\n\n";
+                        persist();
+                    } else if (sc.type == milansql::CommandType::INSERT) {
+                        const auto& rows45 = sc.multiValues.empty()
+                            ? std::vector<std::vector<std::string>>{sc.values}
+                            : sc.multiValues;
+                        for (const auto& vals : rows45)
+                            engine.insertRow(sc.tableName, vals);
+                        persist();
+                        std::cout << "  " << rows45.size()
+                                  << " Zeile(n) eingefuegt.\n\n";
+                    } else if (sc.type == milansql::CommandType::DELETE) {
+                        std::size_t n = 0;
+                        if (sc.whereColumn.empty()) {
+                            n = engine.deleteAll(sc.tableName);
+                        } else {
+                            n = engine.deleteWhere(sc.tableName,
+                                sc.whereColumn, sc.whereValue);
+                        }
+                        std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
+                        persist();
+                    } else {
+                        std::cout << "  [EXECUTE] Unbekannter Befehl in Statement: '"
+                                  << boundSql << "'\n\n";
+                    }
+                } catch (const std::runtime_error& ex45) {
+                    std::cout << "  FEHLER: " << ex45.what() << "\n\n";
+                }
+                break;
+            }
+
+            // ── Phase 45: DEALLOCATE PREPARE ──────────────────────
+            case milansql::CommandType::DEALLOCATE_STMT: {
+                if (cmd.preparedName.empty()) {
+                    std::cout << "  Fehler: DEALLOCATE PREPARE name\n\n"; break;
+                }
+                engine.deallocateStmt(cmd.preparedName);
+                std::cout << "  Statement '" << cmd.preparedName << "' freigegeben.\n\n";
+                break;
+            }
+
+            // ── Phase 45: SHOW PREPARED ───────────────────────────
+            case milansql::CommandType::SHOW_PREPARED: {
+                auto stmts = engine.showPrepared();
+                if (stmts.empty()) {
+                    std::cout << "  Keine prepared statements.\n\n";
+                } else {
+                    for (const auto& s : stmts) {
+                        std::cout << "  " << s.name << " | "
+                                  << s.paramCount << " Parameter | "
+                                  << s.sql << "\n";
+                    }
+                    std::cout << "\n";
+                }
+                break;
+            }
+
             case milansql::CommandType::UNKNOWN:
             default:
                 std::cout << "  Unbekannter Befehl: '" << eingabe

@@ -201,6 +201,13 @@ struct ProcedureDef {
     std::string body; // raw SQL body between BEGIN and END
 };
 
+// ── Phase 45: Prepared Statement ─────────────────────────────
+struct PreparedStmt {
+    std::string name;
+    std::string sql;        // original SQL with ? placeholders
+    int paramCount = 0;     // number of ? placeholders
+};
+
 // ── Phase 36: EXPLAIN — Übergabe-Struct (alle engine.hpp-Typen verfügbar) ──
 struct ExplainRequest {
     std::string tableName;
@@ -2104,9 +2111,53 @@ public:
         tempTableNames_.clear();
     }
 
+    // ── Phase 45: Prepared Statements ────────────────────────────
+
+    void prepareStmt(const std::string& name, const std::string& sql) {
+        PreparedStmt stmt;
+        stmt.name = name;
+        stmt.sql = sql;
+        stmt.paramCount = (int)std::count(sql.begin(), sql.end(), '?');
+        preparedStmts_[name] = stmt;
+    }
+
+    void deallocateStmt(const std::string& name) {
+        preparedStmts_.erase(name);
+    }
+
+    std::vector<PreparedStmt> showPrepared() const {
+        std::vector<PreparedStmt> result;
+        for (const auto& [n, s] : preparedStmts_)
+            result.push_back(s);
+        return result;
+    }
+
+    // Returns SQL with ? replaced by args in order
+    std::string bindPrepared(const std::string& name,
+                              const std::vector<std::string>& args) const {
+        auto it = preparedStmts_.find(name);
+        if (it == preparedStmts_.end())
+            throw std::runtime_error("Prepared statement '" + name + "' nicht gefunden");
+        std::string sql = it->second.sql;
+        std::string result;
+        size_t argIdx = 0;
+        for (size_t i = 0; i < sql.size(); ++i) {
+            if (sql[i] == '?') {
+                if (argIdx < args.size())
+                    result += args[argIdx++];
+                else
+                    result += "NULL";
+            } else {
+                result += sql[i];
+            }
+        }
+        return result;
+    }
+
 private:
     std::map<std::string, TriggerDef>   triggers_;   // trigger name → def
     std::map<std::string, ProcedureDef> procedures_; // procedure name → def
+    std::map<std::string, PreparedStmt> preparedStmts_; // Phase 45: prepared stmts
 
     // ── Phase 43: Trigger Execution Engine ───────────────────────
 

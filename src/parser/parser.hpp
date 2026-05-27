@@ -48,6 +48,11 @@ enum class CommandType {
     DROP_PROCEDURE,
     SHOW_PROCEDURES,
     CALL_PROCEDURE,
+    // Phase 45: Prepared Statements
+    PREPARE_STMT,
+    EXECUTE_STMT,
+    DEALLOCATE_STMT,
+    SHOW_PREPARED,
     UNKNOWN
 };
 
@@ -169,6 +174,11 @@ struct ParsedCommand {
     std::vector<std::pair<std::string,std::string>> procedureParams; // {name, type}
     std::string procedureBody;
     std::vector<std::string> callArgs; // arguments for CALL
+
+    // Phase 45: Prepared Statement fields
+    std::string preparedName;          // for PREPARE, EXECUTE, DEALLOCATE
+    std::string preparedSql;           // for PREPARE: the SQL after AS
+    std::vector<std::string> execArgs; // for EXECUTE: the arguments
 };
 
 class Parser {
@@ -863,6 +873,9 @@ public:
             // Phase 44: SHOW PROCEDURES
             } else if (kw1 == "PROCEDURES") {
                 cmd.type = CommandType::SHOW_PROCEDURES;
+            // Phase 45: SHOW PREPARED
+            } else if (kw1 == "PREPARED") {
+                cmd.type = CommandType::SHOW_PREPARED;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -896,6 +909,73 @@ public:
         } else if (kw0 == "TRUNCATE" && kw1 == "TABLE") {
             cmd.type = CommandType::TRUNCATE;
             if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 45: PREPARE name AS sql ────────────────────────
+        } else if (kw0 == "PREPARE") {
+            cmd.type = CommandType::PREPARE_STMT;
+            // Find " AS " in input (case-insensitive) to split name from sql
+            std::string upperInput = input;
+            for (char& c : upperInput)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            size_t asPos = upperInput.find(" AS ");
+            if (asPos != std::string::npos) {
+                // name is between "PREPARE " and " AS "
+                cmd.preparedName = input.substr(8, asPos - 8);
+                while (!cmd.preparedName.empty() && cmd.preparedName.back() == ' ')
+                    cmd.preparedName.pop_back();
+                while (!cmd.preparedName.empty() && cmd.preparedName.front() == ' ')
+                    cmd.preparedName = cmd.preparedName.substr(1);
+                // SQL is everything after " AS "
+                cmd.preparedSql = input.substr(asPos + 4);
+                while (!cmd.preparedSql.empty() && cmd.preparedSql.front() == ' ')
+                    cmd.preparedSql = cmd.preparedSql.substr(1);
+            } else {
+                // fallback: use token[1] as name, no sql
+                if (tokens.size() >= 2) cmd.preparedName = tokens[1];
+            }
+
+        // ── Phase 45: EXECUTE name(args) ─────────────────────────
+        } else if (kw0 == "EXECUTE") {
+            cmd.type = CommandType::EXECUTE_STMT;
+            // Parse: EXECUTE name(args) — use raw input
+            // Skip "EXECUTE " prefix (8 chars) but use find for safety
+            size_t s = 0;
+            while (s < input.size() && (input[s] == ' ' || input[s] == '\t')) ++s;
+            s += 7; // length of "EXECUTE"
+            while (s < input.size() && (input[s] == ' ' || input[s] == '\t')) ++s;
+            std::string rest = input.substr(s);
+            size_t parenP = rest.find('(');
+            if (parenP == std::string::npos) {
+                cmd.preparedName = rest;
+                while (!cmd.preparedName.empty() && cmd.preparedName.back() == ' ')
+                    cmd.preparedName.pop_back();
+            } else {
+                cmd.preparedName = rest.substr(0, parenP);
+                while (!cmd.preparedName.empty() && cmd.preparedName.back() == ' ')
+                    cmd.preparedName.pop_back();
+                size_t closeP = rest.rfind(')');
+                std::string argsStr = rest.substr(parenP + 1,
+                    closeP != std::string::npos ? closeP - parenP - 1 : std::string::npos);
+                // Split args by comma
+                std::string cur;
+                for (char c : argsStr) {
+                    if (c == ',') {
+                        while (!cur.empty() && cur.front() == ' ') cur = cur.substr(1);
+                        while (!cur.empty() && cur.back() == ' ') cur.pop_back();
+                        if (!cur.empty()) cmd.execArgs.push_back(cur);
+                        cur = "";
+                    } else cur += c;
+                }
+                while (!cur.empty() && cur.front() == ' ') cur = cur.substr(1);
+                while (!cur.empty() && cur.back() == ' ') cur.pop_back();
+                if (!cur.empty()) cmd.execArgs.push_back(cur);
+            }
+
+        // ── Phase 45: DEALLOCATE PREPARE name ────────────────────
+        } else if (kw0 == "DEALLOCATE" && kw1 == "PREPARE") {
+            cmd.type = CommandType::DEALLOCATE_STMT;
+            if (tokens.size() >= 3) cmd.preparedName = tokens[2];
             else cmd.type = CommandType::UNKNOWN;
 
         } else if (kw0 == "DESCRIBE") {

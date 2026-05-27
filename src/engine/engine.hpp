@@ -1118,7 +1118,8 @@ public:
             };
             std::string resultSide = jc.onLeft;
             std::string rightSide  = jc.onRight;
-            if (tblOf(jc.onLeft) == jc.table)
+            // Use tblNamesMatch to handle bare vs schema-qualified names
+            if (tblNamesMatch(tblOf(jc.onLeft), jc.table))
                 std::swap(resultSide, rightSide);
 
             size_t leftCI  = findQualColIdx(current, resultSide);
@@ -3432,6 +3433,22 @@ private:
     }
 
     // Exakter Match, dann Suffix-Match. Uses rfind for schema.table.col → col.
+    // Returns true if tbl1 and tbl2 refer to the same table
+    // (exact match OR one is a schema-qualified version of the other,
+    //  e.g. "users" matches "public.users")
+    static bool tblNamesMatch(const std::string& a, const std::string& b) {
+        if (a == b) return true;
+        // a is bare, b is schema-qualified: b ends with "."+a
+        if (b.size() > a.size() + 1 &&
+            b[b.size() - a.size() - 1] == '.' &&
+            b.substr(b.size() - a.size()) == a) return true;
+        // b is bare, a is schema-qualified: a ends with "."+b
+        if (a.size() > b.size() + 1 &&
+            a[a.size() - b.size() - 1] == '.' &&
+            a.substr(a.size() - b.size()) == b) return true;
+        return false;
+    }
+
     static size_t findQualColIdx(const Table& t, const std::string& qual) {
         for (size_t i = 0; i < t.columns().size(); ++i)
             if (t.columns()[i].name == qual) return i;
@@ -3442,15 +3459,15 @@ private:
         std::string tblPrefix = dot != std::string::npos ? qual.substr(0, dot) : "";
         for (size_t i = 0; i < t.columns().size(); ++i) {
             const auto& cn = t.columns()[i].name;
-            // cn is like "shop.kunden.id" in qualified result table
+            // cn is like "public.users.id" in qualified result table
             auto p = cn.rfind('.');
             std::string suf = p != std::string::npos ? cn.substr(p + 1) : cn;
             if (suf != raw) continue;
             // If tblPrefix specified, check that the table part matches
+            // Use tblNamesMatch to handle bare vs schema-qualified names
             if (!tblPrefix.empty()) {
                 std::string cnTbl = p != std::string::npos ? cn.substr(0, p) : "";
-                // cnTbl is like "shop.kunden"; tblPrefix is like "shop.kunden"
-                if (!cnTbl.empty() && cnTbl != tblPrefix) continue;
+                if (!cnTbl.empty() && !tblNamesMatch(cnTbl, tblPrefix)) continue;
             }
             return i;
         }
@@ -3970,7 +3987,8 @@ private:
         for (auto& [childName, childTbl] : tables_) {
             if (childName == parentName) continue;
             for (const auto& fk : childTbl.getForeignKeys()) {
-                if (fk.refTable != parentName) continue;
+                // Use tblNamesMatch to handle bare vs schema-qualified names
+                if (!tblNamesMatch(fk.refTable, parentName)) continue;
                 int refCI = parent.colOf(fk.refCol);
                 if (refCI < 0 ||
                     static_cast<size_t>(refCI) >= parentRow.values.size()) continue;

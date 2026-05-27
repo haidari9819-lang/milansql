@@ -712,42 +712,45 @@ public:
 
     void createTable(const std::string& name, std::vector<Column> cols,
                      std::vector<ForeignKeyDef> fks = {}) {
-        if (tables_.count(name))
-            throw std::runtime_error("Tabelle '" + name + "' existiert bereits.");
-        tables_.emplace(name, Table(name, std::move(cols)));
+        auto key = resolveTableName(name);
+        if (tables_.count(key))
+            throw std::runtime_error("Tabelle '" + key + "' existiert bereits.");
+        tables_.emplace(key, Table(key, std::move(cols)));
         for (const auto& fk : fks)
-            tables_.at(name).addForeignKey(fk);
+            tables_.at(key).addForeignKey(fk);
     }
 
     void createIndex(const std::string& tbl,
                      const std::vector<std::string>& cols,
                      const std::string& idxName) {
-        getTable(tbl).createIndex(cols, idxName);
+        getTable(resolveTableName(tbl)).createIndex(cols, idxName);
     }
 
     void dropIndex(const std::string& tbl, const std::string& idxName) {
-        getTable(tbl).dropIndex(idxName);
+        getTable(resolveTableName(tbl)).dropIndex(idxName);
     }
 
     void dropTable(const std::string& name) {
-        if (!tables_.erase(name))
-            throw std::runtime_error("Tabelle '" + name + "' nicht gefunden.");
+        auto key = resolveTableName(name);
+        if (!tables_.erase(key))
+            throw std::runtime_error("Tabelle '" + key + "' nicht gefunden.");
     }
 
     // AUTO_INCREMENT-Zähler setzen (wird beim Laden aus Datei aufgerufen)
     void setTableAutoInc(const std::string& tbl,
                          const std::string& col, uint64_t val) {
-        getTable(tbl).setAutoInc(col, val);
+        getTable(resolveTableName(tbl)).setAutoInc(col, val);
     }
 
     // FOREIGN KEY hinzufügen (wird beim Laden aus Datei aufgerufen)
     void addForeignKey(const std::string& tbl, const ForeignKeyDef& fk) {
-        getTable(tbl).addForeignKey(fk);
+        getTable(resolveTableName(tbl)).addForeignKey(fk);
     }
 
     // ── DML ───────────────────────────────────────────────────
 
-    void insertRow(const std::string& tbl, std::vector<std::string> vals) {
+    void insertRow(const std::string& tblRaw, std::vector<std::string> vals) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
         Table& t = getTable(tbl);       // wirft wenn Tabelle fehlt
         applyDefaults(t, vals);         // fehlende Werte mit DEFAULT/NULL füllen
@@ -797,7 +800,8 @@ public:
 
     // INSERT OR REPLACE: löscht kollidierte Zeilen, fügt neue ein.
     // Gibt true zurück wenn mind. eine Zeile ersetzt wurde, false bei normalem Insert.
-    bool insertOrReplace(const std::string& tbl, std::vector<std::string> vals) {
+    bool insertOrReplace(const std::string& tblRaw, std::vector<std::string> vals) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
         if (inTransaction_)
             throw std::runtime_error("INSERT OR REPLACE nicht innerhalb einer Transaktion.");
@@ -815,7 +819,8 @@ public:
 
     // INSERT OR IGNORE: ignoriert den Insert bei PK/UNIQUE-Konflikt (kein Fehler).
     // Gibt true zurück wenn eingefügt, false wenn ignoriert.
-    bool insertOrIgnore(const std::string& tbl, std::vector<std::string> vals) {
+    bool insertOrIgnore(const std::string& tblRaw, std::vector<std::string> vals) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
         if (inTransaction_)
             throw std::runtime_error("INSERT OR IGNORE nicht innerhalb einer Transaktion.");
@@ -835,13 +840,14 @@ public:
     };
 
     const Table& selectAll(const std::string& tbl) const {
-        return getTable(tbl);
+        return getTable(resolveTableName(tbl));
     }
 
     // SELECT mit WHERE (AND / OR, alle Operatoren inkl. LIKE)
-    WhereResult selectWhere(const std::string& tblName,
+    WhereResult selectWhere(const std::string& tblNameRaw,
                             const std::vector<WhereCondition>& conds,
                             const std::string& logic = "AND") const {
+        auto tblName = resolveTableName(tblNameRaw);
         const Table& src = getTable(tblName);
         Table result(tblName, src.columns());
         bool usedIndex = false;
@@ -888,7 +894,7 @@ public:
 
     // COUNT(*) [mit optionalem WHERE]
     std::size_t countRows(const std::string& tbl) const {
-        return getTable(tbl).rowCount();
+        return getTable(resolveTableName(tbl)).rowCount();
     }
 
     std::size_t countWhere(const std::string& tblName,
@@ -899,11 +905,12 @@ public:
     }
 
     // Aggregatfunktion ohne GROUP BY
-    std::string computeAggregate(const std::string& tblName,
+    std::string computeAggregate(const std::string& tblNameRaw,
                                   const std::string& func,
                                   const std::string& col,
                                   const std::vector<WhereCondition>& conds,
                                   const std::string& logic = "AND") const {
+        auto tblName = resolveTableName(tblNameRaw);
         const Table& src = getTable(tblName);
         std::size_t ci = colIdx(src, col);
         std::vector<double> nums;
@@ -933,7 +940,7 @@ public:
     // Führt eine GROUP BY-Abfrage aus.
     // Reihenfolge: WHERE → GROUP → SELECT/AGG → HAVING
     // ORDER BY und LIMIT werden danach in main.cpp angewendet.
-    Table groupBy(const std::string& tblName,
+    Table groupBy(const std::string& tblNameRaw,
                   const std::vector<WhereCondition>& whereConds,
                   const std::string& whereLogic,
                   const std::vector<std::string>& groupCols,
@@ -941,6 +948,7 @@ public:
                   const std::vector<HavingCondition>& havingConds,
                   const std::string& havingLogic) const {
 
+        auto tblName = resolveTableName(tblNameRaw);
         const Table& src = getTable(tblName);
 
         if (groupCols.empty())
@@ -1017,10 +1025,12 @@ public:
     // Nested-Loop INNER JOIN zweier Tabellen.
     // Ergebnis-Spalten heißen "tabellenname.spaltenname".
     // onT1Col / onT2Col: einfacher Spaltenname (ohne Tabellen-Prefix).
-    Table innerJoin(const std::string& t1Name, const std::string& t2Name,
+    Table innerJoin(const std::string& t1NameRaw, const std::string& t2NameRaw,
                     const std::string& onT1Col, const std::string& onT2Col,
                     const std::vector<WhereCondition>& whereConds,
                     const std::string& whereLogic) const {
+        auto t1Name = resolveTableName(t1NameRaw);
+        auto t2Name = resolveTableName(t2NameRaw);
         const Table& t1 = getTable(t1Name);
         const Table& t2 = getTable(t2Name);
 
@@ -1065,10 +1075,16 @@ public:
     // Führt eine Kette von JOINs aus (INNER oder LEFT).
     // Ergebnis-Spalten: "tabelle.spalte" (qualifiziert).
     // WHERE wird auf das Gesamtergebnis angewendet.
-    Table executeJoins(const std::string& baseName,
-                       const std::vector<JoinClause>& joins,
+    Table executeJoins(const std::string& baseNameRaw,
+                       const std::vector<JoinClause>& joinsRaw,
                        const std::vector<WhereCondition>& whereConds,
                        const std::string& whereLogic) const {
+
+        auto baseName = resolveTableName(baseNameRaw);
+        // Resolve table names in join clauses
+        std::vector<JoinClause> joins = joinsRaw;
+        for (auto& jc : joins)
+            jc.table = resolveTableName(jc.table);
 
         const Table& base = getTable(baseName);
 
@@ -1095,8 +1111,9 @@ public:
 
             // ON-Seiten zuordnen: eine Seite gehört zur rechten Tabelle, die andere
             // zum bisherigen Ergebnis. Seiten ggf. tauschen.
+            // For schema-qualified refs like "shop.kunden.id", table = "shop.kunden"
             auto tblOf = [](const std::string& s) -> std::string {
-                auto p = s.find('.');
+                auto p = s.rfind('.');  // use LAST dot to separate table.col
                 return p != std::string::npos ? s.substr(0, p) : "";
             };
             std::string resultSide = jc.onLeft;
@@ -1236,11 +1253,12 @@ public:
     // ── Phase 16: ALTER TABLE ────────────────────────────────
 
     // op: "ADD", "DROP", "RENAME"
-    void alterTable(const std::string& tblName,
+    void alterTable(const std::string& tblNameRaw,
                     const std::string& op,
                     const std::string& colName,
                     const std::string& colType,    // nur für ADD
                     const std::string& newName) {  // nur für RENAME
+        auto tblName = resolveTableName(tblNameRaw);
         if (inTransaction_) {
             BufferedOp bufOp;
             bufOp.opType       = BufferedOp::Type::ALTER;
@@ -1272,10 +1290,11 @@ public:
     // Führt "SELECT col FROM tbl [WHERE ...]" aus und gibt
     // alle Werte der ersten Ergebnisspalte als Liste zurück.
     std::vector<std::string> subqueryValues(
-            const std::string& tblName,
+            const std::string& tblNameRaw,
             const std::string& col,
             const std::vector<WhereCondition>& conds,
             const std::string& logic) const {
+        auto tblName = resolveTableName(tblNameRaw);
         const Table& src = getTable(tblName);
         size_t ci = colIdx(src, col);
         std::vector<std::string> result;
@@ -1289,9 +1308,10 @@ public:
 
     // ── Mutation ──────────────────────────────────────────────
 
-    std::size_t updateWhere(const std::string& tbl,
+    std::size_t updateWhere(const std::string& tblRaw,
                             const std::string& setCol, const std::string& setVal,
                             const std::string& wCol,   const std::string& wVal) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
@@ -1308,8 +1328,9 @@ public:
         return t.updateWhere(colIdx(t, setCol), setVal, colIdx(t, wCol), wVal);
     }
 
-    std::size_t updateAll(const std::string& tbl,
+    std::size_t updateAll(const std::string& tblRaw,
                           const std::string& setCol, const std::string& setVal) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
@@ -1325,8 +1346,9 @@ public:
         return t.updateAll(colIdx(t, setCol), setVal);
     }
 
-    std::size_t deleteWhere(const std::string& tbl,
+    std::size_t deleteWhere(const std::string& tblRaw,
                             const std::string& wCol, const std::string& wVal) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
         // Phase 21: CASCADE / SET NULL / RESTRICT für betroffene Zeilen
         {
@@ -1388,10 +1410,11 @@ public:
     }
 
     // Phase 22: Multi-Column UPDATE WHERE
-    std::size_t updateWhere(const std::string& tbl,
+    std::size_t updateWhere(const std::string& tblRaw,
                             const std::vector<std::string>& setCols,
                             const std::vector<std::string>& setVals,
                             const std::string& wCol, const std::string& wVal) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         // Phase 44: Check if any setVal contains an expression (col op num)
         // If so, do per-row evaluation
@@ -1485,9 +1508,10 @@ public:
     }
 
     // Phase 22: Multi-Column UPDATE ALL
-    std::size_t updateAll(const std::string& tbl,
+    std::size_t updateAll(const std::string& tblRaw,
                           const std::vector<std::string>& setCols,
                           const std::vector<std::string>& setVals) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
         if (inTransaction_) {
@@ -1502,7 +1526,8 @@ public:
         return t.updateAll(setCIs, setVals);
     }
 
-    std::size_t deleteAll(const std::string& tbl) {
+    std::size_t deleteAll(const std::string& tblRaw) {
+        auto tbl = resolveTableName(tblRaw);
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
         // Phase 21: CASCADE / SET NULL / RESTRICT für alle Zeilen
         {
@@ -1526,7 +1551,8 @@ public:
     // Löscht alle Zeilen, behält Schema + Constraints.
     // AUTO_INCREMENT Counter wird auf 1 zurückgesetzt.
     // Keine FK-Prüfung (wie MySQL TRUNCATE — DDL-Semantik).
-    void truncateTable(const std::string& tbl) {
+    void truncateTable(const std::string& tblRaw) {
+        auto tbl = resolveTableName(tblRaw);
         Table& t = getTable(tbl);
         t.deleteAll();   // direkte Table-Methode, ohne FK-Check
         for (const auto& col : t.columns())
@@ -1580,10 +1606,24 @@ public:
     // ── Metadaten ─────────────────────────────────────────────
 
     std::vector<IndexInfo> getIndexes(const std::string& tbl) const {
-        return getTable(tbl).getIndexes();
+        return getTable(resolveTableName(tbl)).getIndexes();
     }
 
     std::vector<std::string> getAllTableNames() const {
+        // Phase 51: return tables in current schema (strip prefix) + bare-name tables
+        std::vector<std::string> names;
+        std::string prefix = currentSchema_ + ".";
+        for (const auto& [n, _] : tables_) {
+            if (n.size() > prefix.size() && n.substr(0, prefix.size()) == prefix)
+                names.push_back(n.substr(prefix.size()));
+            else if (n.find('.') == std::string::npos)
+                names.push_back(n);  // backward compat: bare names
+        }
+        return names;
+    }
+
+    // Returns full internal names (schema.table) for all tables
+    std::vector<std::string> getAllTableNamesInternal() const {
         std::vector<std::string> names;
         for (const auto& [n, _] : tables_) names.push_back(n);
         return names;
@@ -1648,8 +1688,9 @@ public:
         }
     }
 
-    void createFulltextIndex(const std::string& idxName, const std::string& tableName,
+    void createFulltextIndex(const std::string& idxName, const std::string& tableNameRaw,
                               const std::vector<std::string>& cols) {
+        auto tableName = resolveTableName(tableNameRaw);
         auto it = tables_.find(tableName);
         if (it == tables_.end())
             throw std::runtime_error("Tabelle '" + tableName + "' nicht gefunden");
@@ -1669,9 +1710,10 @@ public:
 
     // Returns {rowIndex, score} sorted by score descending
     std::vector<std::pair<size_t, double>> searchFulltext(
-            const std::string& tableName,
+            const std::string& tableNameRaw,
             const std::vector<std::string>& searchCols,
             const std::string& query) const {
+        auto tableName = resolveTableName(tableNameRaw);
 
         // Find the fulltext index for this table+cols combination
         FullTextIndex const* idx = nullptr;
@@ -1746,7 +1788,8 @@ public:
     }
 
     // Returns fulltext indexes for a given table (for SHOW INDEXES)
-    std::vector<IndexInfo> getFulltextIndexes(const std::string& tableName) const {
+    std::vector<IndexInfo> getFulltextIndexes(const std::string& tableNameRaw) const {
+        auto tableName = resolveTableName(tableNameRaw);
         std::vector<IndexInfo> result;
         for (const auto& [n, fi] : fulltextIndices_) {
             if (fi.tableName == tableName) {
@@ -1761,7 +1804,9 @@ public:
         return result;
     }
 
-    bool tableExists(const std::string& n) const { return tables_.count(n) > 0; }
+    bool tableExists(const std::string& n) const {
+        return tables_.count(resolveTableName(n)) > 0;
+    }
 
     // ── Phase 31/32: CASE/Func — Projektion mit Ausdrücken ──────
     Table projectWithItems(const Table& src,
@@ -2589,7 +2634,59 @@ public:
         return result;
     }
 
+    // ── Phase 51: Schema Management ──────────────────────────────
+
+    void createSchema(const std::string& name) { schemas_.insert(name); }
+
+    void loadSchema(const std::string& name) { schemas_.insert(name); }
+
+    void dropSchema(const std::string& name) {
+        if (name == "public")
+            throw std::runtime_error("Schema 'public' kann nicht geloescht werden");
+        std::vector<std::string> toRemove;
+        for (const auto& [tname, _] : tables_)
+            if (tname.size() > name.size() + 1 &&
+                tname.substr(0, name.size()) == name && tname[name.size()] == '.')
+                toRemove.push_back(tname);
+        for (const auto& t : toRemove) tables_.erase(t);
+        schemas_.erase(name);
+        if (currentSchema_ == name) currentSchema_ = "public";
+    }
+
+    std::vector<std::string> showSchemas() const {
+        return {schemas_.begin(), schemas_.end()};
+    }
+
+    void useSchema(const std::string& name) {
+        schemas_.insert(name);
+        currentSchema_ = name;
+    }
+
+    std::string getCurrentSchema() const { return currentSchema_; }
+
+    std::vector<std::string> showTablesInSchema(const std::string& schema) const {
+        std::vector<std::string> result;
+        std::string prefix = schema + ".";
+        for (const auto& [tname, _] : tables_)
+            if (tname.size() > prefix.size() &&
+                tname.substr(0, prefix.size()) == prefix)
+                result.push_back(tname.substr(prefix.size()));
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
+    // Resolves a table name: if it already contains '.', return as-is.
+    // Backward compat: if bare name exists in tables_, return it as-is.
+    // Otherwise prepend currentSchema_ + "."
+    std::string resolveTableName(const std::string& name) const {
+        if (name.find('.') != std::string::npos) return name;
+        if (tables_.count(name)) return name;
+        return currentSchema_ + "." + name;
+    }
+
 private:
+    std::set<std::string>               schemas_ = {"public"};  // Phase 51: schema registry
+    std::string                         currentSchema_ = "public"; // Phase 51: active schema
     std::map<std::string, FullTextIndex> fulltextIndices_; // Phase 49: index name → fulltext index
     std::map<std::string, TriggerDef>   triggers_;   // trigger name → def
     std::map<std::string, ProcedureDef> procedures_; // procedure name → def
@@ -2921,8 +3018,9 @@ private:
         }
 
         // Insert directly into table (bypass trigger firing)
-        if (!tables_.count(tblName)) return;
-        Table& tbl = tables_.at(tblName);
+        auto resolvedTbl = resolveTableName(tblName);
+        if (!tables_.count(resolvedTbl)) return;
+        Table& tbl = tables_.at(resolvedTbl);
         applyDefaults(tbl, vals);
         applyAutoInc(tbl, vals);
         tbl.insert(Row(vals));
@@ -2938,8 +3036,9 @@ private:
             const std::vector<std::string>& oldRow,
             std::string& signalMsg)
     {
-        if (!tables_.count(tableName)) return true;
-        const std::vector<Column>& cols = tables_.at(tableName).columns();
+        auto resolvedTbl = resolveTableName(tableName);
+        if (!tables_.count(resolvedTbl)) return true;
+        const std::vector<Column>& cols = tables_.at(resolvedTbl).columns();
 
         for (auto& [trgName, trg] : triggers_) {
             if (trgUpper(trg.timing)   != trgUpper(timing))   continue;
@@ -3332,26 +3431,37 @@ private:
         return result;
     }
 
-    // Exakter Match, dann Suffix-Match.
+    // Exakter Match, dann Suffix-Match. Uses rfind for schema.table.col → col.
     static size_t findQualColIdx(const Table& t, const std::string& qual) {
         for (size_t i = 0; i < t.columns().size(); ++i)
             if (t.columns()[i].name == qual) return i;
-        auto dot = qual.find('.');
+        // For schema.table.col style references, use the last component as raw col name
+        auto dot = qual.rfind('.');
         std::string raw = dot != std::string::npos ? qual.substr(dot + 1) : qual;
+        // Also get the table prefix (everything before last dot) for matching
+        std::string tblPrefix = dot != std::string::npos ? qual.substr(0, dot) : "";
         for (size_t i = 0; i < t.columns().size(); ++i) {
             const auto& cn = t.columns()[i].name;
-            auto p = cn.find('.');
+            // cn is like "shop.kunden.id" in qualified result table
+            auto p = cn.rfind('.');
             std::string suf = p != std::string::npos ? cn.substr(p + 1) : cn;
-            if (suf == raw) return i;
+            if (suf != raw) continue;
+            // If tblPrefix specified, check that the table part matches
+            if (!tblPrefix.empty()) {
+                std::string cnTbl = p != std::string::npos ? cn.substr(0, p) : "";
+                // cnTbl is like "shop.kunden"; tblPrefix is like "shop.kunden"
+                if (!cnTbl.empty() && cnTbl != tblPrefix) continue;
+            }
+            return i;
         }
         throw std::runtime_error(
             "JOIN ON: Spalte '" + qual + "' nicht im Ergebnis gefunden.");
     }
 
     // Spalte in roher Tabelle suchen (unqualifizierte Namen).
-    // Entfernt Tabellen-Prefix falls vorhanden.
+    // Entfernt Tabellen-Prefix falls vorhanden. Uses rfind for schema.table.col support.
     static size_t findRawColIdx(const Table& t, const std::string& qual) {
-        auto dot = qual.find('.');
+        auto dot = qual.rfind('.');  // use LAST dot for schema.table.col → col
         const std::string raw = dot != std::string::npos ? qual.substr(dot + 1) : qual;
         for (size_t i = 0; i < t.columns().size(); ++i)
             if (t.columns()[i].name == raw) return i;
@@ -3363,8 +3473,9 @@ private:
     std::string evalScalarSub(const ScalarSubSpec& spec,
                               const std::vector<Column>& outerCols,
                               const Row& outerRow) const {
-        if (!tables_.count(spec.subTable)) return "NULL";
-        const Table& sub = tables_.at(spec.subTable);
+        auto resolvedSub = resolveTableName(spec.subTable);
+        if (!tables_.count(resolvedSub)) return "NULL";
+        const Table& sub = tables_.at(resolvedSub);
 
         auto findCI = [](const Table& t, const std::string& ref) -> int {
             for (size_t i = 0; i < t.columns().size(); ++i)
@@ -3829,7 +3940,8 @@ private:
             if (val == "NULL") continue;  // NULL → kein Parent nötig
 
             // Eltern-Tabelle suchen
-            auto it = tables_.find(fk.refTable);
+            auto resolvedRef = resolveTableName(fk.refTable);
+            auto it = tables_.find(resolvedRef);
             if (it == tables_.end())
                 throw std::runtime_error(
                     "FOREIGN KEY: Elterntabelle '" + fk.refTable + "' nicht gefunden.");
@@ -3994,8 +4106,8 @@ public:
             bool useIndex = false;
             std::string idxName = "-";
             if (!req.whereConds.empty() && req.whereConds[0].op == "=" &&
-                tables_.count(req.tableName)) {
-                const Table& t = tables_.at(req.tableName);
+                tables_.count(resolveTableName(req.tableName))) {
+                const Table& t = tables_.at(resolveTableName(req.tableName));
                 if (t.hasIndex(req.whereConds[0].col)) {
                     useIndex = true;
                     // Index-Namen heraussuchen (führende Spalte)

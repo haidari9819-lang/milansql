@@ -84,7 +84,7 @@ private:
         o << "  \"version\": \"1.0\",\n";
         o << "  \"tables\": {\n";
 
-        const auto names = engine.getAllTableNames();
+        const auto names = engine.getAllTableNamesInternal();
         for (std::size_t ti = 0; ti < names.size(); ++ti) {
             const Table& tbl = engine.selectAll(names[ti]);
 
@@ -477,7 +477,7 @@ private:
     // SERIALIZER (Engine → Binär-Puffer)
     // ============================================================
     static void serializeData(std::ostream& o, const Engine& engine) {
-        const auto names = engine.getAllTableNames();
+        const auto names = engine.getAllTableNamesInternal();
         writeU16(o, static_cast<uint16_t>(names.size()));
 
         for (const auto& tname : names) {

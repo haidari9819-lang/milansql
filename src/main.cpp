@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  Neue Datenbank gestartet.\n\n";
         } else {
             std::size_t rowCount = 0;
-            for (const auto& t : engine.getAllTableNames())
+            for (const auto& t : engine.getAllTableNamesInternal())
                 rowCount += engine.selectAll(t).rowCount();
             std::cout << "  Binary format v" << milansql::MilanBinaryStorage::FORMAT_VERSION
                       << " geladen \u2014 " << tableCount << " Tabelle(n), "
@@ -90,6 +90,17 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& ex) {
         std::cout << "  WARNUNG: Laden fehlgeschlagen: " << ex.what()
                   << "\n  Starte mit leerer Datenbank.\n\n";
+    }
+
+    // Phase 51: Load schemas from separate file
+    {
+        std::ifstream sf("database.schemas");
+        if (sf) {
+            std::string line;
+            while (std::getline(sf, line)) {
+                if (!line.empty()) engine.loadSchema(line);
+            }
+        }
     }
 
     // Phase 46: Load users from separate file

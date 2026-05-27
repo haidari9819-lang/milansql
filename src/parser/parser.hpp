@@ -65,6 +65,12 @@ enum class CommandType {
     // Phase 49: Full-Text Search
     CREATE_FULLTEXT_INDEX,
     DROP_FULLTEXT_INDEX,
+    // Phase 51: Schemas / Namespaces
+    CREATE_SCHEMA,
+    DROP_SCHEMA,
+    SHOW_SCHEMAS,
+    USE_SCHEMA,
+    SHOW_TABLES_IN,
     UNKNOWN
 };
 
@@ -202,6 +208,9 @@ struct ParsedCommand {
     std::string grantTable;         // for GRANT/REVOKE
     std::vector<std::string> grantPrivs; // for GRANT/REVOKE (list of privileges)
     std::string grantTargetUser;    // for GRANT TO / REVOKE FROM / SHOW GRANTS FOR
+
+    // Phase 51: Schema fields
+    std::string schemaName;         // for schema commands (CREATE/DROP/USE/SHOW TABLES IN)
 };
 
 class Parser {
@@ -296,6 +305,50 @@ public:
                 if (k == "BEGIN")    { cmd.type = CommandType::BEGIN;    return cmd; }
                 if (k == "COMMIT")   { cmd.type = CommandType::COMMIT;   return cmd; }
                 if (k == "ROLLBACK") { cmd.type = CommandType::ROLLBACK; return cmd; }
+            }
+        }
+
+        // ── Phase 51: Schema-Befehle ─────────────────────────────
+        {
+            auto st = tokenize(input);
+            if (!st.empty()) {
+                std::string k0 = toUpper(st[0]);
+                std::string k1 = st.size() > 1 ? toUpper(st[1]) : "";
+                std::string k2 = st.size() > 2 ? toUpper(st[2]) : "";
+                std::string k3 = st.size() > 3 ? toUpper(st[3]) : "";
+                // CREATE SCHEMA name
+                if (k0 == "CREATE" && k1 == "SCHEMA") {
+                    cmd.type = CommandType::CREATE_SCHEMA;
+                    if (st.size() >= 3) cmd.schemaName = st[2];
+                    else cmd.type = CommandType::UNKNOWN;
+                    return cmd;
+                }
+                // DROP SCHEMA name
+                if (k0 == "DROP" && k1 == "SCHEMA") {
+                    cmd.type = CommandType::DROP_SCHEMA;
+                    if (st.size() >= 3) cmd.schemaName = st[2];
+                    else cmd.type = CommandType::UNKNOWN;
+                    return cmd;
+                }
+                // SHOW SCHEMAS
+                if (k0 == "SHOW" && k1 == "SCHEMAS") {
+                    cmd.type = CommandType::SHOW_SCHEMAS;
+                    return cmd;
+                }
+                // USE schemaname
+                if (k0 == "USE") {
+                    cmd.type = CommandType::USE_SCHEMA;
+                    if (st.size() >= 2) cmd.schemaName = st[1];
+                    else cmd.type = CommandType::UNKNOWN;
+                    return cmd;
+                }
+                // SHOW TABLES IN schemaname
+                if (k0 == "SHOW" && k1 == "TABLES" && k2 == "IN") {
+                    cmd.type = CommandType::SHOW_TABLES_IN;
+                    if (st.size() >= 4) cmd.schemaName = st[3];
+                    else cmd.type = CommandType::UNKNOWN;
+                    return cmd;
+                }
             }
         }
 
@@ -1118,6 +1171,24 @@ public:
     }
 
 private:
+    // ── Phase 51: Qualified name helper ──────────────────────
+    // Reads a possibly schema-qualified name from tokenizeFull tokens.
+    // If tokens[i] is "name" and tokens[i+1] is "." and tokens[i+2] is "table",
+    // collapses them into "name.table" and advances i by 3.
+    // Otherwise just returns tokens[i] and advances i by 1.
+    static std::string parseQualifiedName(const std::vector<std::string>& toks,
+                                          size_t& i) {
+        if (i >= toks.size()) return "";
+        std::string name = toks[i++];
+        // Check for dot-qualified suffix (schema.table or table.col pattern)
+        if (i < toks.size() && toks[i] == "." && i + 1 < toks.size()) {
+            // Only collapse if the next part looks like an identifier (not a keyword/operator)
+            ++i; // skip "."
+            name += "." + toks[i++];
+        }
+        return name;
+    }
+
     // ── Phase 22: Multi-Column SET-Zuweisung (UPDATE) ────────
     // Parst beliebig viele "col=val" Paare (Komma-getrennt) bis end.
     // Setzt updateCols/updateVals und backward-compat setColumn/setValue.

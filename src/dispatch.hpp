@@ -1560,6 +1560,75 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 51: Schema Management ─────────────────────────────
+
+    case milansql::CommandType::CREATE_SCHEMA: {
+        if (cmd.schemaName.empty()) {
+            std::cout << "  Fehler: CREATE SCHEMA name\n"; break;
+        }
+        engine.createSchema(cmd.schemaName);
+        // Save schemas to file
+        {
+            std::ofstream sf("database.schemas");
+            if (sf) for (const auto& s : engine.showSchemas()) sf << s << "\n";
+        }
+        std::cout << "  Schema '" << cmd.schemaName << "' erstellt.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DROP_SCHEMA: {
+        if (cmd.schemaName.empty()) {
+            std::cout << "  Fehler: DROP SCHEMA name\n"; break;
+        }
+        try {
+            engine.dropSchema(cmd.schemaName);
+            persistFn();  // Save tables (some may have been deleted)
+            {
+                std::ofstream sf("database.schemas");
+                if (sf) for (const auto& s : engine.showSchemas()) sf << s << "\n";
+            }
+            std::cout << "  Schema '" << cmd.schemaName << "' geloescht.\n\n";
+        } catch (const std::exception& ex) {
+            std::cout << "  FEHLER: " << ex.what() << "\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SCHEMAS: {
+        auto schemas = engine.showSchemas();
+        std::cout << "  Schemas:\n";
+        for (const auto& s : schemas)
+            std::cout << "    " << s
+                      << (s == engine.getCurrentSchema() ? "  (aktiv)" : "") << "\n";
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::USE_SCHEMA: {
+        if (cmd.schemaName.empty()) {
+            std::cout << "  Fehler: USE schemaname\n"; break;
+        }
+        engine.useSchema(cmd.schemaName);
+        {
+            std::ofstream sf("database.schemas");
+            if (sf) for (const auto& s : engine.showSchemas()) sf << s << "\n";
+        }
+        std::cout << "  Schema '" << cmd.schemaName << "' aktiviert.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TABLES_IN: {
+        if (cmd.schemaName.empty()) {
+            std::cout << "  Fehler: SHOW TABLES IN schemaname\n"; break;
+        }
+        auto tables = engine.showTablesInSchema(cmd.schemaName);
+        std::cout << "  Tabellen in Schema '" << cmd.schemaName << "':\n";
+        if (tables.empty()) std::cout << "    (keine)\n";
+        for (const auto& t : tables) std::cout << "    " << t << "\n";
+        std::cout << "\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

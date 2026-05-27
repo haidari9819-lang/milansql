@@ -1,5 +1,7 @@
 # MilanSQL
 
+![Version](https://img.shields.io/badge/version-v0.9.0-blue)
+
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
 Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 

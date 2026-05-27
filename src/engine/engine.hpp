@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cmath>
 #include <sstream>
+#include <iomanip>
 
 #include "btree.hpp"
 
@@ -126,6 +127,11 @@ struct WhereCondition {
     bool          isFuncLhs   = false;
     std::string   funcLhsExpr;  // space-separated token string: "CAST ( col AS INT )"
 
+    // Phase 49: MATCH(...) AGAINST('query') in WHERE
+    bool                     isMatchAgainst = false;
+    std::vector<std::string> matchCols;
+    std::string              againstQuery;
+
     // Default constructor (all fields zero-/empty-initialized)
     WhereCondition() = default;
     // Convenience constructor used in parser for simple conditions
@@ -160,6 +166,11 @@ struct SelectItem {
     bool          isScalarSubquery = false;
     ScalarSubSpec scalarSub;
 
+    // Phase 49: MATCH(...) AGAINST('query') AS score in SELECT
+    bool                     isMatchAgainst = false;
+    std::vector<std::string> matchCols;
+    std::string              againstQuery;
+
     // Phase 42: Window Functions
     bool        isWindowFunc     = false;
     std::string windowFunc;          // ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX
@@ -183,6 +194,19 @@ struct JoinClause {
     std::string table;     // Name der rechten Tabelle
     std::string onLeft;    // "tabelle.spalte" linke ON-Seite
     std::string onRight;   // "tabelle.spalte" rechte ON-Seite
+};
+
+// ── Phase 49: Full-Text Index ─────────────────────────────────
+struct FullTextIndex {
+    std::string name;
+    std::string tableName;
+    std::vector<std::string> cols;
+    // inverted index: word → list of row indices
+    std::map<std::string, std::vector<size_t>> invertedIndex;
+    // forward index: row idx → word counts (for TF scoring)
+    std::map<size_t, std::map<std::string,int>> forwardIndex;
+    // total word counts per row
+    std::map<size_t, int> rowWordCount;
 };
 
 // ── Phase 43: Trigger-Definition ─────────────────────────────
@@ -754,6 +778,13 @@ public:
         }
         t.insert(Row(vals));
 
+        // Phase 49: Update fulltext indexes for this table
+        for (auto& [n, fi] : fulltextIndices_) {
+            if (fi.tableName == tbl) {
+                buildFulltextIndex(fi, tables_[tbl]);
+            }
+        }
+
         // Phase 43: AFTER INSERT triggers
         {
             std::string signalMsg;
@@ -828,12 +859,13 @@ public:
             return {std::move(result), usedIndex};
         }
 
-        // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries + CAST-LHS brauchen rowMatches
+        // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries + CAST-LHS + MATCH AGAINST brauchen rowMatches
         bool hasCorrelated = false;
         for (const auto& cond : conds) {
             if (cond.op == "EXISTS" || cond.op == "NOT EXISTS") { hasCorrelated = true; break; }
-            if (cond.isScalarSub) { hasCorrelated = true; break; }
-            if (cond.isFuncLhs)   { hasCorrelated = true; break; }
+            if (cond.isScalarSub)    { hasCorrelated = true; break; }
+            if (cond.isFuncLhs)      { hasCorrelated = true; break; }
+            if (cond.isMatchAgainst) { hasCorrelated = true; break; }
         }
 
         if (hasCorrelated) {
@@ -1338,6 +1370,13 @@ public:
         Table& t = getTable(tbl);
         std::size_t deleted = t.deleteWhere(colIdx(t, wCol), wVal);
 
+        // Phase 49: Update fulltext indexes for this table
+        for (auto& [n, fi] : fulltextIndices_) {
+            if (fi.tableName == tbl) {
+                buildFulltextIndex(fi, tables_[tbl]);
+            }
+        }
+
         // Phase 43: AFTER DELETE triggers
         for (auto& rowVals : matchedRows) {
             std::string signalMsg;
@@ -1423,6 +1462,13 @@ public:
         }
 
         std::size_t n = tblRef.updateWhere(setCIs2, setVals, wCI, wVal);
+
+        // Phase 49: Update fulltext indexes for this table
+        for (auto& [fn, fi] : fulltextIndices_) {
+            if (fi.tableName == tbl) {
+                buildFulltextIndex(fi, tables_[tbl]);
+            }
+        }
 
         // Phase 43: AFTER UPDATE triggers
         for (auto& oldVals : oldRows) {
@@ -1543,6 +1589,178 @@ public:
         return names;
     }
 
+    // ── Phase 49: Full-Text Search ────────────────────────────────
+
+    static std::vector<std::string> tokenizeText(const std::string& text) {
+        static const std::set<std::string> stopwords = {
+            "der", "die", "das", "und", "oder", "in", "ist", "ein", "eine",
+            "the", "a", "an", "of", "to", "and", "or", "is", "for", "with",
+            "mit", "fuer", "fur", "von", "auf", "im", "zu"
+        };
+        std::vector<std::string> tokens;
+        std::string cur;
+        for (char c : text) {
+            if (std::isalpha((unsigned char)c) || std::isdigit((unsigned char)c) || c == '+') {
+                cur += std::tolower((unsigned char)c);
+            } else {
+                if (!cur.empty()) {
+                    if (!stopwords.count(cur)) tokens.push_back(cur);
+                    cur.clear();
+                }
+            }
+        }
+        if (!cur.empty() && !stopwords.count(cur)) tokens.push_back(cur);
+        return tokens;
+    }
+
+    void buildFulltextIndex(FullTextIndex& idx, const Table& table) {
+        idx.invertedIndex.clear();
+        idx.forwardIndex.clear();
+        idx.rowWordCount.clear();
+
+        const auto& cols = table.columns();
+        const auto& rows = table.rows();
+
+        for (size_t rowI = 0; rowI < rows.size(); ++rowI) {
+            std::string fullText;
+            for (const auto& colName : idx.cols) {
+                for (size_t c = 0; c < cols.size(); ++c) {
+                    if (cols[c].name == colName && c < rows[rowI].values.size()) {
+                        fullText += " " + rows[rowI].values[c];
+                        break;
+                    }
+                }
+            }
+
+            auto words = tokenizeText(fullText);
+            idx.rowWordCount[rowI] = (int)words.size();
+
+            for (const auto& w : words) {
+                idx.invertedIndex[w].push_back(rowI);
+                idx.forwardIndex[rowI][w]++;
+            }
+        }
+
+        // Deduplicate invertedIndex entries
+        for (auto& [w, idxList] : idx.invertedIndex) {
+            std::sort(idxList.begin(), idxList.end());
+            idxList.erase(std::unique(idxList.begin(), idxList.end()), idxList.end());
+        }
+    }
+
+    void createFulltextIndex(const std::string& idxName, const std::string& tableName,
+                              const std::vector<std::string>& cols) {
+        auto it = tables_.find(tableName);
+        if (it == tables_.end())
+            throw std::runtime_error("Tabelle '" + tableName + "' nicht gefunden");
+
+        FullTextIndex idx;
+        idx.name = idxName;
+        idx.tableName = tableName;
+        idx.cols = cols;
+
+        buildFulltextIndex(idx, it->second);
+        fulltextIndices_[idxName] = idx;
+    }
+
+    void dropFulltextIndex(const std::string& idxName) {
+        fulltextIndices_.erase(idxName);
+    }
+
+    // Returns {rowIndex, score} sorted by score descending
+    std::vector<std::pair<size_t, double>> searchFulltext(
+            const std::string& tableName,
+            const std::vector<std::string>& searchCols,
+            const std::string& query) const {
+
+        // Find the fulltext index for this table+cols combination
+        FullTextIndex const* idx = nullptr;
+        for (const auto& [n, fi] : fulltextIndices_) {
+            if (fi.tableName == tableName) {
+                bool ok = true;
+                for (const auto& sc : searchCols) {
+                    bool found = false;
+                    for (const auto& ic : fi.cols) if (ic == sc) { found = true; break; }
+                    if (!found) { ok = false; break; }
+                }
+                if (ok) { idx = &fi; break; }
+            }
+        }
+
+        auto queryWords = tokenizeText(query);
+        if (queryWords.empty()) return {};
+
+        std::map<size_t, double> scores;
+
+        if (idx) {
+            for (const auto& qw : queryWords) {
+                auto it = idx->invertedIndex.find(qw);
+                if (it == idx->invertedIndex.end()) continue;
+                for (size_t rowI : it->second) {
+                    int termCount = 0;
+                    auto fi2 = idx->forwardIndex.find(rowI);
+                    if (fi2 != idx->forwardIndex.end()) {
+                        auto wi = fi2->second.find(qw);
+                        if (wi != fi2->second.end()) termCount = wi->second;
+                    }
+                    int totalWords = 1;
+                    auto wc = idx->rowWordCount.find(rowI);
+                    if (wc != idx->rowWordCount.end()) totalWords = std::max(1, wc->second);
+                    scores[rowI] += (double)termCount / totalWords;
+                }
+            }
+        } else {
+            auto tblIt = tables_.find(tableName);
+            if (tblIt == tables_.end()) return {};
+            const auto& table = tblIt->second;
+            const auto& cols = table.columns();
+            const auto& rows = table.rows();
+
+            for (size_t rowI = 0; rowI < rows.size(); ++rowI) {
+                std::string fullText;
+                for (const auto& colName : searchCols) {
+                    for (size_t c = 0; c < cols.size(); ++c) {
+                        if (cols[c].name == colName && c < rows[rowI].values.size()) {
+                            fullText += " " + rows[rowI].values[c];
+                            break;
+                        }
+                    }
+                }
+                auto words = tokenizeText(fullText);
+                int totalWords = std::max(1, (int)words.size());
+                std::map<std::string,int> wc;
+                for (const auto& w : words) wc[w]++;
+                for (const auto& qw : queryWords) {
+                    auto it = wc.find(qw);
+                    if (it != wc.end()) scores[rowI] += (double)it->second / totalWords;
+                }
+            }
+        }
+
+        std::vector<std::pair<size_t, double>> result;
+        for (const auto& [rowI, sc] : scores)
+            if (sc > 0.0) result.push_back({rowI, sc});
+        std::sort(result.begin(), result.end(),
+                  [](const auto& a, const auto& b){ return a.second > b.second; });
+        return result;
+    }
+
+    // Returns fulltext indexes for a given table (for SHOW INDEXES)
+    std::vector<IndexInfo> getFulltextIndexes(const std::string& tableName) const {
+        std::vector<IndexInfo> result;
+        for (const auto& [n, fi] : fulltextIndices_) {
+            if (fi.tableName == tableName) {
+                std::string colList;
+                for (size_t i = 0; i < fi.cols.size(); ++i) {
+                    if (i > 0) colList += ", ";
+                    colList += fi.cols[i];
+                }
+                result.push_back({fi.name, colList, "FULLTEXT"});
+            }
+        }
+        return result;
+    }
+
     bool tableExists(const std::string& n) const { return tables_.count(n) > 0; }
 
     // ── Phase 31/32: CASE/Func — Projektion mit Ausdrücken ──────
@@ -1551,7 +1769,11 @@ public:
         // Ergebnis-Schema aufbauen
         std::vector<Column> newCols;
         for (const auto& item : items) {
-            if (item.isFuncExpr) {
+            if (item.isMatchAgainst) {
+                // Phase 49: MATCH AGAINST score column
+                std::string cname = item.alias.empty() ? "score" : item.alias;
+                newCols.emplace_back(cname, "TEXT");
+            } else if (item.isFuncExpr) {
                 // Phase 32: String-Funktionen
                 std::string cname;
                 if (!item.alias.empty()) {
@@ -1588,7 +1810,28 @@ public:
             std::vector<std::string> vals;
             vals.reserve(items.size());
             for (const auto& item : items) {
-                if (item.isFuncExpr) {
+                if (item.isMatchAgainst) {
+                    // Phase 49: Compute TF score for this row
+                    std::string text;
+                    for (const auto& col : item.matchCols) {
+                        int ci2 = findColIdx(src, col);
+                        if (ci2 >= 0 && static_cast<size_t>(ci2) < row.values.size())
+                            text += " " + row.values[static_cast<size_t>(ci2)];
+                    }
+                    auto docWords = tokenizeText(text);
+                    int totalWords = std::max(1, (int)docWords.size());
+                    std::map<std::string,int> wc;
+                    for (const auto& w : docWords) wc[w]++;
+                    double score = 0.0;
+                    auto qWords = tokenizeText(item.againstQuery);
+                    for (const auto& qw : qWords) {
+                        auto it2 = wc.find(qw);
+                        if (it2 != wc.end()) score += (double)it2->second / totalWords;
+                    }
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(4) << score;
+                    vals.push_back(oss.str());
+                } else if (item.isFuncExpr) {
                     vals.push_back(evaluateFunc(item.funcName, item.funcArgs, src, row));
                 } else if (item.isCaseExpr) {
                     vals.push_back(evalCase(item, src, row));
@@ -2347,6 +2590,7 @@ public:
     }
 
 private:
+    std::map<std::string, FullTextIndex> fulltextIndices_; // Phase 49: index name → fulltext index
     std::map<std::string, TriggerDef>   triggers_;   // trigger name → def
     std::map<std::string, ProcedureDef> procedures_; // procedure name → def
     std::map<std::string, PreparedStmt> preparedStmts_; // Phase 45: prepared stmts
@@ -3336,6 +3580,22 @@ private:
             if (c.isFuncLhs) {
                 std::string lhsVal = evalExprStr(c.funcLhsExpr, src.columns(), row);
                 return evalCond(lhsVal, c);
+            }
+            // Phase 49: MATCH(...) AGAINST('query') in WHERE
+            if (c.isMatchAgainst) {
+                std::string text;
+                for (const auto& col : c.matchCols) {
+                    int ci2 = findColIdx(src, col);
+                    if (ci2 >= 0 && static_cast<size_t>(ci2) < row.values.size())
+                        text += " " + row.values[static_cast<size_t>(ci2)];
+                }
+                auto docWords = tokenizeText(text);
+                std::set<std::string> docSet(docWords.begin(), docWords.end());
+                auto qWords = tokenizeText(c.againstQuery);
+                for (const auto& qw : qWords) {
+                    if (docSet.count(qw)) return true;
+                }
+                return false;
             }
             size_t ci = colIdx(src, c.col);
             return ci < row.values.size() && evalCond(row.values[ci], c);

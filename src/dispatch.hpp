@@ -568,7 +568,11 @@ inline bool dispatchCommand(
             std::cout << "  Fehler: SHOW INDEXES FROM tabellenname\n"; break;
         }
         std::cout << "\n";
-        dispatch_printIndexes(engine.getIndexes(cmd.tableName), cmd.tableName);
+        // Combine B-Tree indexes and FULLTEXT indexes
+        auto allIndexes = engine.getIndexes(cmd.tableName);
+        auto ftIndexes  = engine.getFulltextIndexes(cmd.tableName);
+        for (const auto& fi : ftIndexes) allIndexes.push_back(fi);
+        dispatch_printIndexes(allIndexes, cmd.tableName);
         break;
     }
 
@@ -1525,6 +1529,25 @@ inline bool dispatchCommand(
     case milansql::CommandType::DISCONNECT_USER: {
         engine.disconnectUser();
         std::cout << "Verbindung getrennt. Aktiver User: root.\n";
+        break;
+    }
+
+    // ── Phase 49: Full-Text Search ─────────────────────────────
+    case milansql::CommandType::CREATE_FULLTEXT_INDEX: {
+        if (cmd.fulltextIndexName.empty() || cmd.tableName.empty() || cmd.fulltextCols.empty()) {
+            std::cout << "  Fehler: CREATE FULLTEXT INDEX name ON tabelle (spalte, ...)\n"; break;
+        }
+        engine.createFulltextIndex(cmd.fulltextIndexName, cmd.tableName, cmd.fulltextCols);
+        std::cout << "  Fulltext-Index '" << cmd.fulltextIndexName << "' erstellt.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DROP_FULLTEXT_INDEX: {
+        if (cmd.fulltextIndexName.empty()) {
+            std::cout << "  Fehler: DROP FULLTEXT INDEX name ON tabelle\n"; break;
+        }
+        engine.dropFulltextIndex(cmd.fulltextIndexName);
+        std::cout << "  Fulltext-Index '" << cmd.fulltextIndexName << "' geloescht.\n\n";
         break;
     }
 

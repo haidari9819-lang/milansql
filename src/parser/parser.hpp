@@ -62,6 +62,9 @@ enum class CommandType {
     SHOW_GRANTS,
     CONNECT_USER,
     DISCONNECT_USER,
+    // Phase 49: Full-Text Search
+    CREATE_FULLTEXT_INDEX,
+    DROP_FULLTEXT_INDEX,
     UNKNOWN
 };
 
@@ -189,6 +192,10 @@ struct ParsedCommand {
     std::string preparedSql;           // for PREPARE: the SQL after AS
     std::vector<std::string> execArgs; // for EXECUTE: the arguments
 
+    // Phase 49: Full-Text Index fields
+    std::string              fulltextIndexName;
+    std::vector<std::string> fulltextCols;
+
     // Phase 46: User Management fields
     std::string userName;           // for user commands
     std::string userPassword;       // for CREATE USER / CONNECT
@@ -199,7 +206,12 @@ struct ParsedCommand {
 
 class Parser {
 public:
-    ParsedCommand parse(const std::string& input) {
+    ParsedCommand parse(const std::string& inputRaw) {
+        // Strip trailing semicolon and whitespace
+        std::string input = inputRaw;
+        while (!input.empty() && (input.back() == ';' || input.back() == ' ' || input.back() == '\t' || input.back() == '\r'))
+            input.pop_back();
+
         ParsedCommand cmd;
         cmd.raw = input;
 
@@ -320,13 +332,13 @@ public:
             }
         }
 
-        // ── IN / BETWEEN / EXISTS-Erkennung ──────────────────────
+        // ── IN / BETWEEN / EXISTS / MATCH-Erkennung ──────────────
         {
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
                     std::string u = toUpper(tok);
-                    if (u == "IN" || u == "BETWEEN" || u == "EXISTS") {
+                    if (u == "IN" || u == "BETWEEN" || u == "EXISTS" || u == "MATCH") {
                         parseSelectFull(input, cmd);
                         return cmd;
                     }
@@ -380,7 +392,7 @@ public:
             static const std::vector<std::string> SFUNCS =
                 {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE", "CAST"};
+                 "IFNULL", "COALESCE", "CAST", "MATCH"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -725,6 +737,36 @@ public:
             cmd.type = CommandType::DROP_PROCEDURE;
             if (tokens.size() >= 3) cmd.procedureName = tokens[2];
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 49: CREATE FULLTEXT INDEX ──────────────────────
+        // Syntax: CREATE FULLTEXT INDEX name ON table (col1, col2, ...)
+        } else if (kw0 == "CREATE" && kw1 == "FULLTEXT" && kw2 == "INDEX") {
+            cmd.type = CommandType::CREATE_FULLTEXT_INDEX;
+            {
+                auto toks = tokenizeFull(input);
+                // toks: CREATE FULLTEXT INDEX name ON table ( col1 , col2 )
+                size_t i = 3;
+                if (i < toks.size()) cmd.fulltextIndexName = toks[i++];
+                if (i < toks.size() && toUpper(toks[i]) == "ON") ++i;
+                if (i < toks.size()) cmd.tableName = toks[i++];
+                if (i < toks.size() && toks[i] == "(") ++i;
+                while (i < toks.size() && toks[i] != ")") {
+                    if (toks[i] != ",") cmd.fulltextCols.push_back(toks[i]);
+                    ++i;
+                }
+            }
+
+        // ── Phase 49: DROP FULLTEXT INDEX ────────────────────────
+        // Syntax: DROP FULLTEXT INDEX name ON table
+        } else if (kw0 == "DROP" && kw1 == "FULLTEXT" && kw2 == "INDEX") {
+            cmd.type = CommandType::DROP_FULLTEXT_INDEX;
+            {
+                auto toks = tokenizeFull(input);
+                size_t i = 3;
+                if (i < toks.size()) cmd.fulltextIndexName = toks[i++];
+                if (i < toks.size() && toUpper(toks[i]) == "ON") ++i;
+                if (i < toks.size()) cmd.tableName = toks[i];
+            }
 
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
@@ -1454,6 +1496,31 @@ private:
             WhereCondition cond;
             bool parsed = false;
 
+            // Phase 49: MATCH(col1, col2) AGAINST('query') in WHERE
+            if (u == "MATCH") {
+                cond.isMatchAgainst = true;
+                ++i; // skip MATCH
+                if (i < end && ft[i] == "(") ++i; // skip (
+                while (i < end && ft[i] != ")") {
+                    if (ft[i] != ",") cond.matchCols.push_back(ft[i]);
+                    ++i;
+                }
+                if (i < end) ++i; // skip )
+                if (i < end && toUpper(ft[i]) == "AGAINST") ++i; // skip AGAINST
+                if (i < end && ft[i] == "(") ++i; // skip (
+                while (i < end && ft[i] != ")") {
+                    std::string qt = ft[i];
+                    if (qt.size() >= 2 && qt.front() == '\'' && qt.back() == '\'')
+                        qt = qt.substr(1, qt.size() - 2);
+                    if (!cond.againstQuery.empty()) cond.againstQuery += " ";
+                    cond.againstQuery += qt;
+                    ++i;
+                }
+                if (i < end) ++i; // skip )
+                cmd.whereConds.push_back(cond);
+                continue;
+            }
+
             // Phase 40: CAST ( expr AS TYPE ) op val
             if (u == "CAST" && i + 1 < end && ft[i+1] == "(") {
                 // Collect all tokens from CAST through the matching ) to build funcLhsExpr
@@ -1825,7 +1892,7 @@ private:
         static const std::vector<std::string> SFUNCS32 =
             {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE", "CAST"};
+                 "IFNULL", "COALESCE", "CAST", "MATCH"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -1969,7 +2036,7 @@ private:
                 static const std::vector<std::string> SFUNCS32 =
                     {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE", "CAST"};
+                 "IFNULL", "COALESCE", "CAST", "MATCH"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
@@ -2130,6 +2197,29 @@ private:
                         }
                     }
                     if (i < end && ft[i] == ")") ++i;
+
+                    // Phase 49: MATCH(...) AGAINST('query') — treat specially
+                    if (u == "MATCH") {
+                        item.isMatchAgainst = true;
+                        item.isFuncExpr = false;
+                        item.matchCols = item.funcArgs;
+                        item.funcArgs.clear();
+                        // Parse AGAINST ( 'query' )
+                        if (i < end && toUpper(ft[i]) == "AGAINST") {
+                            ++i; // skip AGAINST
+                            if (i < end && ft[i] == "(") ++i; // skip (
+                            while (i < end && ft[i] != ")") {
+                                std::string qt = ft[i];
+                                if (qt.size() >= 2 && qt.front() == '\'' && qt.back() == '\'')
+                                    qt = qt.substr(1, qt.size() - 2);
+                                if (!item.againstQuery.empty()) item.againstQuery += " ";
+                                item.againstQuery += qt;
+                                ++i;
+                            }
+                            if (i < end && ft[i] == ")") ++i; // skip )
+                        }
+                    }
+
                     // optionales AS alias
                     if (i < end && toUpper(ft[i]) == "AS") {
                         ++i;

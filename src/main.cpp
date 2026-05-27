@@ -566,6 +566,9 @@ int main() {
                   << "\n  Starte mit leerer Datenbank.\n\n";
     }
 
+    // Phase 46: Load users from separate file
+    engine.loadUsers("database.users");
+
     // Phase 43: Load triggers from separate file
     {
         std::ifstream tf("database.triggers");
@@ -1057,6 +1060,10 @@ int main() {
             case milansql::CommandType::SELECT: {
                 if (cmd.tableName.empty()) {
                     std::cout << "  Fehler: Kein Tabellenname.\n"; break;
+                }
+                // Phase 46: privilege check for SELECT (skip for views and CTEs)
+                if (!engine.viewExists(cmd.tableName) && cmd.cteList.empty()) {
+                    engine.checkPrivilege("SELECT", cmd.tableName);
                 }
 
                 // ── Phase 41: WITH / CTE ──────────────────────────
@@ -1880,6 +1887,97 @@ int main() {
                     }
                     std::cout << "\n";
                 }
+                break;
+            }
+
+            // ── Phase 46: CREATE USER ─────────────────────────────
+            case milansql::CommandType::CREATE_USER: {
+                try {
+                    engine.createUser(cmd.userName, cmd.userPassword);
+                    std::cout << "User '" << cmd.userName << "' erstellt.\n";
+                } catch (const std::runtime_error& e) {
+                    std::cout << "FEHLER: " << e.what() << "\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: DROP USER ────────────────────────────────
+            case milansql::CommandType::DROP_USER: {
+                try {
+                    engine.dropUser(cmd.userName);
+                    std::cout << "User '" << cmd.userName << "' geloescht.\n";
+                } catch (const std::runtime_error& e) {
+                    std::cout << "FEHLER: " << e.what() << "\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: SHOW USERS ───────────────────────────────
+            case milansql::CommandType::SHOW_USERS: {
+                auto users = engine.showUsers();
+                for (const auto& u : users) {
+                    std::string role = (u.name == "root") ? " [superuser]" : "";
+                    std::cout << u.name << role << "\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: GRANT ────────────────────────────────────
+            case milansql::CommandType::GRANT_PRIV: {
+                try {
+                    engine.grantPrivilege(cmd.grantTargetUser, cmd.grantTable, cmd.grantPrivs);
+                    std::string privStr;
+                    for (size_t i = 0; i < cmd.grantPrivs.size(); ++i) {
+                        if (i > 0) privStr += ", ";
+                        privStr += cmd.grantPrivs[i];
+                    }
+                    std::cout << privStr << " ON " << cmd.grantTable
+                              << " granted to " << cmd.grantTargetUser << ".\n";
+                } catch (const std::runtime_error& e) {
+                    std::cout << "FEHLER: " << e.what() << "\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: REVOKE ───────────────────────────────────
+            case milansql::CommandType::REVOKE_PRIV: {
+                try {
+                    engine.revokePrivilege(cmd.grantTargetUser, cmd.grantTable, cmd.grantPrivs);
+                    std::cout << "Revoked from " << cmd.grantTargetUser << ".\n";
+                } catch (const std::runtime_error& e) {
+                    std::cout << "FEHLER: " << e.what() << "\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: SHOW GRANTS ──────────────────────────────
+            case milansql::CommandType::SHOW_GRANTS: {
+                try {
+                    auto grants = engine.showGrants(cmd.grantTargetUser);
+                    if (grants.empty())
+                        std::cout << "Keine Rechte fuer " << cmd.grantTargetUser << ".\n";
+                    else
+                        for (const auto& g : grants) std::cout << g << "\n";
+                } catch (const std::runtime_error& e) {
+                    std::cout << "FEHLER: " << e.what() << "\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: CONNECT ──────────────────────────────────
+            case milansql::CommandType::CONNECT_USER: {
+                if (engine.connectUser(cmd.userName, cmd.userPassword)) {
+                    std::cout << "Verbunden als " << cmd.userName << ".\n";
+                } else {
+                    std::cout << "FEHLER: Falscher Benutzername oder Passwort.\n";
+                }
+                break;
+            }
+
+            // ── Phase 46: DISCONNECT ───────────────────────────────
+            case milansql::CommandType::DISCONNECT_USER: {
+                engine.disconnectUser();
+                std::cout << "Verbindung getrennt. Aktiver User: root.\n";
                 break;
             }
 

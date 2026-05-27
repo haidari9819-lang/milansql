@@ -208,6 +208,14 @@ struct PreparedStmt {
     int paramCount = 0;     // number of ? placeholders
 };
 
+// ── Phase 46: User Definition ─────────────────────────────────
+struct UserDef {
+    std::string name;
+    std::size_t passwordHash = 0;  // std::hash<std::string>{}(password)
+    // grants: table name → set of privileges ("SELECT","INSERT","UPDATE","DELETE","ALL")
+    std::map<std::string, std::set<std::string>> grants;
+};
+
 // ── Phase 36: EXPLAIN — Übergabe-Struct (alle engine.hpp-Typen verfügbar) ──
 struct ExplainRequest {
     std::string tableName;
@@ -716,6 +724,7 @@ public:
     // ── DML ───────────────────────────────────────────────────
 
     void insertRow(const std::string& tbl, std::vector<std::string> vals) {
+        checkPrivilege("INSERT", tbl);  // Phase 46: access control
         Table& t = getTable(tbl);       // wirft wenn Tabelle fehlt
         applyDefaults(t, vals);         // fehlende Werte mit DEFAULT/NULL füllen
         applyAutoInc(t, vals);          // AUTO_INCREMENT-Spalten befüllen
@@ -758,6 +767,7 @@ public:
     // INSERT OR REPLACE: löscht kollidierte Zeilen, fügt neue ein.
     // Gibt true zurück wenn mind. eine Zeile ersetzt wurde, false bei normalem Insert.
     bool insertOrReplace(const std::string& tbl, std::vector<std::string> vals) {
+        checkPrivilege("INSERT", tbl);  // Phase 46: access control
         if (inTransaction_)
             throw std::runtime_error("INSERT OR REPLACE nicht innerhalb einer Transaktion.");
         Table& t = getTable(tbl);
@@ -775,6 +785,7 @@ public:
     // INSERT OR IGNORE: ignoriert den Insert bei PK/UNIQUE-Konflikt (kein Fehler).
     // Gibt true zurück wenn eingefügt, false wenn ignoriert.
     bool insertOrIgnore(const std::string& tbl, std::vector<std::string> vals) {
+        checkPrivilege("INSERT", tbl);  // Phase 46: access control
         if (inTransaction_)
             throw std::runtime_error("INSERT OR IGNORE nicht innerhalb einer Transaktion.");
         Table& t = getTable(tbl);
@@ -1249,6 +1260,7 @@ public:
     std::size_t updateWhere(const std::string& tbl,
                             const std::string& setCol, const std::string& setVal,
                             const std::string& wCol,   const std::string& wVal) {
+        checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -1266,6 +1278,7 @@ public:
 
     std::size_t updateAll(const std::string& tbl,
                           const std::string& setCol, const std::string& setVal) {
+        checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -1282,6 +1295,7 @@ public:
 
     std::size_t deleteWhere(const std::string& tbl,
                             const std::string& wCol, const std::string& wVal) {
+        checkPrivilege("DELETE", tbl);  // Phase 46: access control
         // Phase 21: CASCADE / SET NULL / RESTRICT für betroffene Zeilen
         {
             const Table& t = getTable(tbl);
@@ -1339,6 +1353,7 @@ public:
                             const std::vector<std::string>& setCols,
                             const std::vector<std::string>& setVals,
                             const std::string& wCol, const std::string& wVal) {
+        checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         // Phase 44: Check if any setVal contains an expression (col op num)
         // If so, do per-row evaluation
         bool hasExpr = false;
@@ -1427,6 +1442,7 @@ public:
     std::size_t updateAll(const std::string& tbl,
                           const std::vector<std::string>& setCols,
                           const std::vector<std::string>& setVals) {
+        checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
         if (inTransaction_) {
             for (size_t k = 0; k < setCols.size() && k < setVals.size(); ++k)
@@ -1441,6 +1457,7 @@ public:
     }
 
     std::size_t deleteAll(const std::string& tbl) {
+        checkPrivilege("DELETE", tbl);  // Phase 46: access control
         // Phase 21: CASCADE / SET NULL / RESTRICT für alle Zeilen
         {
             std::vector<Row> rowsCopy(getTable(tbl).rows().begin(),
@@ -2130,6 +2147,181 @@ public:
         for (const auto& [n, s] : preparedStmts_)
             result.push_back(s);
         return result;
+    }
+
+    // ── Phase 46: User Management ────────────────────────────────
+
+    void initUsers() {
+        if (users_.find("root") == users_.end()) {
+            UserDef root;
+            root.name = "root";
+            root.passwordHash = 0;
+            users_["root"] = root;
+        }
+    }
+
+    void createUser(const std::string& name, const std::string& password) {
+        if (users_.count(name))
+            throw std::runtime_error("User '" + name + "' existiert bereits");
+        UserDef u;
+        u.name = name;
+        u.passwordHash = std::hash<std::string>{}(password);
+        users_[name] = u;
+        saveUsers();
+    }
+
+    void dropUser(const std::string& name) {
+        if (name == "root")
+            throw std::runtime_error("root kann nicht geloescht werden");
+        users_.erase(name);
+        saveUsers();
+    }
+
+    std::vector<UserDef> showUsers() const {
+        std::vector<UserDef> result;
+        for (const auto& [n, u] : users_) result.push_back(u);
+        return result;
+    }
+
+    bool connectUser(const std::string& name, const std::string& password) {
+        auto it = users_.find(name);
+        if (it == users_.end()) return false;
+        if (name == "root") {
+            currentUser_ = "root";
+            return true;
+        }
+        if (it->second.passwordHash != std::hash<std::string>{}(password)) return false;
+        currentUser_ = name;
+        return true;
+    }
+
+    void disconnectUser() {
+        currentUser_ = "root";
+    }
+
+    const std::string& getCurrentUser() const { return currentUser_; }
+
+    void grantPrivilege(const std::string& userName, const std::string& tableName,
+                        const std::vector<std::string>& privs) {
+        auto it = users_.find(userName);
+        if (it == users_.end())
+            throw std::runtime_error("User '" + userName + "' nicht gefunden");
+        for (const auto& p : privs)
+            it->second.grants[tableName].insert(toUpperStatic(p));
+        saveUsers();
+    }
+
+    void revokePrivilege(const std::string& userName, const std::string& tableName,
+                         const std::vector<std::string>& privs) {
+        auto it = users_.find(userName);
+        if (it == users_.end())
+            throw std::runtime_error("User '" + userName + "' nicht gefunden");
+        for (const auto& p : privs)
+            it->second.grants[tableName].erase(toUpperStatic(p));
+        saveUsers();
+    }
+
+    std::vector<std::string> showGrants(const std::string& userName) const {
+        auto it = users_.find(userName);
+        if (it == users_.end())
+            throw std::runtime_error("User '" + userName + "' nicht gefunden");
+        std::vector<std::string> result;
+        for (const auto& [tbl, privSet] : it->second.grants) {
+            if (privSet.empty()) continue;  // skip tables with no active grants
+            std::string line = tbl + ": ";
+            bool first = true;
+            for (const auto& p : privSet) {
+                if (!first) line += ", ";
+                line += p;
+                first = false;
+            }
+            result.push_back(line);
+        }
+        return result;
+    }
+
+    // Check if current user has privilege on table. Throws if denied.
+    void checkPrivilege(const std::string& operation, const std::string& tableName) const {
+        if (currentUser_ == "root") return; // superuser
+        // Skip check for CTE temp tables
+        if (tempTableNames_.count(tableName)) return;
+        // Skip check for views
+        if (views_.count(tableName)) return;
+        // Only check for regular tables
+        auto it = users_.find(currentUser_);
+        if (it == users_.end())
+            throw std::runtime_error("Kein aktiver Benutzer");
+        const auto& grants = it->second.grants;
+        auto tblIt = grants.find(tableName);
+        if (tblIt != grants.end()) {
+            const auto& privSet = tblIt->second;
+            if (privSet.count("ALL") || privSet.count(operation)) return;
+        }
+        throw std::runtime_error("Keine " + operation + "-Berechtigung fuer " + currentUser_);
+    }
+
+    void saveUsers(const std::string& path = "database.users") const {
+        std::ofstream f(path);
+        for (const auto& [n, u] : users_) {
+            if (n == "root") continue; // don't persist root
+            f << u.name << "\t" << u.passwordHash << "\n";
+            for (const auto& [tbl, privSet] : u.grants) {
+                f << "  " << tbl << ":";
+                bool first = true;
+                for (const auto& p : privSet) {
+                    if (!first) f << ",";
+                    f << p;
+                    first = false;
+                }
+                f << "\n";
+            }
+            f << "---\n";
+        }
+    }
+
+    void loadUsers(const std::string& path = "database.users") {
+        // Ensure root always exists
+        if (users_.find("root") == users_.end()) {
+            UserDef root;
+            root.name = "root";
+            root.passwordHash = 0;
+            users_["root"] = root;
+        }
+        std::ifstream f(path);
+        if (!f) return;
+        std::string line;
+        UserDef current;
+        bool inUser = false;
+        while (std::getline(f, line)) {
+            if (line == "---") {
+                if (inUser) users_[current.name] = current;
+                current = UserDef{};
+                inUser = false;
+            } else if (line.size() >= 2 && line[0] == ' ' && line[1] == ' ') {
+                // grant line: "  tableName:PRIV1,PRIV2"
+                std::string rest = line.substr(2);
+                size_t colon = rest.find(':');
+                if (colon != std::string::npos) {
+                    std::string tbl = rest.substr(0, colon);
+                    std::string privStr = rest.substr(colon + 1);
+                    std::string p;
+                    for (char c : privStr) {
+                        if (c == ',') { if (!p.empty()) current.grants[tbl].insert(p); p = ""; }
+                        else p += c;
+                    }
+                    if (!p.empty()) current.grants[tbl].insert(p);
+                }
+            } else {
+                // user line: "name\thash"
+                size_t tab = line.find('\t');
+                if (tab != std::string::npos) {
+                    current.name = line.substr(0, tab);
+                    try { current.passwordHash = std::stoull(line.substr(tab + 1)); } catch (...) {}
+                    inUser = true;
+                }
+            }
+        }
+        if (inUser) users_[current.name] = current;
     }
 
     // Returns SQL with ? replaced by args in order
@@ -3671,6 +3863,10 @@ public:
     bool                     inTransaction_ = false;
     std::string              walPath_;
     std::vector<BufferedOp>  txBuffer_;
+
+    // Phase 46: User management
+    std::map<std::string, UserDef> users_;
+    std::string currentUser_ = "root";
 };
 
 } // namespace milansql

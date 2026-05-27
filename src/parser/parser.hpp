@@ -53,6 +53,15 @@ enum class CommandType {
     EXECUTE_STMT,
     DEALLOCATE_STMT,
     SHOW_PREPARED,
+    // Phase 46: User Management
+    CREATE_USER,
+    DROP_USER,
+    SHOW_USERS,
+    GRANT_PRIV,
+    REVOKE_PRIV,
+    SHOW_GRANTS,
+    CONNECT_USER,
+    DISCONNECT_USER,
     UNKNOWN
 };
 
@@ -179,6 +188,13 @@ struct ParsedCommand {
     std::string preparedName;          // for PREPARE, EXECUTE, DEALLOCATE
     std::string preparedSql;           // for PREPARE: the SQL after AS
     std::vector<std::string> execArgs; // for EXECUTE: the arguments
+
+    // Phase 46: User Management fields
+    std::string userName;           // for user commands
+    std::string userPassword;       // for CREATE USER / CONNECT
+    std::string grantTable;         // for GRANT/REVOKE
+    std::vector<std::string> grantPrivs; // for GRANT/REVOKE (list of privileges)
+    std::string grantTargetUser;    // for GRANT TO / REVOKE FROM / SHOW GRANTS FOR
 };
 
 class Parser {
@@ -876,6 +892,14 @@ public:
             // Phase 45: SHOW PREPARED
             } else if (kw1 == "PREPARED") {
                 cmd.type = CommandType::SHOW_PREPARED;
+            // Phase 46: SHOW USERS
+            } else if (kw1 == "USERS") {
+                cmd.type = CommandType::SHOW_USERS;
+            // Phase 46: SHOW GRANTS FOR user
+            } else if (kw1 == "GRANTS") {
+                cmd.type = CommandType::SHOW_GRANTS;
+                if (tokens.size() >= 4 && toUpper(tokens[2]) == "FOR")
+                    cmd.grantTargetUser = tokens[3];
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -977,6 +1001,68 @@ public:
             cmd.type = CommandType::DEALLOCATE_STMT;
             if (tokens.size() >= 3) cmd.preparedName = tokens[2];
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 46: CREATE USER ─────────────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "USER") {
+            cmd.type = CommandType::CREATE_USER;
+            // Tokens: CREATE USER name IDENTIFIED BY password
+            auto toks46 = tokenizeFull(input);
+            if (toks46.size() >= 3) cmd.userName = toks46[2];
+            for (size_t i = 3; i < toks46.size(); ++i)
+                if (toUpper(toks46[i]) == "BY" && i + 1 < toks46.size()) {
+                    cmd.userPassword = toks46[i + 1]; break;
+                }
+
+        // ── Phase 46: DROP USER ────────────────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "USER") {
+            cmd.type = CommandType::DROP_USER;
+            if (tokens.size() >= 3) cmd.userName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 46: GRANT ────────────────────────────────────────
+        } else if (kw0 == "GRANT") {
+            cmd.type = CommandType::GRANT_PRIV;
+            {
+                auto toks46 = tokenizeFull(input);
+                size_t i = 1;
+                // Collect privs until ON
+                while (i < toks46.size() && toUpper(toks46[i]) != "ON") {
+                    if (toks46[i] != ",") cmd.grantPrivs.push_back(toUpper(toks46[i]));
+                    ++i;
+                }
+                ++i; // skip ON
+                if (i < toks46.size()) cmd.grantTable = toks46[i++];
+                // skip TO
+                if (i < toks46.size() && toUpper(toks46[i]) == "TO") ++i;
+                if (i < toks46.size()) cmd.grantTargetUser = toks46[i];
+            }
+
+        // ── Phase 46: REVOKE ───────────────────────────────────────
+        } else if (kw0 == "REVOKE") {
+            cmd.type = CommandType::REVOKE_PRIV;
+            {
+                auto toks46 = tokenizeFull(input);
+                size_t i = 1;
+                while (i < toks46.size() && toUpper(toks46[i]) != "ON") {
+                    if (toks46[i] != ",") cmd.grantPrivs.push_back(toUpper(toks46[i]));
+                    ++i;
+                }
+                ++i; // skip ON
+                if (i < toks46.size()) cmd.grantTable = toks46[i++];
+                // skip FROM
+                if (i < toks46.size() && toUpper(toks46[i]) == "FROM") ++i;
+                if (i < toks46.size()) cmd.grantTargetUser = toks46[i];
+            }
+
+        // ── Phase 46: CONNECT ──────────────────────────────────────
+        } else if (kw0 == "CONNECT") {
+            cmd.type = CommandType::CONNECT_USER;
+            if (tokens.size() >= 2) cmd.userName = tokens[1];
+            if (tokens.size() >= 3) cmd.userPassword = tokens[2];
+
+        // ── Phase 46: DISCONNECT ───────────────────────────────────
+        } else if (kw0 == "DISCONNECT") {
+            cmd.type = CommandType::DISCONNECT_USER;
 
         } else if (kw0 == "DESCRIBE") {
             cmd.type = CommandType::DESCRIBE;

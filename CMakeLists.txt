@@ -15,7 +15,7 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src src/server)
+target_include_directories(milansql PRIVATE src src/server src/optimizer)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)

@@ -3855,6 +3855,34 @@ public:
         return plan;
     }
 
+    // ── Phase 48: EXPLAIN mit Optimizer-Notizen ───────────────
+    // Optimizer-Notiz-Struct (forward-deklariert hier, da optimizer.hpp Engine inkludiert)
+    struct OptimizerNote {
+        std::string step;
+        std::string original;
+        std::string optimized;
+        double costBefore = 0.0;
+        double costAfter  = 0.0;
+    };
+
+    ExplainPlan buildExplainWithNotes(const ExplainRequest& req,
+                                      const std::vector<OptimizerNote>& notes) const {
+        ExplainPlan plan = buildExplain(req);
+        int nr = static_cast<int>(plan.steps.size()) + 1;
+        for (const auto& note : notes) {
+            std::string det = note.original + " => " + note.optimized;
+            plan.steps.push_back({nr++, "OPT:" + note.step, "-", det, "-"});
+        }
+        return plan;
+    }
+
+    // ── Phase 48: Row count accessor for optimizer ────────────
+    size_t getRowCount(const std::string& tableName) const {
+        auto it = tables_.find(tableName);
+        if (it == tables_.end()) return 0;
+        return it->second.rowCount();
+    }
+
     std::map<std::string, Table>  tables_;
     std::map<std::string, std::string> views_;   // Phase 24: name → SQL
     std::set<std::string> tempTableNames_;        // Phase 41: CTE-Tabellennamen

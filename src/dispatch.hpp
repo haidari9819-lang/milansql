@@ -15,6 +15,7 @@
 #include "engine/btree.hpp"
 #include "parser/parser.hpp"
 #include "storage/storage.hpp"
+#include "optimizer/optimizer.hpp"
 
 namespace milansql {
 
@@ -418,6 +419,11 @@ static inline milansql::Table dispatch_executeSelectToTable(
     }
 
     if (cmd.isJoin) {
+        // Phase 48: silently optimize join order before execution
+        {
+            milansql::QueryOptimizer qopt;
+            qopt.optimize(cmd, engine);
+        }
         auto result = engine.executeJoins(
             cmd.tableName, cmd.joinClauses,
             cmd.whereConds, cmd.whereLogic);
@@ -707,27 +713,46 @@ inline bool dispatchCommand(
         }
 
         if (cmd.isExplain) {
+            // Phase 48: Run optimizer on a copy of cmd to collect notes
+            milansql::ParsedCommand cmdOpt = cmd;
+            milansql::QueryOptimizer qopt;
+            auto optNotes = qopt.optimize(cmdOpt, engine);
+
+            // Build ExplainRequest from (possibly reordered) cmdOpt
             milansql::ExplainRequest req;
-            req.tableName     = cmd.tableName;
-            req.isJoin        = cmd.isJoin;
-            req.joinClauses   = cmd.joinClauses;
-            req.whereConds    = cmd.whereConds;
-            req.whereLogic    = cmd.whereLogic;
-            req.isGroupBy     = cmd.isGroupBy;
-            req.groupByCols   = cmd.groupByCols;
-            req.havingConds   = cmd.havingConds;
-            req.isAggregate   = cmd.isAggregate;
-            req.aggFunc       = cmd.aggFunc;
-            req.aggCol        = cmd.aggCol;
-            req.selectItems   = cmd.selectItems;
-            req.hasCaseItems  = cmd.hasCaseItems;
-            req.selectColumns = cmd.selectColumns;
-            req.orderByCols   = cmd.orderByCols;
-            req.limit         = cmd.limit;
-            req.limitOffset   = cmd.limitOffset;
-            req.isSetOp       = cmd.isSetOp;
-            req.setOp         = cmd.setOp;
-            dispatch_printExplain(engine.buildExplain(req));
+            req.tableName     = cmdOpt.tableName;
+            req.isJoin        = cmdOpt.isJoin;
+            req.joinClauses   = cmdOpt.joinClauses;
+            req.whereConds    = cmdOpt.whereConds;
+            req.whereLogic    = cmdOpt.whereLogic;
+            req.isGroupBy     = cmdOpt.isGroupBy;
+            req.groupByCols   = cmdOpt.groupByCols;
+            req.havingConds   = cmdOpt.havingConds;
+            req.isAggregate   = cmdOpt.isAggregate;
+            req.aggFunc       = cmdOpt.aggFunc;
+            req.aggCol        = cmdOpt.aggCol;
+            req.selectItems   = cmdOpt.selectItems;
+            req.hasCaseItems  = cmdOpt.hasCaseItems;
+            req.selectColumns = cmdOpt.selectColumns;
+            req.orderByCols   = cmdOpt.orderByCols;
+            req.limit         = cmdOpt.limit;
+            req.limitOffset   = cmdOpt.limitOffset;
+            req.isSetOp       = cmdOpt.isSetOp;
+            req.setOp         = cmdOpt.setOp;
+
+            // Convert OptimizationNote to Engine::OptimizerNote
+            std::vector<milansql::Engine::OptimizerNote> engineNotes;
+            for (const auto& n : optNotes) {
+                milansql::Engine::OptimizerNote en;
+                en.step       = n.step;
+                en.original   = n.original;
+                en.optimized  = n.optimized;
+                en.costBefore = n.costBefore;
+                en.costAfter  = n.costAfter;
+                engineNotes.push_back(en);
+            }
+
+            dispatch_printExplain(engine.buildExplainWithNotes(req, engineNotes));
             break;
         }
 
@@ -789,6 +814,11 @@ inline bool dispatchCommand(
                 std::cout << "  Fehler: JOIN-Syntax: "
                              "FROM t1 [LEFT|INNER] JOIN t2 ON t1.col = t2.col\n";
                 break;
+            }
+            // Phase 48: silently optimize join order before execution
+            {
+                milansql::QueryOptimizer qopt;
+                qopt.optimize(cmd, engine);
             }
             auto result = engine.executeJoins(
                 cmd.tableName, cmd.joinClauses,

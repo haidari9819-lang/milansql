@@ -594,6 +594,15 @@ inline bool dispatchCommand(
             std::cout << "  Fehler: CREATE TABLE name (col TYP, ...)\n"; break;
         }
         engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+        // Auto-create BTREE index for PRIMARY KEY column
+        for (const auto& col : cmd.columns) {
+            if (col.isPrimaryKey) {
+                try {
+                    engine.createIndex(cmd.tableName, {col.name}, "PRIMARY");
+                } catch (...) {}
+                break;
+            }
+        }
         persistFn();
         std::cout << "  Tabelle '" << cmd.tableName << "' erstellt ("
                   << cmd.columns.size() << " Spalten";

@@ -15,13 +15,18 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src)
+target_include_directories(milansql PRIVATE src src/server)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)
     target_compile_options(milansql PRIVATE /W4)
 else()
     target_compile_options(milansql PRIVATE -Wall -Wextra -Wpedantic -Wmissing-field-initializers)
+endif()
+
+# Phase 47: Link ws2_32 on Windows for TCP/IP support
+if(WIN32)
+    target_link_libraries(milansql PRIVATE ws2_32)
 endif()
 
 # ── Test-Suite (Phase 39.5) ──────────────────────────────────

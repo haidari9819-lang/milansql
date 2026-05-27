@@ -31,6 +31,7 @@ Entwickelt von **Mirwais Haidari** als Lernprojekt, Phase für Phase aufgebaut.
 | **Stored Procedures** | `CREATE PROCEDURE name(params) BEGIN...END`, `CALL name(args)`, `DROP PROCEDURE`, `SHOW PROCEDURES` |
 | **Prepared Statements** | `PREPARE name AS sql`, `EXECUTE name(args)`, `DEALLOCATE PREPARE name`, `SHOW PREPARED` |
 | **Benutzerverwaltung** | `CREATE USER`, `DROP USER`, `SHOW USERS`, `GRANT/REVOKE priv ON tbl TO/FROM user`, `SHOW GRANTS FOR user`, `CONNECT user pwd`, `DISCONNECT` |
+| **Server-Modus** | `--server --port N`: TCP-Server, Multi-Client, Thread-Safe; `--client --port N`: Netzwerk-REPL |
 | **Transaktionen** | `BEGIN`, `COMMIT`, `ROLLBACK` (WAL-basiert) |
 | **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
 | **Persistenz** | Eigenes Binärformat (`database.milan`, Format v7) mit Checksumme |
@@ -294,6 +295,7 @@ STATUS
 | 44 | Stored Procedures: `CREATE PROCEDURE / CALL / DROP PROCEDURE / SHOW PROCEDURES` |
 | 45 | Prepared Statements: `PREPARE/EXECUTE/DEALLOCATE PREPARE/SHOW PREPARED` |
 | 46 | Benutzerverwaltung: `CREATE USER / DROP USER / GRANT / REVOKE / CONNECT / DISCONNECT` |
+| 47 | TCP/IP Server: `--server/--client --port N`, Multi-Thread, Winsock2/POSIX |
 
 ---
 

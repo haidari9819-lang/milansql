@@ -19,6 +19,7 @@
 #include "parser/parser.hpp"
 #include "storage/storage.hpp"
 #include "optimizer/optimizer.hpp"
+#include "backup/backup.hpp"
 
 namespace milansql {
 
@@ -33,6 +34,13 @@ static inline milansql::Table dispatch_materializeView(milansql::Engine& engine,
     const std::string& viewName, const milansql::ParsedCommand& outerCmd);
 static inline milansql::Table dispatch_executeSelectToTable(milansql::Engine& engine, milansql::Parser& parser,
     milansql::ParsedCommand cmd);
+
+// Entfernt äußere einfache Anführungszeichen für die Anzeige
+static inline std::string dispatch_displayVal(const std::string& v) {
+    if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'')
+        return v.substr(1, v.size() - 2);
+    return v;
+}
 
 // ── printTable ────────────────────────────────────────────────
 static inline void dispatch_printTable(const milansql::Table& tbl, int limit, int offset) {
@@ -53,7 +61,7 @@ static inline void dispatch_printTable(const milansql::Table& tbl, int limit, in
     for (const auto& col : cols) widths.push_back(col.name.size());
     for (size_t r = startRow; r < startRow + printRows; ++r)
         for (size_t i = 0; i < rows[r].values.size() && i < widths.size(); ++i)
-            widths[i] = std::max(widths[i], rows[r].values[i].size());
+            widths[i] = std::max(widths[i], dispatch_displayVal(rows[r].values[i]).size());
 
     auto hline = [&](const std::string& l, const std::string& m,
                      const std::string& r, const std::string& f) {
@@ -84,8 +92,8 @@ static inline void dispatch_printTable(const milansql::Table& tbl, int limit, in
         for (size_t r = startRow; r < startRow + printRows; ++r) {
             std::cout << "\u2502";
             for (size_t i = 0; i < cols.size(); ++i) {
-                const std::string& val =
-                    (i < rows[r].values.size()) ? rows[r].values[i] : "";
+                const std::string val =
+                    dispatch_displayVal((i < rows[r].values.size()) ? rows[r].values[i] : "");
                 std::cout << " " << val;
                 for (size_t j = val.size(); j < widths[i]; ++j) std::cout << " ";
                 std::cout << " \u2502";
@@ -1370,9 +1378,16 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }
-        engine.dropTable(cmd.tableName);
-        persistFn();
-        std::cout << "  Tabelle '" << cmd.tableName << "' geloescht.\n\n";
+        try {
+            engine.dropTable(cmd.tableName);
+            persistFn();
+            std::cout << "  Tabelle '" << cmd.tableName << "' geloescht.\n\n";
+        } catch (const std::exception& ex) {
+            if (cmd.ifExists)
+                std::cout << "  (Tabelle '" << cmd.tableName << "' nicht vorhanden, uebersprungen)\n\n";
+            else
+                throw;
+        }
         break;
     }
 
@@ -1875,6 +1890,68 @@ inline bool dispatchCommand(
         if (tables.empty()) std::cout << "    (keine)\n";
         for (const auto& t : tables) std::cout << "    " << t << "\n";
         std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 57: BACKUP DATABASE ──────────────────────────────
+    case milansql::CommandType::BACKUP_DATABASE: {
+        std::string msg = milansql::MilanBackup::dumpDatabase(engine, cmd.backupFile);
+        std::cout << "  " << msg << "\n\n";
+        break;
+    }
+
+    // ── Phase 57: BACKUP TABLE ─────────────────────────────────
+    case milansql::CommandType::BACKUP_TABLE: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: BACKUP TABLE name TO 'datei.sql'\n\n"; break;
+        }
+        std::string msg = milansql::MilanBackup::dumpTable(engine, cmd.tableName, cmd.backupFile);
+        std::cout << "  " << msg << "\n\n";
+        break;
+    }
+
+    // ── Phase 57: RESTORE DATABASE ─────────────────────────────
+    case milansql::CommandType::RESTORE_DATABASE: {
+        if (cmd.backupFile.empty()) {
+            std::cout << "  Fehler: RESTORE DATABASE FROM 'datei.sql'\n\n"; break;
+        }
+        std::cout << "  Starte Restore aus '" << cmd.backupFile << "'...\n";
+
+        // Output waehrend Restore unterdruecken (nur Zusammenfassung zeigen)
+        std::streambuf* oldBuf = std::cout.rdbuf();
+        std::ostringstream devNull;
+        std::cout.rdbuf(devNull.rdbuf());
+
+        auto noopPersist = []() {};
+        auto executeSQL  = [&](const std::string& sql) {
+            try {
+                milansql::ParsedCommand rcmd = parser.parse(sql);
+                dispatchCommand(rcmd, engine, parser, sql,
+                                noopPersist, saveProceduresFn, saveTriggFn,
+                                getProcessListFn);
+            } catch (...) {}
+        };
+
+        std::string msg = milansql::MilanBackup::restoreDatabase(cmd.backupFile, executeSQL);
+
+        std::cout.rdbuf(oldBuf);
+
+        persistFn();
+        std::cout << "  Restore abgeschlossen: " << msg << "\n\n";
+        break;
+    }
+
+    // ── Phase 57: SHOW BACKUPS ─────────────────────────────────
+    case milansql::CommandType::SHOW_BACKUPS: {
+        auto files = milansql::MilanBackup::listBackups();
+        if (files.empty()) {
+            std::cout << "  (Keine .sql Backup-Dateien im aktuellen Verzeichnis)\n\n";
+        } else {
+            std::cout << "  Backup-Dateien:\n";
+            for (const auto& f : files)
+                std::cout << "    " << f << "\n";
+            std::cout << "\n";
+        }
         break;
     }
 

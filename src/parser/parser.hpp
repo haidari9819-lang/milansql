@@ -78,6 +78,11 @@ enum class CommandType {
     // Phase 54B: EXPLAIN ANALYZE (flag on ParsedCommand, no separate type)
     // Phase 54D: SHOW PROCESSLIST
     SHOW_PROCESSLIST,
+    // Phase 57: Backup / Restore
+    BACKUP_DATABASE,
+    BACKUP_TABLE,
+    RESTORE_DATABASE,
+    SHOW_BACKUPS,
     UNKNOWN
 };
 
@@ -225,6 +230,10 @@ struct ParsedCommand {
 
     // Phase 51: Schema fields
     std::string schemaName;         // for schema commands (CREATE/DROP/USE/SHOW TABLES IN)
+
+    // Phase 57: Backup / Restore
+    std::string backupFile;         // Dateipfad für BACKUP/RESTORE
+    bool        ifExists = false;   // für DROP TABLE IF EXISTS
 };
 
 class Parser {
@@ -1024,10 +1033,16 @@ public:
             if (tokens.size() >= 3) cmd.triggerName = tokens[2];
             else cmd.type = CommandType::UNKNOWN;
 
-        // ── DROP TABLE ───────────────────────────────────────────
+        // ── DROP TABLE [IF EXISTS] ───────────────────────────────
         } else if (kw0 == "DROP" && kw1 == "TABLE") {
             cmd.type = CommandType::DROP_TABLE;
-            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            size_t tblIdx = 2;
+            if (tokens.size() >= 5 &&
+                toUpper(tokens[2]) == "IF" && toUpper(tokens[3]) == "EXISTS") {
+                cmd.ifExists = true;
+                tblIdx = 4;
+            }
+            if (tokens.size() > tblIdx) cmd.tableName = tokens[tblIdx];
             else cmd.type = CommandType::UNKNOWN;
 
         // ── DROP INDEX ───────────────────────────────────────────
@@ -1075,6 +1090,9 @@ public:
             // Phase 54D: SHOW PROCESSLIST
             } else if (kw1 == "PROCESSLIST") {
                 cmd.type = CommandType::SHOW_PROCESSLIST;
+            // Phase 57: SHOW BACKUPS
+            } else if (kw1 == "BACKUPS") {
+                cmd.type = CommandType::SHOW_BACKUPS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -1119,6 +1137,38 @@ public:
             cmd.type = CommandType::SET_CACHE;
             if (tokens.size() >= 3) cmd.cacheEnabled = toUpper(tokens[2]);
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 57: BACKUP DATABASE TO 'file' ──────────────────
+        } else if (kw0 == "BACKUP" && kw1 == "DATABASE") {
+            cmd.type = CommandType::BACKUP_DATABASE;
+            if (tokens.size() >= 4 && toUpper(tokens[2]) == "TO") {
+                std::string fp = tokens[3];
+                if (fp.size() >= 2 && fp.front() == '\'' && fp.back() == '\'')
+                    fp = fp.substr(1, fp.size() - 2);
+                cmd.backupFile = fp;
+            }
+            // leerer backupFile → auto-generierter Name
+
+        // ── Phase 57: BACKUP TABLE name TO 'file' ────────────────
+        } else if (kw0 == "BACKUP" && kw1 == "TABLE") {
+            cmd.type = CommandType::BACKUP_TABLE;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            if (tokens.size() >= 5 && toUpper(tokens[3]) == "TO") {
+                std::string fp = tokens[4];
+                if (fp.size() >= 2 && fp.front() == '\'' && fp.back() == '\'')
+                    fp = fp.substr(1, fp.size() - 2);
+                cmd.backupFile = fp;
+            }
+
+        // ── Phase 57: RESTORE DATABASE FROM 'file' ───────────────
+        } else if (kw0 == "RESTORE" && kw1 == "DATABASE") {
+            cmd.type = CommandType::RESTORE_DATABASE;
+            if (tokens.size() >= 4 && toUpper(tokens[2]) == "FROM") {
+                std::string fp = tokens[3];
+                if (fp.size() >= 2 && fp.front() == '\'' && fp.back() == '\'')
+                    fp = fp.substr(1, fp.size() - 2);
+                cmd.backupFile = fp;
+            } else cmd.type = CommandType::UNKNOWN;
 
         // ── Phase 45: PREPARE name AS sql ────────────────────────
         } else if (kw0 == "PREPARE") {

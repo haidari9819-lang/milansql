@@ -476,7 +476,10 @@ public:
                  "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
                  "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
                  "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
-                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
+                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+                 // Phase 56: JSON-Funktionen
+                 "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
+                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -1679,10 +1682,23 @@ private:
                 continue;
             }
 
+            // Phase 56: JSON-Funktionen als WHERE-LHS
             // Phase 40: CAST ( expr AS TYPE ) op val
-            if (u == "CAST" && i + 1 < end && ft[i+1] == "(") {
-                // Collect all tokens from CAST through the matching ) to build funcLhsExpr
-                std::string funcExpr = "CAST";
+            // Alle bekannten Funktionen mit ( im WHERE als isFuncLhs behandeln
+            static const std::vector<std::string> FUNC_LHS_NAMES =
+                {"CAST", "JSON_EXTRACT", "JSON_LENGTH", "JSON_CONTAINS",
+                 "JSON_TYPE", "JSON_KEYS", "JSON_VALID",
+                 "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+                 "DATE", "TIME", "NOW", "CURDATE", "CURTIME",
+                 "UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM",
+                 "REPLACE", "ABS", "ROUND", "MOD", "COALESCE", "IFNULL"};
+            bool isFuncLhsCandidate = false;
+            for (const auto& fn : FUNC_LHS_NAMES)
+                if (u == fn) { isFuncLhsCandidate = true; break; }
+
+            if (isFuncLhsCandidate && i + 1 < end && ft[i+1] == "(") {
+                // Collect function tokens including arguments through matching )
+                std::string funcExpr = u;  // function name (uppercase)
                 size_t j = i + 1;
                 int depth = 0;
                 while (j < end) {
@@ -2147,7 +2163,10 @@ private:
                  "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
                  "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
                  "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
-                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
+                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+                 // Phase 56: JSON-Funktionen
+                 "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
+                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -2296,7 +2315,10 @@ private:
                  "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
                  "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
                  "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
-                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
+                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+                 // Phase 56: JSON-Funktionen
+                 "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
+                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
@@ -2955,8 +2977,41 @@ private:
         return tokens;
     }
 
+    // Phase 56: Tiefenkenner Wert-Splitter
+    // Wie splitTrim, aber ignoriert Kommas innerhalb von {}, [], '' und ""
+    static std::vector<std::string> splitValues(const std::string& s) {
+        std::vector<std::string> result;
+        std::string cur;
+        int depth = 0;  // Tiefe von (), {}, []
+        bool inStr = false;
+        char strChar = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (inStr) {
+                cur += c;
+                if (c == '\\' && i + 1 < s.size()) {
+                    cur += s[++i]; // Escape-Zeichen
+                } else if (c == strChar) {
+                    inStr = false;
+                }
+                continue;
+            }
+            if (c == '\'' || c == '"') {
+                inStr = true; strChar = c; cur += c; continue;
+            }
+            if (c == '(' || c == '{' || c == '[') { depth++; cur += c; continue; }
+            if (c == ')' || c == '}' || c == ']') { depth--; cur += c; continue; }
+            if (c == ',' && depth == 0) {
+                result.push_back(trim(cur)); cur.clear(); continue;
+            }
+            cur += c;
+        }
+        if (!cur.empty()) result.push_back(trim(cur));
+        return result;
+    }
+
     // Phase 27: alle (...)-Gruppen nach VALUES extrahieren
-    // Unterstützt: VALUES (a,b), (c,d), (e,f)
+    // Phase 56: berücksichtigt jetzt JSON-Nesting ({...}, [...])
     static std::vector<std::vector<std::string>> parseValueGroups(const std::string& input) {
         // "VALUES" (case-insensitive) suchen
         std::string up = input;
@@ -2978,13 +3033,33 @@ private:
             if (pos >= input.size() || input[pos] != '(') break;
             ++pos;  // '(' überspringen
 
-            // Inhalt bis zum schließenden ')' lesen (keine Verschachtelung)
-            size_t start = pos;
-            while (pos < input.size() && input[pos] != ')') ++pos;
-            std::string content = input.substr(start, pos - start);
-            if (pos < input.size()) ++pos;  // ')' überspringen
+            // Phase 56: Inhalt lesen mit Nesting-Bewusstsein
+            // Track {}, [], () und Strings innerhalb der Werte
+            std::string content;
+            int depth = 0;
+            bool inStr = false; char strChar = 0;
+            while (pos < input.size()) {
+                char c = input[pos];
+                if (inStr) {
+                    content += c;
+                    if (c == '\\' && pos + 1 < input.size()) {
+                        content += input[++pos];
+                    } else if (c == strChar) {
+                        inStr = false;
+                    }
+                    ++pos; continue;
+                }
+                if (c == '\'' || c == '"') {
+                    inStr = true; strChar = c; content += c; ++pos; continue;
+                }
+                if (c == '{' || c == '[' || c == '(') { depth++; content += c; ++pos; continue; }
+                if (c == '}' || c == ']') { depth--; content += c; ++pos; continue; }
+                if (c == ')' && depth == 0) { ++pos; break; }  // Ende der Gruppe
+                if (c == ')') { depth--; content += c; ++pos; continue; }
+                content += c; ++pos;
+            }
 
-            groups.push_back(splitTrim(content, ','));
+            groups.push_back(splitValues(content));
         }
         return groups;
     }

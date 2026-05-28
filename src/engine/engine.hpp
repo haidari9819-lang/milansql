@@ -17,6 +17,7 @@
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
 #include "../utils/date_utils.hpp"
+#include "../utils/json_utils.hpp"
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -759,6 +760,7 @@ public:
         applyAutoInc(t, vals);          // AUTO_INCREMENT-Spalten befüllen
         checkInsertFK(tbl, vals);       // FOREIGN KEY prüfen
         checkAllConstraints(tbl, vals); // Phase 23: CHECK constraints prüfen
+        checkJsonColumns(t, vals);      // Phase 56: JSON-Validierung
 
         // Phase 43: BEFORE INSERT triggers
         {
@@ -3407,6 +3409,55 @@ private:
             return milansql::dateutils::dateFormat(resolveArg(args[0]), resolveArg(args[1]));
         }
 
+        // ── Phase 56: JSON-Funktionen ────────────────────────────
+        if (fn == "JSON_EXTRACT") {
+            if (args.size() < 2) return "NULL";
+            std::string jsonStr = resolveArg(args[0]);
+            // path: strip single quotes
+            std::string path = resolveArg(args[1]);
+            if (path.size() >= 2 && path.front() == '\'' && path.back() == '\'')
+                path = path.substr(1, path.size() - 2);
+            return milansql::jsonutils::extract(jsonStr, path);
+        }
+        if (fn == "JSON_SET") {
+            if (args.size() < 3) return "NULL";
+            std::string jsonStr = resolveArg(args[0]);
+            std::string path    = resolveArg(args[1]);
+            if (path.size() >= 2 && path.front() == '\'' && path.back() == '\'')
+                path = path.substr(1, path.size() - 2);
+            std::string newVal  = resolveArg(args[2]);
+            return milansql::jsonutils::set(jsonStr, path, newVal);
+        }
+        if (fn == "JSON_KEYS") {
+            if (args.empty()) return "NULL";
+            return milansql::jsonutils::keys(resolveArg(args[0]));
+        }
+        if (fn == "JSON_LENGTH") {
+            if (args.empty()) return "NULL";
+            return milansql::jsonutils::length(resolveArg(args[0]));
+        }
+        if (fn == "JSON_CONTAINS") {
+            // JSON_CONTAINS(json, val[, path])
+            if (args.size() < 2) return "0";
+            std::string jsonStr = resolveArg(args[0]);
+            std::string val     = resolveArg(args[1]);
+            std::string path    = "$";
+            if (args.size() >= 3) {
+                path = resolveArg(args[2]);
+                if (path.size() >= 2 && path.front() == '\'' && path.back() == '\'')
+                    path = path.substr(1, path.size() - 2);
+            }
+            return milansql::jsonutils::contains(jsonStr, val, path);
+        }
+        if (fn == "JSON_TYPE") {
+            if (args.empty()) return "NULL";
+            return milansql::jsonutils::type(resolveArg(args[0]));
+        }
+        if (fn == "JSON_VALID") {
+            if (args.empty()) return "0";
+            return milansql::jsonutils::isValid(resolveArg(args[0])) ? "1" : "0";
+        }
+
         return "";
     }
 
@@ -3449,7 +3500,10 @@ private:
              "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
              "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
              "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
-             "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
+             "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+             // Phase 56: JSON
+             "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
+             "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
 
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;
@@ -3940,12 +3994,15 @@ private:
                 if (op == ">=") return da >= db;
             }
         } catch (...) {}
-        if (op == "=")  return a == b;
-        if (op == "!=") return a != b;
-        if (op == "<")  return a <  b;
-        if (op == ">")  return a >  b;
-        if (op == "<=") return a <= b;
-        if (op == ">=") return a >= b;
+        // Normalisiere Strings für Vergleich (entferne äußere Anführungszeichen)
+        const std::string as = milansql::dateutils::stripQuotes(a);
+        const std::string bs = milansql::dateutils::stripQuotes(b);
+        if (op == "=")  return as == bs;
+        if (op == "!=") return as != bs;
+        if (op == "<")  return as <  bs;
+        if (op == ">")  return as >  bs;
+        if (op == "<=") return as <= bs;
+        if (op == ">=") return as >= bs;
         return false;
     }
 
@@ -4029,6 +4086,22 @@ private:
                     throw std::runtime_error(
                         "CHECK constraint verletzt: " + col.name +
                         " " + cc.op + " " + cc.val);
+        }
+    }
+
+    // ── Phase 56: JSON-Validierung ───────────────────────────────────────────
+    static void checkJsonColumns(const Table& t,
+                                  const std::vector<std::string>& vals) {
+        for (size_t i = 0; i < t.columns().size() && i < vals.size(); ++i) {
+            std::string colType = t.columns()[i].type;
+            for (char& c : colType)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (colType != "JSON") continue;
+            const std::string& v = vals[i];
+            if (v.empty() || v == "NULL") continue;
+            if (!milansql::jsonutils::isValid(v))
+                throw std::runtime_error(
+                    "Ungültiges JSON in Spalte '" + t.columns()[i].name + "'");
         }
     }
 

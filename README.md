@@ -432,6 +432,9 @@ STATUS
 | 51 | SCHEMA / Namespaces: CREATE/DROP/SHOW/USE SCHEMA, Cross-Schema JOINs |
 | 52 | REST API: `--http --port 8080`, GET/POST /query, /tables, /schemas, /status |
 | 53 | Client Libraries: Python (DB-API 2.0/PEP 249, TCP+HTTP), Node.js (HTTP) |
+| 54 | Query Cache (LRU/TTL), EXPLAIN ANALYZE, Web Dashboard, SHOW PROCESSLIST |
+| 55 | DATE/TIME Datentypen: DATE, TIME, DATETIME, TIMESTAMP, NOW(), CURDATE(), DATEDIFF(), DATE_ADD(), DATE_FORMAT() |
+| 56 | JSON Datentyp: JSON_EXTRACT, JSON_SET, JSON_KEYS, JSON_LENGTH, JSON_CONTAINS, JSON_TYPE |
 
 ---
 

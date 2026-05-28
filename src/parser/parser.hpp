@@ -91,6 +91,10 @@ enum class CommandType {
     SHOW_BINLOG,
     STOP_SLAVE,
     START_SLAVE,
+    // Phase 60: CSV Import/Export
+    LOAD_DATA,
+    INTO_OUTFILE,
+    SHOW_DATAFILES,
     UNKNOWN
 };
 
@@ -246,6 +250,11 @@ struct ParsedCommand {
     // Phase 58: Benchmark
     int         benchmarkIter = 0;  // Anzahl Iterationen
     std::string benchmarkSql;       // SQL-Statement zum Benchmarken
+
+    // Phase 60: CSV Import / Export
+    std::string csvFile;                // Dateipfad für LOAD DATA / INTO OUTFILE
+    std::string csvSeparator;           // Trennzeichen (default ",")
+    bool        csvSkipHeader = false;  // erste Zeile überspringen
 };
 
 class Parser {
@@ -258,6 +267,55 @@ public:
 
         ParsedCommand cmd;
         cmd.raw = input;
+
+        // ── Phase 60: SELECT … INTO OUTFILE detection ────────────
+        // Detect and strip trailing "INTO OUTFILE 'file' [SEPARATOR 'sep']"
+        // before the SELECT is parsed, so the rest of parse() sees a clean SELECT.
+        {
+            std::string upInp;
+            upInp.reserve(input.size());
+            for (unsigned char c : input)
+                upInp += static_cast<char>(std::toupper(c));
+            const std::string needle = " INTO OUTFILE ";
+            auto pos = upInp.rfind(needle);
+            if (pos != std::string::npos) {
+                std::string suffix = input.substr(pos + needle.size());
+                // Extract quoted file path
+                auto findQuoted = [](const std::string& s) -> std::string {
+                    for (char q : {'\'', '"'}) {
+                        auto q1 = s.find(q);
+                        if (q1 != std::string::npos) {
+                            auto q2 = s.find(q, q1 + 1);
+                            if (q2 != std::string::npos)
+                                return s.substr(q1 + 1, q2 - q1 - 1);
+                        }
+                    }
+                    // unquoted: first token
+                    size_t i = 0;
+                    while (i < s.size() && s[i] == ' ') ++i;
+                    size_t j = i;
+                    while (j < s.size() && s[j] != ' ') ++j;
+                    return s.substr(i, j - i);
+                };
+                std::string fp = findQuoted(suffix);
+                if (!fp.empty()) {
+                    cmd.csvFile      = fp;
+                    cmd.csvSeparator = ",";
+                    // Check for SEPARATOR keyword in suffix
+                    std::string upSuffix;
+                    for (unsigned char c : suffix) upSuffix += static_cast<char>(std::toupper(c));
+                    auto sepKw = upSuffix.find("SEPARATOR");
+                    if (sepKw != std::string::npos) {
+                        std::string afterSep = suffix.substr(sepKw + 9);
+                        cmd.csvSeparator = findQuoted(afterSep);
+                        if (cmd.csvSeparator.empty()) cmd.csvSeparator = ",";
+                    }
+                    // Trim SELECT part
+                    input    = input.substr(0, pos);
+                    cmd.raw  = input;
+                }
+            }
+        }
 
         // ── Phase 41: WITH / CTE erkennen ────────────────────────
         {
@@ -1108,6 +1166,9 @@ public:
             // Phase 58: SHOW STATUS (Alias für STATUS)
             } else if (kw1 == "STATUS") {
                 cmd.type = CommandType::STATUS;
+            // Phase 60: SHOW DATAFILES
+            } else if (kw1 == "DATAFILES") {
+                cmd.type = CommandType::SHOW_DATAFILES;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1356,6 +1417,62 @@ public:
             cmd.type = CommandType::DESCRIBE;
             if (tokens.size() >= 2) cmd.tableName = tokens[1];
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 60: LOAD DATA INFILE 'file' INTO TABLE name ───
+        // [SEPARATOR ','] [SKIP HEADER]
+        } else if (kw0 == "LOAD" && kw1 == "DATA") {
+            cmd.type         = CommandType::LOAD_DATA;
+            cmd.csvSeparator = ","; // default
+            // Build upper-case version for keyword scanning
+            std::string upInp;
+            for (unsigned char c : input) upInp += static_cast<char>(std::toupper(c));
+            // Extract quoted file path after INFILE
+            auto infileKw = upInp.find("INFILE");
+            if (infileKw != std::string::npos) {
+                std::string afterInfile = input.substr(infileKw + 6);
+                for (char q : {'\'', '"'}) {
+                    auto q1 = afterInfile.find(q);
+                    if (q1 != std::string::npos) {
+                        auto q2 = afterInfile.find(q, q1 + 1);
+                        if (q2 != std::string::npos) {
+                            cmd.csvFile = afterInfile.substr(q1 + 1, q2 - q1 - 1);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Table name: word after "TABLE"
+            auto tableKw = upInp.find(" TABLE ");
+            if (tableKw != std::string::npos) {
+                size_t ts = tableKw + 7;
+                while (ts < input.size() && input[ts] == ' ') ++ts;
+                size_t te = ts;
+                while (te < input.size() && input[te] != ' ' && input[te] != '\n') ++te;
+                cmd.tableName = input.substr(ts, te - ts);
+            }
+            // SEPARATOR value
+            auto sepKw = upInp.find("SEPARATOR");
+            if (sepKw != std::string::npos) {
+                std::string afterSep = input.substr(sepKw + 9);
+                for (char q : {'\'', '"'}) {
+                    auto q1 = afterSep.find(q);
+                    if (q1 != std::string::npos) {
+                        auto q2 = afterSep.find(q, q1 + 1);
+                        if (q2 != std::string::npos) {
+                            cmd.csvSeparator = afterSep.substr(q1 + 1, q2 - q1 - 1);
+                            if (cmd.csvSeparator.empty()) cmd.csvSeparator = ",";
+                            break;
+                        }
+                    }
+                }
+            }
+            // SKIP HEADER
+            if (upInp.find("SKIP") != std::string::npos &&
+                upInp.find("HEADER") != std::string::npos)
+                cmd.csvSkipHeader = true;
+
+            if (cmd.csvFile.empty() || cmd.tableName.empty())
+                cmd.type = CommandType::UNKNOWN;
 
         // ── Phase 59: STOP SLAVE / START SLAVE ──────────────────
         } else if (kw0 == "STOP" && kw1 == "SLAVE") {

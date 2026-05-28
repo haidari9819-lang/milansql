@@ -23,6 +23,7 @@
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
+#include "utils/csv_utils.hpp"
 
 namespace milansql {
 
@@ -767,6 +768,39 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::SELECT: {
+        // ── Phase 60: SELECT … INTO OUTFILE ──────────────────────
+        // If csvFile is set (stripped from "INTO OUTFILE" suffix by parser),
+        // execute the SELECT via dispatch_executeSelectToTable and write CSV.
+        if (!cmd.csvFile.empty() && cmd.cteList.empty()) {
+            try {
+                char sep = milansql::CsvUtils::parseSepChar(
+                    cmd.csvSeparator.empty() ? "," : cmd.csvSeparator);
+                milansql::Table result =
+                    dispatch_executeSelectToTable(engine, parser, cmd);
+                // Build header + rows
+                std::vector<std::string> headers;
+                for (const auto& c : result.columns())
+                    headers.push_back(c.name);
+                std::vector<std::vector<std::string>> csvRows;
+                for (const auto& row : result.rows()) {
+                    std::vector<std::string> csvRow;
+                    for (size_t ci = 0; ci < result.columns().size(); ++ci)
+                        csvRow.push_back(dispatch_displayVal(
+                            ci < row.values.size() ? row.values[ci] : ""));
+                    csvRows.push_back(std::move(csvRow));
+                }
+                milansql::CsvUtils::writeFile(cmd.csvFile, headers, csvRows, sep);
+                std::cout << "  " << csvRows.size()
+                          << " Zeile(n) exportiert nach '"
+                          << cmd.csvFile << "' (Separator: '"
+                          << (sep == '\t' ? "\\t" : std::string(1, sep))
+                          << "').\n\n";
+            } catch (const std::exception& ex) {
+                std::cout << "  FEHLER (INTO OUTFILE): " << ex.what() << "\n\n";
+            }
+            break;
+        }
+
         // Phase 55: SELECT ohne FROM (z.B. SELECT NOW(), SELECT 1+1)
         if (cmd.tableName.empty() && cmd.hasCaseItems && !cmd.selectItems.empty()) {
             std::vector<milansql::Column> resCols;
@@ -2243,6 +2277,100 @@ inline bool dispatchCommand(
         }
         if (milansql::g_startSlaveHook) milansql::g_startSlaveHook();
         std::cout << "  Replikation gestartet.\n\n";
+        break;
+    }
+
+    // ── Phase 60: LOAD DATA INFILE ────────────────────────────────
+
+    case milansql::CommandType::LOAD_DATA: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
+        if (cmd.csvFile.empty() || cmd.tableName.empty()) {
+            std::cout << "  Fehler: LOAD DATA INFILE 'file.csv' INTO TABLE name"
+                         " [SEPARATOR ','] [SKIP HEADER]\n\n";
+            break;
+        }
+        try {
+            char sep = milansql::CsvUtils::parseSepChar(
+                cmd.csvSeparator.empty() ? "," : cmd.csvSeparator);
+            auto rows = milansql::CsvUtils::readFile(
+                cmd.csvFile, sep, cmd.csvSkipHeader);
+
+            size_t inserted = 0, skipped = 0;
+            for (const auto& row : rows) {
+                try {
+                    engine.insertRow(cmd.tableName, row);
+                    ++inserted;
+                } catch (const std::exception& rowEx) {
+                    ++skipped;
+                    (void)rowEx; // silently skip constraint violations
+                }
+            }
+            persistFn();
+            dispatch_binlogWrite(eingabe);
+            engine.invalidateCache(cmd.tableName);
+            std::cout << "  " << inserted << " Zeile(n) importiert aus '"
+                      << cmd.csvFile << "' in '" << cmd.tableName << "'";
+            if (skipped > 0)
+                std::cout << " (" << skipped << " Zeile(n) uebersprungen)";
+            std::cout << ".\n\n";
+        } catch (const std::exception& ex) {
+            std::cout << "  FEHLER (LOAD DATA): " << ex.what() << "\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::INTO_OUTFILE: {
+        // Should not normally reach here — handled inside SELECT case.
+        // Fallback if parser set type = INTO_OUTFILE (unused path).
+        std::cout << "  Fehler: SELECT ... INTO OUTFILE nur als SELECT-Suffix.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_DATAFILES: {
+        auto files = milansql::CsvUtils::listCsvFiles();
+        if (files.empty()) {
+            std::cout << "  (Keine .csv/.tsv Dateien im aktuellen Verzeichnis)\n\n";
+        } else {
+            // Tabelle: Name | Groesse
+            struct FileRow { std::string name; std::string size; };
+            std::vector<FileRow> rows;
+            size_t w1 = 4, w2 = 6; // "Name", "Groesse"
+            for (const auto& f : files) {
+                std::string sz = "?";
+                try {
+                    auto bytes = std::filesystem::file_size(f);
+                    if (bytes < 1024)
+                        sz = std::to_string(bytes) + " B";
+                    else if (bytes < 1024 * 1024)
+                        sz = std::to_string(bytes / 1024) + " KB";
+                    else
+                        sz = std::to_string(bytes / (1024 * 1024)) + " MB";
+                } catch (...) {}
+                if (f.size()  > w1) w1 = f.size();
+                if (sz.size() > w2) w2 = sz.size();
+                rows.push_back({f, sz});
+            }
+            auto bar = [&]() {
+                return std::string("+") + std::string(w1 + 2, '-') + "+"
+                     + std::string(w2 + 2, '-') + "+";
+            };
+            std::cout << "\n  " << bar() << "\n";
+            std::cout << "  | " << std::left
+                      << std::setw(static_cast<int>(w1)) << "Name"
+                      << " | " << std::setw(static_cast<int>(w2)) << "Groesse"
+                      << " |\n";
+            std::cout << "  " << bar() << "\n";
+            for (auto& r : rows)
+                std::cout << "  | "
+                          << std::left << std::setw(static_cast<int>(w1)) << r.name
+                          << " | " << std::setw(static_cast<int>(w2)) << r.size
+                          << " |\n";
+            std::cout << "  " << bar() << "\n";
+            std::cout << "  " << rows.size() << " Datei(en).\n\n";
+        }
         break;
     }
 

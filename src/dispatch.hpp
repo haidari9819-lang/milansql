@@ -22,8 +22,21 @@
 #include "optimizer/optimizer.hpp"
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
+#include "replication/repl_state.hpp"
 
 namespace milansql {
+
+// ── Phase 59: Replication helpers ────────────────────────────
+// Returns true if the current operation should be blocked (slave read-only)
+static inline bool dispatch_slaveReadOnly() {
+    return milansql::g_replState.isSlave.load()
+        && !milansql::tl_binlogReplay;
+}
+// Appends sql to binlog (master mode only)
+static inline void dispatch_binlogWrite(const std::string& sql) {
+    if (milansql::g_replState.isMaster.load() && milansql::g_binlogHook)
+        milansql::g_binlogHook(sql);
+}
 
 // ── Forward declarations of helper print functions ───────────
 static inline void dispatch_printTable(const milansql::Table& tbl, int limit = -1, int offset = 0);
@@ -604,6 +617,10 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::CREATE_TABLE: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty() || cmd.columns.empty()) {
             std::cout << "  Fehler: CREATE TABLE name (col TYP, ...)\n"; break;
         }
@@ -618,6 +635,7 @@ inline bool dispatchCommand(
             }
         }
         persistFn();
+        dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
         std::cout << "  Tabelle '" << cmd.tableName << "' erstellt ("
                   << cmd.columns.size() << " Spalten";
@@ -628,6 +646,10 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::INSERT: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }
@@ -658,6 +680,7 @@ inline bool dispatchCommand(
                 ++count;
             }
             persistFn();
+            dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
             std::cout << "  " << count << " Zeile(n) eingefuegt in '"
                       << cmd.tableName << "' (INSERT INTO SELECT).\n\n";
@@ -701,6 +724,7 @@ inline bool dispatchCommand(
             for (const auto& vals : rows)
                 engine.insertOrReplace(cmd.tableName, vals) ? ++replaced : ++inserted;
             persistFn();
+            dispatch_binlogWrite(eingabe);
             if (replaced > 0 && inserted > 0)
                 std::cout << "  " << replaced << " Zeile(n) ersetzt, "
                           << inserted << " eingefuegt in '"
@@ -716,6 +740,7 @@ inline bool dispatchCommand(
             for (const auto& vals : rows)
                 engine.insertOrIgnore(cmd.tableName, vals) ? ++inserted : ++ignored;
             persistFn();
+            dispatch_binlogWrite(eingabe);
             if (ignored > 0 && inserted > 0)
                 std::cout << "  " << inserted << " Zeile(n) eingefuegt, "
                           << ignored << " ignoriert (Konflikt) in '"
@@ -730,6 +755,7 @@ inline bool dispatchCommand(
             for (const auto& vals : rows)
                 engine.insertRow(cmd.tableName, vals);
             persistFn();
+            dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
             if (rows.size() == 1)
                 std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
@@ -1207,6 +1233,10 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::UPDATE: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty() || cmd.updateCols.empty()) {
             std::cout << "  Fehler: UPDATE tabelle SET col=val [, col=val ...] [WHERE ...]\n"; break;
         }
@@ -1219,6 +1249,7 @@ inline bool dispatchCommand(
             std::size_t n = engine.updateAll(
                 cmd.tableName, cmd.updateCols, cmd.updateVals);
             persistFn();
+            dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc << ")\n\n";
@@ -1227,7 +1258,11 @@ inline bool dispatchCommand(
                 cmd.tableName,
                 cmd.updateCols, cmd.updateVals,
                 cmd.whereColumn, cmd.whereValue);
-            if (n > 0) { persistFn(); engine.invalidateCache(cmd.tableName); }
+            if (n > 0) {
+                persistFn();
+                dispatch_binlogWrite(eingabe);
+                engine.invalidateCache(cmd.tableName);
+            }
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc
                       << " WHERE " << cmd.whereColumn
@@ -1237,11 +1272,16 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::TRUNCATE: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: TRUNCATE TABLE tabellenname\n"; break;
         }
         engine.truncateTable(cmd.tableName);
         persistFn();
+        dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
         std::cout << "  Tabelle '" << cmd.tableName
                   << "' geleert (Schema + Constraints behalten,"
@@ -1250,18 +1290,27 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::DELETE: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: DELETE FROM tabelle [WHERE ...]\n"; break;
         }
         if (cmd.whereColumn.empty()) {
             std::size_t n = engine.deleteAll(cmd.tableName);
             persistFn();
+            dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
         } else {
             std::size_t n = engine.deleteWhere(
                 cmd.tableName, cmd.whereColumn, cmd.whereValue);
-            if (n > 0) { persistFn(); engine.invalidateCache(cmd.tableName); }
+            if (n > 0) {
+                persistFn();
+                dispatch_binlogWrite(eingabe);
+                engine.invalidateCache(cmd.tableName);
+            }
             std::cout << "  " << n << " Zeile(n) geloescht"
                       << " (WHERE " << cmd.whereColumn
                       << " = " << cmd.whereValue << ")\n\n";
@@ -1400,12 +1449,17 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::DROP_TABLE: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }
         try {
             engine.dropTable(cmd.tableName);
             persistFn();
+            dispatch_binlogWrite(eingabe);
             std::cout << "  Tabelle '" << cmd.tableName << "' geloescht.\n\n";
         } catch (const std::exception& ex) {
             if (cmd.ifExists)
@@ -1417,6 +1471,10 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::ALTER_TABLE: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
         if (cmd.tableName.empty() || cmd.alterOp.empty()) {
             std::cout << "  Fehler: ALTER TABLE name ADD|DROP|RENAME COLUMN ...\n";
             break;
@@ -1425,6 +1483,7 @@ inline bool dispatchCommand(
                           cmd.alterColName, cmd.alterColType,
                           cmd.alterColNew);
         persistFn();
+        dispatch_binlogWrite(eingabe);
         if (cmd.alterOp == "ADD")
             std::cout << "  Spalte '" << cmd.alterColName
                       << "' (" << cmd.alterColType << ") zu '"
@@ -2043,6 +2102,147 @@ inline bool dispatchCommand(
         long long totalUs = static_cast<long long>(totalMs * 1000.0);
         milansql::g_poolStats.totalQueryTimeUs.fetch_add(totalUs);
 
+        break;
+    }
+
+    // ── Phase 59: Replication Commands ───────────────────────────
+
+    case milansql::CommandType::SHOW_MASTER_STATUS: {
+        if (!milansql::g_replState.isMaster.load()) {
+            std::cout << "  FEHLER: Dieser Server laeuft nicht im Master-Modus.\n\n";
+            break;
+        }
+        long long pos = milansql::g_binlogGetPosFn
+                        ? milansql::g_binlogGetPosFn() : 0;
+        int slaves    = milansql::g_replState.connectedSlaves.load();
+        struct KV { std::string k, v; };
+        std::vector<KV> rows = {
+            {"Binlog-Datei",    milansql::g_replState.binlogFile},
+            {"Position",        std::to_string(pos)},
+            {"Slaves aktiv",    std::to_string(slaves)},
+            {"Repl-Port",       "(siehe --repl-port)"},
+        };
+        size_t w1 = 14, w2 = 24;
+        for (auto& r : rows) {
+            if (r.k.size() > w1) w1 = r.k.size();
+            if (r.v.size() > w2) w2 = r.v.size();
+        }
+        std::string hline(w1 + w2 + 7, '\xe2');
+        auto bar = [&](char lc, char mc, char rc) {
+            std::string s;
+            s += lc; s += std::string(w1 + 2, '-');
+            s += mc; s += std::string(w2 + 2, '-');
+            s += rc; return s;
+        };
+        std::cout << "\n  " << bar('+','+','+') << "\n";
+        std::cout << "  | " << std::left << std::setw(static_cast<int>(w1)) << "Eigenschaft"
+                  << " | " << std::setw(static_cast<int>(w2)) << "Wert" << " |\n";
+        std::cout << "  " << bar('+','+','+') << "\n";
+        for (auto& r : rows)
+            std::cout << "  | " << std::left << std::setw(static_cast<int>(w1)) << r.k
+                      << " | " << std::setw(static_cast<int>(w2)) << r.v << " |\n";
+        std::cout << "  " << bar('+','+','+') << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SLAVE_STATUS: {
+        if (!milansql::g_replState.isSlave.load()) {
+            std::cout << "  FEHLER: Dieser Server laeuft nicht im Slave-Modus.\n\n";
+            break;
+        }
+        std::string status;
+        { std::lock_guard<std::mutex> lk(milansql::g_replState.statusMu);
+          status = milansql::g_replState.slaveStatus; }
+        std::string lagStr = std::to_string(milansql::g_replState.slaveLagMs.load()) + "ms";
+        struct KV { std::string k, v; };
+        std::vector<KV> rows = {
+            {"Master-Host",   milansql::g_replState.masterHost},
+            {"Master-Port",   std::to_string(milansql::g_replState.masterPort)},
+            {"Slave-Status",  status},
+            {"Slave-Position",std::to_string(milansql::g_replState.slavePos.load())},
+            {"Lag",           lagStr},
+            {"Read-Only",     "Ja"},
+        };
+        size_t w1 = 14, w2 = 24;
+        for (auto& r : rows) {
+            if (r.k.size() > w1) w1 = r.k.size();
+            if (r.v.size() > w2) w2 = r.v.size();
+        }
+        auto bar = [&](char lc, char mc, char rc) {
+            std::string s;
+            s += lc; s += std::string(w1 + 2, '-');
+            s += mc; s += std::string(w2 + 2, '-');
+            s += rc; return s;
+        };
+        std::cout << "\n  " << bar('+','+','+') << "\n";
+        std::cout << "  | " << std::left << std::setw(static_cast<int>(w1)) << "Eigenschaft"
+                  << " | " << std::setw(static_cast<int>(w2)) << "Wert" << " |\n";
+        std::cout << "  " << bar('+','+','+') << "\n";
+        for (auto& r : rows)
+            std::cout << "  | " << std::left << std::setw(static_cast<int>(w1)) << r.k
+                      << " | " << std::setw(static_cast<int>(w2)) << r.v << " |\n";
+        std::cout << "  " << bar('+','+','+') << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_BINLOG: {
+        if (!milansql::g_binlogReadLastFn) {
+            std::cout << "  FEHLER: Kein Binlog verfuegbar (Master-Modus erforderlich).\n\n";
+            break;
+        }
+        auto entries = milansql::g_binlogReadLastFn(20);
+        if (entries.empty()) {
+            std::cout << "  Binlog ist leer.\n\n";
+            break;
+        }
+        // column widths
+        size_t wPos = 3, wTs = 19, wSql = 40;
+        for (auto& e : entries) {
+            size_t ps = std::to_string(e.pos).size();
+            if (ps > wPos) wPos = ps;
+            if (e.sql.size() > wSql) wSql = std::min(e.sql.size(), size_t(60));
+        }
+        auto bar = [&]() {
+            return std::string("+") + std::string(wPos + 2, '-') + "+"
+                 + std::string(wTs  + 2, '-') + "+"
+                 + std::string(wSql + 2, '-') + "+";
+        };
+        auto trunc = [](const std::string& s, size_t n) {
+            if (s.size() <= n) return s;
+            return s.substr(0, n - 3) + "...";
+        };
+        std::cout << "\n  " << bar() << "\n";
+        std::cout << "  | " << std::left << std::setw(static_cast<int>(wPos)) << "Pos"
+                  << " | " << std::setw(static_cast<int>(wTs))  << "Timestamp"
+                  << " | " << std::setw(static_cast<int>(wSql)) << "SQL" << " |\n";
+        std::cout << "  " << bar() << "\n";
+        for (auto& e : entries) {
+            std::cout << "  | " << std::left
+                      << std::setw(static_cast<int>(wPos)) << e.pos
+                      << " | " << std::setw(static_cast<int>(wTs))  << e.timestamp
+                      << " | " << std::setw(static_cast<int>(wSql)) << trunc(e.sql, wSql)
+                      << " |\n";
+        }
+        std::cout << "  " << bar() << "\n";
+        std::cout << "  " << entries.size() << " Eintrag/Eintraege.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::STOP_SLAVE: {
+        if (!milansql::g_replState.isSlave.load()) {
+            std::cout << "  FEHLER: Kein Slave-Modus aktiv.\n\n"; break;
+        }
+        if (milansql::g_stopSlaveHook) milansql::g_stopSlaveHook();
+        std::cout << "  Replikation gestoppt.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::START_SLAVE: {
+        if (!milansql::g_replState.isSlave.load()) {
+            std::cout << "  FEHLER: Kein Slave-Modus aktiv.\n\n"; break;
+        }
+        if (milansql::g_startSlaveHook) milansql::g_startSlaveHook();
+        std::cout << "  Replikation gestartet.\n\n";
         break;
     }
 

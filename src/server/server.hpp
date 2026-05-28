@@ -143,6 +143,13 @@ public:
 
     void run();
 
+    // Phase 59: Execute SQL bypassing the slave read-only check.
+    // Called by SlaveReplication to replay binlog entries.
+    // The caller must set tl_binlogReplay = true before calling.
+    std::string replaySql(const std::string& sql) {
+        return executeQuery(sql, -1);
+    }
+
 private:
     int port_;
     std::string dbPath_;

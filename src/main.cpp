@@ -11,12 +11,19 @@
 #include <algorithm>
 #include <cstdio>
 #include <functional>
+#include <memory>
 
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
 #include "parser/parser.hpp"
 #include "storage/storage.hpp"
 #include "dispatch.hpp"
+
+// Phase 59: Replication
+#include "replication/binlog.hpp"
+#include "replication/repl_state.hpp"
+#include "replication/master_repl.hpp"
+#include "replication/slave_repl.hpp"
 
 // ============================================================
 // main.cpp — REPL für MilanSQL (Phase 47)
@@ -42,16 +49,27 @@ int main(int argc, char* argv[]) {
     int  httpPort   = 8080;
     int  poolSize   = 10;   // Phase 58: Connection Pool Größe
     int  maxQueue   = 100;  // Phase 58: max. Queue-Länge
+    // Phase 59: Replication
+    bool masterMode  = false;
+    bool slaveMode   = false;
+    std::string masterHost = "localhost";
+    int  masterPort  = 4407;
+    int  replPort    = 4407;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--server") serverMode = true;
-        else if (arg == "--client") clientMode = true;
-        else if (arg == "--http")   httpMode   = true;
-        else if (arg == "--port"       && i + 1 < argc) port     = std::stoi(argv[++i]);
-        else if (arg == "--http-port"  && i + 1 < argc) httpPort = std::stoi(argv[++i]);
-        else if (arg == "--pool-size"  && i + 1 < argc) poolSize = std::stoi(argv[++i]);
-        else if (arg == "--max-queue"  && i + 1 < argc) maxQueue = std::stoi(argv[++i]);
+        if      (arg == "--server")     serverMode = true;
+        else if (arg == "--client")     clientMode = true;
+        else if (arg == "--http")       httpMode   = true;
+        else if (arg == "--master")     masterMode = true;
+        else if (arg == "--slave")      slaveMode  = true;
+        else if (arg == "--port"         && i + 1 < argc) port       = std::stoi(argv[++i]);
+        else if (arg == "--http-port"    && i + 1 < argc) httpPort   = std::stoi(argv[++i]);
+        else if (arg == "--pool-size"    && i + 1 < argc) poolSize   = std::stoi(argv[++i]);
+        else if (arg == "--max-queue"    && i + 1 < argc) maxQueue   = std::stoi(argv[++i]);
+        else if (arg == "--master-host"  && i + 1 < argc) masterHost = argv[++i];
+        else if (arg == "--master-port"  && i + 1 < argc) masterPort = std::stoi(argv[++i]);
+        else if (arg == "--repl-port"    && i + 1 < argc) replPort   = std::stoi(argv[++i]);
     }
 
     // ── HTTP mode (Phase 52) ──────────────────────────────────
@@ -64,9 +82,74 @@ int main(int argc, char* argv[]) {
 
     // ── Server mode (Phase 58: Pool-Parameter übergeben) ────────
     if (serverMode) {
+        std::string modeTag;
+        if (masterMode) modeTag = " [MASTER, Repl-Port " + std::to_string(replPort) + "]";
+        else if (slaveMode) modeTag = " [SLAVE -> " + masterHost + ":" + std::to_string(masterPort) + "]";
+
         std::cout << "MilanSQL Server startet auf Port " << port
-                  << " (Pool: " << poolSize << " Threads)...\n";
+                  << " (Pool: " << poolSize << " Threads)" << modeTag << "...\n";
+
         MilanServer server(port, "database.milan", poolSize, maxQueue);
+
+        // ── Phase 59: Master setup ────────────────────────────
+        std::unique_ptr<milansql::BinlogWriter>      binlogWriter;
+        std::unique_ptr<milansql::MasterReplication> masterRepl;
+
+        if (masterMode) {
+            milansql::g_replState.isMaster.store(true);
+            milansql::g_replState.binlogFile = "database.binlog";
+
+            binlogWriter = std::make_unique<milansql::BinlogWriter>("database.binlog");
+
+            milansql::g_binlogHook = [&binlogWriter](const std::string& sql) {
+                try { binlogWriter->write(sql); }
+                catch (...) {}
+            };
+            milansql::g_binlogGetPosFn = [&binlogWriter]() -> long long {
+                return binlogWriter->getCurrentPos();
+            };
+            milansql::g_binlogReadLastFn = [&binlogWriter](int n)
+                    -> std::vector<milansql::ReplBinlogEntry> {
+                auto raw = binlogWriter->readLast(n);
+                std::vector<milansql::ReplBinlogEntry> out;
+                out.reserve(raw.size());
+                for (auto& e : raw)
+                    out.push_back({e.pos, e.timestamp, e.sql});
+                return out;
+            };
+
+            masterRepl = std::make_unique<milansql::MasterReplication>(
+                replPort, *binlogWriter);
+            masterRepl->start();
+        }
+
+        // ── Phase 59: Slave setup ─────────────────────────────
+        std::unique_ptr<milansql::SlaveReplication> slaveRepl;
+
+        if (slaveMode) {
+            milansql::g_replState.isSlave.store(true);
+            milansql::g_replState.masterHost = masterHost;
+            milansql::g_replState.masterPort = masterPort;
+
+            slaveRepl = std::make_unique<milansql::SlaveReplication>(
+                masterHost, masterPort,
+                [&server](const std::string& sql) {
+                    milansql::tl_binlogReplay = true;
+                    try { server.replaySql(sql); }
+                    catch (...) {}
+                    milansql::tl_binlogReplay = false;
+                });
+
+            milansql::g_stopSlaveHook  = [&slaveRepl]() {
+                if (slaveRepl) slaveRepl->stop();
+            };
+            milansql::g_startSlaveHook = [&slaveRepl]() {
+                if (slaveRepl) slaveRepl->resume();
+            };
+
+            slaveRepl->start();
+        }
+
         server.run();
         return 0;
     }
@@ -223,6 +306,59 @@ int main(int argc, char* argv[]) {
             std::cout << "  WARNUNG: Speichern fehlgeschlagen: " << ex.what() << "\n";
         }
     };
+
+    // ── Phase 59: REPL-mode Replication setup ─────────────────
+    std::unique_ptr<milansql::BinlogWriter>      replBinlogWriter;
+    std::unique_ptr<milansql::MasterReplication> replMasterRepl;
+    std::unique_ptr<milansql::SlaveReplication>  replSlaveRepl;
+
+    if (masterMode) {
+        milansql::g_replState.isMaster.store(true);
+        milansql::g_replState.binlogFile = "database.binlog";
+        replBinlogWriter = std::make_unique<milansql::BinlogWriter>("database.binlog");
+        milansql::g_binlogHook = [&replBinlogWriter](const std::string& sql) {
+            try { replBinlogWriter->write(sql); } catch (...) {}
+        };
+        milansql::g_binlogGetPosFn = [&replBinlogWriter]() -> long long {
+            return replBinlogWriter->getCurrentPos();
+        };
+        milansql::g_binlogReadLastFn = [&replBinlogWriter](int n)
+                -> std::vector<milansql::ReplBinlogEntry> {
+            auto raw = replBinlogWriter->readLast(n);
+            std::vector<milansql::ReplBinlogEntry> out;
+            for (auto& e : raw) out.push_back({e.pos, e.timestamp, e.sql});
+            return out;
+        };
+        replMasterRepl = std::make_unique<milansql::MasterReplication>(
+            replPort, *replBinlogWriter);
+        replMasterRepl->start();
+        std::cout << "  [Master] Replikation aktiv auf Port " << replPort << ".\n\n";
+    }
+
+    if (slaveMode) {
+        milansql::g_replState.isSlave.store(true);
+        milansql::g_replState.masterHost = masterHost;
+        milansql::g_replState.masterPort = masterPort;
+        replSlaveRepl = std::make_unique<milansql::SlaveReplication>(
+            masterHost, masterPort,
+            [&](const std::string& sql) {
+                milansql::tl_binlogReplay = true;
+                try {
+                    milansql::ParsedCommand rcmd = parser.parse(sql);
+                    milansql::dispatchCommand(rcmd, engine, parser, sql,
+                        persist, saveProcedures, saveTriggers);
+                } catch (...) {}
+                milansql::tl_binlogReplay = false;
+            });
+        milansql::g_stopSlaveHook  = [&replSlaveRepl]() {
+            if (replSlaveRepl) replSlaveRepl->stop();
+        };
+        milansql::g_startSlaveHook = [&replSlaveRepl]() {
+            if (replSlaveRepl) replSlaveRepl->resume();
+        };
+        replSlaveRepl->start();
+        std::cout << "  [Slave] Verbinde zu " << masterHost << ":" << masterPort << "...\n\n";
+    }
 
     while (true) {
         std::cout << "milansql> " << std::flush;

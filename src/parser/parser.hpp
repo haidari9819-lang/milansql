@@ -85,6 +85,12 @@ enum class CommandType {
     SHOW_BACKUPS,
     // Phase 58: Benchmark
     BENCHMARK,
+    // Phase 59: Replication
+    SHOW_MASTER_STATUS,
+    SHOW_SLAVE_STATUS,
+    SHOW_BINLOG,
+    STOP_SLAVE,
+    START_SLAVE,
     UNKNOWN
 };
 
@@ -1102,6 +1108,13 @@ public:
             // Phase 58: SHOW STATUS (Alias für STATUS)
             } else if (kw1 == "STATUS") {
                 cmd.type = CommandType::STATUS;
+            // Phase 59: Replication SHOW commands
+            } else if (kw1 == "MASTER" && kw2 == "STATUS") {
+                cmd.type = CommandType::SHOW_MASTER_STATUS;
+            } else if (kw1 == "SLAVE" && kw2 == "STATUS") {
+                cmd.type = CommandType::SHOW_SLAVE_STATUS;
+            } else if (kw1 == "BINLOG") {
+                cmd.type = CommandType::SHOW_BINLOG;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -1343,6 +1356,13 @@ public:
             cmd.type = CommandType::DESCRIBE;
             if (tokens.size() >= 2) cmd.tableName = tokens[1];
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 59: STOP SLAVE / START SLAVE ──────────────────
+        } else if (kw0 == "STOP" && kw1 == "SLAVE") {
+            cmd.type = CommandType::STOP_SLAVE;
+        } else if (kw0 == "START" && kw1 == "SLAVE") {
+            cmd.type = CommandType::START_SLAVE;
+
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }
         else                     { cmd.type = CommandType::UNKNOWN; }

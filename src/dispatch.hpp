@@ -1296,7 +1296,7 @@ inline bool dispatchCommand(
 
         struct KV { std::string key, val; };
         std::vector<KV> kvs = {
-            {"Version",          "MilanSQL v1.0.0"},
+            {"Version",          "MilanSQL v1.1.0"},
             {"Datei",            "database.milan"},
             {"Format-Version",   std::to_string(milansql::MilanBinaryStorage::FORMAT_VERSION)},
             {"Tabellen",         std::to_string(tnames.size())},

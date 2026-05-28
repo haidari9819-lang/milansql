@@ -1,12 +1,26 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.0.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.1.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **53 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **58 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.1.0
+
+| Phase | Feature |
+|-------|---------|
+| **54** | **Query Cache** (LRU/TTL), `EXPLAIN ANALYZE`, Web Dashboard (`--http`), `SHOW PROCESSLIST` |
+| **55** | **DATE/TIME** Datentypen: `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `NOW()`, `CURDATE()`, `DATEDIFF()`, `DATE_ADD()`, `DATE_FORMAT()` |
+| **56** | **JSON** Datentyp: `JSON_EXTRACT`, `JSON_SET`, `JSON_KEYS`, `JSON_LENGTH`, `JSON_CONTAINS`, `JSON_TYPE`, `JSON_VALID` |
+| **57** | **Backup/Restore**: `BACKUP DATABASE/TABLE TO 'file'`, `RESTORE DATABASE FROM 'file'`, `SHOW BACKUPS`, SQL-Dump Format, Topological Sort (FK) |
+| **58** | **Connection Pooling** (Thread Pool, `--pool-size N`, `--max-queue N`), `BENCHMARK N sql`, `SHOW STATUS` mit Pool-Metriken |
+
+> **Python & Node.js Client Libraries** (Phase 53) wurden ebenfalls in v1.1.0 aufgenommen.
 
 ---
 
@@ -38,7 +52,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v1.0.0 ===           ║
+  ║        === MilanSQL v1.1.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝

@@ -803,6 +803,9 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }
+        if (milansql::Engine::isInfoSchemaName(cmd.tableName)) {
+            std::cout << "  FEHLER: INFORMATION_SCHEMA ist read-only.\n\n"; break;
+        }
         if (cmd.isInsertSelect) {
             if (cmd.insertSelectSql.empty()) {
                 std::cout << "  Fehler: INSERT INTO name SELECT ...\n"; break;
@@ -1445,6 +1448,9 @@ inline bool dispatchCommand(
             std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
             break;
         }
+        if (milansql::Engine::isInfoSchemaName(cmd.tableName)) {
+            std::cout << "  FEHLER: INFORMATION_SCHEMA ist read-only.\n\n"; break;
+        }
         if (cmd.tableName.empty() || cmd.updateCols.empty()) {
             std::cout << "  Fehler: UPDATE tabelle SET col=val [, col=val ...] [WHERE ...]\n"; break;
         }
@@ -1501,6 +1507,9 @@ inline bool dispatchCommand(
         if (dispatch_slaveReadOnly()) {
             std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
             break;
+        }
+        if (milansql::Engine::isInfoSchemaName(cmd.tableName)) {
+            std::cout << "  FEHLER: INFORMATION_SCHEMA ist read-only.\n\n"; break;
         }
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: DELETE FROM tabelle [WHERE ...]\n"; break;

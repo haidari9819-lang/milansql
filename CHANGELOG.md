@@ -4,6 +4,33 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.6.0] — 2026-05-28
+
+### Added
+
+#### Phase 63 — INFORMATION_SCHEMA
+- `SELECT * FROM information_schema.tables` — alle Tabellen und Views (TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS)
+- `SELECT * FROM information_schema.columns` — alle Spalten mit ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE, COLUMN_KEY (PRI/UNI), EXTRA (auto_increment)
+- `SELECT * FROM information_schema.indexes` — alle B-Tree-Indizes (TABLE_NAME, INDEX_NAME, COLUMN_NAME, INDEX_TYPE)
+- `SELECT * FROM information_schema.views` — alle Views mit VIEW_DEFINITION
+- `SELECT * FROM information_schema.triggers` — alle Trigger (EVENT_MANIPULATION, EVENT_OBJECT_TABLE, ACTION_TIMING, ACTION_STATEMENT)
+- `SELECT * FROM information_schema.routines` — alle Stored Procedures (ROUTINE_TYPE, ROUTINE_DEFINITION)
+- `SELECT * FROM information_schema.schemata` — alle Schemas mit DEFAULT_CHARACTER_SET_NAME
+- `SELECT * FROM information_schema.partitions` — partitionierte Tabellen (PARTITION_NAME, PARTITION_METHOD, PARTITION_EXPRESSION, TABLE_ROWS)
+- `SELECT * FROM information_schema.events` — alle Events (INTERVAL_VALUE, STATUS, EVENT_DEFINITION)
+- `SELECT * FROM information_schema.user_privileges` — Benutzerrechte (GRANTEE, TABLE_NAME, PRIVILEGE_TYPE)
+- WHERE-Filter und JOINs auf alle INFORMATION_SCHEMA-Tabellen vollständig unterstützt
+- Read-only: INSERT/UPDATE/DELETE auf INFORMATION_SCHEMA → FEHLER
+- Virtuelle Tabellen werden on-demand aus dem Engine-State gebaut (keine Persistenz nötig)
+
+### Architecture
+- `Engine::isInfoSchemaName(name)` — öffentliche statische Hilfsmethode
+- `Engine::buildInfoSchemaTable(rawName)` — baut virtuelle Table-Objekte on-demand
+- `Engine::getTable(n) const` — interceptiert `information_schema.*`-Namen via `mutable infoSchemaCache_`
+- Write-Protection in `dispatch.hpp` für INSERT/UPDATE/DELETE auf `information_schema.*`
+
+---
+
 ## [v1.5.0] — 2026-05-28
 
 ### Added

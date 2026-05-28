@@ -1,12 +1,31 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.5.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.6.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **62 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **63 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.6.0
+
+| Phase | Feature |
+|-------|---------|
+| **63** | **INFORMATION_SCHEMA**: 10 virtuelle Read-Only-Meta-Tabellen |
+| | `information_schema.tables` — alle Tabellen & Views (TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS) |
+| | `information_schema.columns` — alle Spalten (ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA) |
+| | `information_schema.indexes` — alle B-Tree-Indizes (INDEX_NAME, COLUMN_NAME, INDEX_TYPE) |
+| | `information_schema.views` — alle Views mit VIEW_DEFINITION |
+| | `information_schema.triggers` — alle Trigger (EVENT_MANIPULATION, ACTION_TIMING, ACTION_STATEMENT) |
+| | `information_schema.routines` — alle Stored Procedures |
+| | `information_schema.schemata` — alle Schemas |
+| | `information_schema.partitions` — partitionierte Tabellen (PARTITION_METHOD, PARTITION_EXPRESSION) |
+| | `information_schema.events` — alle Events (INTERVAL_VALUE, STATUS) |
+| | `information_schema.user_privileges` — Benutzerrechte (GRANTEE, PRIVILEGE_TYPE) |
+| | WHERE-Filter und JOINs vollständig unterstützt; INSERT/UPDATE/DELETE → FEHLER (read-only) |
 
 ---
 

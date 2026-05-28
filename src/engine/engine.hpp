@@ -20,6 +20,7 @@
 #include "../cache/query_cache.hpp"
 #include "../utils/date_utils.hpp"
 #include "../utils/json_utils.hpp"
+#include "../scheduler/event_scheduler.hpp"
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -3207,6 +3208,241 @@ private:
 
     // ── Tabellen-Zugriff ──────────────────────────────────────
 
+    // Phase 63: build a virtual INFORMATION_SCHEMA table on demand
+    Table buildInfoSchemaTable(const std::string& rawName) const {
+        // Extract the sub-table name (part after the dot)
+        std::string low = rawName;
+        for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        std::string sub;
+        auto dot = low.find('.');
+        sub = (dot != std::string::npos) ? low.substr(dot + 1) : "tables";
+
+        // Helper: split "schema.name" into (schema, bareName)
+        auto splitName = [](const std::string& fullName)
+            -> std::pair<std::string, std::string>
+        {
+            auto p = fullName.find('.');
+            if (p != std::string::npos)
+                return {fullName.substr(0, p), fullName.substr(p + 1)};
+            return {"public", fullName};
+        };
+
+        if (sub == "tables") {
+            Table t(rawName, {
+                Column("TABLE_SCHEMA", "TEXT"),
+                Column("TABLE_NAME",   "TEXT"),
+                Column("TABLE_TYPE",   "TEXT"),
+                Column("TABLE_ROWS",   "INT")
+            });
+            for (const auto& [tname, tbl] : tables_) {
+                if (tempTableNames_.count(tname)) continue;
+                auto [schema, bare] = splitName(tname);
+                t.insert(Row({schema, bare, "BASE TABLE",
+                              std::to_string(tbl.rowCount())}));
+            }
+            for (const auto& [vname, vsql] : views_) {
+                (void)vsql;
+                auto [schema, bare] = splitName(vname);
+                t.insert(Row({schema, bare, "VIEW", "0"}));
+            }
+            return t;
+        }
+
+        if (sub == "columns") {
+            Table t(rawName, {
+                Column("TABLE_SCHEMA",     "TEXT"),
+                Column("TABLE_NAME",       "TEXT"),
+                Column("COLUMN_NAME",      "TEXT"),
+                Column("ORDINAL_POSITION", "INT"),
+                Column("DATA_TYPE",        "TEXT"),
+                Column("IS_NULLABLE",      "TEXT"),
+                Column("COLUMN_KEY",       "TEXT"),
+                Column("EXTRA",            "TEXT")
+            });
+            for (const auto& [tname, tbl] : tables_) {
+                if (tempTableNames_.count(tname)) continue;
+                auto [schema, bare] = splitName(tname);
+                const auto& cols = tbl.columns();
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    const Column& c = cols[i];
+                    std::string colKey;
+                    if (c.isPrimaryKey)  colKey = "PRI";
+                    else if (c.isUnique) colKey = "UNI";
+                    std::string extra = c.autoIncrement ? "auto_increment" : "";
+                    std::string isNull = (c.notNull || c.isPrimaryKey) ? "NO" : "YES";
+                    t.insert(Row({schema, bare, c.name,
+                                  std::to_string(i + 1), c.type,
+                                  isNull, colKey, extra}));
+                }
+            }
+            return t;
+        }
+
+        if (sub == "indexes" || sub == "statistics") {
+            Table t(rawName, {
+                Column("TABLE_SCHEMA", "TEXT"),
+                Column("TABLE_NAME",   "TEXT"),
+                Column("INDEX_NAME",   "TEXT"),
+                Column("COLUMN_NAME",  "TEXT"),
+                Column("NON_UNIQUE",   "INT"),
+                Column("INDEX_TYPE",   "TEXT")
+            });
+            for (const auto& [tname, tbl] : tables_) {
+                if (tempTableNames_.count(tname)) continue;
+                auto [schema, bare] = splitName(tname);
+                for (const auto& idx : tbl.getIndexes()) {
+                    t.insert(Row({schema, bare, idx.indexName,
+                                  idx.colName, "1", "BTREE"}));
+                }
+            }
+            return t;
+        }
+
+        if (sub == "views") {
+            Table t(rawName, {
+                Column("TABLE_SCHEMA",    "TEXT"),
+                Column("VIEW_NAME",       "TEXT"),
+                Column("VIEW_DEFINITION", "TEXT")
+            });
+            for (const auto& [vname, vsql] : views_) {
+                auto [schema, bare] = splitName(vname);
+                t.insert(Row({schema, bare, vsql}));
+            }
+            return t;
+        }
+
+        if (sub == "triggers") {
+            Table t(rawName, {
+                Column("TRIGGER_SCHEMA",     "TEXT"),
+                Column("TRIGGER_NAME",       "TEXT"),
+                Column("EVENT_MANIPULATION", "TEXT"),
+                Column("EVENT_OBJECT_TABLE", "TEXT"),
+                Column("ACTION_TIMING",      "TEXT"),
+                Column("ACTION_STATEMENT",   "TEXT")
+            });
+            for (const auto& [trgName, trg] : triggers_) {
+                (void)trgName;
+                auto [schema, bare] = splitName(trg.tableName);
+                (void)bare;
+                t.insert(Row({schema, trg.name, trg.event,
+                              trg.tableName, trg.timing, trg.body}));
+            }
+            return t;
+        }
+
+        if (sub == "routines") {
+            Table t(rawName, {
+                Column("ROUTINE_SCHEMA",     "TEXT"),
+                Column("ROUTINE_NAME",       "TEXT"),
+                Column("ROUTINE_TYPE",       "TEXT"),
+                Column("ROUTINE_DEFINITION", "TEXT")
+            });
+            for (const auto& [pname, proc] : procedures_) {
+                (void)pname;
+                t.insert(Row({"public", proc.name, "PROCEDURE", proc.body}));
+            }
+            return t;
+        }
+
+        if (sub == "schemata") {
+            Table t(rawName, {
+                Column("SCHEMA_NAME",               "TEXT"),
+                Column("DEFAULT_CHARACTER_SET_NAME", "TEXT")
+            });
+            for (const auto& s : schemas_) {
+                t.insert(Row({s, "utf8mb4"}));
+            }
+            return t;
+        }
+
+        if (sub == "partitions") {
+            Table t(rawName, {
+                Column("TABLE_SCHEMA",         "TEXT"),
+                Column("TABLE_NAME",           "TEXT"),
+                Column("PARTITION_NAME",       "TEXT"),
+                Column("PARTITION_METHOD",     "TEXT"),
+                Column("PARTITION_EXPRESSION", "TEXT"),
+                Column("TABLE_ROWS",           "INT")
+            });
+            for (const auto& [tname, tbl] : tables_) {
+                if (tempTableNames_.count(tname)) continue;
+                const PartitionInfo& pi = tbl.getPartitionInfo();
+                if (!pi.hasPartitions()) continue;
+                auto [schema, bare] = splitName(tname);
+                std::string method;
+                if      (pi.type == PartitionType::RANGE) method = "RANGE";
+                else if (pi.type == PartitionType::LIST)  method = "LIST";
+                else if (pi.type == PartitionType::HASH)  method = "HASH";
+                auto stats = tbl.getPartitionStats();
+                for (const auto& [pname, cnt] : stats) {
+                    std::string expr;
+                    if (pi.type == PartitionType::RANGE) {
+                        for (const auto& r : pi.ranges)
+                            if (r.name == pname) { expr = "< " + r.limitStr; break; }
+                    } else if (pi.type == PartitionType::LIST) {
+                        for (const auto& l : pi.lists) {
+                            if (l.name == pname) {
+                                for (size_t i = 0; i < l.values.size(); ++i) {
+                                    if (i) expr += ",";
+                                    expr += l.values[i];
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        expr = "HASH(" + pi.column + ")";
+                    }
+                    t.insert(Row({schema, bare, pname, method, expr,
+                                  std::to_string(cnt)}));
+                }
+            }
+            return t;
+        }
+
+        if (sub == "events") {
+            Table t(rawName, {
+                Column("EVENT_SCHEMA",     "TEXT"),
+                Column("EVENT_NAME",       "TEXT"),
+                Column("EVENT_DEFINITION", "TEXT"),
+                Column("INTERVAL_VALUE",   "TEXT"),
+                Column("STATUS",           "TEXT")
+            });
+            if (g_eventScheduler) {
+                for (const auto& ev : g_eventScheduler->getEvents()) {
+                    std::string interval;
+                    if (ev.recurring) {
+                        interval = "EVERY " + std::to_string(ev.intervalSecs) + "s";
+                        if (ev.hasAt) interval += " AT " + ev.atTime;
+                    } else {
+                        interval = "AT " + ev.atTime;
+                    }
+                    std::string status = ev.enabled ? "ENABLED" : "DISABLED";
+                    t.insert(Row({"public", ev.name, ev.sql, interval, status}));
+                }
+            }
+            return t;
+        }
+
+        if (sub == "user_privileges") {
+            Table t(rawName, {
+                Column("GRANTEE",        "TEXT"),
+                Column("TABLE_NAME",     "TEXT"),
+                Column("PRIVILEGE_TYPE", "TEXT")
+            });
+            for (const auto& [uname, user] : users_) {
+                for (const auto& [tname, privs] : user.grants) {
+                    for (const auto& priv : privs) {
+                        t.insert(Row({uname, tname, priv}));
+                    }
+                }
+            }
+            return t;
+        }
+
+        throw std::runtime_error(
+            "Unknown INFORMATION_SCHEMA table: '" + sub + "'");
+    }
+
     Table& getTable(const std::string& n) {
         auto it = tables_.find(n);
         if (it == tables_.end())
@@ -3214,6 +3450,10 @@ private:
         return it->second;
     }
     const Table& getTable(const std::string& n) const {
+        if (isInfoSchemaName(n)) {
+            infoSchemaCache_[n] = buildInfoSchemaTable(n);
+            return infoSchemaCache_[n];
+        }
         auto it = tables_.find(n);
         if (it == tables_.end())
             throw std::runtime_error("Tabelle '" + n + "' nicht gefunden.");
@@ -4618,6 +4858,15 @@ public:
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
 
+    // Phase 63: public static helper — check if name refers to INFORMATION_SCHEMA
+    static bool isInfoSchemaName(const std::string& name) {
+        if (name.size() < 18) return false;
+        std::string low = name;
+        for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return low.substr(0, 18) == "information_schema" &&
+               (low.size() == 18 || low[18] == '.');
+    }
+
     // Gibt die Spalten einer Tabelle zurück (für INSERT-Umordnung in dispatch)
     const std::vector<Column>& tableColumns(const std::string& tblRaw) const {
         auto name = resolveTableName(tblRaw);
@@ -4757,6 +5006,9 @@ public:
 private:
     // Phase 54A: Query Cache instance
     QueryCache queryCache_;
+
+    // Phase 63: INFORMATION_SCHEMA virtual table cache (mutable for const access)
+    mutable std::map<std::string, Table> infoSchemaCache_;
 };
 
 } // namespace milansql

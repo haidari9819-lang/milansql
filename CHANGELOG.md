@@ -4,6 +4,37 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.9.0] — 2026-05-28
+
+### Added
+
+#### Phase 66 — Cursor in Stored Procedures (DECLARE/OPEN/FETCH/CLOSE + LOOP/IF)
+
+**Cursor-Unterstützung:**
+- `DECLARE name CURSOR FOR SELECT ...` — Cursor deklarieren
+- `OPEN name` — Cursor öffnen (führt SELECT aus, lädt Ergebnismenge)
+- `FETCH name INTO v1, v2, ...` — nächste Zeile in lokale Variablen laden
+- `CLOSE name` — Cursor schließen
+- `DECLARE CONTINUE HANDLER FOR NOT FOUND SET var = val` — EOF-Handler
+
+**Variablen:**
+- `DECLARE name TYPE [DEFAULT val]` — lokale Variable deklarieren (INT, VARCHAR, etc.)
+- `SET var = expr` — Variable setzen (auch arithmetische Ausdrücke: `+`, `-`, `*`, `/`)
+- Variable-Substitution: alle Vorkommen lokaler Variablen in SQL-Statements werden substituiert (whole-word boundary)
+
+**Kontrollstrukturen:**
+- `label: LOOP ... END LOOP` — Schleife mit Label
+- `LEAVE label` — Schleife verlassen
+- `IF cond THEN ... [ELSE ...] END IF` — Bedingungsausdruck (verschachtelbar)
+
+### Architecture
+- `ProcState` Struct: `vars` (map), `cursors` (map mit CursorSt: sql, rows, colNames, pos, isOpen), `notFoundVar/Val/hasNotFoundHandler`
+- `ProcExec` Struct: `execBody()` / `execStmt()` (mutual recursion in same struct), `splitStmts()` (depth-tracking für LOOP/THEN/END LOOP/END IF), `evalCond()`, `execSql()`, `subst()`
+- `splitStmts`: Scannt body char-by-char; depth++ bei `LOOP`/`THEN`, depth-- bei `END LOOP`/`END IF`; Split auf `;` nur bei depth==0 — erhält komplette LOOP/IF-Blöcke als einzelne Statements
+- CALL_PROCEDURE Handler ersetzt alten `;`-Split durch `ProcExec::execBody()`
+
+---
+
 ## [v1.8.0] — 2026-05-28
 
 ### Added

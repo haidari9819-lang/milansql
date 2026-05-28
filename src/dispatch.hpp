@@ -614,6 +614,463 @@ inline void dispatch_loadPartitions(milansql::Engine& engine,
     }
 }
 
+// ── Phase 66: Procedure Interpreter (DECLARE/CURSOR/LOOP/IF) ──────────────────
+namespace {
+
+struct ProcState {
+    std::map<std::string, std::string> vars;
+    struct CursorSt {
+        std::string sql;
+        std::vector<std::vector<std::string>> rows;
+        std::vector<std::string> colNames;
+        size_t pos = 0;
+        bool isOpen = false;
+    };
+    std::map<std::string, CursorSt> cursors;
+    std::string notFoundVar;
+    std::string notFoundVal = "1";
+    bool hasNotFoundHandler = false;
+};
+
+struct ProcExec {
+    ProcState& state;
+    milansql::Engine& engine;
+    std::function<void()>& persistFn;
+
+    static std::string pu(std::string s) {
+        for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    }
+    static std::string ptrim(std::string s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        return s;
+    }
+    static std::string stripQ(const std::string& s) {
+        if (s.size() >= 2 &&
+            ((s.front()=='\'' && s.back()=='\'') ||
+             (s.front()=='"'  && s.back()=='"')))
+            return s.substr(1, s.size()-2);
+        return s;
+    }
+    static bool isAlnumU(char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    }
+    static bool wbLeft(const std::string& s, size_t pos) {
+        return pos == 0 || !isAlnumU(s[pos-1]);
+    }
+    static bool wbRight(const std::string& s, size_t pos, size_t len) {
+        return (pos + len >= s.size()) || !isAlnumU(s[pos + len]);
+    }
+
+    // Whole-word variable substitution
+    std::string subst(const std::string& sql) const {
+        std::string result = sql;
+        for (const auto& [varName, varVal] : state.vars) {
+            std::string out;
+            size_t pos = 0;
+            while (pos < result.size()) {
+                size_t found = result.find(varName, pos);
+                if (found == std::string::npos) { out += result.substr(pos); break; }
+                if (wbLeft(result, found) && wbRight(result, found, varName.size())) {
+                    out += result.substr(pos, found - pos) + varVal;
+                    pos = found + varName.size();
+                } else {
+                    out += result.substr(pos, found - pos + 1);
+                    pos = found + 1;
+                }
+            }
+            result = out;
+        }
+        return result;
+    }
+
+    // Resolve a token: local var lookup, else literal
+    std::string resolve(const std::string& tok) const {
+        auto it = state.vars.find(tok);
+        if (it != state.vars.end()) return it->second;
+        return tok;
+    }
+
+    // Split procedure body into logical statements.
+    // depth++ on LOOP or THEN, depth-- on END LOOP or END IF.
+    // Split on ';' only at depth==0.
+    static std::vector<std::string> splitStmts(const std::string& body) {
+        std::vector<std::string> stmts;
+        std::string cur;
+        int depth = 0;
+        size_t i = 0;
+        while (i < body.size()) {
+            if (wbLeft(body, i)) {
+                if (i + 8 <= body.size() && pu(body.substr(i, 8)) == "END LOOP" && wbRight(body, i, 8)) {
+                    cur += body.substr(i, 8); i += 8; depth--; continue;
+                }
+                if (i + 6 <= body.size() && pu(body.substr(i, 6)) == "END IF" && wbRight(body, i, 6)) {
+                    cur += body.substr(i, 6); i += 6; depth--; continue;
+                }
+                if (i + 4 <= body.size() && pu(body.substr(i, 4)) == "LOOP" && wbRight(body, i, 4)) {
+                    cur += body.substr(i, 4); i += 4; depth++; continue;
+                }
+                if (i + 4 <= body.size() && pu(body.substr(i, 4)) == "THEN" && wbRight(body, i, 4)) {
+                    cur += body.substr(i, 4); i += 4; depth++; continue;
+                }
+            }
+            if (body[i] == ';' && depth == 0) {
+                auto s = ptrim(cur);
+                if (!s.empty()) stmts.push_back(s);
+                cur.clear(); i++;
+            } else {
+                cur += body[i++];
+            }
+        }
+        auto s = ptrim(cur);
+        if (!s.empty()) stmts.push_back(s);
+        return stmts;
+    }
+
+    // Evaluate simple condition: lhs op rhs (with var resolution)
+    bool evalCond(const std::string& cond) const {
+        std::vector<std::string> toks;
+        std::istringstream iss(cond);
+        std::string t;
+        while (iss >> t) toks.push_back(t);
+        if (toks.size() == 1) {
+            std::string v = stripQ(resolve(toks[0]));
+            return !v.empty() && v != "0";
+        }
+        if (toks.size() < 3) return false;
+        std::string lhs = stripQ(resolve(toks[0]));
+        const std::string& op = toks[1];
+        std::string rhs = stripQ(resolve(toks[2]));
+        try {
+            double lv = std::stod(lhs), rv = std::stod(rhs);
+            if (op == "=")  return lv == rv;
+            if (op == "!=" || op == "<>") return lv != rv;
+            if (op == "<")  return lv <  rv;
+            if (op == ">")  return lv >  rv;
+            if (op == "<=") return lv <= rv;
+            if (op == ">=") return lv >= rv;
+        } catch (...) {}
+        if (op == "=")  return lhs == rhs;
+        if (op == "!=" || op == "<>") return lhs != rhs;
+        if (op == "<")  return lhs <  rhs;
+        if (op == ">")  return lhs >  rhs;
+        if (op == "<=") return lhs <= rhs;
+        if (op == ">=") return lhs >= rhs;
+        return false;
+    }
+
+    // Execute a SQL statement with variable substitution
+    void execSql(const std::string& rawSql) {
+        std::string sql = subst(rawSql);
+        milansql::Parser p2;
+        milansql::ParsedCommand sc = p2.parse(sql);
+        for (const auto& sq : sc.subqueries) {
+            if (sq.condIdx < sc.whereConds.size()) {
+                sc.whereConds[sq.condIdx].inList =
+                    engine.subqueryValues(sq.subTable, sq.subCol,
+                                          sq.subWhere, sq.subWhereLogic);
+            }
+        }
+        if (sc.type == milansql::CommandType::SELECT) {
+            milansql::Table result;
+            if (!sc.whereConds.empty()) {
+                auto qr = engine.selectWhere(sc.tableName, sc.whereConds, sc.whereLogic);
+                result = std::move(qr.table);
+            } else {
+                result = engine.selectAll(sc.tableName).clone();
+            }
+            if (!sc.selectColumns.empty()) result = result.project(sc.selectColumns);
+            if (!sc.orderByCols.empty()) result.sortByMulti(sc.orderByCols);
+            dispatch_printTable(result, sc.limit, sc.limitOffset);
+        } else if (sc.type == milansql::CommandType::UPDATE) {
+            std::size_t n = 0;
+            if (sc.whereColumn.empty())
+                n = engine.updateAll(sc.tableName, sc.updateCols, sc.updateVals);
+            else
+                n = engine.updateWhere(sc.tableName, sc.updateCols, sc.updateVals,
+                                       sc.whereColumn, sc.whereValue);
+            std::cout << "  " << n << " Zeile(n) aktualisiert.\n\n";
+            persistFn();
+        } else if (sc.type == milansql::CommandType::INSERT) {
+            const auto& rows66 = sc.multiValues.empty()
+                ? std::vector<std::vector<std::string>>{sc.values} : sc.multiValues;
+            for (const auto& vals : rows66) engine.insertRow(sc.tableName, vals);
+            persistFn();
+            std::cout << "  " << rows66.size() << " Zeile(n) eingefuegt.\n\n";
+        } else if (sc.type == milansql::CommandType::DELETE) {
+            std::size_t n = 0;
+            if (sc.whereColumn.empty()) n = engine.deleteAll(sc.tableName);
+            else n = engine.deleteWhere(sc.tableName, sc.whereColumn, sc.whereValue);
+            std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
+            persistFn();
+        } else {
+            std::cout << "  [CALL] Unbekannter Befehl: '" << sql << "'\n\n";
+        }
+    }
+
+    // Forward declarations — mutual recursion resolved by being in same struct
+    std::string execBody(const std::string& body) {
+        auto stmts = splitStmts(body);
+        for (const auto& s : stmts) {
+            std::string res = execStmt(s);
+            if (!res.empty()) return res;
+        }
+        return "";
+    }
+
+    std::string execStmt(const std::string& rawStmt) {
+        std::string stmt = ptrim(rawStmt);
+        if (stmt.empty()) return "";
+        std::string up = pu(stmt);
+
+        // ── LEAVE label ───────────────────────────────────────────────
+        if (up.size() > 6 && up.substr(0, 6) == "LEAVE ") {
+            return ptrim(stmt.substr(6));
+        }
+
+        // ── DECLARE ───────────────────────────────────────────────────
+        if (up.size() > 8 && up.substr(0, 8) == "DECLARE ") {
+            std::vector<std::string> toks;
+            { std::istringstream iss(stmt); std::string t; while (iss >> t) toks.push_back(t); }
+
+            // DECLARE CONTINUE HANDLER FOR NOT FOUND SET var = val
+            if (toks.size() >= 10 &&
+                pu(toks[1]) == "CONTINUE" && pu(toks[2]) == "HANDLER" &&
+                pu(toks[3]) == "FOR"      && pu(toks[4]) == "NOT"     &&
+                pu(toks[5]) == "FOUND"    && pu(toks[6]) == "SET") {
+                state.notFoundVar = toks[7];
+                state.notFoundVal = (toks.size() > 9) ? toks[9] : "1";
+                state.hasNotFoundHandler = true;
+                return "";
+            }
+            // DECLARE name CURSOR FOR SELECT ...
+            {
+                size_t cfPos = up.find(" CURSOR FOR ");
+                if (cfPos != std::string::npos) {
+                    std::string curName = pu(ptrim(stmt.substr(8, cfPos - 8)));
+                    std::string curSql  = ptrim(stmt.substr(cfPos + 12));
+                    ProcState::CursorSt cs;
+                    cs.sql = curSql;
+                    state.cursors[curName] = cs;
+                    return "";
+                }
+            }
+            // DECLARE var TYPE [DEFAULT val]
+            if (toks.size() >= 3) {
+                std::string varName = toks[1];
+                std::string defVal = "0";
+                for (size_t k = 2; k + 1 < toks.size(); ++k) {
+                    if (pu(toks[k]) == "DEFAULT") { defVal = stripQ(toks[k+1]); break; }
+                }
+                std::string typUp = pu(toks[2]);
+                if (typUp.find("VARCHAR") != std::string::npos ||
+                    typUp.find("CHAR")    != std::string::npos ||
+                    typUp.find("TEXT")    != std::string::npos) {
+                    if (defVal == "0") defVal = "";
+                }
+                state.vars[varName] = defVal;
+            }
+            return "";
+        }
+
+        // ── SET var = expr ────────────────────────────────────────────
+        if (up.size() > 4 && up.substr(0, 4) == "SET ") {
+            std::string rest = ptrim(stmt.substr(4));
+            size_t eq = rest.find('=');
+            if (eq != std::string::npos) {
+                std::string varName = ptrim(rest.substr(0, eq));
+                std::string expr    = ptrim(rest.substr(eq + 1));
+                std::vector<std::string> toks;
+                { std::istringstream iss(expr); std::string t; while (iss >> t) toks.push_back(t); }
+                if (toks.size() == 3) {
+                    const std::string& op = toks[1];
+                    if (op == "+" || op == "-" || op == "*" || op == "/") {
+                        try {
+                            double lv = std::stod(stripQ(resolve(toks[0])));
+                            double rv = std::stod(stripQ(resolve(toks[2])));
+                            double res = 0;
+                            if      (op == "+") res = lv + rv;
+                            else if (op == "-") res = lv - rv;
+                            else if (op == "*") res = lv * rv;
+                            else if (op == "/" && rv != 0) res = lv / rv;
+                            else { state.vars[varName] = expr; return ""; }
+                            if (res == std::floor(res))
+                                state.vars[varName] = std::to_string(static_cast<long long>(res));
+                            else
+                                state.vars[varName] = std::to_string(res);
+                            return "";
+                        } catch (...) {}
+                    }
+                }
+                state.vars[varName] = stripQ(resolve(toks.empty() ? expr : toks[0]));
+            }
+            return "";
+        }
+
+        // ── OPEN cursor ───────────────────────────────────────────────
+        if (up.size() > 5 && up.substr(0, 5) == "OPEN ") {
+            std::string curName = pu(ptrim(stmt.substr(5)));
+            auto it = state.cursors.find(curName);
+            if (it == state.cursors.end()) {
+                std::cout << "  FEHLER: Cursor '" << curName << "' nicht deklariert.\n\n";
+                return "";
+            }
+            auto& cs = it->second;
+            milansql::Parser p2;
+            milansql::ParsedCommand sc = p2.parse(subst(cs.sql));
+            milansql::Table result;
+            if (!sc.whereConds.empty()) {
+                auto qr = engine.selectWhere(sc.tableName, sc.whereConds, sc.whereLogic);
+                result = std::move(qr.table);
+            } else {
+                result = engine.selectAll(sc.tableName).clone();
+            }
+            if (!sc.selectColumns.empty()) result = result.project(sc.selectColumns);
+            if (!sc.orderByCols.empty()) result.sortByMulti(sc.orderByCols);
+            cs.rows.clear(); cs.colNames.clear();
+            for (const auto& col : result.columns()) cs.colNames.push_back(col.name);
+            for (const auto& row : result.rows()) cs.rows.push_back(row.values);
+            cs.pos = 0; cs.isOpen = true;
+            return "";
+        }
+
+        // ── CLOSE cursor ──────────────────────────────────────────────
+        if (up.size() > 6 && up.substr(0, 6) == "CLOSE ") {
+            std::string curName = pu(ptrim(stmt.substr(6)));
+            auto it = state.cursors.find(curName);
+            if (it != state.cursors.end()) { it->second.isOpen = false; it->second.pos = 0; }
+            return "";
+        }
+
+        // ── FETCH cursor INTO v1, v2 ... ──────────────────────────────
+        if (up.size() > 6 && up.substr(0, 6) == "FETCH ") {
+            std::string rest  = ptrim(stmt.substr(6));
+            std::string upRest = pu(rest);
+            size_t intoPos = upRest.find(" INTO ");
+            if (intoPos == std::string::npos) {
+                std::cout << "  FEHLER: FETCH ohne INTO\n\n"; return "";
+            }
+            std::string curName = pu(ptrim(rest.substr(0, intoPos)));
+            std::string varList = ptrim(rest.substr(intoPos + 6));
+            auto it = state.cursors.find(curName);
+            if (it == state.cursors.end()) {
+                std::cout << "  FEHLER: Cursor '" << curName << "' nicht gefunden.\n\n"; return "";
+            }
+            auto& cs = it->second;
+            if (cs.pos >= cs.rows.size()) {
+                if (state.hasNotFoundHandler && !state.notFoundVar.empty())
+                    state.vars[state.notFoundVar] = state.notFoundVal;
+                return "";
+            }
+            std::vector<std::string> varNames;
+            { std::istringstream iss(varList); std::string v;
+              while (std::getline(iss, v, ',')) varNames.push_back(ptrim(v)); }
+            const auto& row = cs.rows[cs.pos++];
+            for (size_t k = 0; k < varNames.size() && k < row.size(); ++k)
+                state.vars[varNames[k]] = stripQ(row[k]);
+            return "";
+        }
+
+        // ── [label:] LOOP ... END LOOP ────────────────────────────────
+        {
+            std::string label;
+            std::string bodyPart = stmt;
+            size_t colonPos = stmt.find(':');
+            if (colonPos != std::string::npos && colonPos < 64) {
+                std::string pl = ptrim(stmt.substr(0, colonPos));
+                bool isLabel = !pl.empty();
+                for (char c : pl) if (!isAlnumU(c)) { isLabel = false; break; }
+                if (isLabel) { label = pl; bodyPart = ptrim(stmt.substr(colonPos + 1)); }
+            }
+            std::string upBody = pu(bodyPart);
+            if (upBody.substr(0, 4) == "LOOP") {
+                // find last END LOOP
+                std::string upB = pu(bodyPart);
+                size_t lastEl = std::string::npos;
+                { size_t p = 0;
+                  while ((p = upB.find("END LOOP", p)) != std::string::npos) { lastEl = p; p += 8; } }
+                if (lastEl == std::string::npos) {
+                    std::cout << "  FEHLER: LOOP ohne END LOOP\n\n"; return "";
+                }
+                std::string innerBody = ptrim(bodyPart.substr(4, lastEl - 4));
+                for (int iter = 0; iter < 1000000; ++iter) {
+                    std::string res = execBody(innerBody);
+                    if (!res.empty()) {
+                        if (label.empty() || pu(res) == pu(label)) return "";
+                        return res;
+                    }
+                }
+                return "";
+            }
+        }
+
+        // ── IF cond THEN ... [ELSE ...] END IF ────────────────────────
+        if (up.size() > 3 && up.substr(0, 3) == "IF ") {
+            // Find outer THEN (skip nested IFs)
+            size_t thenPos = std::string::npos;
+            {
+                int d = 0;
+                size_t i = 3;
+                while (i < up.size()) {
+                    if (i + 2 <= up.size() && up.substr(i,2) == "IF" && wbLeft(up,i) && wbRight(up,i,2)) {
+                        d++;
+                    } else if (i + 4 <= up.size() && up.substr(i,4) == "THEN" && wbLeft(up,i) && wbRight(up,i,4)) {
+                        if (d == 0) { thenPos = i; break; }
+                        d--;
+                    }
+                    i++;
+                }
+            }
+            if (thenPos == std::string::npos) { try { execSql(stmt); } catch (...) {} return ""; }
+
+            std::string condStr  = ptrim(stmt.substr(3, thenPos - 3));
+            std::string afterThen = ptrim(stmt.substr(thenPos + 4));
+            std::string upAT = pu(afterThen);
+
+            // Find top-level ELSE and END IF in afterThen
+            size_t elsePos = std::string::npos, endIfPos = std::string::npos;
+            {
+                int d = 0;
+                for (size_t i = 0; i < upAT.size(); ) {
+                    if (i + 2 <= upAT.size() && upAT.substr(i,2) == "IF" && wbLeft(upAT,i) && wbRight(upAT,i,2)) {
+                        d++; i += 2; continue;
+                    }
+                    if (i + 6 <= upAT.size() && upAT.substr(i,6) == "END IF" && wbLeft(upAT,i)) {
+                        if (d == 0) { endIfPos = i; break; }
+                        d--; i += 6; continue;
+                    }
+                    if (d == 0 && i + 4 <= upAT.size() && upAT.substr(i,4) == "ELSE" && wbLeft(upAT,i) && wbRight(upAT,i,4)) {
+                        elsePos = i; i += 4; continue;
+                    }
+                    i++;
+                }
+            }
+
+            std::string thenBody, elseBody;
+            size_t endBound = (endIfPos != std::string::npos) ? endIfPos : afterThen.size();
+            if (elsePos != std::string::npos) {
+                thenBody = ptrim(afterThen.substr(0, elsePos));
+                elseBody = ptrim(afterThen.substr(elsePos + 4, endBound - (elsePos + 4)));
+            } else {
+                thenBody = ptrim(afterThen.substr(0, endBound));
+            }
+
+            if (evalCond(condStr)) return execBody(thenBody);
+            if (!elseBody.empty())  return execBody(elseBody);
+            return "";
+        }
+
+        // ── Regular SQL ───────────────────────────────────────────────
+        try { execSql(stmt); } catch (const std::exception& ex) {
+            std::cout << "  FEHLER in Procedure: " << ex.what() << "\n\n";
+        }
+        return "";
+    }
+};
+
+} // anonymous namespace
+
 // ── dispatchCommand ───────────────────────────────────────────
 // Main dispatch function: takes a parsed command and executes it against the engine.
 // Writes output to std::cout (can be redirected via rdbuf for capture).
@@ -1979,94 +2436,13 @@ inline bool dispatchCommand(
         if (cmd.procedureName.empty()) {
             std::cout << "  Fehler: CALL name(args)\n"; break;
         }
-        std::string body = engine.getProcedureBody(
-            cmd.procedureName, cmd.callArgs);
-        std::vector<std::string> stmts;
-        std::string cur;
-        for (char c : body) {
-            if (c == ';') {
-                while (!cur.empty() &&
-                       (cur.front()==' '||cur.front()=='\n'||cur.front()=='\t'))
-                    cur = cur.substr(1);
-                while (!cur.empty() &&
-                       (cur.back()==' '||cur.back()=='\n'||cur.back()=='\t'))
-                    cur.pop_back();
-                if (!cur.empty()) stmts.push_back(cur);
-                cur = "";
-            } else cur += c;
-        }
-        while (!cur.empty() &&
-               (cur.front()==' '||cur.front()=='\n'||cur.front()=='\t'))
-            cur = cur.substr(1);
-        while (!cur.empty() &&
-               (cur.back()==' '||cur.back()=='\n'||cur.back()=='\t'))
-            cur.pop_back();
-        if (!cur.empty()) stmts.push_back(cur);
-
-        for (const auto& stmt : stmts) {
-            if (stmt.empty()) continue;
-            milansql::Parser stmtParser;
-            milansql::ParsedCommand sc = stmtParser.parse(stmt);
-            for (const auto& sq : sc.subqueries) {
-                if (sq.condIdx < sc.whereConds.size()) {
-                    sc.whereConds[sq.condIdx].inList =
-                        engine.subqueryValues(sq.subTable, sq.subCol,
-                                              sq.subWhere, sq.subWhereLogic);
-                }
-            }
-            try {
-                if (sc.type == milansql::CommandType::SELECT) {
-                    milansql::Table result;
-                    if (!sc.whereConds.empty()) {
-                        auto qr = engine.selectWhere(sc.tableName,
-                            sc.whereConds, sc.whereLogic);
-                        result = std::move(qr.table);
-                    } else {
-                        result = engine.selectAll(sc.tableName).clone();
-                    }
-                    if (!sc.selectColumns.empty())
-                        result = result.project(sc.selectColumns);
-                    if (!sc.orderByCols.empty())
-                        result.sortByMulti(sc.orderByCols);
-                    dispatch_printTable(result, sc.limit, sc.limitOffset);
-                } else if (sc.type == milansql::CommandType::UPDATE) {
-                    std::size_t n = 0;
-                    if (sc.whereColumn.empty()) {
-                        n = engine.updateAll(sc.tableName,
-                            sc.updateCols, sc.updateVals);
-                    } else {
-                        n = engine.updateWhere(sc.tableName,
-                            sc.updateCols, sc.updateVals,
-                            sc.whereColumn, sc.whereValue);
-                    }
-                    std::cout << "  " << n << " Zeile(n) aktualisiert.\n\n";
-                    persistFn();
-                } else if (sc.type == milansql::CommandType::INSERT) {
-                    const auto& rows44 = sc.multiValues.empty()
-                        ? std::vector<std::vector<std::string>>{sc.values}
-                        : sc.multiValues;
-                    for (const auto& vals : rows44)
-                        engine.insertRow(sc.tableName, vals);
-                    persistFn();
-                    std::cout << "  " << rows44.size()
-                              << " Zeile(n) eingefuegt.\n\n";
-                } else if (sc.type == milansql::CommandType::DELETE) {
-                    std::size_t n = 0;
-                    if (sc.whereColumn.empty()) {
-                        n = engine.deleteAll(sc.tableName);
-                    } else {
-                        n = engine.deleteWhere(sc.tableName,
-                            sc.whereColumn, sc.whereValue);
-                    }
-                    std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
-                    persistFn();
-                } else {
-                    std::cout << "  [CALL] Unbekannter Befehl in Procedure: '"
-                              << stmt << "'\n\n";
-                }
-            } catch (const std::exception& ex2) {
-                std::cout << "  FEHLER in Procedure: " << ex2.what() << "\n\n";
-            }
+        try {
+            std::string body = engine.getProcedureBody(cmd.procedureName, cmd.callArgs);
+            ProcState state;
+            ProcExec exec{state, engine, persistFn};
+            exec.execBody(body);
+        } catch (const std::exception& ex) {
+            std::cout << "  FEHLER (CALL): " << ex.what() << "\n\n";
         }
         break;
     }

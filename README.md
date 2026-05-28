@@ -1,12 +1,25 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.6.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.7.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **63 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **64 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.7.0
+
+| Phase | Feature |
+|-------|---------|
+| **64** | **REGEXP/RLIKE**: `WHERE col REGEXP 'pattern'` / `WHERE col NOT REGEXP 'pattern'` |
+| | `RLIKE` als Alias für REGEXP |
+| | `REGEXP_REPLACE(col, pattern, repl)` — Regex-Ersetzung in SELECT |
+| | `REGEXP_EXTRACT(col, pattern)` — erstes Match extrahieren |
+| | **SAVEPOINT**: `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` / `RELEASE SAVEPOINT name` |
+| | Verschachtelte Transaktionen via txBuffer_-Größen-Snapshot |
 
 ---
 

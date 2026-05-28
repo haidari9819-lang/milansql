@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <limits>
 #include <functional>
+#include <regex>
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
@@ -1727,6 +1728,7 @@ public:
         std::remove(walPath_.c_str());   // alte WAL löschen (Crash-Recovery)
         inTransaction_ = true;
         txBuffer_.clear();
+        savepointStack_.clear();         // Phase 64
     }
 
     // COMMIT: alle gepufferten Ops auf Tabellen anwenden,
@@ -1738,6 +1740,7 @@ public:
         for (const auto& op : txBuffer_)
             applyOp(op);
         txBuffer_.clear();
+        savepointStack_.clear();         // Phase 64
         inTransaction_ = false;
         deleteWal();
     }
@@ -1748,8 +1751,42 @@ public:
         if (!inTransaction_)
             throw std::runtime_error("Keine aktive Transaktion.");
         txBuffer_.clear();
+        savepointStack_.clear();         // Phase 64
         inTransaction_ = false;
         deleteWal();
+    }
+
+    // ── Phase 64: SAVEPOINT ──────────────────────────────────────
+
+    void createSavepoint(const std::string& name) {
+        if (!inTransaction_)
+            throw std::runtime_error("SAVEPOINT erfordert eine aktive Transaktion (BEGIN).");
+        savepointStack_.push_back({name, txBuffer_.size()});
+    }
+
+    void rollbackToSavepoint(const std::string& name) {
+        if (!inTransaction_)
+            throw std::runtime_error("Keine aktive Transaktion.");
+        for (int i = static_cast<int>(savepointStack_.size()) - 1; i >= 0; --i) {
+            if (savepointStack_[static_cast<size_t>(i)].name == name) {
+                txBuffer_.resize(savepointStack_[static_cast<size_t>(i)].txSize);
+                savepointStack_.resize(static_cast<size_t>(i));
+                return;
+            }
+        }
+        throw std::runtime_error("SAVEPOINT '" + name + "' nicht gefunden.");
+    }
+
+    void releaseSavepoint(const std::string& name) {
+        if (!inTransaction_)
+            throw std::runtime_error("Keine aktive Transaktion.");
+        for (int i = static_cast<int>(savepointStack_.size()) - 1; i >= 0; --i) {
+            if (savepointStack_[static_cast<size_t>(i)].name == name) {
+                savepointStack_.resize(static_cast<size_t>(i));
+                return;
+            }
+        }
+        throw std::runtime_error("SAVEPOINT '" + name + "' nicht gefunden.");
     }
 
     // WAL-Datei löschen (wird auch von main.cpp beim Start aufgerufen)
@@ -3847,6 +3884,28 @@ private:
             return milansql::jsonutils::isValid(resolveArg(args[0])) ? "1" : "0";
         }
 
+        // ── Phase 64: REGEXP-Funktionen ──────────────────────────────
+        if (fn == "REGEXP_REPLACE") {
+            if (args.size() < 3) return args.empty() ? "" : resolveArg(args[0]);
+            std::string str     = milansql::dateutils::stripQuotes(resolveArg(args[0]));
+            std::string pattern = resolveArg(args[1]);
+            std::string repl    = resolveArg(args[2]);
+            try {
+                return std::regex_replace(str, std::regex(pattern), repl);
+            } catch (...) { return str; }
+        }
+        if (fn == "REGEXP_EXTRACT") {
+            if (args.size() < 2) return "";
+            std::string str     = milansql::dateutils::stripQuotes(resolveArg(args[0]));
+            std::string pattern = resolveArg(args[1]);
+            try {
+                std::smatch m;
+                if (std::regex_search(str, m, std::regex(pattern)))
+                    return m[0].str();
+            } catch (...) {}
+            return "";
+        }
+
         return "";
     }
 
@@ -4370,6 +4429,15 @@ private:
         if (op == "LIKE")        return likeMatch(a, b);
         if (op == "IS NULL")     return a == "NULL";
         if (op == "IS NOT NULL") return a != "NULL";
+        // Phase 64: REGEXP / NOT REGEXP
+        if (op == "REGEXP" || op == "NOT REGEXP") {
+            try {
+                const std::string pattern  = milansql::dateutils::stripQuotes(b);
+                const std::string haystack = milansql::dateutils::stripQuotes(a);
+                bool match = std::regex_search(haystack, std::regex(pattern));
+                return (op == "REGEXP") ? match : !match;
+            } catch (...) { return false; }
+        }
         try {
             size_t ea = 0, eb = 0;
             double da = std::stod(a, &ea);
@@ -4850,6 +4918,13 @@ public:
     bool                     inTransaction_ = false;
     std::string              walPath_;
     std::vector<BufferedOp>  txBuffer_;
+
+    // Phase 64: SAVEPOINT stack
+    struct SavepointEntry {
+        std::string name;
+        std::size_t txSize;  // txBuffer_.size() when savepoint was created
+    };
+    std::vector<SavepointEntry> savepointStack_;
 
     // Phase 46: User management
     std::map<std::string, UserDef> users_;

@@ -1,6 +1,6 @@
 {
   "name": "milansql",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Node.js client for MilanSQL database (HTTP REST API)",
   "main": "index.js",
   "scripts": {

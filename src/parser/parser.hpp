@@ -103,6 +103,10 @@ enum class CommandType {
     SET_EVENT_SCHEDULER,
     // Phase 62: Partitioning
     SHOW_PARTITIONS,
+    // Phase 64: SAVEPOINT
+    SAVEPOINT,
+    ROLLBACK_TO_SAVEPOINT,
+    RELEASE_SAVEPOINT,
     UNKNOWN
 };
 
@@ -296,6 +300,8 @@ struct ParsedCommand {
     ParsedPartitionRange addRangeDef;
     // For ALTER TABLE ADD PARTITION (LIST)
     ParsedPartitionList  addListDef;
+    // Phase 64: SAVEPOINT
+    std::string savepointName;
 };
 
 class Parser {
@@ -450,7 +456,33 @@ public:
                 std::string k = toUpper(st[0]);
                 if (k == "BEGIN")    { cmd.type = CommandType::BEGIN;    return cmd; }
                 if (k == "COMMIT")   { cmd.type = CommandType::COMMIT;   return cmd; }
-                if (k == "ROLLBACK") { cmd.type = CommandType::ROLLBACK; return cmd; }
+                if (k == "ROLLBACK") {
+                    // ROLLBACK TO SAVEPOINT name  or  ROLLBACK TO name
+                    if (st.size() >= 3 && toUpper(st[1]) == "TO") {
+                        size_t ni = 2;
+                        if (st.size() >= 4 && toUpper(st[2]) == "SAVEPOINT") ni = 3;
+                        if (ni < st.size()) {
+                            cmd.type = CommandType::ROLLBACK_TO_SAVEPOINT;
+                            cmd.savepointName = st[ni];
+                            return cmd;
+                        }
+                    }
+                    cmd.type = CommandType::ROLLBACK;
+                    return cmd;
+                }
+                // Phase 64: SAVEPOINT name
+                if (k == "SAVEPOINT" && st.size() >= 2) {
+                    cmd.type = CommandType::SAVEPOINT;
+                    cmd.savepointName = st[1];
+                    return cmd;
+                }
+                // Phase 64: RELEASE SAVEPOINT name
+                if (k == "RELEASE" && st.size() >= 3 &&
+                    toUpper(st[1]) == "SAVEPOINT") {
+                    cmd.type = CommandType::RELEASE_SAVEPOINT;
+                    cmd.savepointName = st[2];
+                    return cmd;
+                }
             }
         }
 
@@ -599,7 +631,9 @@ public:
                  "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
                  // Phase 56: JSON-Funktionen
                  "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
-                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
+                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
+                 // Phase 64: REGEXP-Funktionen
+                 "REGEXP_REPLACE", "REGEXP_EXTRACT"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -1932,6 +1966,14 @@ private:
                 parseInList(tokens, i, cond, cmd);
                 parsed = true;
 
+            // Phase 64: NOT REGEXP / NOT RLIKE
+            } else if (i + 3 < tokens.size() &&
+                       toUpper(tokens[i + 1]) == "NOT" &&
+                       (toUpper(tokens[i + 2]) == "REGEXP" ||
+                        toUpper(tokens[i + 2]) == "RLIKE")) {
+                cond = {tokens[i], "NOT REGEXP", tokens[i + 3]};
+                i += 4; parsed = true;
+
             // IN (...)
             } else if (i + 1 < tokens.size() &&
                        toUpper(tokens[i + 1]) == "IN") {
@@ -1946,6 +1988,13 @@ private:
 
             } else if (i + 2 < tokens.size() && toUpper(tokens[i + 1]) == "LIKE") {
                 cond = {tokens[i], "LIKE", tokens[i + 2]};
+                i += 3; parsed = true;
+
+            // Phase 64: REGEXP / RLIKE
+            } else if (i + 2 < tokens.size() &&
+                       (toUpper(tokens[i + 1]) == "REGEXP" ||
+                        toUpper(tokens[i + 1]) == "RLIKE")) {
+                cond = {tokens[i], "REGEXP", tokens[i + 2]};
                 i += 3; parsed = true;
 
             } else if (i + 2 < tokens.size()) {
@@ -2644,7 +2693,9 @@ private:
                          "IFNULL","COALESCE","CAST",
                          "NOW","CURDATE","CURTIME","DATE","TIME",
                          "YEAR","MONTH","DAY","HOUR","MINUTE","SECOND",
-                         "DATEDIFF","DATE_ADD","DATE_SUB","DATE_FORMAT"};
+                         "DATEDIFF","DATE_ADD","DATE_SUB","DATE_FORMAT",
+                 // Phase 64: REGEXP-Funktionen
+                 "REGEXP_REPLACE","REGEXP_EXTRACT"};
                     if (exprToks.size() >= 3 && exprToks[1] == "(") {
                         std::string fn = toUpper(exprToks[0]);
                         bool isKnown = false;
@@ -2714,7 +2765,7 @@ private:
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
         }
-        // Phase 31/32: CASE oder String-Funktion im Spaltenbereich?
+        // Phase 31/32/64: CASE oder String-Funktion im Spaltenbereich?
         static const std::vector<std::string> SFUNCS32 =
             {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
@@ -2726,7 +2777,9 @@ private:
                  "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
                  // Phase 56: JSON-Funktionen
                  "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
-                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
+                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
+                 // Phase 64: REGEXP-Funktionen
+                 "REGEXP_REPLACE", "REGEXP_EXTRACT"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -2878,7 +2931,9 @@ private:
                  "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
                  // Phase 56: JSON-Funktionen
                  "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
-                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
+                 "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
+                 // Phase 64: REGEXP-Funktionen
+                 "REGEXP_REPLACE", "REGEXP_EXTRACT"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 

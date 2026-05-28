@@ -1786,6 +1786,34 @@ inline bool dispatchCommand(
         std::cout << "  Transaktion abgebrochen (ROLLBACK).\n\n";
         break;
 
+    // ── Phase 64: SAVEPOINT ──────────────────────────────────────
+    case milansql::CommandType::SAVEPOINT:
+        try {
+            engine.createSavepoint(cmd.savepointName);
+            std::cout << "  SAVEPOINT '" << cmd.savepointName << "' gesetzt.\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+
+    case milansql::CommandType::ROLLBACK_TO_SAVEPOINT:
+        try {
+            engine.rollbackToSavepoint(cmd.savepointName);
+            std::cout << "  ROLLBACK TO SAVEPOINT '" << cmd.savepointName << "' durchgeführt.\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+
+    case milansql::CommandType::RELEASE_SAVEPOINT:
+        try {
+            engine.releaseSavepoint(cmd.savepointName);
+            std::cout << "  RELEASE SAVEPOINT '" << cmd.savepointName << "'.\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+
     case milansql::CommandType::CREATE_TRIGGER: {
         if (cmd.triggerName.empty() || cmd.triggerTiming.empty() ||
             cmd.triggerEvent.empty() || cmd.triggerTable.empty()) {

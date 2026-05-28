@@ -4,6 +4,36 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.7.0] — 2026-05-28
+
+### Added
+
+#### Phase 64 — REGEXP/RLIKE + SAVEPOINT
+
+**REGEXP / RLIKE:**
+- `WHERE col REGEXP 'pattern'` — reguläre Ausdrücke in WHERE (C++17 `std::regex`)
+- `WHERE col RLIKE 'pattern'` — Alias für REGEXP
+- `WHERE col NOT REGEXP 'pattern'` — negierter Regexp-Match
+- Unterstützte Features: `^` `$` `.` `*` `+` `?` `[abc]` `[a-z]` `[^abc]` `(a|b)` `\d` `\w` `\s`
+- `REGEXP_REPLACE(col, 'pattern', 'repl')` — Regex-Ersetzung in SELECT
+- `REGEXP_EXTRACT(col, 'pattern')` — erstes Match extrahieren in SELECT
+
+**SAVEPOINT (verschachtelte Transaktionen):**
+- `SAVEPOINT name` — aktuellen Transaktionsstand sichern
+- `ROLLBACK TO SAVEPOINT name` — auf gespeicherten Stand zurückrollen (Ops nach dem Savepoint verworfen)
+- `ROLLBACK TO name` — Kurzform ohne SAVEPOINT-Keyword
+- `RELEASE SAVEPOINT name` — Savepoint entfernen ohne Rollback
+
+### Architecture
+- `Engine::compareValues()`: REGEXP/NOT REGEXP via `std::regex_search`
+- `Engine::evaluateFunc()`: REGEXP_REPLACE (`std::regex_replace`) + REGEXP_EXTRACT
+- `Engine::createSavepoint()` / `rollbackToSavepoint()` / `releaseSavepoint()`
+- `Engine::savepointStack_` — vector von `{name, txSize}` (txBuffer_-Größe zum Savepoint-Zeitpunkt)
+- `Parser::parseWhere()`: NOT REGEXP / REGEXP / RLIKE erkannt
+- Alle 4 Funktionslisten in parser.hpp (SFUNCS, SFUNCS32×2, ALLFUNCS) um REGEXP_REPLACE/REGEXP_EXTRACT erweitert
+
+---
+
 ## [v1.6.0] — 2026-05-28
 
 ### Added

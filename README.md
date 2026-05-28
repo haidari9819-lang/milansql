@@ -1,12 +1,22 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.1.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.2.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **58 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **59 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.2.0
+
+| Phase | Feature |
+|-------|---------|
+| **59** | **Master/Slave Replikation**: `--master --repl-port N`, `--slave --master-host H --master-port N`, Binlog (`database.binlog`), Auto-Sync alle 500ms, Auto-Reconnect |
+| | `SHOW MASTER STATUS`, `SHOW SLAVE STATUS`, `SHOW BINLOG`, `STOP SLAVE`, `START SLAVE` |
+| | Slave ist read-only — schreibende Operationen werden abgelehnt |
 
 ---
 
@@ -52,7 +62,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v1.1.0 ===           ║
+  ║        === MilanSQL v1.2.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -451,6 +461,7 @@ STATUS
 | 56 | JSON Datentyp: JSON_EXTRACT, JSON_SET, JSON_KEYS, JSON_LENGTH, JSON_CONTAINS, JSON_TYPE |
 | 57 | Backup/Restore: BACKUP DATABASE/TABLE TO, RESTORE FROM, SHOW BACKUPS, SQL-Dump Format |
 | 58 | Connection Pooling (Thread Pool, --pool-size), BENCHMARK Command, SHOW STATUS erweitert |
+| 59 | Master/Slave Replikation: Binlog, Auto-Sync, Read-Only Slave, SHOW MASTER/SLAVE STATUS |
 
 ---
 

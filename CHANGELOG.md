@@ -4,6 +4,30 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.2.0] — 2026-05-28
+
+### Added
+
+#### Phase 59 — Master/Slave Replikation
+- `--master --repl-port N` — Master-Server mit Replikations-Port
+- `--slave --master-host HOST --master-port N` — Slave verbindet sich zum Master
+- Binlog (`database.binlog`): jede Schreiboperation wird geloggt (`pos|timestamp|sql`)
+- Slave pollt Master alle 500ms, repliziert neue Einträge automatisch
+- Auto-Reconnect alle 5s bei Verbindungsunterbrechung
+- Slave ist read-only: INSERT/UPDATE/DELETE → Fehler
+- `SHOW MASTER STATUS` — Binlog-Position, aktive Slaves
+- `SHOW SLAVE STATUS` — Master-Host/Port, Verbindungsstatus, Position, Lag
+- `SHOW BINLOG` — letzte 20 Binlog-Einträge
+- `STOP SLAVE` / `START SLAVE` — Replikation pausieren/fortsetzen
+
+### Architecture
+- `src/replication/binlog.hpp` — `BinlogWriter` (thread-safe Append + Lesen ab Position N)
+- `src/replication/repl_state.hpp` — Globaler Zustand + Hooks + `tl_binlogReplay` (thread_local bypass)
+- `src/replication/master_repl.hpp` — TCP-Server auf repl-port, bedient Slave-Sync-Anfragen
+- `src/replication/slave_repl.hpp` — Polling-Client, replay via `tl_binlogReplay`-Flag
+
+---
+
 ## [v1.1.0] — 2026-05-28
 
 ### Neue Features

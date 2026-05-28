@@ -16,6 +16,7 @@
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
+#include "../utils/date_utils.hpp"
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -3326,6 +3327,86 @@ private:
                 return inner;
             }
         }
+
+        // ── Phase 55: DATE/TIME-Funktionen ──────────────────────
+        if (fn == "NOW" || fn == "CURRENT_TIMESTAMP")
+            return milansql::dateutils::currentDatetimeStr();
+        if (fn == "CURDATE" || fn == "CURRENT_DATE")
+            return milansql::dateutils::currentDateStr();
+        if (fn == "CURTIME" || fn == "CURRENT_TIME")
+            return milansql::dateutils::currentTimeStr();
+
+        if (fn == "YEAR" || fn == "MONTH" || fn == "DAY" ||
+            fn == "HOUR" || fn == "MINUTE" || fn == "SECOND") {
+            if (args.empty()) return "NULL";
+            return milansql::dateutils::extractPart(resolveArg(args[0]), fn);
+        }
+
+        if (fn == "DATE") {
+            // DATE(datetime) → nur Datumsteil "YYYY-MM-DD"
+            if (args.empty()) return "NULL";
+            std::string v = milansql::dateutils::stripQuotes(resolveArg(args[0]));
+            if (v.size() >= 10) return v.substr(0, 10);
+            return "NULL";
+        }
+        if (fn == "TIME") {
+            // TIME(datetime) → nur Zeitteil "HH:MM:SS"
+            if (args.empty()) return "NULL";
+            std::string v = milansql::dateutils::stripQuotes(resolveArg(args[0]));
+            if (v.size() >= 19) return v.substr(11, 8);
+            if (v.size() >= 5 && v[2] == ':') return v;
+            return "NULL";
+        }
+
+        if (fn == "DATEDIFF") {
+            // DATEDIFF(date1, date2) → Tage
+            if (args.size() < 2) return "NULL";
+            return milansql::dateutils::dateDiff(resolveArg(args[0]), resolveArg(args[1]));
+        }
+
+        if (fn == "DATE_ADD" || fn == "DATE_SUB") {
+            // DATE_ADD(date, INTERVAL n UNIT)
+            // Parser may produce:
+            //   args[0]=date, args[1]="INTERVAL n UNIT"  (2 args)
+            // or:
+            //   args[0]=date, args[1]=n, args[2]=unit    (3 args)
+            if (args.size() < 2) return "NULL";
+            std::string dateVal = resolveArg(args[0]);
+            long n = 0;
+            std::string unit;
+            if (args.size() >= 3) {
+                // 3-arg form
+                try { n = std::stol(resolveArg(args[1])); } catch (...) { return "NULL"; }
+                unit = resolveArg(args[2]);
+            } else {
+                // 2-arg form: args[1] = "INTERVAL n UNIT" (possibly with leading INTERVAL token)
+                std::string intervalStr = args[1];
+                // strip leading "INTERVAL " (case-insensitive)
+                if (intervalStr.size() > 9) {
+                    std::string pfx = intervalStr.substr(0, 9);
+                    for (char& c : pfx) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    if (pfx == "INTERVAL ") intervalStr = intervalStr.substr(9);
+                }
+                // trim
+                while (!intervalStr.empty() && intervalStr.front() == ' ') intervalStr.erase(intervalStr.begin());
+                while (!intervalStr.empty() && intervalStr.back()  == ' ') intervalStr.pop_back();
+                // split on space: first = n, second = unit
+                auto sp = intervalStr.find(' ');
+                if (sp == std::string::npos) return "NULL";
+                try { n = std::stol(intervalStr.substr(0, sp)); } catch (...) { return "NULL"; }
+                unit = intervalStr.substr(sp + 1);
+                while (!unit.empty() && unit.front() == ' ') unit.erase(unit.begin());
+                while (!unit.empty() && unit.back()  == ' ') unit.pop_back();
+            }
+            if (fn == "DATE_SUB") n = -n;
+            return milansql::dateutils::dateAdd(dateVal, n, unit);
+        }
+
+        if (fn == "DATE_FORMAT") {
+            if (args.size() < 2) return "NULL";
+            return milansql::dateutils::dateFormat(resolveArg(args[0]), resolveArg(args[1]));
+        }
+
         return "";
     }
 
@@ -3363,7 +3444,12 @@ private:
         static const std::vector<std::string> KNOWN_FUNCS =
             {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
              "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-             "IFNULL", "COALESCE", "CAST"};
+             "IFNULL", "COALESCE", "CAST",
+             // Phase 55: DATE/TIME
+             "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
+             "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+             "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
+             "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
 
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;
@@ -3881,10 +3967,30 @@ private:
 
     // Füllt fehlende Werte am Ende mit DEFAULT-Wert oder "NULL" auf.
     // Wird vor jedem INSERT aufgerufen, um kürzere VALUES-Listen zu erlauben.
+    static std::string resolveDefault(const Column& col) {
+        if (!col.hasDefault) return "NULL";
+        std::string defUp = col.defaultValue;
+        for (char& c : defUp)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (defUp == "CURRENT_TIMESTAMP" || defUp == "NOW()")
+            return milansql::dateutils::currentDatetimeStr();
+        if (defUp == "CURDATE()" || defUp == "CURRENT_DATE")
+            return milansql::dateutils::currentDateStr();
+        if (defUp == "CURTIME()" || defUp == "CURRENT_TIME")
+            return milansql::dateutils::currentTimeStr();
+        return col.defaultValue;
+    }
+
     static void applyDefaults(const Table& t, std::vector<std::string>& vals) {
+        // Phase 55: in-place: "" = unspecified slot from named-column INSERT → apply default
+        for (size_t i = 0; i < vals.size() && i < t.columns().size(); ++i) {
+            if (vals[i].empty())
+                vals[i] = resolveDefault(t.columns()[i]);
+        }
+        // Append missing values at the end
         while (vals.size() < t.columns().size()) {
             const Column& col = t.columns()[vals.size()];
-            vals.push_back(col.hasDefault ? col.defaultValue : "NULL");
+            vals.push_back(resolveDefault(col));
         }
     }
 
@@ -4288,6 +4394,23 @@ public:
     std::string currentUser_ = "root";
 
 public:
+    // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
+
+    // Gibt die Spalten einer Tabelle zurück (für INSERT-Umordnung in dispatch)
+    const std::vector<Column>& tableColumns(const std::string& tblRaw) const {
+        auto name = resolveTableName(tblRaw);
+        return getTable(name).columns();
+    }
+
+    // Öffentlicher Zugriff auf evaluateFunc (für SELECT ohne FROM) ──
+    // Erstellt eine temporäre leere Tabelle + leere Zeile und ruft evaluateFunc auf.
+    static std::string evalFuncPublic(const std::string& fn,
+                                      const std::vector<std::string>& args) {
+        Table tmpTbl("", {Column("_", "TEXT")});
+        Row  emptyRow(std::vector<std::string>{"NULL"});
+        return evaluateFunc(fn, args, tmpTbl, emptyRow);
+    }
+
     // ── Phase 54A: Query Cache ────────────────────────────────
     QueryCache& getQueryCache() { return queryCache_; }
     const QueryCache& getQueryCache() const { return queryCache_; }

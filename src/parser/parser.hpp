@@ -161,6 +161,9 @@ struct ParsedCommand {
     // Phase 27: Multi-row INSERT
     std::vector<std::vector<std::string>> multiValues;
 
+    // Phase 55: Named-column INSERT (INSERT INTO t (col1, col3) VALUES ...)
+    std::vector<std::string> insertColumnNames;
+
     // Phase 28: INSERT INTO ... SELECT ...
     bool        isInsertSelect  = false;
     std::string insertSelectSql;
@@ -468,7 +471,12 @@ public:
             static const std::vector<std::string> SFUNCS =
                 {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE", "CAST", "MATCH"};
+                 "IFNULL", "COALESCE", "CAST", "MATCH",
+                 // Phase 55: DATE/TIME-Funktionen
+                 "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
+                 "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+                 "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
+                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -653,13 +661,53 @@ public:
                     else
                         cmd.type = CommandType::UNKNOWN;
                 } else {
-                    // INSERT INTO name VALUES (...),...
+                    // INSERT INTO name [( col1, col2, ... )] VALUES (...),...
+                    // Phase 55: Spalten-Liste parsen, falls vorhanden
+                    {
+                        std::string up = input;
+                        for (char& c : up)
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        // Finde erstes "(" das NICHT direkt nach "VALUES" kommt
+                        auto vpos = up.find("VALUES");
+                        auto ppos = up.find('(');
+                        // Gibt es ein ( VOR VALUES?  → das ist die Spalten-Liste
+                        if (ppos != std::string::npos &&
+                            (vpos == std::string::npos || ppos < vpos)) {
+                            // Finde zugehörige ")"
+                            auto closePpos = up.find(')', ppos + 1);
+                            if (closePpos != std::string::npos) {
+                                std::string colStr = input.substr(ppos + 1, closePpos - ppos - 1);
+                                for (const auto& colTok : splitTrim(colStr, ','))
+                                    if (!colTok.empty()) cmd.insertColumnNames.push_back(colTok);
+                            }
+                        }
+                    }
                     cmd.multiValues = parseValueGroups(input);
                     if (!cmd.multiValues.empty())
                         cmd.values = cmd.multiValues[0];  // Backward-Compat
                 }
             } else if (tokens.size() == 3) {
                 cmd.tableName   = tokens[2];
+                // Phase 55: INSERT INTO name (col1, col2, ...) VALUES (...)
+                // tokens is from beforeParen → beforeParen = "INSERT INTO name "
+                // Column list is in parenContent, which starts with "col1, col2, ...) VALUES ..."
+                // Use raw input to parse column list
+                {
+                    std::string up = input;
+                    for (char& c : up)
+                        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    auto vpos = up.find("VALUES");
+                    auto ppos = up.find('(');
+                    if (ppos != std::string::npos &&
+                        (vpos == std::string::npos || ppos < vpos)) {
+                        auto closePpos = up.find(')', ppos + 1);
+                        if (closePpos != std::string::npos) {
+                            std::string colStr = input.substr(ppos + 1, closePpos - ppos - 1);
+                            for (const auto& colTok : splitTrim(colStr, ','))
+                                if (!colTok.empty()) cmd.insertColumnNames.push_back(colTok);
+                        }
+                    }
+                }
                 cmd.multiValues = parseValueGroups(input);
                 if (!cmd.multiValues.empty())
                     cmd.values = cmd.multiValues[0];
@@ -1975,7 +2023,99 @@ private:
         }
 
         if (fromPos == N || fromPos + 1 >= N) {
-            cmd.type = CommandType::UNKNOWN; return;
+            // Phase 55: SELECT ohne FROM — z.B. SELECT NOW(), SELECT 1+1
+            cmd.tableName = "";  // kein Tabellenname → Auswertung gegen leere Zeile
+            // Spaltenbereich: alles nach SELECT bis Ende (skip DISTINCT)
+            size_t noFromSelStart = 1;
+            if (noFromSelStart < N && toUpper(ft[noFromSelStart]) == "DISTINCT") {
+                cmd.isDistinct = true; ++noFromSelStart;
+            }
+            cmd.hasCaseItems = true;
+            for (size_t i = noFromSelStart; i < N; ) {
+                if (ft[i] == ",") { ++i; continue; }
+                std::string u = toUpper(ft[i]);
+                // Ist es eine Funktion mit ()?
+                static const std::vector<std::string> DATE0ARGS =
+                    {"NOW", "CURDATE", "CURTIME", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
+                bool isDate0 = false;
+                for (const auto& f : DATE0ARGS) if (u == f) { isDate0 = true; break; }
+                if (isDate0) {
+                    SelectItem item; item.isFuncExpr = true; item.funcName = u; ++i;
+                    if (i < N && ft[i] == "(") { ++i; if (i < N && ft[i] == ")") ++i; }
+                    if (i < N && toUpper(ft[i]) == "AS") { ++i; if (i < N && ft[i] != ",") { item.alias = ft[i]; ++i; } }
+                    cmd.selectItems.push_back(item);
+                    continue;
+                }
+                // Generic: collect tokens until next comma (top-level)
+                std::string expr;
+                int depth = 0;
+                while (i < N) {
+                    if (ft[i] == "(") { depth++; expr += ft[i] + " "; i++; continue; }
+                    if (ft[i] == ")") { if (depth == 0) break; depth--; expr += ft[i] + " "; i++; continue; }
+                    if (depth == 0 && ft[i] == ",") break;
+                    expr += ft[i] + " ";
+                    i++;
+                }
+                while (!expr.empty() && expr.back() == ' ') expr.pop_back();
+                // Try to detect FUNC(...) pattern
+                SelectItem item;
+                {
+                    // Tokenize the expression to find func name
+                    auto exprToks = tokenizeFull(expr);
+                    static const std::vector<std::string> ALLFUNCS =
+                        {"UPPER","LOWER","LENGTH","CONCAT","SUBSTR","TRIM","REPLACE",
+                         "ABS","ROUND","MOD","POWER","SQRT","CEIL","FLOOR",
+                         "IFNULL","COALESCE","CAST",
+                         "NOW","CURDATE","CURTIME","DATE","TIME",
+                         "YEAR","MONTH","DAY","HOUR","MINUTE","SECOND",
+                         "DATEDIFF","DATE_ADD","DATE_SUB","DATE_FORMAT"};
+                    if (exprToks.size() >= 3 && exprToks[1] == "(") {
+                        std::string fn = toUpper(exprToks[0]);
+                        bool isKnown = false;
+                        for (const auto& f : ALLFUNCS) if (fn == f) { isKnown = true; break; }
+                        if (isKnown) {
+                            item.isFuncExpr = true; item.funcName = fn;
+                            // collect args between outer parens
+                            int d = 0; std::string curArg;
+                            for (size_t j = 2; j < exprToks.size(); ++j) {
+                                if (exprToks[j] == "(") { d++; curArg += exprToks[j] + " "; continue; }
+                                if (exprToks[j] == ")") {
+                                    if (d == 0) break;
+                                    d--; curArg += exprToks[j] + " "; continue;
+                                }
+                                if (d == 0 && exprToks[j] == ",") {
+                                    while (!curArg.empty() && curArg.back() == ' ') curArg.pop_back();
+                                    if (!curArg.empty()) item.funcArgs.push_back(curArg);
+                                    curArg = ""; continue;
+                                }
+                                curArg += exprToks[j] + " ";
+                            }
+                            while (!curArg.empty() && curArg.back() == ' ') curArg.pop_back();
+                            if (!curArg.empty()) item.funcArgs.push_back(curArg);
+                        }
+                    }
+                    if (!item.isFuncExpr) {
+                        // Check AS alias
+                        item.colName = expr;
+                        // Look for " AS " pattern
+                        std::string upper = expr;
+                        for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        auto asPos = upper.rfind(" AS ");
+                        if (asPos != std::string::npos) {
+                            item.alias   = expr.substr(asPos + 4);
+                            item.colName = expr.substr(0, asPos);
+                        }
+                    } else {
+                        // Parse AS alias after closing paren
+                        if (i < N && toUpper(ft[i]) == "AS") {
+                            ++i;
+                            if (i < N && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                        }
+                    }
+                }
+                cmd.selectItems.push_back(item);
+            }
+            return;
         }
         cmd.tableName = ft[fromPos + 1];
 
@@ -2002,7 +2142,12 @@ private:
         static const std::vector<std::string> SFUNCS32 =
             {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE", "CAST", "MATCH"};
+                 "IFNULL", "COALESCE", "CAST", "MATCH",
+                 // Phase 55: DATE/TIME-Funktionen
+                 "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
+                 "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+                 "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
+                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -2146,7 +2291,12 @@ private:
                 static const std::vector<std::string> SFUNCS32 =
                     {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
                  "ABS", "ROUND", "MOD", "POWER", "SQRT", "CEIL", "FLOOR",
-                 "IFNULL", "COALESCE", "CAST", "MATCH"};
+                 "IFNULL", "COALESCE", "CAST", "MATCH",
+                 // Phase 55: DATE/TIME-Funktionen
+                 "NOW", "CURDATE", "CURTIME", "DATE", "TIME",
+                 "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
+                 "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT",
+                 "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
@@ -2258,6 +2408,24 @@ private:
                     }
                     cmd.selectItems.push_back(item);
 
+                } else if (isStrFunc && (i + 1 >= end || ft[i + 1] != "(") &&
+                           (u == "NOW" || u == "CURDATE" || u == "CURTIME" ||
+                            u == "CURRENT_TIMESTAMP" || u == "CURRENT_DATE" || u == "CURRENT_TIME")) {
+                    // Phase 55: Zero-arg date functions used without ()
+                    SelectItem item;
+                    item.isFuncExpr = true;
+                    item.funcName   = u;
+                    ++i;
+                    // skip "()" if present
+                    if (i < end && ft[i] == "(") {
+                        ++i;
+                        if (i < end && ft[i] == ")") ++i;
+                    }
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(item);
                 } else if (isStrFunc && i + 1 < end && ft[i + 1] == "(") {
                     SelectItem item;
                     item.isFuncExpr = true;

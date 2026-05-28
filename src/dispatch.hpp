@@ -654,9 +654,37 @@ inline bool dispatchCommand(
             break;
         }
 
-        const auto& rows = cmd.multiValues.empty()
-            ? std::vector<std::vector<std::string>>{cmd.values}
-            : cmd.multiValues;
+        // Phase 55: Werte bei benannter Spalten-Liste neu anordnen
+        // INSERT INTO t (col2, col4) VALUES (v2, v4) → [NULL, v2, NULL, v4]
+        auto remapForNamedCols =
+            [&](std::vector<std::string> srcVals) -> std::vector<std::string> {
+            if (cmd.insertColumnNames.empty()) return srcVals;
+            try {
+                const auto& tblCols = engine.tableColumns(cmd.tableName);
+                // "" = Sentinel: "nicht angegeben" → applyDefaults füllt DEFAULT ein
+                std::vector<std::string> out(tblCols.size(), "");
+                for (size_t si = 0; si < cmd.insertColumnNames.size() && si < srcVals.size(); ++si) {
+                    std::string cn = cmd.insertColumnNames[si];
+                    for (char& c : cn)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    for (size_t ti = 0; ti < tblCols.size(); ++ti) {
+                        std::string tn = tblCols[ti].name;
+                        for (char& c : tn)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        if (tn == cn) { out[ti] = srcVals[si]; break; }
+                    }
+                }
+                return out;
+            } catch (...) { return srcVals; }
+        };
+
+        std::vector<std::vector<std::string>> rowsStorage;
+        if (cmd.multiValues.empty())
+            rowsStorage.push_back(remapForNamedCols(cmd.values));
+        else
+            for (const auto& v : cmd.multiValues)
+                rowsStorage.push_back(remapForNamedCols(v));
+        const auto& rows = rowsStorage;
 
         if (cmd.upsertMode == "REPLACE") {
             size_t replaced = 0, inserted = 0;
@@ -703,6 +731,39 @@ inline bool dispatchCommand(
     }
 
     case milansql::CommandType::SELECT: {
+        // Phase 55: SELECT ohne FROM (z.B. SELECT NOW(), SELECT 1+1)
+        if (cmd.tableName.empty() && cmd.hasCaseItems && !cmd.selectItems.empty()) {
+            std::vector<milansql::Column> resCols;
+            std::vector<std::string>      resVals;
+            for (const auto& item : cmd.selectItems) {
+                // Spaltenüberschrift
+                std::string header = item.alias;
+                if (header.empty() && item.isFuncExpr) {
+                    header = item.funcName + "(";
+                    for (size_t ai = 0; ai < item.funcArgs.size(); ++ai) {
+                        if (ai) header += ",";
+                        header += item.funcArgs[ai];
+                    }
+                    header += ")";
+                }
+                if (header.empty()) header = item.colName;
+                resCols.push_back(milansql::Column(header, "TEXT"));
+
+                // Wert auswerten
+                std::string val;
+                if (item.isFuncExpr) {
+                    val = milansql::Engine::evalFuncPublic(item.funcName, item.funcArgs);
+                } else {
+                    val = item.colName;
+                }
+                resVals.push_back(val);
+            }
+            milansql::Table result("", resCols);
+            result.insert(milansql::Row(std::move(resVals)));
+            std::cout << "\n";
+            dispatch_printTable(result, -1, 0);
+            break;
+        }
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }

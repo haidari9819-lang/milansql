@@ -83,6 +83,8 @@ enum class CommandType {
     BACKUP_TABLE,
     RESTORE_DATABASE,
     SHOW_BACKUPS,
+    // Phase 58: Benchmark
+    BENCHMARK,
     UNKNOWN
 };
 
@@ -234,6 +236,10 @@ struct ParsedCommand {
     // Phase 57: Backup / Restore
     std::string backupFile;         // Dateipfad für BACKUP/RESTORE
     bool        ifExists = false;   // für DROP TABLE IF EXISTS
+
+    // Phase 58: Benchmark
+    int         benchmarkIter = 0;  // Anzahl Iterationen
+    std::string benchmarkSql;       // SQL-Statement zum Benchmarken
 };
 
 class Parser {
@@ -1093,6 +1099,9 @@ public:
             // Phase 57: SHOW BACKUPS
             } else if (kw1 == "BACKUPS") {
                 cmd.type = CommandType::SHOW_BACKUPS;
+            // Phase 58: SHOW STATUS (Alias für STATUS)
+            } else if (kw1 == "STATUS") {
+                cmd.type = CommandType::STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -1169,6 +1178,37 @@ public:
                     fp = fp.substr(1, fp.size() - 2);
                 cmd.backupFile = fp;
             } else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 58: BENCHMARK n SQL ─────────────────────────────
+        } else if (kw0 == "BENCHMARK") {
+            if (tokens.size() >= 3) {
+                int iter = 0;
+                bool ok = true;
+                try { iter = std::stoi(tokens[1]); }
+                catch (...) { ok = false; }
+                if (ok && iter > 0) {
+                    // SQL-Teil aus Originalstring extrahieren
+                    // Format: BENCHMARK <n> <sql...>
+                    size_t p = 0;
+                    // "BENCHMARK" überspringen
+                    while (p < input.size() && !std::isspace((unsigned char)input[p])) ++p;
+                    while (p < input.size() &&  std::isspace((unsigned char)input[p])) ++p;
+                    // Zahl überspringen
+                    while (p < input.size() && !std::isspace((unsigned char)input[p])) ++p;
+                    while (p < input.size() &&  std::isspace((unsigned char)input[p])) ++p;
+                    if (p < input.size()) {
+                        cmd.type          = CommandType::BENCHMARK;
+                        cmd.benchmarkIter = iter;
+                        cmd.benchmarkSql  = input.substr(p);
+                    } else {
+                        cmd.type = CommandType::UNKNOWN;
+                    }
+                } else {
+                    cmd.type = CommandType::UNKNOWN;
+                }
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
 
         // ── Phase 45: PREPARE name AS sql ────────────────────────
         } else if (kw0 == "PREPARE") {

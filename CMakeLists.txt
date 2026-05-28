@@ -32,7 +32,7 @@ endif()
 # ── Test-Suite (Phase 39.5) ──────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src)
+target_include_directories(milansql_tests PRIVATE src src/server)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()

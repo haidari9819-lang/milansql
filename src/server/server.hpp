@@ -1,6 +1,7 @@
 #pragma once
 // ============================================================
 // server.hpp — MilanSQL TCP Server (Phase 47)
+// Phase 58: Connection Pool (Thread Pool) hinzugefügt
 // ============================================================
 
 #if defined(_WIN32)
@@ -30,6 +31,8 @@
 
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <queue>
 #include <functional>
 #include <string>
 #include <sstream>
@@ -38,11 +41,14 @@
 #include <map>
 #include <chrono>
 #include <atomic>
+#include <memory>
+#include <vector>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "pool_stats.hpp"
 
 // ── Phase 54D: Process tracking ──────────────────────────────
 struct ProcessInfo {
@@ -54,10 +60,86 @@ struct ProcessInfo {
     std::chrono::steady_clock::time_point connectedAt;
 };
 
+// ── Phase 58: Thread Pool ─────────────────────────────────────
+// Verwaltet einen festen Pool von Worker-Threads.
+// Eingehende Client-Verbindungen werden in eine Queue eingereiht.
+class ThreadPool {
+public:
+    using Task = std::function<void()>;
+
+    ThreadPool(int poolSize, int maxQueue)
+        : maxQueueSize_(maxQueue), stopping_(false) {
+        milansql::g_poolStats.poolSize.store(poolSize);
+        milansql::g_poolStats.maxQueueSize.store(maxQueue);
+        for (int i = 0; i < poolSize; ++i)
+            workers_.emplace_back([this] { workerLoop(); });
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : workers_)
+            if (t.joinable()) t.join();
+    }
+
+    // Fügt Task in Queue ein. Gibt false zurück wenn Queue voll.
+    bool enqueue(Task task) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (static_cast<int>(q_.size()) >= maxQueueSize_) return false;
+        q_.push(std::move(task));
+        milansql::g_poolStats.queuedRequests.store(static_cast<int>(q_.size()));
+        cv_.notify_one();
+        return true;
+    }
+
+    int poolSize()    const { return milansql::g_poolStats.poolSize.load(); }
+    int activeCount() const { return milansql::g_poolStats.activeWorkers.load(); }
+    int queuedCount() const { return milansql::g_poolStats.queuedRequests.load(); }
+
+private:
+    void workerLoop() {
+        while (true) {
+            Task task;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [this] { return stopping_ || !q_.empty(); });
+                if (stopping_ && q_.empty()) return;
+                task = std::move(q_.front());
+                q_.pop();
+                milansql::g_poolStats.queuedRequests.store(
+                    static_cast<int>(q_.size()));
+            }
+            milansql::g_poolStats.activeWorkers.fetch_add(1);
+            auto t0 = std::chrono::high_resolution_clock::now();
+
+            task();
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            milansql::g_poolStats.totalQueryTimeUs.fetch_add(us);
+            milansql::g_poolStats.totalRequests.fetch_add(1);
+            milansql::g_poolStats.activeWorkers.fetch_sub(1);
+        }
+    }
+
+    int maxQueueSize_;
+    bool stopping_;
+    std::vector<std::thread> workers_;
+    std::queue<Task> q_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+};
+
+// ── MilanServer ───────────────────────────────────────────────
 class MilanServer {
 public:
-    MilanServer(int port, const std::string& dbPath)
-        : port_(port), dbPath_(dbPath), storage_(dbPath_) {}
+    MilanServer(int port, const std::string& dbPath,
+                int poolSize = 10, int maxQueue = 100)
+        : port_(port), dbPath_(dbPath), storage_(dbPath_),
+          poolSize_(poolSize), maxQueueSize_(maxQueue) {}
 
     void run();
 
@@ -67,6 +149,10 @@ private:
     milansql::Engine engine_;
     milansql::MilanBinaryStorage storage_;
     std::mutex engineMutex_;
+
+    int poolSize_;
+    int maxQueueSize_;
+    std::unique_ptr<ThreadPool> pool_;
 
     // Phase 54D: Process list
     std::map<int, ProcessInfo> processList_;
@@ -396,6 +482,11 @@ inline void MilanServer::run() {
 
     initEngine();
 
+    // Phase 58: Thread Pool erstellen
+    pool_ = std::make_unique<ThreadPool>(poolSize_, maxQueueSize_);
+    std::cout << "MilanSQL Connection Pool: " << poolSize_ << " Worker-Threads"
+              << ", max. Queue: " << maxQueueSize_ << "\n";
+
     sock_t serverSock = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSock == INVALID_SOCK) {
         std::cerr << "Fehler: socket() fehlgeschlagen.\n";
@@ -447,7 +538,16 @@ inline void MilanServer::run() {
             break;
         }
 
-        std::thread(&MilanServer::handleClient, this, clientSock).detach();
+        // Phase 58: Verbindung in Thread Pool einreihen
+        bool queued = pool_->enqueue(
+            [this, clientSock]() { handleClient(clientSock); });
+
+        if (!queued) {
+            // Queue voll: Client ablehnen
+            sendAll(clientSock,
+                    "ERROR\nServer ueberlastet: Verbindungspool voll\nEND\n");
+            closesocket(clientSock);
+        }
     }
 
     closesocket(serverSock);

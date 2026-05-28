@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <limits>
 
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
@@ -20,6 +21,7 @@
 #include "storage/storage.hpp"
 #include "optimizer/optimizer.hpp"
 #include "backup/backup.hpp"
+#include "server/pool_stats.hpp"
 
 namespace milansql {
 
@@ -1283,19 +1285,35 @@ inline bool dispatchCommand(
             if (fs) fileSize = std::to_string(fs.tellg()) + " Bytes";
             else    fileSize = "(noch nicht gespeichert)";
         }
+        // Phase 58: Pool-Statistiken
+        long long totalReq = milansql::g_poolStats.totalRequests.load();
+        long long totalUs  = milansql::g_poolStats.totalQueryTimeUs.load();
+        double avgMs = (totalReq > 0)
+            ? (static_cast<double>(totalUs) / static_cast<double>(totalReq) / 1000.0)
+            : 0.0;
+        std::ostringstream avgStr;
+        avgStr << std::fixed << std::setprecision(3) << avgMs << "ms";
+
         struct KV { std::string key, val; };
         std::vector<KV> kvs = {
-            {"Version",        "MilanSQL v1.0.0"},
-            {"Datei",          "database.milan"},
-            {"Format-Version", std::to_string(milansql::MilanBinaryStorage::FORMAT_VERSION)},
-            {"Tabellen",       std::to_string(tnames.size())},
-            {"Views",          std::to_string(vnames.size())},
-            {"Gesamt-Spalten", std::to_string(totalCols)},
-            {"Gesamt-Zeilen",  std::to_string(totalRows)},
-            {"Datei-Groesse",  fileSize},
+            {"Version",          "MilanSQL v1.0.0"},
+            {"Datei",            "database.milan"},
+            {"Format-Version",   std::to_string(milansql::MilanBinaryStorage::FORMAT_VERSION)},
+            {"Tabellen",         std::to_string(tnames.size())},
+            {"Views",            std::to_string(vnames.size())},
+            {"Gesamt-Spalten",   std::to_string(totalCols)},
+            {"Gesamt-Zeilen",    std::to_string(totalRows)},
+            {"Datei-Groesse",    fileSize},
+            {"---",              ""},   // Trennlinie
+            {"Pool Size",        std::to_string(milansql::g_poolStats.poolSize.load())},
+            {"Active Workers",   std::to_string(milansql::g_poolStats.activeWorkers.load())},
+            {"Queued Requests",  std::to_string(milansql::g_poolStats.queuedRequests.load())},
+            {"Total Requests",   std::to_string(totalReq)},
+            {"Avg Query Time",   avgStr.str()},
         };
         size_t maxKey = 0, maxVal = 0;
         for (const auto& kv : kvs) {
+            if (kv.key == "---") continue;  // Trennlinie überspringen
             maxKey = std::max(maxKey, kv.key.size());
             maxVal = std::max(maxVal, kv.val.size());
         }
@@ -1317,6 +1335,13 @@ inline bool dispatchCommand(
         std::cout << "\u2502\n";
         hline("\u251c", "\u2524");
         for (const auto& kv : kvs) {
+            if (kv.key == "---") {
+                // Trennlinie innerhalb der Box
+                std::cout << "  \u251c";
+                for (size_t i = 0; i < boxW; ++i) std::cout << "\u2500";
+                std::cout << "\u2524\n";
+                continue;
+            }
             std::cout << "  \u2502  " << kv.key;
             for (size_t i = kv.key.size(); i < maxKey; ++i) std::cout << " ";
             std::cout << " : " << kv.val;
@@ -1952,6 +1977,72 @@ inline bool dispatchCommand(
                 std::cout << "    " << f << "\n";
             std::cout << "\n";
         }
+        break;
+    }
+
+    // ── Phase 58: BENCHMARK ────────────────────────────────────
+    case milansql::CommandType::BENCHMARK: {
+        if (cmd.benchmarkSql.empty() || cmd.benchmarkIter <= 0) {
+            std::cout << "  Fehler: BENCHMARK <n> <SQL>\n\n"; break;
+        }
+
+        using clock_t = std::chrono::high_resolution_clock;
+        double minMs   = std::numeric_limits<double>::max();
+        double maxMs   = 0.0;
+        double totalMs = 0.0;
+
+        // Output während Benchmark unterdrücken
+        std::streambuf* oldBuf = std::cout.rdbuf();
+        std::ostringstream devNull;
+        auto noop = []() {};
+
+        for (int bi = 0; bi < cmd.benchmarkIter; ++bi) {
+            std::cout.rdbuf(devNull.rdbuf());
+            auto t0 = clock_t::now();
+
+            try {
+                milansql::ParsedCommand bcmd = parser.parse(cmd.benchmarkSql);
+                dispatchCommand(bcmd, engine, parser, cmd.benchmarkSql,
+                                noop, noop, noop, nullptr);
+            } catch (...) {}
+
+            auto t1 = clock_t::now();
+            std::cout.rdbuf(oldBuf);
+
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            totalMs += ms;
+            if (ms < minMs) minMs = ms;
+            if (ms > maxMs) maxMs = ms;
+        }
+
+        std::cout.rdbuf(oldBuf);  // Sicherheits-Restore
+
+        double avgMs = totalMs / cmd.benchmarkIter;
+        double qps   = (totalMs > 0.0) ? (cmd.benchmarkIter * 1000.0 / totalMs) : 0.0;
+
+        auto fmtMs = [](double ms) -> std::string {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(3) << ms << "ms";
+            return ss.str();
+        };
+        std::ostringstream qpsStr;
+        qpsStr << std::fixed << std::setprecision(0) << qps;
+
+        std::cout << "\n";
+        std::cout << "  Benchmark: " << cmd.benchmarkIter << " Iterationen\n";
+        std::cout << "  SQL: " << cmd.benchmarkSql << "\n";
+        std::cout << "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n";
+        std::cout << "  Gesamtzeit:    " << fmtMs(totalMs) << "\n";
+        std::cout << "  Durchschnitt:  " << fmtMs(avgMs) << " pro Query\n";
+        std::cout << "  Min:           " << fmtMs(minMs) << "\n";
+        std::cout << "  Max:           " << fmtMs(maxMs) << "\n";
+        std::cout << "  Queries/sec:   " << qpsStr.str() << "\n\n";
+
+        // Pool-Statistiken aktualisieren
+        milansql::g_poolStats.totalRequests.fetch_add(cmd.benchmarkIter);
+        long long totalUs = static_cast<long long>(totalMs * 1000.0);
+        milansql::g_poolStats.totalQueryTimeUs.fetch_add(totalUs);
+
         break;
     }
 

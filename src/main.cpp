@@ -40,14 +40,18 @@ int main(int argc, char* argv[]) {
     bool httpMode   = false;
     int  port       = 4406;
     int  httpPort   = 8080;
+    int  poolSize   = 10;   // Phase 58: Connection Pool Größe
+    int  maxQueue   = 100;  // Phase 58: max. Queue-Länge
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if      (arg == "--server") serverMode = true;
         else if (arg == "--client") clientMode = true;
         else if (arg == "--http")   httpMode   = true;
-        else if (arg == "--port"      && i + 1 < argc) port     = std::stoi(argv[++i]);
-        else if (arg == "--http-port" && i + 1 < argc) httpPort = std::stoi(argv[++i]);
+        else if (arg == "--port"       && i + 1 < argc) port     = std::stoi(argv[++i]);
+        else if (arg == "--http-port"  && i + 1 < argc) httpPort = std::stoi(argv[++i]);
+        else if (arg == "--pool-size"  && i + 1 < argc) poolSize = std::stoi(argv[++i]);
+        else if (arg == "--max-queue"  && i + 1 < argc) maxQueue = std::stoi(argv[++i]);
     }
 
     // ── HTTP mode (Phase 52) ──────────────────────────────────
@@ -58,10 +62,11 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // ── Server mode ───────────────────────────────────────────
+    // ── Server mode (Phase 58: Pool-Parameter übergeben) ────────
     if (serverMode) {
-        std::cout << "MilanSQL Server startet auf Port " << port << "...\n";
-        MilanServer server(port, "database.milan");
+        std::cout << "MilanSQL Server startet auf Port " << port
+                  << " (Pool: " << poolSize << " Threads)...\n";
+        MilanServer server(port, "database.milan", poolSize, maxQueue);
         server.run();
         return 0;
     }

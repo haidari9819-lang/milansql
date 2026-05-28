@@ -435,7 +435,8 @@ STATUS
 | 54 | Query Cache (LRU/TTL), EXPLAIN ANALYZE, Web Dashboard, SHOW PROCESSLIST |
 | 55 | DATE/TIME Datentypen: DATE, TIME, DATETIME, TIMESTAMP, NOW(), CURDATE(), DATEDIFF(), DATE_ADD(), DATE_FORMAT() |
 | 56 | JSON Datentyp: JSON_EXTRACT, JSON_SET, JSON_KEYS, JSON_LENGTH, JSON_CONTAINS, JSON_TYPE |
-| 57 | Backup/Restore: BACKUP DATABASE/TABLE TO, RESTORE DATABASE FROM, SHOW BACKUPS, SQL-Dump (mysqldump-kompatibel) |
+| 57 | Backup/Restore: BACKUP DATABASE/TABLE TO, RESTORE FROM, SHOW BACKUPS, SQL-Dump Format |
+| 58 | Connection Pooling (Thread Pool, --pool-size), BENCHMARK Command, SHOW STATUS erweitert |
 
 ---
 

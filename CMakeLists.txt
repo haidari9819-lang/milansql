@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Projektname und Version
-project(milansql VERSION 1.7.0 LANGUAGES CXX)
+project(milansql VERSION 1.8.0 LANGUAGES CXX)
 
 # C++17 Standard festlegen
 set(CMAKE_CXX_STANDARD 17)
@@ -15,7 +15,7 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src src/server src/optimizer src/cache src/utils src/backup src/replication src/scheduler)
+target_include_directories(milansql PRIVATE src src/server src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)
@@ -32,7 +32,7 @@ endif()
 # ── Test-Suite (Phase 39.5) ──────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src src/server)
+target_include_directories(milansql_tests PRIVATE src src/server src/locking)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()
@@ -42,7 +42,7 @@ endif()
 # ── Benchmark (Phase 39.5) ───────────────────────────────────
 add_executable(milansql_bench src/tests/benchmark.cpp)
 target_compile_features(milansql_bench PRIVATE cxx_std_17)
-target_include_directories(milansql_bench PRIVATE src)
+target_include_directories(milansql_bench PRIVATE src src/locking)
 if(MSVC)
     target_compile_options(milansql_bench PRIVATE /W4)
 else()

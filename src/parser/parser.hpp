@@ -107,6 +107,10 @@ enum class CommandType {
     SAVEPOINT,
     ROLLBACK_TO_SAVEPOINT,
     RELEASE_SAVEPOINT,
+    // Phase 65: Locking
+    LOCK_TABLE,
+    UNLOCK_TABLES,
+    SHOW_LOCKS,
     UNKNOWN
 };
 
@@ -302,6 +306,10 @@ struct ParsedCommand {
     ParsedPartitionList  addListDef;
     // Phase 64: SAVEPOINT
     std::string savepointName;
+
+    // Phase 65: SELECT FOR UPDATE / LOCK TABLE
+    bool        isForUpdate = false;   // SELECT ... FOR UPDATE
+    std::string lockType;              // "READ" or "WRITE" for LOCK TABLE
 };
 
 class Parser {
@@ -361,6 +369,20 @@ public:
                     input    = input.substr(0, pos);
                     cmd.raw  = input;
                 }
+            }
+        }
+
+        // ── Phase 65: SELECT … FOR UPDATE — strip suffix ─────────
+        {
+            std::string upInpFU;
+            upInpFU.reserve(input.size());
+            for (unsigned char c : input) upInpFU += static_cast<char>(std::toupper(c));
+            const std::string fuNeedle = " FOR UPDATE";
+            if (upInpFU.size() >= fuNeedle.size() &&
+                upInpFU.substr(upInpFU.size() - fuNeedle.size()) == fuNeedle) {
+                cmd.isForUpdate = true;
+                input   = input.substr(0, input.size() - fuNeedle.size());
+                cmd.raw = input;
             }
         }
 
@@ -481,6 +503,26 @@ public:
                     toUpper(st[1]) == "SAVEPOINT") {
                     cmd.type = CommandType::RELEASE_SAVEPOINT;
                     cmd.savepointName = st[2];
+                    return cmd;
+                }
+                // Phase 65: LOCK TABLE name READ|WRITE
+                if (k == "LOCK" && st.size() >= 4 &&
+                    toUpper(st[1]) == "TABLE") {
+                    cmd.type      = CommandType::LOCK_TABLE;
+                    cmd.tableName = st[2];
+                    cmd.lockType  = toUpper(st[3]);  // "READ" or "WRITE"
+                    return cmd;
+                }
+                // Phase 65: UNLOCK TABLES
+                if (k == "UNLOCK" && st.size() >= 2 &&
+                    toUpper(st[1]) == "TABLES") {
+                    cmd.type = CommandType::UNLOCK_TABLES;
+                    return cmd;
+                }
+                // Phase 65: SHOW LOCKS
+                if (k == "SHOW" && st.size() >= 2 &&
+                    toUpper(st[1]) == "LOCKS") {
+                    cmd.type = CommandType::SHOW_LOCKS;
                     return cmd;
                 }
             }

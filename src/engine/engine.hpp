@@ -16,12 +16,14 @@
 #include <limits>
 #include <functional>
 #include <regex>
+#include <thread>
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
 #include "../utils/date_utils.hpp"
 #include "../utils/json_utils.hpp"
 #include "../scheduler/event_scheduler.hpp"
+#include "../locking/lock_manager.hpp"
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -906,6 +908,8 @@ public:
     void insertRow(const std::string& tblRaw, std::vector<std::string> vals) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
+        if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
+            throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         Table& t = getTable(tbl);       // wirft wenn Tabelle fehlt
         applyDefaults(t, vals);         // fehlende Werte mit DEFAULT/NULL füllen
         applyAutoInc(t, vals);          // AUTO_INCREMENT-Spalten befüllen
@@ -1469,6 +1473,8 @@ public:
                             const std::string& wCol,   const std::string& wVal) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
+        if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
+            throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -1488,6 +1494,8 @@ public:
                           const std::string& setCol, const std::string& setVal) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
+        if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
+            throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -1506,6 +1514,8 @@ public:
                             const std::string& wCol, const std::string& wVal) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
+        if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
+            throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         // Phase 21: CASCADE / SET NULL / RESTRICT für betroffene Zeilen
         {
             const Table& t = getTable(tbl);
@@ -1741,6 +1751,7 @@ public:
             applyOp(op);
         txBuffer_.clear();
         savepointStack_.clear();         // Phase 64
+        g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
         inTransaction_ = false;
         deleteWal();
     }
@@ -1752,6 +1763,7 @@ public:
             throw std::runtime_error("Keine aktive Transaktion.");
         txBuffer_.clear();
         savepointStack_.clear();         // Phase 64
+        g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
         inTransaction_ = false;
         deleteWal();
     }
@@ -1787,6 +1799,37 @@ public:
             }
         }
         throw std::runtime_error("SAVEPOINT '" + name + "' nicht gefunden.");
+    }
+
+    // ── Phase 65: LOCK TABLE / UNLOCK TABLES / SELECT FOR UPDATE ────
+
+    void lockTable(const std::string& tblRaw, const std::string& lockTypeStr) {
+        auto tbl = resolveTableName(tblRaw);
+        LockType lt = (lockTypeStr == "READ") ? LockType::READ : LockType::WRITE;
+        if (!g_lockManager.acquireTableLock(tbl, lt))
+            throw std::runtime_error("LOCK TABLE Timeout — Tabelle '" + tbl + "' ist durch einen anderen Thread gesperrt.");
+    }
+
+    void unlockTables() {
+        g_lockManager.releaseTableLocks(std::this_thread::get_id());
+    }
+
+    std::vector<std::string> showLockInfo() const {
+        return g_lockManager.showLocks();
+    }
+
+    // Acquire row-level WRITE locks on all rows returned by a SELECT FOR UPDATE.
+    // Uses the first column of each result row as the row key.
+    void acquireForUpdateLocks(const std::string& tblRaw, const Table& result) {
+        auto tbl = resolveTableName(tblRaw);
+        for (const auto& row : result.rows()) {
+            if (!row.values.empty()) {
+                if (!g_lockManager.acquireRowLock(tbl, row.values[0]))
+                    throw std::runtime_error(
+                        "SELECT FOR UPDATE Timeout — Zeile '" + row.values[0] +
+                        "' in '" + tbl + "' ist bereits gesperrt.");
+            }
+        }
     }
 
     // WAL-Datei löschen (wird auch von main.cpp beim Start aufgerufen)

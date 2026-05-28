@@ -1,12 +1,25 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.7.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.8.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **64 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **65 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.8.0
+
+| Phase | Feature |
+|-------|---------|
+| **65** | **SELECT FOR UPDATE**: `SELECT … FROM t WHERE … FOR UPDATE` — Row-Level WRITE-Locks |
+| | Locks automatisch freigegeben bei `COMMIT` / `ROLLBACK`, 5s Timeout |
+| | **LOCK TABLE**: `LOCK TABLE name READ\|WRITE` — exklusive Tabellensperre |
+| | `UNLOCK TABLES` — alle Tabellensperren des aktuellen Threads freigeben |
+| | `SHOW LOCKS` — aktive Row- und Table-Locks anzeigen |
+| | DML-Schutz: `INSERT`/`UPDATE`/`DELETE` respektieren `LOCK TABLE READ`-Sperren |
 
 ---
 

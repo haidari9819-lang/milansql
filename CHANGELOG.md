@@ -4,6 +4,39 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.8.0] — 2026-05-28
+
+### Added
+
+#### Phase 65 — SELECT FOR UPDATE + LOCK TABLE (Row/Table Level Locking)
+
+**SELECT FOR UPDATE:**
+- `SELECT ... FROM table WHERE ... FOR UPDATE` — sperrt alle Ergebnis-Zeilen mit Row-Level WRITE-Locks
+- Locks werden bei `COMMIT` oder `ROLLBACK` automatisch freigegeben
+- Wirft Fehler wenn Zeile bereits von einem anderen Thread gesperrt ist
+
+**LOCK TABLE / UNLOCK TABLES:**
+- `LOCK TABLE name READ` — exklusiver Read-Lock (blockiert Schreibzugriffe anderer Threads)
+- `LOCK TABLE name WRITE` — exklusiver Write-Lock (blockiert alle Zugriffe anderer Threads)
+- `UNLOCK TABLES` — gibt alle Tabellen-Locks des aktuellen Threads frei
+- `SHOW LOCKS` — zeigt alle aktiven Row- und Table-Locks
+
+**DML-Schutz:**
+- `INSERT`, `UPDATE`, `DELETE` prüfen automatisch Tabellen-Locks anderer Threads
+- Schreiboperationen auf READ-gesperrte Tabellen → Fehler
+
+### Architecture
+- `src/locking/lock_manager.hpp` — `LockManager` Klasse mit `rowLocks_` (map `"table:key"→threadId`) und `tableLocks_` (map `table→{threadId, LockType}`)
+- `LockType` Enum (READ, WRITE), `inline LockManager g_lockManager` Global
+- `std::mutex` für thread-sichere Lock-Verwaltung; nicht-blockierendes Try-and-Fail-Design
+- `Engine::lockTable()`, `unlockTables()`, `showLockInfo()`, `acquireForUpdateLocks()`
+- `g_lockManager.releaseRowLocks()` in `applyAndCommit()` und `rollbackTransaction()`
+- Write-Guards in `insertRow()`, `updateWhere()`, `updateAll()`, `deleteWhere()` (Phase 65)
+- Parser: `isForUpdate` Flag (FOR UPDATE suffix stripping), `lockType` Feld
+- `CommandType::LOCK_TABLE`, `UNLOCK_TABLES`, `SHOW_LOCKS`
+
+---
+
 ## [v1.7.0] — 2026-05-28
 
 ### Added

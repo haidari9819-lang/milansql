@@ -1350,6 +1350,17 @@ inline bool dispatchCommand(
                 result = engine.selectAll(cmd.tableName).clone();
             }
 
+            // Phase 65: SELECT FOR UPDATE — acquire row-level WRITE locks
+            if (cmd.isForUpdate) {
+                try {
+                    engine.acquireForUpdateLocks(cmd.tableName, result);
+                } catch (const std::exception& ex) {
+                    if (oldBuf) std::cout.rdbuf(oldBuf);
+                    std::cout << "  FEHLER (FOR UPDATE): " << ex.what() << "\n\n";
+                    break;
+                }
+            }
+
             std::size_t totalFound = result.rowCount();
 
             if (totalFound == 0 && !cmd.whereConds.empty()) {
@@ -1813,6 +1824,66 @@ inline bool dispatchCommand(
             std::cout << "  FEHLER: " << e.what() << "\n\n";
         }
         break;
+
+    // ── Phase 65: LOCK TABLE / UNLOCK TABLES / SHOW LOCKS ───────
+    case milansql::CommandType::LOCK_TABLE:
+        try {
+            if (cmd.tableName.empty() || cmd.lockType.empty()) {
+                std::cout << "  Fehler: LOCK TABLE name READ|WRITE\n\n";
+                break;
+            }
+            engine.lockTable(cmd.tableName, cmd.lockType);
+            std::cout << "  LOCK TABLE '" << cmd.tableName
+                      << "' (" << cmd.lockType << ") gesetzt.\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+
+    case milansql::CommandType::UNLOCK_TABLES:
+        engine.unlockTables();
+        std::cout << "  UNLOCK TABLES — alle Tabellensperren freigegeben.\n\n";
+        break;
+
+    case milansql::CommandType::SHOW_LOCKS: {
+        auto locks = engine.showLockInfo();
+        if (locks.empty()) {
+            std::cout << "  Keine aktiven Sperren.\n\n";
+        } else {
+            std::cout << "\n";
+            milansql::Table lt("", {milansql::Column("Type","TEXT"),
+                                    milansql::Column("Target","TEXT"),
+                                    milansql::Column("Mode","TEXT"),
+                                    milansql::Column("Thread","TEXT")});
+            for (const auto& line : locks) {
+                // Format: "ROW  | table:key | WRITE | thread:..."
+                // or     "TBL  | table     | READ  | thread:..."
+                auto split = [](const std::string& s, char d) {
+                    std::vector<std::string> parts;
+                    std::string cur;
+                    for (char c : s) {
+                        if (c == d) { parts.push_back(cur); cur.clear(); }
+                        else cur += c;
+                    }
+                    parts.push_back(cur);
+                    return parts;
+                };
+                auto parts = split(line, '|');
+                auto trim = [](std::string s) {
+                    while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+                    while (!s.empty() && s.back() == ' ') s.pop_back();
+                    return s;
+                };
+                std::string type   = parts.size() > 0 ? trim(parts[0]) : "";
+                std::string target = parts.size() > 1 ? trim(parts[1]) : "";
+                std::string mode   = parts.size() > 2 ? trim(parts[2]) : "";
+                std::string thread = parts.size() > 3 ? trim(parts[3]) : "";
+                lt.insert(milansql::Row({type, target, mode, thread}));
+            }
+            dispatch_printTable(lt, -1, 0);
+        }
+        break;
+    }
 
     case milansql::CommandType::CREATE_TRIGGER: {
         if (cmd.triggerName.empty() || cmd.triggerTiming.empty() ||

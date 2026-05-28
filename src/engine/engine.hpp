@@ -13,6 +13,8 @@
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <limits>
+#include <functional>
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
@@ -78,6 +80,29 @@ struct ExplainStep {
 
 struct ExplainPlan {
     std::vector<ExplainStep> steps;
+};
+
+// ── Phase 62: Partitioning ────────────────────────────────────
+enum class PartitionType { NONE, RANGE, LIST, HASH };
+
+struct PartitionRangeDef {
+    std::string name;
+    std::string limitStr;   // "100" or "MAXVALUE"
+    long long   limit;      // numeric (LLONG_MAX for MAXVALUE)
+};
+
+struct PartitionListDef {
+    std::string name;
+    std::vector<std::string> values;
+};
+
+struct PartitionInfo {
+    PartitionType type = PartitionType::NONE;
+    std::string   column;
+    std::vector<PartitionRangeDef> ranges;
+    std::vector<PartitionListDef>  lists;
+    int           hashCount = 0;
+    bool hasPartitions() const { return type != PartitionType::NONE; }
 };
 
 // ── Phase 37: Korrelierte Subquery-Strukturen ─────────────────
@@ -658,6 +683,129 @@ public:
     std::vector<Row>& mutableRows() { return rows_; }
     void rebuildIndexes() { rebuildAll(); }
 
+    // Phase 62: Partition accessors
+    void setPartitionInfo(const PartitionInfo& pi) { partitionInfo_ = pi; }
+    const PartitionInfo& getPartitionInfo() const { return partitionInfo_; }
+
+    // Returns the partition name for a given row (based on partition column value)
+    std::string getPartitionName(const Row& row) const {
+        if (!partitionInfo_.hasPartitions()) return "";
+        int ci = colOf(partitionInfo_.column);
+        std::string val = (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
+                          ? row.values[ci] : "";
+        // Strip surrounding single quotes (stored as 'value' by parser)
+        if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'')
+            val = val.substr(1, val.size() - 2);
+        if (partitionInfo_.type == PartitionType::RANGE) {
+            long long numVal = 0;
+            try { numVal = std::stoll(val); } catch (...) { numVal = 0; }
+            for (auto& r : partitionInfo_.ranges) {
+                if (numVal < r.limit) return r.name;
+            }
+            return "";
+        }
+        if (partitionInfo_.type == PartitionType::LIST) {
+            for (auto& l : partitionInfo_.lists) {
+                for (auto& v : l.values) {
+                    if (v == val) return l.name;
+                }
+            }
+            return "";
+        }
+        if (partitionInfo_.type == PartitionType::HASH) {
+            if (partitionInfo_.hashCount <= 0) return "";
+            long long h = 0;
+            try { h = std::stoll(val); } catch (...) {
+                for (char c : val) h = h * 31 + static_cast<unsigned char>(c);
+            }
+            int bucket = static_cast<int>(((h % partitionInfo_.hashCount) + partitionInfo_.hashCount)
+                                           % partitionInfo_.hashCount);
+            return "p" + std::to_string(bucket);
+        }
+        return "";
+    }
+
+    // Returns partition stats: vector of {name, rowCount}
+    std::vector<std::pair<std::string, size_t>> getPartitionStats() const {
+        std::map<std::string, size_t> counts;
+        if (partitionInfo_.type == PartitionType::RANGE) {
+            for (auto& r : partitionInfo_.ranges) counts[r.name] = 0;
+        } else if (partitionInfo_.type == PartitionType::LIST) {
+            for (auto& l : partitionInfo_.lists) counts[l.name] = 0;
+        } else if (partitionInfo_.type == PartitionType::HASH) {
+            for (int i = 0; i < partitionInfo_.hashCount; ++i)
+                counts["p" + std::to_string(i)] = 0;
+        }
+        for (auto& row : rows_) {
+            std::string pn = getPartitionName(row);
+            if (!pn.empty()) counts[pn]++;
+        }
+        std::vector<std::pair<std::string, size_t>> result;
+        for (auto& kv : counts) result.push_back(kv);
+        return result;
+    }
+
+    // Returns set of partition names that could contain rows matching col op val
+    // (partition pruning). Returns all partition names if pruning not applicable.
+    std::vector<std::string> prunePartitions(const std::string& col,
+                                              const std::string& op,
+                                              const std::string& val) const {
+        std::vector<std::string> all;
+        if (partitionInfo_.type == PartitionType::RANGE) {
+            for (auto& r : partitionInfo_.ranges) all.push_back(r.name);
+        } else if (partitionInfo_.type == PartitionType::LIST) {
+            for (auto& l : partitionInfo_.lists) all.push_back(l.name);
+        } else if (partitionInfo_.type == PartitionType::HASH) {
+            for (int i = 0; i < partitionInfo_.hashCount; ++i)
+                all.push_back("p" + std::to_string(i));
+        }
+        if (col != partitionInfo_.column) return all;
+        // Strip surrounding quotes from WHERE value for consistent matching
+        std::string cmpVal = val;
+        if (cmpVal.size() >= 2 && cmpVal.front() == '\'' && cmpVal.back() == '\'')
+            cmpVal = cmpVal.substr(1, cmpVal.size() - 2);
+        if (partitionInfo_.type == PartitionType::RANGE) {
+            long long numVal = 0;
+            try { numVal = std::stoll(cmpVal); } catch (...) { return all; }
+            std::vector<std::string> pruned;
+            long long prevLimit = std::numeric_limits<long long>::min();
+            for (auto& r : partitionInfo_.ranges) {
+                // partition covers [prevLimit, r.limit)
+                bool keep = false;
+                if (op == "=" || op == "BETWEEN") {
+                    keep = (numVal >= prevLimit && numVal < r.limit);
+                } else if (op == "<" || op == "<=") {
+                    keep = (prevLimit < numVal + (op == "<=" ? 1 : 0));
+                } else if (op == ">" || op == ">=") {
+                    keep = (r.limit > numVal);
+                } else {
+                    keep = true;
+                }
+                if (keep) pruned.push_back(r.name);
+                prevLimit = r.limit;
+            }
+            return pruned.empty() ? all : pruned;
+        }
+        if (partitionInfo_.type == PartitionType::LIST && op == "=") {
+            for (auto& l : partitionInfo_.lists) {
+                for (auto& v : l.values) {
+                    if (v == cmpVal) return {l.name};
+                }
+            }
+            return {};
+        }
+        if (partitionInfo_.type == PartitionType::HASH && op == "=") {
+            long long h = 0;
+            try { h = std::stoll(cmpVal); } catch (...) {
+                for (char c : cmpVal) h = h * 31 + static_cast<unsigned char>(c);
+            }
+            int bucket = static_cast<int>(((h % partitionInfo_.hashCount) + partitionInfo_.hashCount)
+                                           % partitionInfo_.hashCount);
+            return {"p" + std::to_string(bucket)};
+        }
+        return all;
+    }
+
 private:
     std::string         name_;
     std::vector<Column> columns_;
@@ -665,6 +813,7 @@ private:
     std::map<std::string, IndexEntry>  indices_;
     std::map<std::string, uint64_t>    autoIncMap_;      // colName → nächster Wert
     std::vector<ForeignKeyDef>         foreignKeys_;     // FK-Definitionen
+    PartitionInfo                      partitionInfo_;   // Phase 62: Partition metadata
 
     void rebuildAll() {
         for (auto& [idxName, entry] : indices_) {
@@ -4490,6 +4639,119 @@ public:
 
     void invalidateCache(const std::string& tableName) {
         queryCache_.invalidate(tableName);
+    }
+
+    // ── Phase 62: Partition management ───────────────────────────
+    void setTablePartitionInfo(const std::string& tblRaw, const PartitionInfo& pi) {
+        auto name = resolveTableName(tblRaw);
+        auto it = tables_.find(name);
+        if (it == tables_.end()) throw std::runtime_error("Table not found: " + tblRaw);
+        it->second.setPartitionInfo(pi);
+    }
+
+    const PartitionInfo& getTablePartitionInfo(const std::string& tblRaw) const {
+        auto name = resolveTableName(tblRaw);
+        return getTable(name).getPartitionInfo();
+    }
+
+    // SHOW PARTITIONS FROM tbl — returns printable lines
+    std::vector<std::string> showPartitions(const std::string& tblRaw) const {
+        auto name = resolveTableName(tblRaw);
+        const Table& tbl = getTable(name);
+        const PartitionInfo& pi = tbl.getPartitionInfo();
+        if (!pi.hasPartitions()) {
+            return {"Table '" + tblRaw + "' has no partitions."};
+        }
+        auto stats = tbl.getPartitionStats();
+        std::vector<std::string> lines;
+        std::string typeStr;
+        if      (pi.type == PartitionType::RANGE) typeStr = "RANGE";
+        else if (pi.type == PartitionType::LIST)  typeStr = "LIST";
+        else if (pi.type == PartitionType::HASH)  typeStr = "HASH";
+        lines.push_back("Table: " + tblRaw + "  PARTITION BY " + typeStr + "(" + pi.column + ")");
+        lines.push_back(std::string(60, '-'));
+        lines.push_back("Name                 Type    Description              Rows");
+        lines.push_back(std::string(60, '-'));
+        for (auto& [pname, cnt] : stats) {
+            std::string desc;
+            if (pi.type == PartitionType::RANGE) {
+                for (auto& r : pi.ranges) {
+                    if (r.name == pname) { desc = "VALUES LESS THAN (" + r.limitStr + ")"; break; }
+                }
+            } else if (pi.type == PartitionType::LIST) {
+                for (auto& l : pi.lists) {
+                    if (l.name == pname) {
+                        desc = "VALUES IN (";
+                        for (size_t i = 0; i < l.values.size(); ++i) {
+                            if (i) desc += ",";
+                            desc += l.values[i];
+                        }
+                        desc += ")";
+                        break;
+                    }
+                }
+            } else if (pi.type == PartitionType::HASH) {
+                desc = "HASH bucket";
+            }
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "%-20s %-7s %-24s %zu",
+                          pname.c_str(), typeStr.c_str(), desc.c_str(), cnt);
+            lines.push_back(buf);
+        }
+        return lines;
+    }
+
+    // ALTER TABLE t ADD PARTITION for RANGE
+    void addRangePartition(const std::string& tblRaw, const PartitionRangeDef& def) {
+        auto name = resolveTableName(tblRaw);
+        auto it = tables_.find(name);
+        if (it == tables_.end()) throw std::runtime_error("Table not found: " + tblRaw);
+        PartitionInfo pi = it->second.getPartitionInfo();
+        if (pi.type != PartitionType::RANGE)
+            throw std::runtime_error("Table is not RANGE-partitioned");
+        pi.ranges.push_back(def);
+        it->second.setPartitionInfo(pi);
+    }
+
+    // ALTER TABLE t ADD PARTITION for LIST
+    void addListPartition(const std::string& tblRaw, const PartitionListDef& def) {
+        auto name = resolveTableName(tblRaw);
+        auto it = tables_.find(name);
+        if (it == tables_.end()) throw std::runtime_error("Table not found: " + tblRaw);
+        PartitionInfo pi = it->second.getPartitionInfo();
+        if (pi.type != PartitionType::LIST)
+            throw std::runtime_error("Table is not LIST-partitioned");
+        pi.lists.push_back(def);
+        it->second.setPartitionInfo(pi);
+    }
+
+    // ALTER TABLE t DROP PARTITION name
+    void dropPartitionByName(const std::string& tblRaw, const std::string& partName) {
+        auto name = resolveTableName(tblRaw);
+        auto it = tables_.find(name);
+        if (it == tables_.end()) throw std::runtime_error("Table not found: " + tblRaw);
+        PartitionInfo pi = it->second.getPartitionInfo();
+        bool found = false;
+        if (pi.type == PartitionType::RANGE) {
+            for (auto rit = pi.ranges.begin(); rit != pi.ranges.end(); ++rit) {
+                if (rit->name == partName) { pi.ranges.erase(rit); found = true; break; }
+            }
+        } else if (pi.type == PartitionType::LIST) {
+            for (auto lit = pi.lists.begin(); lit != pi.lists.end(); ++lit) {
+                if (lit->name == partName) { pi.lists.erase(lit); found = true; break; }
+            }
+        }
+        if (!found) throw std::runtime_error("Partition not found: " + partName);
+        it->second.setPartitionInfo(pi);
+    }
+
+    // Returns pruned partition names for a WHERE condition
+    std::vector<std::string> prunePartitions(const std::string& tblRaw,
+                                              const std::string& col,
+                                              const std::string& op,
+                                              const std::string& val) const {
+        auto name = resolveTableName(tblRaw);
+        return getTable(name).prunePartitions(col, op, val);
     }
 
 private:

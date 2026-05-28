@@ -284,6 +284,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Phase 62: Load partitions from separate file
+    milansql::dispatch_loadPartitions(engine, "database.partitions");
+
     // Helper lambda: save procedures to file
     auto saveProcedures = [&]() {
         std::ofstream pf("database.procedures");

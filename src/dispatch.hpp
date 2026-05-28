@@ -498,6 +498,122 @@ static inline milansql::Table dispatch_executeSelectToTable(
     return result;
 }
 
+// ── Phase 62: Partition persistence ──────────────────────────
+// Format: tableName\ttype\tcolumn\thashCount\tRANGES:name=limitStr,...\tLISTS:name=v1|v2,...
+inline void dispatch_savePartitions(const milansql::Engine& engine,
+                                    const std::string& path = "database.partitions") {
+    // Gather all tables with partitions by iterating SHOW command output
+    // We save directly from engine via a known list; use a helper approach:
+    // Write one line per table with partition info.
+    // We access tables via engine's public showPartitions which also tells us they exist.
+    // Since we don't have a "listPartitionedTables" method, we'll use a workaround:
+    // iterate via engine's showTables and check each.
+    std::ofstream out(path);
+    if (!out.is_open()) return;
+    // Get all tables
+    for (const auto& tblName : engine.getAllTableNames()) {
+        try {
+            const milansql::PartitionInfo& pi = engine.getTablePartitionInfo(tblName);
+            if (!pi.hasPartitions()) continue;
+            std::string typeStr;
+            if      (pi.type == milansql::PartitionType::RANGE) typeStr = "RANGE";
+            else if (pi.type == milansql::PartitionType::LIST)  typeStr = "LIST";
+            else if (pi.type == milansql::PartitionType::HASH)  typeStr = "HASH";
+            else continue;
+            out << tblName << "\t" << typeStr << "\t" << pi.column << "\t" << pi.hashCount;
+            if (pi.type == milansql::PartitionType::RANGE) {
+                out << "\tRANGES:";
+                for (size_t i = 0; i < pi.ranges.size(); ++i) {
+                    if (i) out << ",";
+                    out << pi.ranges[i].name << "=" << pi.ranges[i].limitStr;
+                }
+            } else if (pi.type == milansql::PartitionType::LIST) {
+                out << "\tLISTS:";
+                for (size_t i = 0; i < pi.lists.size(); ++i) {
+                    if (i) out << ",";
+                    out << pi.lists[i].name << "=";
+                    for (size_t j = 0; j < pi.lists[i].values.size(); ++j) {
+                        if (j) out << "|";
+                        out << pi.lists[i].values[j];
+                    }
+                }
+            } else {
+                out << "\t";
+            }
+            out << "\n";
+        } catch (...) {}
+    }
+}
+
+inline void dispatch_loadPartitions(milansql::Engine& engine,
+                                    const std::string& path = "database.partitions") {
+    std::ifstream in(path);
+    if (!in.is_open()) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        // Split by tab
+        std::vector<std::string> fields;
+        std::string cur;
+        for (char c : line) {
+            if (c == '\t') { fields.push_back(cur); cur.clear(); }
+            else cur += c;
+        }
+        fields.push_back(cur);
+        if (fields.size() < 4) continue;
+        std::string tbl      = fields[0];
+        std::string typeStr  = fields[1];
+        std::string col      = fields[2];
+        int hashCount = 0;
+        try { hashCount = std::stoi(fields[3]); } catch (...) {}
+        milansql::PartitionInfo pi;
+        pi.column = col;
+        pi.hashCount = hashCount;
+        if (typeStr == "RANGE") {
+            pi.type = milansql::PartitionType::RANGE;
+            if (fields.size() >= 5 && fields[4].substr(0, 7) == "RANGES:") {
+                std::string rdata = fields[4].substr(7);
+                // split by comma
+                std::stringstream ss(rdata);
+                std::string token;
+                while (std::getline(ss, token, ',')) {
+                    auto eq = token.find('=');
+                    if (eq == std::string::npos) continue;
+                    milansql::PartitionRangeDef r;
+                    r.name = token.substr(0, eq);
+                    r.limitStr = token.substr(eq + 1);
+                    if (r.limitStr == "MAXVALUE")
+                        r.limit = std::numeric_limits<long long>::max();
+                    else { try { r.limit = std::stoll(r.limitStr); } catch (...) { r.limit = 0; } }
+                    pi.ranges.push_back(r);
+                }
+            }
+        } else if (typeStr == "LIST") {
+            pi.type = milansql::PartitionType::LIST;
+            if (fields.size() >= 5 && fields[4].substr(0, 6) == "LISTS:") {
+                std::string ldata = fields[4].substr(6);
+                std::stringstream ss(ldata);
+                std::string token;
+                while (std::getline(ss, token, ',')) {
+                    auto eq = token.find('=');
+                    if (eq == std::string::npos) continue;
+                    milansql::PartitionListDef l;
+                    l.name = token.substr(0, eq);
+                    std::string vdata = token.substr(eq + 1);
+                    std::stringstream sv(vdata);
+                    std::string val;
+                    while (std::getline(sv, val, '|'))
+                        l.values.push_back(val);
+                    pi.lists.push_back(l);
+                }
+            }
+        } else if (typeStr == "HASH") {
+            pi.type = milansql::PartitionType::HASH;
+        }
+        try { engine.setTablePartitionInfo(tbl, pi); } catch (...) {}
+    }
+}
+
 // ── dispatchCommand ───────────────────────────────────────────
 // Main dispatch function: takes a parsed command and executes it against the engine.
 // Writes output to std::cout (can be redirected via rdbuf for capture).
@@ -636,6 +752,36 @@ inline bool dispatchCommand(
                 break;
             }
         }
+        // Phase 62: Apply partition info if specified
+        if (!cmd.partitionType.empty()) {
+            milansql::PartitionInfo pi;
+            pi.column = cmd.partitionColumn;
+            if (cmd.partitionType == "RANGE") {
+                pi.type = milansql::PartitionType::RANGE;
+                for (auto& r : cmd.partitionRanges) {
+                    milansql::PartitionRangeDef rd;
+                    rd.name = r.name;
+                    rd.limitStr = r.limitStr;
+                    if (r.limitStr == "MAXVALUE")
+                        rd.limit = std::numeric_limits<long long>::max();
+                    else { try { rd.limit = std::stoll(r.limitStr); } catch (...) { rd.limit = 0; } }
+                    pi.ranges.push_back(rd);
+                }
+            } else if (cmd.partitionType == "LIST") {
+                pi.type = milansql::PartitionType::LIST;
+                for (auto& l : cmd.partitionLists) {
+                    milansql::PartitionListDef ld;
+                    ld.name = l.name;
+                    ld.values = l.values;
+                    pi.lists.push_back(ld);
+                }
+            } else if (cmd.partitionType == "HASH") {
+                pi.type = milansql::PartitionType::HASH;
+                pi.hashCount = cmd.partitionHashCount;
+            }
+            try { engine.setTablePartitionInfo(cmd.tableName, pi); } catch (...) {}
+            dispatch_savePartitions(engine);
+        }
         persistFn();
         dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
@@ -643,6 +789,8 @@ inline bool dispatchCommand(
                   << cmd.columns.size() << " Spalten";
         if (!cmd.foreignKeys.empty())
             std::cout << ", " << cmd.foreignKeys.size() << " FK";
+        if (!cmd.partitionType.empty())
+            std::cout << ", PARTITION BY " << cmd.partitionType;
         std::cout << ").\n\n";
         break;
     }
@@ -1019,7 +1167,32 @@ inline bool dispatchCommand(
                 engineNotes.push_back(en);
             }
 
-            dispatch_printExplain(engine.buildExplainWithNotes(req, engineNotes));
+            auto plan = engine.buildExplainWithNotes(req, engineNotes);
+            // Phase 62: Add partition pruning info to EXPLAIN
+            if (!cmd.tableName.empty() && !cmd.whereConds.empty()) {
+                try {
+                    const auto& pi = engine.getTablePartitionInfo(cmd.tableName);
+                    if (pi.hasPartitions()) {
+                        for (auto& wc : cmd.whereConds) {
+                            if (wc.col == pi.column && !wc.val.empty()) {
+                                auto pruned = engine.prunePartitions(
+                                    cmd.tableName, wc.col, wc.op, wc.val);
+                                std::string partStr;
+                                for (size_t pi2 = 0; pi2 < pruned.size(); ++pi2) {
+                                    if (pi2) partStr += ", ";
+                                    partStr += pruned[pi2];
+                                }
+                                int nr = static_cast<int>(plan.steps.size()) + 1;
+                                plan.steps.push_back({nr, "PARTITION PRUNING",
+                                    cmd.tableName,
+                                    "Partitions: " + partStr, "-"});
+                                break;
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+            dispatch_printExplain(plan);
             break;
         }
 
@@ -1511,7 +1684,49 @@ inline bool dispatchCommand(
             break;
         }
         if (cmd.tableName.empty() || cmd.alterOp.empty()) {
-            std::cout << "  Fehler: ALTER TABLE name ADD|DROP|RENAME COLUMN ...\n";
+            std::cout << "  Fehler: ALTER TABLE name ADD|DROP COLUMN/PARTITION ...\n";
+            break;
+        }
+        // Phase 62: ADD PARTITION / DROP PARTITION
+        if (cmd.alterOp == "ADD_PARTITION") {
+            try {
+                // Determine if RANGE or LIST based on which def was filled
+                if (!cmd.addRangeDef.name.empty()) {
+                    milansql::PartitionRangeDef rd;
+                    rd.name = cmd.addRangeDef.name;
+                    rd.limitStr = cmd.addRangeDef.limitStr;
+                    if (rd.limitStr == "MAXVALUE")
+                        rd.limit = std::numeric_limits<long long>::max();
+                    else { try { rd.limit = std::stoll(rd.limitStr); } catch (...) { rd.limit = 0; } }
+                    engine.addRangePartition(cmd.tableName, rd);
+                    dispatch_savePartitions(engine);
+                    std::cout << "  Partition '" << rd.name << "' zu '"
+                              << cmd.tableName << "' hinzugefuegt.\n\n";
+                } else if (!cmd.addListDef.name.empty()) {
+                    milansql::PartitionListDef ld;
+                    ld.name = cmd.addListDef.name;
+                    ld.values = cmd.addListDef.values;
+                    engine.addListPartition(cmd.tableName, ld);
+                    dispatch_savePartitions(engine);
+                    std::cout << "  Partition '" << ld.name << "' zu '"
+                              << cmd.tableName << "' hinzugefuegt.\n\n";
+                } else {
+                    std::cout << "  Fehler: Keine gueltige Partition-Definition.\n\n";
+                }
+            } catch (const std::exception& e) {
+                std::cout << "  Fehler: " << e.what() << "\n\n";
+            }
+            break;
+        }
+        if (cmd.alterOp == "DROP_PARTITION") {
+            try {
+                engine.dropPartitionByName(cmd.tableName, cmd.partitionName);
+                dispatch_savePartitions(engine);
+                std::cout << "  Partition '" << cmd.partitionName << "' aus '"
+                          << cmd.tableName << "' geloescht.\n\n";
+            } catch (const std::exception& e) {
+                std::cout << "  Fehler: " << e.what() << "\n\n";
+            }
             break;
         }
         engine.alterTable(cmd.tableName, cmd.alterOp,
@@ -1530,6 +1745,19 @@ inline bool dispatchCommand(
             std::cout << "  Spalte '" << cmd.alterColName
                       << "' umbenannt zu '" << cmd.alterColNew
                       << "' in '" << cmd.tableName << "'.\n\n";
+        break;
+    }
+
+    // Phase 62: SHOW PARTITIONS FROM table
+    case milansql::CommandType::SHOW_PARTITIONS: {
+        try {
+            auto lines = engine.showPartitions(cmd.tableName);
+            std::cout << "\n";
+            for (auto& l : lines) std::cout << "  " << l << "\n";
+            std::cout << "\n";
+        } catch (const std::exception& e) {
+            std::cout << "  Fehler: " << e.what() << "\n\n";
+        }
         break;
     }
 

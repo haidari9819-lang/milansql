@@ -101,6 +101,8 @@ enum class CommandType {
     SHOW_EVENTS,
     ALTER_EVENT,
     SET_EVENT_SCHEDULER,
+    // Phase 62: Partitioning
+    SHOW_PARTITIONS,
     UNKNOWN
 };
 
@@ -272,6 +274,28 @@ struct ParsedCommand {
     std::string eventAtTime;           // "HH:MM:SS" (hasAt) or "YYYY-MM-DD HH:MM:SS" (once)
     bool        eventEnabled = true;   // for ALTER EVENT ENABLE/DISABLE
     bool        eventSchedulerOn = true; // for SET EVENT_SCHEDULER = ON/OFF
+
+    // Phase 62: Partitioning
+    // Used by CREATE TABLE parser to pass partition info to dispatch
+    struct ParsedPartitionRange {
+        std::string name;
+        std::string limitStr;  // "100" or "MAXVALUE"
+    };
+    struct ParsedPartitionList {
+        std::string name;
+        std::vector<std::string> values;
+    };
+    std::string partitionType;   // "RANGE", "LIST", "HASH", or ""
+    std::string partitionColumn; // column name
+    int         partitionHashCount = 0;
+    std::vector<ParsedPartitionRange> partitionRanges;
+    std::vector<ParsedPartitionList>  partitionLists;
+    // For SHOW PARTITIONS / ALTER TABLE DROP PARTITION
+    std::string partitionName;   // partition name for DROP PARTITION
+    // For ALTER TABLE ADD PARTITION (RANGE)
+    ParsedPartitionRange addRangeDef;
+    // For ALTER TABLE ADD PARTITION (LIST)
+    ParsedPartitionList  addListDef;
 };
 
 class Parser {
@@ -479,7 +503,7 @@ public:
             auto st = tokenize(input);
             if (st.size() >= 2 &&
                 toUpper(st[0]) == "ALTER" && toUpper(st[1]) == "TABLE") {
-                parseAlterTableCmd(st, cmd);
+                parseAlterTableCmd(st, cmd, input);
                 return cmd;
             }
         }
@@ -608,6 +632,144 @@ public:
                 }
             }
             (void)WFUNCS;  // suppress unused warning
+        }
+
+        // ── Phase 62: Pre-process CREATE TABLE ... PARTITION BY ... ──
+        {
+            std::string uinput = toUpper(input);
+            // Check if this is CREATE TABLE with PARTITION BY
+            if (uinput.size() > 12 && uinput.substr(0, 12) == "CREATE TABLE") {
+                // Find first '(' — start of column definitions
+                auto colStart = input.find('(');
+                if (colStart != std::string::npos) {
+                    // Find balanced ')' for column list
+                    int depth = 0;
+                    size_t colEnd = std::string::npos;
+                    for (size_t ci = colStart; ci < input.size(); ++ci) {
+                        if (input[ci] == '(') ++depth;
+                        else if (input[ci] == ')') {
+                            --depth;
+                            if (depth == 0) { colEnd = ci; break; }
+                        }
+                    }
+                    if (colEnd != std::string::npos && colEnd + 1 < input.size()) {
+                        std::string remainder = input.substr(colEnd + 1);
+                        std::string urem = toUpper(remainder);
+                        // Check for PARTITION BY in remainder
+                        auto pbPos = urem.find("PARTITION BY");
+                        if (pbPos != std::string::npos) {
+                            // Extract partition clause
+                            std::string partClause = remainder.substr(pbPos + 12); // after "PARTITION BY"
+                            while (!partClause.empty() && partClause.front() == ' ') partClause = partClause.substr(1);
+                            std::string upart = toUpper(partClause);
+                            // Determine type
+                            std::string ptype;
+                            size_t afterType = 0;
+                            if (upart.substr(0, 5) == "RANGE") { ptype = "RANGE"; afterType = 5; }
+                            else if (upart.substr(0, 4) == "LIST") { ptype = "LIST"; afterType = 4; }
+                            else if (upart.substr(0, 4) == "HASH") { ptype = "HASH"; afterType = 4; }
+                            if (!ptype.empty()) {
+                                cmd.partitionType = ptype;
+                                // Extract (column)
+                                auto colParen = partClause.find('(', afterType);
+                                if (colParen != std::string::npos) {
+                                    auto colParenEnd = partClause.find(')', colParen);
+                                    if (colParenEnd != std::string::npos) {
+                                        std::string colInner = trim(partClause.substr(colParen + 1, colParenEnd - colParen - 1));
+                                        cmd.partitionColumn = colInner;
+                                        // Now look for PARTITIONS n (HASH) or partition list
+                                        std::string rest = partClause.substr(colParenEnd + 1);
+                                        std::string urest = toUpper(rest);
+                                        // HASH: look for PARTITIONS n
+                                        if (ptype == "HASH") {
+                                            auto pn = urest.find("PARTITIONS");
+                                            if (pn != std::string::npos) {
+                                                std::string nstr = trim(rest.substr(pn + 10));
+                                                try { cmd.partitionHashCount = std::stoi(nstr); } catch (...) {}
+                                            }
+                                        } else {
+                                            // RANGE or LIST: parse (PARTITION p VALUES ...)
+                                            auto listStart = rest.find('(');
+                                            if (listStart != std::string::npos) {
+                                                // Find balanced end
+                                                int d2 = 0;
+                                                size_t listEnd2 = std::string::npos;
+                                                for (size_t ci2 = listStart; ci2 < rest.size(); ++ci2) {
+                                                    if (rest[ci2] == '(') ++d2;
+                                                    else if (rest[ci2] == ')') {
+                                                        --d2;
+                                                        if (d2 == 0) { listEnd2 = ci2; break; }
+                                                    }
+                                                }
+                                                if (listEnd2 != std::string::npos) {
+                                                    std::string partDefs = rest.substr(listStart + 1, listEnd2 - listStart - 1);
+                                                    // Split by top-level commas
+                                                    std::vector<std::string> pdParts;
+                                                    {
+                                                        int dep = 0;
+                                                        std::string cur;
+                                                        for (char c : partDefs) {
+                                                            if (c == '(') { ++dep; cur += c; }
+                                                            else if (c == ')') { --dep; cur += c; }
+                                                            else if (c == ',' && dep == 0) {
+                                                                pdParts.push_back(trim(cur)); cur.clear();
+                                                            } else { cur += c; }
+                                                        }
+                                                        if (!trim(cur).empty()) pdParts.push_back(trim(cur));
+                                                    }
+                                                    for (auto& pd : pdParts) {
+                                                        auto tpd = tokenize(pd);
+                                                        if (tpd.size() < 2) continue;
+                                                        // PARTITION name VALUES LESS THAN (n) or VALUES IN (v1,v2)
+                                                        if (toUpper(tpd[0]) != "PARTITION") continue;
+                                                        std::string pname = tpd[1];
+                                                        std::string upd = toUpper(pd);
+                                                        if (ptype == "RANGE") {
+                                                            ParsedCommand::ParsedPartitionRange rdef;
+                                                            rdef.name = pname;
+                                                            auto vltPos = upd.find("VALUES LESS THAN");
+                                                            if (vltPos != std::string::npos) {
+                                                                auto vp = pd.find('(', vltPos);
+                                                                auto vpe = pd.find(')', vp);
+                                                                if (vp != std::string::npos && vpe != std::string::npos)
+                                                                    rdef.limitStr = trim(pd.substr(vp + 1, vpe - vp - 1));
+                                                                else rdef.limitStr = "MAXVALUE";
+                                                            } else if (upd.find("MAXVALUE") != std::string::npos) {
+                                                                rdef.limitStr = "MAXVALUE";
+                                                            }
+                                                            cmd.partitionRanges.push_back(rdef);
+                                                        } else if (ptype == "LIST") {
+                                                            ParsedCommand::ParsedPartitionList ldef;
+                                                            ldef.name = pname;
+                                                            auto viPos = upd.find("VALUES IN");
+                                                            if (viPos != std::string::npos) {
+                                                                auto vp = pd.find('(', viPos);
+                                                                auto vpe = pd.rfind(')');
+                                                                if (vp != std::string::npos && vpe != std::string::npos) {
+                                                                    std::string vals = pd.substr(vp + 1, vpe - vp - 1);
+                                                                    for (auto& v : splitTrim(vals, ',')) {
+                                                                        std::string sv = v;
+                                                                        if (sv.size() >= 2 && sv.front() == '\'' && sv.back() == '\'')
+                                                                            sv = sv.substr(1, sv.size() - 2);
+                                                                        ldef.values.push_back(sv);
+                                                                    }
+                                                                }
+                                                            }
+                                                            cmd.partitionLists.push_back(ldef);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Truncate input to remove PARTITION BY clause
+                                input = input.substr(0, colEnd + 1);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // ── Standard-Parsing (Phasen 1–9) ─────────────────────
@@ -1189,6 +1351,10 @@ public:
             // Phase 61: SHOW EVENTS
             } else if (kw1 == "EVENTS") {
                 cmd.type = CommandType::SHOW_EVENTS;
+            // Phase 62: SHOW PARTITIONS FROM table
+            } else if (kw1 == "PARTITIONS" && tokens.size() >= 4 && toUpper(tokens[2]) == "FROM") {
+                cmd.type = CommandType::SHOW_PARTITIONS;
+                cmd.tableName = tokens[3];
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1949,17 +2115,69 @@ private:
     //   ALTER TABLE tbl ADD    COLUMN col TYPE
     //   ALTER TABLE tbl DROP   COLUMN col
     //   ALTER TABLE tbl RENAME COLUMN old TO new
+    //   ALTER TABLE tbl ADD    PARTITION (...)     [Phase 62]
+    //   ALTER TABLE tbl DROP   PARTITION name      [Phase 62]
     static void parseAlterTableCmd(const std::vector<std::string>& tokens,
-                                    ParsedCommand& cmd) {
+                                    ParsedCommand& cmd,
+                                    const std::string& rawInput = "") {
         cmd.type = CommandType::ALTER_TABLE;
-        // tokens: [ALTER, TABLE, tblname, op, COLUMN, ...]
-        if (tokens.size() < 5) { cmd.type = CommandType::UNKNOWN; return; }
+        // tokens: [ALTER, TABLE, tblname, op, COLUMN/PARTITION, ...]
+        if (tokens.size() < 4) { cmd.type = CommandType::UNKNOWN; return; }
 
         cmd.tableName = tokens[2];
         std::string op  = toUpper(tokens[3]);
-        std::string kw4 = toUpper(tokens[4]);
+        std::string kw4 = tokens.size() >= 5 ? toUpper(tokens[4]) : "";
 
-        if (op == "ADD" && kw4 == "COLUMN" && tokens.size() >= 6) {
+        // Phase 62: ALTER TABLE t ADD PARTITION (...)
+        if (op == "ADD" && kw4 == "PARTITION") {
+            cmd.alterOp = "ADD_PARTITION";
+            // Parse partition definition from rawInput paren content
+            auto pstart = rawInput.find('(');
+            if (pstart != std::string::npos) {
+                auto pend = rawInput.rfind(')');
+                if (pend != std::string::npos && pend > pstart) {
+                    std::string pdef = trim(rawInput.substr(pstart + 1, pend - pstart - 1));
+                    std::string updef = toUpper(pdef);
+                    // PARTITION name VALUES LESS THAN (n)
+                    auto tpd = tokenize(pdef);
+                    if (tpd.size() >= 2 && toUpper(tpd[0]) == "PARTITION") {
+                        cmd.partitionName = tpd[1];
+                        if (updef.find("VALUES LESS THAN") != std::string::npos) {
+                            // RANGE partition
+                            auto vp = pdef.find('(', updef.find("VALUES LESS THAN") + 16);
+                            auto vpe = pdef.rfind(')');
+                            if (vp != std::string::npos && vpe != std::string::npos && vpe > vp) {
+                                cmd.addRangeDef.name = tpd[1];
+                                cmd.addRangeDef.limitStr = trim(pdef.substr(vp + 1, vpe - vp - 1));
+                            }
+                        } else if (updef.find("VALUES IN") != std::string::npos) {
+                            // LIST partition
+                            auto viPos = updef.find("VALUES IN");
+                            auto vp = pdef.find('(', viPos + 9);
+                            auto vpe = pdef.rfind(')');
+                            if (vp != std::string::npos && vpe != std::string::npos && vpe > vp) {
+                                cmd.addListDef.name = tpd[1];
+                                std::string vals = pdef.substr(vp + 1, vpe - vp - 1);
+                                for (auto& v : splitTrim(vals, ',')) {
+                                    std::string sv = v;
+                                    if (sv.size() >= 2 && sv.front() == '\'' && sv.back() == '\'')
+                                        sv = sv.substr(1, sv.size() - 2);
+                                    cmd.addListDef.values.push_back(sv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        // Phase 62: ALTER TABLE t DROP PARTITION name
+        } else if (op == "DROP" && kw4 == "PARTITION" && tokens.size() >= 6) {
+            cmd.alterOp      = "DROP_PARTITION";
+            cmd.partitionName = tokens[5];
+
+        } else if (tokens.size() < 5) {
+            cmd.type = CommandType::UNKNOWN;
+
+        } else if (op == "ADD" && kw4 == "COLUMN" && tokens.size() >= 6) {
             cmd.alterOp      = "ADD";
             cmd.alterColName = tokens[5];
             cmd.alterColType = tokens.size() >= 7 ? toUpper(tokens[6]) : "TEXT";

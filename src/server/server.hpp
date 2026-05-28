@@ -255,6 +255,9 @@ inline void MilanServer::initEngine() {
             }
         }
     }
+
+    // Phase 62: Load partitions
+    milansql::dispatch_loadPartitions(engine_, dbPath_ + ".partitions");
 }
 
 // ── MilanServer::recvAll ──────────────────────────────────────

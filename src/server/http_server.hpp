@@ -581,7 +581,7 @@ inline std::string MilanHttpServer::handleStatus() {
     auto schemas = engine_.showSchemas();
 
     std::string json = "{\"success\":true,\"status\":{";
-    json += "\"version\":\"MilanSQL v1.2.0\",";
+    json += "\"version\":\"MilanSQL v1.3.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tableCount\":" + std::to_string(tables.size()) + ",";
     json += "\"schemaCount\":" + std::to_string(schemas.size());
@@ -643,9 +643,9 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#128449; MilanSQL v1.2.0 Dashboard</div>
+  <div class="logo">&#128449; MilanSQL v1.3.0 Dashboard</div>
   <div class="status-bar">
-    <span id="sv">v1.2.0</span>
+    <span id="sv">v1.3.0</span>
     <span>Uptime: <span class="badge" id="su">-</span>s</span>
     <span>Tables: <span class="badge" id="st">-</span></span>
     <span>Port: <span class="badge" id="sp">8080</span></span>
@@ -685,7 +685,7 @@ async function loadSidebar(){
     tl.innerHTML=(td.tables&&td.tables.length)?td.tables.map(t=>`<div class="tbl-item" onclick="qt('${esc(t)}')" title="SELECT * FROM ${esc(t)}">${esc(t)}</div>`).join(''):'<div class="empty">No tables</div>';
     const sl=document.getElementById('sch-list');
     sl.innerHTML=(sd.schemas&&sd.schemas.length)?sd.schemas.map(s=>`<div class="sch-item">&#128193; ${esc(s)}</div>`).join(''):'<div class="empty">No schemas</div>';
-    if(std.status){const s=std.status;document.getElementById('sv').textContent=s.version||'v1.2.0';document.getElementById('su').textContent=s.uptime;document.getElementById('st').textContent=s.tableCount;document.getElementById('sp').textContent=s.port||'8080';}
+    if(std.status){const s=std.status;document.getElementById('sv').textContent=s.version||'v1.3.0';document.getElementById('su').textContent=s.uptime;document.getElementById('st').textContent=s.tableCount;document.getElementById('sp').textContent=s.port||'8080';}
   }catch(e){document.getElementById('tbl-list').innerHTML='<div class="empty">Connection error</div>';}
 }
 function qt(n){document.getElementById('sql').value='SELECT * FROM '+n;run();}

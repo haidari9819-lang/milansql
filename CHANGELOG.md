@@ -4,6 +4,22 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.3.0] — 2026-05-28
+
+### Added
+
+#### Phase 60 — CSV Import/Export
+- `LOAD DATA INFILE 'datei.csv' INTO TABLE t [SEPARATOR ','] [SKIP HEADER]` — CSV/TSV-Datei in Tabelle importieren
+- `SELECT … INTO OUTFILE 'datei.csv' [SEPARATOR ',']` — Abfrageergebnis als CSV exportieren
+- `SHOW DATAFILES` — listet alle `.csv`/`.tsv`-Dateien im Arbeitsverzeichnis mit Dateigröße
+- RFC-4180 konformes Parsing (Quoting, `""` Escaping, Auto-Separator-Erkennung)
+- Separator-Optionen: `,` `;` `\t` oder beliebiges Zeichen
+
+### Architecture
+- `src/utils/csv_utils.hpp` — `CsvUtils` (parseLine, readFile, writeFile, escapeField, detectSeparator, parseSepChar, listCsvFiles)
+
+---
+
 ## [v1.2.0] — 2026-05-28
 
 ### Added

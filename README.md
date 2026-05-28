@@ -1,12 +1,23 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.2.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.3.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **59 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **60 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.3.0
+
+| Phase | Feature |
+|-------|---------|
+| **60** | **CSV Import/Export**: `LOAD DATA INFILE 'file.csv' INTO TABLE t [SEPARATOR ','] [SKIP HEADER]` |
+| | `SELECT … INTO OUTFILE 'file.csv' [SEPARATOR ',']` — Abfrageergebnis als CSV exportieren |
+| | `SHOW DATAFILES` — listet alle `.csv`/`.tsv`-Dateien mit Größe |
+| | RFC-4180 Quoting, Auto-Separator-Erkennung, Tab-Separator (`\t`) |
 
 ---
 
@@ -462,6 +473,7 @@ STATUS
 | 57 | Backup/Restore: BACKUP DATABASE/TABLE TO, RESTORE FROM, SHOW BACKUPS, SQL-Dump Format |
 | 58 | Connection Pooling (Thread Pool, --pool-size), BENCHMARK Command, SHOW STATUS erweitert |
 | 59 | Master/Slave Replikation: Binlog, Auto-Sync, Read-Only Slave, SHOW MASTER/SLAVE STATUS |
+| 60 | CSV Import/Export: LOAD DATA INFILE, SELECT INTO OUTFILE, SHOW DATAFILES, RFC-4180 |
 
 ---
 

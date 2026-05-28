@@ -4,6 +4,30 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.5.0] — 2026-05-28
+
+### Added
+
+#### Phase 62 — Partitionierung
+- `CREATE TABLE … PARTITION BY RANGE (col) (PARTITION p VALUES LESS THAN (n), …)` — RANGE-Partitionierung
+- `CREATE TABLE … PARTITION BY LIST (col) (PARTITION p VALUES IN (v1, v2), …)` — LIST-Partitionierung
+- `CREATE TABLE … PARTITION BY HASH (col) PARTITIONS n` — HASH-Partitionierung (gleichmäßige Verteilung)
+- `SHOW PARTITIONS FROM table` — zeigt Name, Typ, Beschreibung und Zeilenanzahl je Partition
+- `ALTER TABLE t ADD PARTITION (PARTITION p VALUES LESS THAN (n))` — RANGE-Partition hinzufügen
+- `ALTER TABLE t ADD PARTITION (PARTITION p VALUES IN (v1, v2))` — LIST-Partition hinzufügen
+- `ALTER TABLE t DROP PARTITION name` — Partition löschen
+- Partition Pruning: `EXPLAIN SELECT * FROM t WHERE col = val` zeigt `PARTITION PRUNING: Partitions: p_klein`
+- Persistenz: `database.partitions` (automatisch geladen beim Start)
+- Quote-Stripping bei LIST-Wertvergleichen (gespeicherte `'value'` vs. Partitionsdefinition `value`)
+
+### Architecture
+- `PartitionType` Enum + `PartitionRangeDef`, `PartitionListDef`, `PartitionInfo` Structs in `engine.hpp`
+- `Table::getPartitionName(row)`, `Table::getPartitionStats()`, `Table::prunePartitions(col, op, val)`
+- `Engine::showPartitions()`, `Engine::addRangePartition()`, `Engine::addListPartition()`, `Engine::dropPartitionByName()`
+- `dispatch_savePartitions()` / `dispatch_loadPartitions()` in `dispatch.hpp`
+
+---
+
 ## [v1.4.0] — 2026-05-28
 
 ### Added

@@ -95,6 +95,12 @@ enum class CommandType {
     LOAD_DATA,
     INTO_OUTFILE,
     SHOW_DATAFILES,
+    // Phase 61: Event Scheduler
+    CREATE_EVENT,
+    DROP_EVENT,
+    SHOW_EVENTS,
+    ALTER_EVENT,
+    SET_EVENT_SCHEDULER,
     UNKNOWN
 };
 
@@ -255,6 +261,17 @@ struct ParsedCommand {
     std::string csvFile;                // Dateipfad für LOAD DATA / INTO OUTFILE
     std::string csvSeparator;           // Trennzeichen (default ",")
     bool        csvSkipHeader = false;  // erste Zeile überspringen
+
+    // Phase 61: Event Scheduler
+    std::string eventName;             // Event-Name
+    std::string eventSql;              // DO <sql>
+    bool        eventRecurring = true; // true=EVERY, false=AT (once)
+    long long   eventIntervalN = 0;    // n in EVERY n UNIT
+    std::string eventIntervalUnit;     // SECOND/MINUTE/HOUR/DAY/WEEK/MONTH
+    bool        eventHasAt = false;    // EVERY n DAY AT 'HH:MM:SS'
+    std::string eventAtTime;           // "HH:MM:SS" (hasAt) or "YYYY-MM-DD HH:MM:SS" (once)
+    bool        eventEnabled = true;   // for ALTER EVENT ENABLE/DISABLE
+    bool        eventSchedulerOn = true; // for SET EVENT_SCHEDULER = ON/OFF
 };
 
 class Parser {
@@ -1169,6 +1186,9 @@ public:
             // Phase 60: SHOW DATAFILES
             } else if (kw1 == "DATAFILES") {
                 cmd.type = CommandType::SHOW_DATAFILES;
+            // Phase 61: SHOW EVENTS
+            } else if (kw1 == "EVENTS") {
+                cmd.type = CommandType::SHOW_EVENTS;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1473,6 +1493,101 @@ public:
 
             if (cmd.csvFile.empty() || cmd.tableName.empty())
                 cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 61: CREATE EVENT name ON SCHEDULE ... DO ... ───
+        } else if (kw0 == "CREATE" && kw1 == "EVENT") {
+            cmd.type = CommandType::CREATE_EVENT;
+            {
+                // Find " DO " in uppercase to split schedule from sql
+                std::string upInp;
+                for (unsigned char c : input)
+                    upInp += static_cast<char>(std::toupper(c));
+                auto doPos = upInp.find(" DO ");
+                if (doPos != std::string::npos) {
+                    std::string sqlPart = input.substr(doPos + 4);
+                    while (!sqlPart.empty() && (sqlPart.front()==' '||sqlPart.front()=='\t'))
+                        sqlPart = sqlPart.substr(1);
+                    cmd.eventSql = sqlPart;
+                }
+                // Parse schedule from the prefix (before DO)
+                std::string prefix = (doPos != std::string::npos)
+                    ? input.substr(0, doPos) : input;
+                auto ft = tokenizeFull(prefix);
+                size_t i = 2; // skip CREATE EVENT
+                if (i < ft.size()) cmd.eventName = ft[i++];
+                // skip ON SCHEDULE
+                if (i < ft.size() && toUpper(ft[i]) == "ON")       ++i;
+                if (i < ft.size() && toUpper(ft[i]) == "SCHEDULE") ++i;
+                if (i < ft.size()) {
+                    std::string schedType = toUpper(ft[i]);
+                    if (schedType == "EVERY") {
+                        cmd.eventRecurring = true;
+                        ++i;
+                        if (i < ft.size()) {
+                            try { cmd.eventIntervalN = std::stoll(ft[i]); }
+                            catch (...) { cmd.eventIntervalN = 1; }
+                            ++i;
+                        }
+                        if (i < ft.size()) {
+                            cmd.eventIntervalUnit = toUpper(ft[i]); ++i;
+                        }
+                        // Optional: AT 'HH:MM:SS'
+                        if (i < ft.size() && toUpper(ft[i]) == "AT") {
+                            ++i;
+                            if (i < ft.size()) {
+                                cmd.eventHasAt = true;
+                                cmd.eventAtTime = ft[i];
+                                // strip surrounding single quotes
+                                if (cmd.eventAtTime.size() >= 2 &&
+                                    cmd.eventAtTime.front() == '\'')
+                                    cmd.eventAtTime = cmd.eventAtTime.substr(
+                                        1, cmd.eventAtTime.size() - 2);
+                            }
+                        }
+                    } else if (schedType == "AT") {
+                        cmd.eventRecurring = false;
+                        ++i;
+                        if (i < ft.size()) {
+                            cmd.eventAtTime = ft[i];
+                            if (cmd.eventAtTime.size() >= 2 &&
+                                cmd.eventAtTime.front() == '\'')
+                                cmd.eventAtTime = cmd.eventAtTime.substr(
+                                    1, cmd.eventAtTime.size() - 2);
+                        }
+                    }
+                }
+                if (cmd.eventName.empty() || cmd.eventSql.empty())
+                    cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 61: DROP EVENT name ─────────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "EVENT") {
+            cmd.type = CommandType::DROP_EVENT;
+            if (tokens.size() >= 3) cmd.eventName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 61: ALTER EVENT name ENABLE/DISABLE ─────────────
+        } else if (kw0 == "ALTER" && kw1 == "EVENT") {
+            cmd.type = CommandType::ALTER_EVENT;
+            if (tokens.size() >= 4) {
+                cmd.eventName = tokens[2];
+                std::string action = toUpper(tokens[3]);
+                if (action == "ENABLE")        cmd.eventEnabled = true;
+                else if (action == "DISABLE")  cmd.eventEnabled = false;
+                else cmd.type = CommandType::UNKNOWN;
+            } else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 61: SET EVENT_SCHEDULER = ON/OFF ────────────────
+        } else if (kw0 == "SET" && toUpper(kw1) == "EVENT_SCHEDULER") {
+            cmd.type = CommandType::SET_EVENT_SCHEDULER;
+            // tokens: SET EVENT_SCHEDULER = ON  or  SET EVENT_SCHEDULER ON
+            std::string val;
+            for (size_t si = 2; si < tokens.size(); ++si) {
+                std::string t = toUpper(tokens[si]);
+                if (t == "ON" || t == "OFF") { val = t; break; }
+            }
+            if (val.empty()) cmd.type = CommandType::UNKNOWN;
+            else cmd.eventSchedulerOn = (val == "ON");
 
         // ── Phase 59: STOP SLAVE / START SLAVE ──────────────────
         } else if (kw0 == "STOP" && kw1 == "SLAVE") {

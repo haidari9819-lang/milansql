@@ -24,6 +24,7 @@
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
 #include "utils/csv_utils.hpp"
+#include "scheduler/event_scheduler.hpp"
 
 namespace milansql {
 
@@ -2370,6 +2371,146 @@ inline bool dispatchCommand(
                           << " |\n";
             std::cout << "  " << bar() << "\n";
             std::cout << "  " << rows.size() << " Datei(en).\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 61: CREATE EVENT ────────────────────────────────────
+    case milansql::CommandType::CREATE_EVENT: {
+        if (cmd.eventName.empty() || cmd.eventSql.empty()) {
+            std::cout << "  Fehler: CREATE EVENT name ON SCHEDULE "
+                         "EVERY n UNIT [AT 'HH:MM:SS'] DO sql\n\n";
+            break;
+        }
+        milansql::EventDef ev;
+        ev.name      = cmd.eventName;
+        ev.sql       = cmd.eventSql;
+        ev.enabled   = true;
+        ev.recurring = cmd.eventRecurring;
+
+        if (ev.recurring) {
+            // Convert interval to seconds
+            long long n = (cmd.eventIntervalN > 0) ? cmd.eventIntervalN : 1;
+            std::string unit = cmd.eventIntervalUnit;
+            long long factor = 1;
+            if      (unit == "MINUTE" || unit == "MINUTES") factor = 60;
+            else if (unit == "HOUR"   || unit == "HOURS")   factor = 3600;
+            else if (unit == "DAY"    || unit == "DAYS")     factor = 86400;
+            else if (unit == "WEEK"   || unit == "WEEKS")    factor = 604800;
+            else if (unit == "MONTH"  || unit == "MONTHS")   factor = 2592000;
+            ev.intervalSecs = n * factor;
+            ev.hasAt  = cmd.eventHasAt;
+            ev.atTime = cmd.eventAtTime;
+            ev.nextRun = milansql::EventScheduler::computeNextRunRecurring(
+                ev.intervalSecs, ev.hasAt, ev.atTime);
+        } else {
+            ev.atTime  = cmd.eventAtTime;
+            ev.nextRun = milansql::EventScheduler::computeNextRunOnce(ev.atTime);
+            // If time is already in the past, disable immediately
+            if (ev.nextRun <= std::time(nullptr)) {
+                ev.enabled = false;
+            }
+        }
+
+        if (milansql::g_eventScheduler) {
+            milansql::g_eventScheduler->createEvent(ev);
+        } else {
+            // REPL without scheduler started — store in a simple fallback list
+            // (in practice, main.cpp always creates the scheduler)
+        }
+        std::cout << "  Event '" << ev.name << "' erstellt";
+        if (!ev.enabled) std::cout << " (Zeitpunkt in der Vergangenheit — deaktiviert)";
+        std::cout << ".\n\n";
+        break;
+    }
+
+    // ── Phase 61: DROP EVENT ──────────────────────────────────────
+    case milansql::CommandType::DROP_EVENT: {
+        if (cmd.eventName.empty()) {
+            std::cout << "  Fehler: DROP EVENT name\n\n"; break;
+        }
+        bool dropped = milansql::g_eventScheduler &&
+                       milansql::g_eventScheduler->dropEvent(cmd.eventName);
+        if (dropped)
+            std::cout << "  Event '" << cmd.eventName << "' geloescht.\n\n";
+        else
+            std::cout << "  FEHLER: Event '" << cmd.eventName << "' nicht gefunden.\n\n";
+        break;
+    }
+
+    // ── Phase 61: SHOW EVENTS ─────────────────────────────────────
+    case milansql::CommandType::SHOW_EVENTS: {
+        auto evts = milansql::g_eventScheduler
+            ? milansql::g_eventScheduler->getEvents()
+            : std::vector<milansql::EventDef>{};
+
+        if (evts.empty()) {
+            std::cout << "  (Keine Events definiert)\n\n"; break;
+        }
+
+        // Column headers
+        const std::string h0 = "Name", h1 = "Schedule", h2 = "Status";
+        size_t w0 = h0.size(), w1 = h1.size(), w2 = h2.size();
+        std::vector<std::array<std::string, 3>> rows;
+        for (const auto& ev : evts) {
+            std::string sched = milansql::EventScheduler::scheduleStr(ev);
+            std::string status = ev.enabled ? "ENABLED" : "DISABLED";
+            w0 = std::max(w0, ev.name.size());
+            w1 = std::max(w1, sched.size());
+            w2 = std::max(w2, status.size());
+            rows.push_back({ev.name, sched, status});
+        }
+
+        auto bar = [&]() {
+            return "+" + std::string(w0 + 2, '-') + "+"
+                 + std::string(w1 + 2, '-') + "+"
+                 + std::string(w2 + 2, '-') + "+";
+        };
+        auto printRow = [&](const std::string& c0, const std::string& c1,
+                            const std::string& c2) {
+            std::cout << "  | " << std::left
+                      << std::setw(static_cast<int>(w0)) << c0 << " | "
+                      << std::setw(static_cast<int>(w1)) << c1 << " | "
+                      << std::setw(static_cast<int>(w2)) << c2 << " |\n";
+        };
+        std::cout << "\n  " << bar() << "\n";
+        printRow(h0, h1, h2);
+        std::cout << "  " << bar() << "\n";
+        for (const auto& r : rows) printRow(r[0], r[1], r[2]);
+        std::cout << "  " << bar() << "\n";
+        std::cout << "  " << evts.size() << " Event(s).\n\n";
+
+        // Show scheduler status
+        bool on = milansql::g_eventScheduler &&
+                  milansql::g_eventScheduler->isOn();
+        std::cout << "  Event Scheduler: " << (on ? "ON" : "OFF") << "\n\n";
+        break;
+    }
+
+    // ── Phase 61: ALTER EVENT name ENABLE/DISABLE ─────────────────
+    case milansql::CommandType::ALTER_EVENT: {
+        if (cmd.eventName.empty()) {
+            std::cout << "  Fehler: ALTER EVENT name ENABLE|DISABLE\n\n"; break;
+        }
+        bool ok = milansql::g_eventScheduler &&
+                  milansql::g_eventScheduler->setEventEnabled(
+                      cmd.eventName, cmd.eventEnabled);
+        if (ok)
+            std::cout << "  Event '" << cmd.eventName << "' "
+                      << (cmd.eventEnabled ? "aktiviert" : "deaktiviert") << ".\n\n";
+        else
+            std::cout << "  FEHLER: Event '" << cmd.eventName << "' nicht gefunden.\n\n";
+        break;
+    }
+
+    // ── Phase 61: SET EVENT_SCHEDULER = ON/OFF ────────────────────
+    case milansql::CommandType::SET_EVENT_SCHEDULER: {
+        if (milansql::g_eventScheduler) {
+            milansql::g_eventScheduler->setOn(cmd.eventSchedulerOn);
+            std::cout << "  Event Scheduler "
+                      << (cmd.eventSchedulerOn ? "aktiviert" : "deaktiviert") << ".\n\n";
+        } else {
+            std::cout << "  Event Scheduler nicht verfuegbar.\n\n";
         }
         break;
     }

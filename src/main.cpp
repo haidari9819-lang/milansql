@@ -25,6 +25,9 @@
 #include "replication/master_repl.hpp"
 #include "replication/slave_repl.hpp"
 
+// Phase 61: Event Scheduler
+#include "scheduler/event_scheduler.hpp"
+
 // ============================================================
 // main.cpp — REPL für MilanSQL (Phase 47)
 // Neu: --server / --client / --port N Modi
@@ -149,6 +152,15 @@ int main(int argc, char* argv[]) {
 
             slaveRepl->start();
         }
+
+        // ── Phase 61: Event Scheduler (server mode) ───────────
+        auto srvEventExecFn = [&server](const std::string& sql) {
+            try { server.replaySql(sql); } catch (...) {}
+        };
+        milansql::EventScheduler srvEventScheduler(srvEventExecFn, "database.events");
+        milansql::g_eventScheduler = &srvEventScheduler;
+        srvEventScheduler.loadEvents();
+        srvEventScheduler.start();
 
         server.run();
         return 0;
@@ -359,6 +371,19 @@ int main(int argc, char* argv[]) {
         replSlaveRepl->start();
         std::cout << "  [Slave] Verbinde zu " << masterHost << ":" << masterPort << "...\n\n";
     }
+
+    // ── Phase 61: Event Scheduler (REPL mode) ────────────────
+    auto eventExecFn = [&](const std::string& sql) {
+        try {
+            milansql::ParsedCommand ecmd = parser.parse(sql);
+            milansql::dispatchCommand(ecmd, engine, parser, sql,
+                persist, saveProcedures, saveTriggers);
+        } catch (...) {}
+    };
+    milansql::EventScheduler eventScheduler(eventExecFn, "database.events");
+    milansql::g_eventScheduler = &eventScheduler;
+    eventScheduler.loadEvents();
+    eventScheduler.start();
 
     while (true) {
         std::cout << "milansql> " << std::flush;

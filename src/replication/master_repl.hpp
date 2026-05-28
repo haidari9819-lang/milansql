@@ -29,7 +29,9 @@
   #include <arpa/inet.h>
   #include <unistd.h>
   using sock_t = int;
+  #ifndef INVALID_SOCKET
   constexpr sock_t INVALID_SOCKET = -1;
+  #endif
   static inline void repl_closesock(sock_t s) { ::close(s); }
 #endif
 

@@ -4,6 +4,27 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.4.0] — 2026-05-28
+
+### Added
+
+#### Phase 61 — Event Scheduler
+- `CREATE EVENT name ON SCHEDULE EVERY n SECOND|MINUTE|HOUR|DAY|WEEK|MONTH DO sql` — wiederkehrender Job
+- `CREATE EVENT name ON SCHEDULE EVERY n DAY AT 'HH:MM:SS' DO sql` — täglich zur fixen Uhrzeit
+- `CREATE EVENT name ON SCHEDULE AT 'YYYY-MM-DD HH:MM:SS' DO sql` — einmaliger Job
+- `SHOW EVENTS` — alle Events auflisten (Name, Schedule, Status) + Scheduler-Zustand
+- `DROP EVENT name` — Event löschen
+- `ALTER EVENT name ENABLE|DISABLE` — Event aktivieren/deaktivieren
+- `SET EVENT_SCHEDULER = ON|OFF` — Scheduler global starten/stoppen
+- Persistenz: `database.events` (Tab-separiert, automatisch geladen beim Start)
+- Scheduler-Thread prüft jede Sekunde auf fällige Events; einmalige Events werden nach Ausführung deaktiviert
+- Vergangenheitsdaten bei einmaligen Events → automatisch deaktiviert (keine unerwartete Ausführung)
+
+### Architecture
+- `src/scheduler/event_scheduler.hpp` — `EventDef` Struct + `EventScheduler` Klasse (Thread-sicher, `g_eventScheduler` Global)
+
+---
+
 ## [v1.3.0] — 2026-05-28
 
 ### Added

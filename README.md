@@ -1,12 +1,24 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.3.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.4.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **60 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **61 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.4.0
+
+| Phase | Feature |
+|-------|---------|
+| **61** | **Event Scheduler**: `CREATE EVENT name ON SCHEDULE EVERY n UNIT DO sql` |
+| | `CREATE EVENT name ON SCHEDULE AT 'YYYY-MM-DD HH:MM:SS' DO sql` — einmalig |
+| | `SHOW EVENTS`, `DROP EVENT`, `ALTER EVENT ENABLE\|DISABLE` |
+| | `SET EVENT_SCHEDULER = ON\|OFF` — Scheduler global steuern |
+| | Persistenz (`database.events`), Thread-sicher, automatischer Start beim REPL/Server |
 
 ---
 
@@ -474,6 +486,7 @@ STATUS
 | 58 | Connection Pooling (Thread Pool, --pool-size), BENCHMARK Command, SHOW STATUS erweitert |
 | 59 | Master/Slave Replikation: Binlog, Auto-Sync, Read-Only Slave, SHOW MASTER/SLAVE STATUS |
 | 60 | CSV Import/Export: LOAD DATA INFILE, SELECT INTO OUTFILE, SHOW DATAFILES, RFC-4180 |
+| 61 | Event Scheduler: CREATE EVENT, ON SCHEDULE EVERY/AT, DO, SHOW/DROP/ALTER EVENT, SET EVENT_SCHEDULER |
 
 ---
 

@@ -1,10 +1,10 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v2.2.0-gold)
+![Version](https://img.shields.io/badge/version-v2.3.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![Phases](https://img.shields.io/badge/phases-70-brightgreen)
+![Phases](https://img.shields.io/badge/phases-71-brightgreen)
 
 > **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
@@ -19,7 +19,7 @@ Developed by **Mirwais Haidari**, built phase by phase from a blank file to a fu
 | **SQL** | SELECT/INSERT/UPDATE/DELETE, INNER/LEFT/RIGHT/FULL OUTER JOIN, correlated Subqueries, CTEs (`WITH`), Window Functions, `CASE WHEN`, `UNION`/`INTERSECT`/`EXCEPT` |
 | **DDL** | `CREATE`/`DROP`/`ALTER TABLE`, Views, Triggers (`BEFORE`/`AFTER`), Stored Procedures with Cursors, B-Tree Indexes, Full-Text Search |
 | **Constraints** | `PRIMARY KEY`, `FOREIGN KEY` (CASCADE/SET NULL/RESTRICT), `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `AUTO_INCREMENT` |
-| **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, WAL-based crash recovery, `SELECT FOR UPDATE`, `LOCK TABLE READ\|WRITE` |
+| **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, WAL-based crash recovery, `SELECT FOR UPDATE`, `LOCK TABLE READ\|WRITE`, MVCC (xmin/xmax), `VACUUM`, `SET TRANSACTION ISOLATION LEVEL`, `SHOW TRANSACTIONS` |
 | **Data Types** | `INT`, `TEXT`, `REAL`, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `JSON` |
 | **Functions** | String (`UPPER`/`LOWER`/`CONCAT`/`SUBSTR`/`REPLACE`/`TRIM`), Math (`ABS`/`ROUND`/`SQRT`/`POWER`), Date (`NOW`/`DATEDIFF`/`DATE_ADD`/`DATE_FORMAT`), JSON (`JSON_EXTRACT`/`JSON_SET`/`JSON_KEYS`), Regex (`REGEXP_REPLACE`/`REGEXP_EXTRACT`), Null (`COALESCE`/`IFNULL`), Window (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) |
 | **Server** | TCP/IP multi-threaded server (port 4406), REST API (port 8080), connection pool, multi-statement queries |
@@ -54,7 +54,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v2.2.0 ===           ║
+  ║        === MilanSQL v2.3.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -181,6 +181,18 @@ CREATE TABLE produkte (
 INSERT INTO produkte VALUES (NULL, 'Laptop', 1000);
 SELECT * FROM produkte;
 -- brutto: 1190  |  mwst: 190  (auto-computed)
+
+-- MVCC (Phase 71)
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT * FROM konto;          -- snapshot from BEGIN
+UPDATE konto SET balance = 9999 WHERE name = Alice;
+SELECT * FROM konto;          -- still sees old values (REPEATABLE READ)
+COMMIT;
+SELECT * FROM konto;          -- now sees updated values
+BEGIN; DELETE FROM konto WHERE name = Bob; COMMIT;
+VACUUM;                       -- physically remove logically deleted rows
+SHOW TRANSACTIONS;            -- list active transactions
 
 -- Spatial (Phase 70)
 CREATE TABLE staedte (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, pos TEXT);
@@ -377,6 +389,7 @@ GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on
 | **68** | **Virtual/Generated Columns (GENERATED ALWAYS AS (expr) STORED/VIRTUAL)** |
 | **69** | **Query Profiler (PROFILE ON/OFF, SHOW PROFILES, SHOW PROFILE FOR QUERY n)** |
 | **70** | **Spatial Index (POINT type, ST_DISTANCE/Haversine, ST_X/ST_Y/ST_WITHIN/ST_ASTEXT, CREATE SPATIAL INDEX)** |
+| **71** | **MVCC (xmin/xmax versioned rows, TransactionManager, VACUUM, SET TRANSACTION ISOLATION LEVEL, SHOW TRANSACTIONS)** |
 
 ---
 

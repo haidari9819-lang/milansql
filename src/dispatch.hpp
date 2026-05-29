@@ -2391,6 +2391,7 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::COMMIT:
         engine.applyAndCommit();
+        engine.getQueryCache().clear();  // Phase 71: invalidate cache after tx commit
         persistFn();
         std::cout << "  Transaktion erfolgreich abgeschlossen (COMMIT).\n\n";
         break;
@@ -3410,6 +3411,33 @@ inline bool dispatchCommand(
         } catch (const std::exception& e) {
             std::cout << "  FEHLER: " << e.what() << "\n\n";
         }
+        break;
+    }
+
+    // ── Phase 71: MVCC ─────────────────────────────────────────────
+
+    case milansql::CommandType::VACUUM:
+    case milansql::CommandType::VACUUM_ANALYZE: {
+        size_t cleaned = engine.vacuumAll();
+        std::cout << "  VACUUM: " << cleaned << " alte Version(en) bereinigt.\n";
+        if (cmd.type == milansql::CommandType::VACUUM_ANALYZE)
+            std::cout << "  ANALYZE: Tabellenstatistiken aktualisiert.\n";
+        std::cout << "\n";
+        persistFn();
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TRANSACTIONS:
+        engine.showTransactions();
+        break;
+
+    case milansql::CommandType::SET_TRANSACTION_ISOLATION: {
+        if (cmd.isolationLevel.empty()) {
+            std::cout << "  Fehler: SET TRANSACTION ISOLATION LEVEL <level>\n\n";
+            break;
+        }
+        engine.setIsolationLevel(cmd.isolationLevel);
+        std::cout << "  Isolation Level gesetzt: " << cmd.isolationLevel << "\n\n";
         break;
     }
 

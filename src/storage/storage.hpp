@@ -517,8 +517,12 @@ private:
             }
 
             const auto& rows = tbl.rows();
-            writeU32(o, static_cast<uint32_t>(rows.size()));   // Zeilenanzahl
+            // Phase 71: only serialize alive rows (xmax == 0); dead rows are vacuumed on load
+            uint32_t aliveCount = 0;
+            for (const auto& row : rows) if (row.xmax == 0) ++aliveCount;
+            writeU32(o, aliveCount);
             for (const auto& row : rows) {
+                if (row.xmax != 0) continue;  // Phase 71: skip logically deleted rows
                 for (const auto& val : row.values) {
                     writeStrV(o, val);                          // Wert (uint16 Länge)
                 }

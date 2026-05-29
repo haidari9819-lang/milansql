@@ -25,6 +25,7 @@
 #include "../scheduler/event_scheduler.hpp"
 #include "../locking/lock_manager.hpp"
 #include "../spatial/spatial.hpp"      // Phase 70: Spatial Index
+#include "../mvcc/transaction_manager.hpp"  // Phase 71: MVCC
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -69,6 +70,9 @@ struct ForeignKeyDef {
 
 struct Row {
     std::vector<std::string> values;
+    // Phase 71: MVCC version stamps
+    uint64_t xmin = 0;  // tx that created this row (0 = always visible / auto-commit)
+    uint64_t xmax = 0;  // tx that deleted this row (0 = alive)
     explicit Row(std::vector<std::string> v) : values(std::move(v)) {}
 };
 
@@ -338,7 +342,8 @@ public:
             // UNIQUE (NULL-Werte sind erlaubt — mehrere NULLs OK)
             if (columns_[i].isUnique && row.values[i] != "NULL") {
                 for (const auto& r : rows_)
-                    if (i < r.values.size() && r.values[i] == row.values[i])
+                    if (r.xmax == 0 &&  // Phase 71: skip logically deleted rows
+                        i < r.values.size() && r.values[i] == row.values[i])
                         throw std::runtime_error(
                             "UNIQUE verletzt: '" + row.values[i] +
                             "' in Spalte '" + columns_[i].name +
@@ -351,7 +356,8 @@ public:
         for (auto& [idxName, entry] : indices_) {
             if (entry.cols.empty()) continue;
             int ci = colOf(entry.cols[0]);
-            if (ci >= 0 && static_cast<size_t>(ci) < rows_[ni].values.size())
+            if (ci >= 0 && static_cast<size_t>(ci) < rows_[ni].values.size()
+                && rows_[ni].xmax == 0)  // Phase 71: don't index dead rows
                 entry.tree->insert(rows_[ni].values[ci], ni);
         }
     }
@@ -426,7 +432,8 @@ public:
             if (!columns_[i].isUnique) continue;
             if (vals[i] == "NULL")     continue;  // NULL kollidiert nicht
             for (size_t r = 0; r < rows_.size(); ++r)
-                if (i < rows_[r].values.size() && rows_[r].values[i] == vals[i])
+                if (rows_[r].xmax == 0 &&  // Phase 71: skip deleted rows
+                    i < rows_[r].values.size() && rows_[r].values[i] == vals[i])
                     flag[r] = true;
         }
         std::vector<size_t> result;
@@ -663,6 +670,7 @@ public:
         }
         Table result(name_, std::move(newCols));
         for (const auto& row : rows_) {
+            if (row.xmax != 0) continue;  // Phase 71: skip dead rows
             std::vector<std::string> vals;
             vals.reserve(cis.size());
             for (int ci : cis)
@@ -676,7 +684,8 @@ public:
 
     Table clone() const {
         Table t(name_, columns_);
-        t.rows_        = rows_;
+        for (const auto& row : rows_)
+            if (row.xmax == 0) t.rows_.push_back(row);  // Phase 71: skip dead rows
         t.autoIncMap_  = autoIncMap_;
         t.foreignKeys_ = foreignKeys_;
         return t;
@@ -698,6 +707,50 @@ public:
     // Phase 44: Mutable row access and index rebuild for expression-based updates
     std::vector<Row>& mutableRows() { return rows_; }
     void rebuildIndexes() { rebuildAll(); }
+
+    // ── Phase 71: MVCC helpers ────────────────────────────────
+
+    // Logical delete: stamp xmax on matching rows (instead of physical delete)
+    std::size_t stampDeleteWhere(std::size_t wCI, const std::string& wVal, uint64_t txId) {
+        std::size_t n = 0;
+        for (auto& row : rows_)
+            if (row.xmax == 0 && wCI < row.values.size() && row.values[wCI] == wVal)
+                { row.xmax = txId; ++n; }
+        if (n) rebuildAll();
+        return n;
+    }
+
+    // Logical delete all alive rows
+    std::size_t stampDeleteAll(uint64_t txId) {
+        std::size_t n = 0;
+        for (auto& row : rows_)
+            if (row.xmax == 0) { row.xmax = txId; ++n; }
+        if (n) rebuildAll();
+        return n;
+    }
+
+    // Stamp xmin on the most recently inserted row
+    void stampXminLast(uint64_t txId) {
+        if (!rows_.empty()) rows_.back().xmin = txId;
+    }
+
+    // VACUUM: physically remove rows whose xmax is committed (callable predicate)
+    std::size_t vacuum(const std::function<bool(uint64_t)>& isCommitted) {
+        std::size_t before = rows_.size();
+        rows_.erase(std::remove_if(rows_.begin(), rows_.end(),
+            [&](const Row& r) { return r.xmax != 0 && isCommitted(r.xmax); }),
+            rows_.end());
+        std::size_t n = before - rows_.size();
+        if (n) rebuildAll();
+        return n;
+    }
+
+    // Count dead (xmax'd) rows
+    std::size_t deadRowCount() const {
+        std::size_t n = 0;
+        for (const auto& r : rows_) if (r.xmax != 0) ++n;
+        return n;
+    }
 
     // Phase 62: Partition accessors
     void setPartitionInfo(const PartitionInfo& pi) { partitionInfo_ = pi; }
@@ -838,7 +891,8 @@ private:
             if (ci < 0) continue;
             entry.tree->clear();
             for (size_t ri = 0; ri < rows_.size(); ++ri)
-                if (static_cast<size_t>(ci) < rows_[ri].values.size())
+                if (rows_[ri].xmax == 0 &&  // Phase 71: skip dead rows
+                    static_cast<size_t>(ci) < rows_[ri].values.size())
                     entry.tree->insert(rows_[ri].values[ci], ri);
         }
     }
@@ -1027,7 +1081,10 @@ public:
         bool usedIndex = false;
 
         if (conds.empty()) {
-            for (const auto& row : src.rows()) result.insert(row);
+            for (const auto& row : src.rows()) {
+                if (row.xmax != 0) continue;  // Phase 71: skip dead rows
+                result.insert(row);
+            }
             return {std::move(result), false};
         }
 
@@ -1035,7 +1092,8 @@ public:
         if (conds.size() == 1 && conds[0].op == "=" && src.hasIndex(conds[0].col)) {
             usedIndex = true;
             for (size_t ri : src.indexSearch(conds[0].col, conds[0].val))
-                if (ri < src.rows().size()) result.insert(src.rows()[ri]);
+                if (ri < src.rows().size() && src.rows()[ri].xmax == 0)  // Phase 71
+                    result.insert(src.rows()[ri]);
             return {std::move(result), usedIndex};
         }
 
@@ -1049,8 +1107,10 @@ public:
         }
 
         if (hasCorrelated) {
-            for (const auto& row : src.rows())
+            for (const auto& row : src.rows()) {
+                if (row.xmax != 0) continue;  // Phase 71: skip dead rows
                 if (rowMatches(src, row, conds, logic)) result.insert(row);
+            }
             return {std::move(result), false};
         }
 
@@ -1060,6 +1120,7 @@ public:
             cis.push_back(colIdx(src, cond.col));
 
         for (const auto& row : src.rows()) {
+            if (row.xmax != 0) continue;  // Phase 71: skip dead rows
             if (rowMatchesByIdx(row, conds, cis, logic))
                 result.insert(row);
         }
@@ -1089,6 +1150,7 @@ public:
         std::size_t ci = colIdx(src, col);
         std::vector<double> nums;
         for (const auto& row : src.rows()) {
+            if (row.xmax != 0) continue;  // Phase 71: skip dead rows
             if (!rowMatches(src, row, conds, logic)) continue;
             if (ci < row.values.size()) {
                 try { nums.push_back(std::stod(row.values[ci])); }
@@ -1133,9 +1195,11 @@ public:
         // Step 1 — WHERE-Filter: indizes der passenden Zeilen sammeln
         std::vector<size_t> filtered;
         filtered.reserve(src.rows().size());
-        for (size_t i = 0; i < src.rows().size(); ++i)
+        for (size_t i = 0; i < src.rows().size(); ++i) {
+            if (src.rows()[i].xmax != 0) continue;  // Phase 71: skip dead rows
             if (rowMatches(src, src.rows()[i], whereConds, whereLogic))
                 filtered.push_back(i);
+        }
 
         // Step 2 — GROUP BY-Spaltenindizes vorab auflösen
         std::vector<size_t> groupCIs;
@@ -1223,9 +1287,11 @@ public:
 
         // Nested Loop
         for (const auto& row1 : t1.rows()) {
+            if (row1.xmax != 0) continue;  // Phase 71: skip dead rows
             const std::string& k1 =
                 ci1 < row1.values.size() ? row1.values[ci1] : "";
             for (const auto& row2 : t2.rows()) {
+                if (row2.xmax != 0) continue;  // Phase 71
                 const std::string& k2 =
                     ci2 < row2.values.size() ? row2.values[ci2] : "";
                 if (k1 != k2) continue;
@@ -1269,7 +1335,10 @@ public:
             initCols.emplace_back(baseName + "." + c.name, c.type);
 
         Table current("", initCols);
-        for (const auto& r : base.rows()) current.insert(r);
+        for (const auto& r : base.rows()) {
+            if (r.xmax != 0) continue;  // Phase 71: skip dead rows
+            current.insert(r);
+        }
 
         // Jeden JOIN-Schritt nacheinander anwenden
         for (const auto& jc : joins) {
@@ -1767,6 +1836,8 @@ public:
         inTransaction_ = true;
         txBuffer_.clear();
         savepointStack_.clear();         // Phase 64
+        // Phase 71: MVCC — start versioned transaction
+        mvccTxId_ = txManager_.beginTx(isolationLevel_);
     }
 
     // COMMIT: alle gepufferten Ops auf Tabellen anwenden,
@@ -1780,6 +1851,11 @@ public:
         txBuffer_.clear();
         savepointStack_.clear();         // Phase 64
         g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
+        // Phase 71: MVCC commit — mark tx as committed, then clear txId
+        if (mvccTxId_ != 0) {
+            txManager_.commitTx(mvccTxId_);
+            mvccTxId_ = 0;
+        }
         inTransaction_ = false;
         deleteWal();
     }
@@ -1792,6 +1868,11 @@ public:
         txBuffer_.clear();
         savepointStack_.clear();         // Phase 64
         g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
+        // Phase 71: MVCC rollback — remove tx from active set (not committed)
+        if (mvccTxId_ != 0) {
+            txManager_.rollbackTx(mvccTxId_);
+            mvccTxId_ = 0;
+        }
         inTransaction_ = false;
         deleteWal();
     }
@@ -4896,7 +4977,10 @@ private:
     void applyOp(const BufferedOp& op) {
         switch (op.opType) {
             case BufferedOp::Type::INSERT: {
-                getTable(op.tableName).insert(Row(op.values));
+                Table& t = getTable(op.tableName);
+                t.insert(Row(op.values));
+                // Phase 71: stamp xmin on newly committed row
+                if (mvccTxId_ != 0) t.stampXminLast(mvccTxId_);
                 break;
             }
             case BufferedOp::Type::UPDATE_WHERE: {
@@ -4921,11 +5005,21 @@ private:
             }
             case BufferedOp::Type::DELETE_WHERE: {
                 Table& t = getTable(op.tableName);
-                t.deleteWhere(colIdx(t, op.whereCol), op.whereVal);
+                if (mvccTxId_ != 0) {
+                    // Phase 71: MVCC logical delete — stamp xmax instead of physical remove
+                    t.stampDeleteWhere(colIdx(t, op.whereCol), op.whereVal, mvccTxId_);
+                } else {
+                    t.deleteWhere(colIdx(t, op.whereCol), op.whereVal);
+                }
                 break;
             }
             case BufferedOp::Type::DELETE_ALL: {
-                getTable(op.tableName).deleteAll();
+                if (mvccTxId_ != 0) {
+                    // Phase 71: MVCC logical delete all
+                    getTable(op.tableName).stampDeleteAll(mvccTxId_);
+                } else {
+                    getTable(op.tableName).deleteAll();
+                }
                 break;
             }
             case BufferedOp::Type::ALTER: {
@@ -5152,6 +5246,11 @@ public:
     };
     std::vector<SavepointEntry> savepointStack_;
 
+    // Phase 71: MVCC
+    TransactionManager txManager_;
+    uint64_t           mvccTxId_      = 0;  // current tx's MVCC ID (0 = none)
+    std::string        isolationLevel_ = "REPEATABLE READ";
+
     // Phase 46: User management
     std::map<std::string, UserDef> users_;
     std::string currentUser_ = "root";
@@ -5303,6 +5402,47 @@ public:
         auto name = resolveTableName(tblRaw);
         return getTable(name).prunePartitions(col, op, val);
     }
+
+    // ── Phase 71: MVCC public API ─────────────────────────────
+
+    // VACUUM: physically remove logically-deleted rows from all tables
+    size_t vacuumAll() {
+        size_t total = 0;
+        for (auto& [name, tbl] : tables_) {
+            total += tbl.vacuum([this](uint64_t txId) {
+                return txManager_.isCommitted(txId);
+            });
+        }
+        return total;
+    }
+
+    // VACUUM on a single table
+    size_t vacuumTable(const std::string& tblRaw) {
+        auto name = resolveTableName(tblRaw);
+        return getTable(name).vacuum([this](uint64_t txId) {
+            return txManager_.isCommitted(txId);
+        });
+    }
+
+    // Count dead rows across all tables (for diagnostics)
+    size_t deadRowCount() const {
+        size_t total = 0;
+        for (const auto& [name, tbl] : tables_)
+            total += tbl.deadRowCount();
+        return total;
+    }
+
+    // SHOW TRANSACTIONS
+    void showTransactions() const {
+        txManager_.showTransactions();
+    }
+
+    // SET TRANSACTION ISOLATION LEVEL
+    void setIsolationLevel(const std::string& level) {
+        isolationLevel_ = level;
+    }
+
+    const std::string& getIsolationLevel() const { return isolationLevel_; }
 
 private:
     // Phase 54A: Query Cache instance

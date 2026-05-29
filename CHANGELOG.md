@@ -4,6 +4,45 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v2.3.0] — 2026-05-29
+
+### Phase 71 — MVCC (Multi-Version Concurrency Control + VACUUM)
+
+**Features:**
+- Versioned rows: `xmin` (txId that created the row) and `xmax` (txId that deleted the row, 0 = alive)
+- Logical deletes: `DELETE` at COMMIT time stamps `xmax` instead of physically removing rows
+- `VACUUM` / `VACUUM ANALYZE` — physically removes all logically deleted rows and rebuilds indexes
+- `SHOW TRANSACTIONS` — Unicode table listing all active (uncommitted) transactions with ID, status, start time, isolation level
+- `SET TRANSACTION ISOLATION LEVEL READ COMMITTED | REPEATABLE READ | SERIALIZABLE`
+- `TransactionManager`: tracks `globalTxId_`, active/committed sets, provides `beginTx`/`commitTx`/`rollbackTx`/`isCommitted`
+- WAL-buffer provides natural REPEATABLE READ: SELECTs inside a transaction see pre-BEGIN state until COMMIT
+- Query cache invalidated automatically on every COMMIT
+
+**Example:**
+```sql
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT * FROM konto;          -- snapshot from BEGIN
+UPDATE konto SET balance = 9999 WHERE name = Alice;
+SELECT * FROM konto;          -- still sees old values (REPEATABLE READ)
+COMMIT;
+SELECT * FROM konto;          -- sees updated values
+BEGIN; DELETE FROM konto WHERE name = Bob; COMMIT;
+VACUUM;                       -- "1 alte Version(en) bereinigt"
+SHOW TRANSACTIONS;            -- "(Keine aktiven Transaktionen)"
+```
+
+**Technical changes:**
+- New `src/mvcc/transaction_manager.hpp`: `TxInfo` struct + `TransactionManager` class
+- `Row` struct: added `uint64_t xmin = 0` and `uint64_t xmax = 0`
+- All read paths (`selectWhere`, `computeAggregate`, `groupBy`, `innerJoin`, `executeJoins`, `clone`, `project`, UNIQUE checks, index rebuild) skip rows with `xmax != 0`
+- `applyOp`: INSERT stamps `xmin = mvccTxId_`; DELETE stamps `xmax = mvccTxId_` (MVCC logical delete)
+- `Storage::save()`: skips rows with `xmax != 0` (no FORMAT_VERSION bump)
+- Parser: `VACUUM`, `VACUUM ANALYZE`, `SHOW TRANSACTIONS`, `SET TRANSACTION ISOLATION LEVEL`
+- Dispatch: COMMIT handler clears query cache; Phase 71 command handlers added
+
+---
+
 ## [v2.2.0] — 2026-05-29
 
 ### Phase 70 — Spatial Index (POINT + ST_DISTANCE + Haversine)

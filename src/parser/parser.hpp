@@ -118,6 +118,11 @@ enum class CommandType {
     SHOW_PROFILE_FOR_QUERY,
     // Phase 70: Spatial Index
     CREATE_SPATIAL_INDEX,
+    // Phase 71: MVCC
+    VACUUM,
+    VACUUM_ANALYZE,
+    SHOW_TRANSACTIONS,
+    SET_TRANSACTION_ISOLATION,
     UNKNOWN
 };
 
@@ -320,6 +325,9 @@ struct ParsedCommand {
 
     // Phase 69: Query Profiler
     int         profileQueryId = 0;    // SHOW PROFILE FOR QUERY n
+
+    // Phase 71: MVCC
+    std::string isolationLevel;        // SET TRANSACTION ISOLATION LEVEL ...
 };
 
 class Parser {
@@ -1516,6 +1524,9 @@ public:
                     toUpper(tokens[2]) == "FOR" && toUpper(tokens[3]) == "QUERY") {
                     try { cmd.profileQueryId = std::stoi(tokens[4]); } catch (...) {}
                 }
+            // Phase 71: SHOW TRANSACTIONS
+            } else if (kw1 == "TRANSACTIONS") {
+                cmd.type = CommandType::SHOW_TRANSACTIONS;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1526,6 +1537,30 @@ public:
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
+
+        // ── Phase 71: VACUUM / VACUUM ANALYZE ────────────────────
+        } else if (kw0 == "VACUUM") {
+            if (tokens.size() >= 2 && toUpper(tokens[1]) == "ANALYZE")
+                cmd.type = CommandType::VACUUM_ANALYZE;
+            else
+                cmd.type = CommandType::VACUUM;
+
+        // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
+        // SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+        // SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
+        // SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+        } else if (kw0 == "SET" && tokens.size() >= 5 &&
+                   toUpper(tokens[1]) == "TRANSACTION" &&
+                   toUpper(tokens[2]) == "ISOLATION" &&
+                   toUpper(tokens[3]) == "LEVEL") {
+            cmd.type = CommandType::SET_TRANSACTION_ISOLATION;
+            // collect remaining tokens as isolation level
+            std::string lvl;
+            for (size_t i = 4; i < tokens.size(); ++i) {
+                if (!lvl.empty()) lvl += " ";
+                lvl += toUpper(tokens[i]);
+            }
+            cmd.isolationLevel = lvl;
 
         // ── STATUS ───────────────────────────────────────────────
         } else if (kw0 == "STATUS") {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Projektname und Version
-project(milansql VERSION 2.2.0 LANGUAGES CXX)
+project(milansql VERSION 2.3.0 LANGUAGES CXX)
 
 # C++17 Standard festlegen
 set(CMAKE_CXX_STANDARD 17)

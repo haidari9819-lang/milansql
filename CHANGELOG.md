@@ -4,6 +4,48 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v2.4.0] — 2026-05-29
+
+### Phase 72 — WAL Crash Recovery + Materialized Views
+
+**TEIL A — WAL Crash Recovery:**
+- `src/wal/wal_recovery.hpp`: new `WalRecovery` class with `scanWal()`, `parseOpBlock()`, `recover()`
+- Extended WAL format: `TX_BEGIN:<txId>`, `TX_COMMIT:<txId>`, `TX_ROLLBACK:<txId>` markers
+- On startup: load binary DB first, then replay all committed-but-not-yet-persisted WAL transactions
+- Crash safety: WAL deleted only AFTER successful `persist()` — not at commit time
+- `SHOW RECOVERY STATUS` — reports hadWal, recoveredTxCount, discardedTxCount, replayedOpCount
+
+**TEIL B — Materialized Views:**
+- `CREATE MATERIALIZED VIEW name AS SELECT ...` — executes query and caches result to memory + disk
+- `SELECT * FROM mv_name` — uses cached data (no re-execution), supports WHERE / ORDER BY / LIMIT
+- `REFRESH MATERIALIZED VIEW name` — re-executes original SQL, updates cache and `database.matviews`
+- `DROP MATERIALIZED VIEW name` — removes from memory and rewrites `database.matviews`
+- `SHOW MATERIALIZED VIEWS` — lists all materialized views with name, SQL, and last refresh time
+- Persisted in `database.matviews` (binary); re-loaded and refreshed on startup
+
+**Example:**
+```sql
+-- WAL Recovery (automatic on startup after crash)
+SHOW RECOVERY STATUS;
+-- WAL found: yes | Recovered TX: 2 | Discarded TX: 1 | Replayed ops: 5
+
+-- Materialized Views
+CREATE MATERIALIZED VIEW mv_stats AS SELECT dept, COUNT(*) FROM emp GROUP BY dept;
+SELECT * FROM mv_stats;
+REFRESH MATERIALIZED VIEW mv_stats;
+SHOW MATERIALIZED VIEWS;
+DROP MATERIALIZED VIEW mv_stats;
+```
+
+**Technical changes:**
+- `src/wal/wal_recovery.hpp`: `WalTxEntry` struct, `WalRecovery` class, `RecoveryResult` struct; includes `engine.hpp` after class decl to avoid circular dep
+- `engine.hpp`: `beginTransaction()` writes `TX_BEGIN`, `applyAndCommit()` writes `TX_COMMIT` but no longer calls `deleteWal()`, `rollbackTransaction()` writes `TX_ROLLBACK`; added `applyBufferedOp()`, `RecoveryStatus`, `MaterializedViewDef`, full matview CRUD API
+- `parser.hpp`: new CommandTypes `SHOW_RECOVERY_STATUS`, `CREATE/REFRESH/DROP_MATERIALIZED_VIEW`, `SHOW_MATERIALIZED_VIEWS`; added `matViewName`/`matViewSql` fields to `ParsedCommand`
+- `dispatch.hpp`: COMMIT handler calls `engine.deleteWal()` after `persistFn()`; SELECT checks materialized views before regular views; Phase 72 command handlers
+- `main.cpp`: two-step startup (load binary DB → WAL recovery); loads `database.matviews` on startup
+
+---
+
 ## [v2.3.0] — 2026-05-29
 
 ### Phase 71 — MVCC (Multi-Version Concurrency Control + VACUUM)

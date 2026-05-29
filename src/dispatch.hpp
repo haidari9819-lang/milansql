@@ -1819,6 +1819,25 @@ inline bool dispatchCommand(
             break;
         }
 
+        // ── Phase 72: Materialized View — use cached data ────────
+        if (engine.isMaterializedView(cmd.tableName)) {
+            const auto& mv = engine.getMaterializedView(cmd.tableName);
+            milansql::Table result(cmd.tableName, mv.columns);
+            for (const auto& row : mv.data)
+                result.insert(milansql::Row(row));
+            if (!cmd.whereConds.empty())
+                result = engine.filterTable(result, cmd.whereConds, cmd.whereLogic);
+            std::cout << "\n";
+            if (!cmd.orderByCols.empty())
+                result.sortByMulti(cmd.orderByCols);
+            if (!cmd.selectColumns.empty())
+                result = result.project(cmd.selectColumns);
+            if (cmd.isDistinct)
+                result.makeDistinct();
+            dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+            break;
+        }
+
         if (engine.viewExists(cmd.tableName)) {
             milansql::Table result = dispatch_materializeView(engine, parser, cmd.tableName, cmd);
             std::cout << "\n";
@@ -2393,6 +2412,7 @@ inline bool dispatchCommand(
         engine.applyAndCommit();
         engine.getQueryCache().clear();  // Phase 71: invalidate cache after tx commit
         persistFn();
+        engine.deleteWal();             // Phase 72: delete WAL only after successful persist
         std::cout << "  Transaktion erfolgreich abgeschlossen (COMMIT).\n\n";
         break;
 
@@ -3438,6 +3458,90 @@ inline bool dispatchCommand(
         }
         engine.setIsolationLevel(cmd.isolationLevel);
         std::cout << "  Isolation Level gesetzt: " << cmd.isolationLevel << "\n\n";
+        break;
+    }
+
+    // ── Phase 72: WAL Recovery Status ─────────────────────────────
+    case milansql::CommandType::SHOW_RECOVERY_STATUS:
+        engine.showRecoveryStatus();
+        break;
+
+    // ── Phase 72: Materialized Views ──────────────────────────────
+
+    case milansql::CommandType::SHOW_MATERIALIZED_VIEWS:
+        engine.showMaterializedViews();
+        break;
+
+    case milansql::CommandType::CREATE_MATERIALIZED_VIEW: {
+        if (cmd.matViewName.empty() || cmd.matViewSql.empty()) {
+            std::cout << "  Fehler: CREATE MATERIALIZED VIEW name AS SELECT ...\n\n";
+            break;
+        }
+        try {
+            milansql::ParsedCommand inner = parser.parse(cmd.matViewSql);
+            milansql::Table result = dispatch_executeSelectToTable(engine, parser, inner);
+            engine.createMaterializedView(cmd.matViewName, cmd.matViewSql,
+                                          result.columns(), result.rows());
+            // Persist matview definitions
+            {
+                std::ofstream mf("database.matviews", std::ios::app);
+                if (mf) mf << cmd.matViewName << "\t" << cmd.matViewSql << "\n";
+            }
+            std::cout << "  Materialized View '" << cmd.matViewName
+                      << "' erstellt (" << result.rowCount() << " Zeile(n)).\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::REFRESH_MATERIALIZED_VIEW: {
+        if (cmd.matViewName.empty()) {
+            std::cout << "  Fehler: REFRESH MATERIALIZED VIEW name\n\n";
+            break;
+        }
+        try {
+            const auto& mv = engine.getMaterializedView(cmd.matViewName);
+            milansql::ParsedCommand inner = parser.parse(mv.sql);
+            milansql::Table result = dispatch_executeSelectToTable(engine, parser, inner);
+            engine.setMaterializedViewData(cmd.matViewName, result.columns(), result.rows());
+            std::cout << "  Materialized View '" << cmd.matViewName
+                      << "' aktualisiert (" << result.rowCount() << " Zeile(n)).\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::DROP_MATERIALIZED_VIEW: {
+        if (cmd.matViewName.empty()) {
+            std::cout << "  Fehler: DROP MATERIALIZED VIEW name\n\n";
+            break;
+        }
+        try {
+            engine.dropMaterializedView(cmd.matViewName);
+            // Remove from database.matviews file by rewriting it
+            {
+                std::ifstream fin("database.matviews");
+                std::string content;
+                if (fin) {
+                    std::string line;
+                    while (std::getline(fin, line)) {
+                        if (line.empty()) continue;
+                        size_t tab = line.find('\t');
+                        if (tab != std::string::npos && line.substr(0, tab) == cmd.matViewName)
+                            continue;
+                        content += line + "\n";
+                    }
+                    fin.close();
+                    std::ofstream fout("database.matviews");
+                    if (fout) fout << content;
+                }
+            }
+            std::cout << "  Materialized View '" << cmd.matViewName << "' geloescht.\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
         break;
     }
 

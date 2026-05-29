@@ -123,6 +123,12 @@ enum class CommandType {
     VACUUM_ANALYZE,
     SHOW_TRANSACTIONS,
     SET_TRANSACTION_ISOLATION,
+    // Phase 72: WAL Recovery + Materialized Views
+    SHOW_RECOVERY_STATUS,
+    CREATE_MATERIALIZED_VIEW,
+    REFRESH_MATERIALIZED_VIEW,
+    DROP_MATERIALIZED_VIEW,
+    SHOW_MATERIALIZED_VIEWS,
     UNKNOWN
 };
 
@@ -328,6 +334,10 @@ struct ParsedCommand {
 
     // Phase 71: MVCC
     std::string isolationLevel;        // SET TRANSACTION ISOLATION LEVEL ...
+
+    // Phase 72: Materialized Views
+    std::string matViewName;           // CREATE/REFRESH/DROP MATERIALIZED VIEW name
+    std::string matViewSql;            // CREATE MATERIALIZED VIEW ... AS <sql>
 };
 
 class Parser {
@@ -1527,6 +1537,12 @@ public:
             // Phase 71: SHOW TRANSACTIONS
             } else if (kw1 == "TRANSACTIONS") {
                 cmd.type = CommandType::SHOW_TRANSACTIONS;
+            // Phase 72: SHOW RECOVERY STATUS
+            } else if (kw1 == "RECOVERY" && tokens.size() >= 3 && toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_RECOVERY_STATUS;
+            // Phase 72: SHOW MATERIALIZED VIEWS
+            } else if (kw1 == "MATERIALIZED" && tokens.size() >= 3 && toUpper(tokens[2]) == "VIEWS") {
+                cmd.type = CommandType::SHOW_MATERIALIZED_VIEWS;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1544,6 +1560,43 @@ public:
                 cmd.type = CommandType::VACUUM_ANALYZE;
             else
                 cmd.type = CommandType::VACUUM;
+
+        // ── Phase 72: SHOW RECOVERY STATUS ───────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "RECOVERY" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "STATUS") {
+            cmd.type = CommandType::SHOW_RECOVERY_STATUS;
+
+        // ── Phase 72: SHOW MATERIALIZED VIEWS ────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "MATERIALIZED" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "VIEWS") {
+            cmd.type = CommandType::SHOW_MATERIALIZED_VIEWS;
+
+        // ── Phase 72: CREATE MATERIALIZED VIEW name AS <sql> ─────
+        } else if (kw0 == "CREATE" && kw1 == "MATERIALIZED" && tokens.size() >= 5 &&
+                   toUpper(tokens[2]) == "VIEW") {
+            cmd.matViewName = tokens[3];
+            // Find "AS" keyword
+            std::string upInput = input;
+            for (char& c : upInput) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            auto asPos = upInput.find(" AS ");
+            if (asPos != std::string::npos) {
+                cmd.matViewSql = trim(input.substr(asPos + 4));
+                cmd.type = CommandType::CREATE_MATERIALIZED_VIEW;
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 72: REFRESH MATERIALIZED VIEW name ─────────────
+        } else if (kw0 == "REFRESH" && kw1 == "MATERIALIZED" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "VIEW") {
+            cmd.matViewName = tokens[3];
+            cmd.type = CommandType::REFRESH_MATERIALIZED_VIEW;
+
+        // ── Phase 72: DROP MATERIALIZED VIEW name ─────────────────
+        } else if (kw0 == "DROP" && kw1 == "MATERIALIZED" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "VIEW") {
+            cmd.matViewName = tokens[3];
+            cmd.type = CommandType::DROP_MATERIALIZED_VIEW;
 
         // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
         // SET TRANSACTION ISOLATION LEVEL READ COMMITTED

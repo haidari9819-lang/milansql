@@ -597,7 +597,7 @@ inline std::string MilanHttpServer::handleStatus() {
     auto schemas = engine_.showSchemas();
 
     std::string json = "{\"success\":true,\"status\":{";
-    json += "\"version\":\"MilanSQL v2.3.0\",";
+    json += "\"version\":\"MilanSQL v2.4.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tableCount\":" + std::to_string(tables.size()) + ",";
     json += "\"schemaCount\":" + std::to_string(schemas.size());
@@ -659,7 +659,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#128449; MilanSQL v2.3.0 Dashboard</div>
+  <div class="logo">&#128449; MilanSQL v2.4.0 Dashboard</div>
   <div class="status-bar">
     <span id="sv">v1.4.0</span>
     <span>Uptime: <span class="badge" id="su">-</span>s</span>

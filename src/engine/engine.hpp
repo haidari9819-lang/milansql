@@ -1832,17 +1832,22 @@ public:
         if (inTransaction_)
             throw std::runtime_error("Transaktion bereits aktiv.");
         walPath_ = walPath;
-        std::remove(walPath_.c_str());   // alte WAL löschen (Crash-Recovery)
+        // Phase 71: MVCC — start versioned transaction
+        // Phase 72: Write TX_BEGIN marker (WAL cleared at startup by recovery, not here)
+        mvccTxId_ = txManager_.beginTx(isolationLevel_);
+        {
+            std::ofstream wal(walPath_, std::ios::app);
+            if (wal) wal << "TX_BEGIN:" << mvccTxId_ << "\n";
+        }
         inTransaction_ = true;
         txBuffer_.clear();
         savepointStack_.clear();         // Phase 64
-        // Phase 71: MVCC — start versioned transaction
-        mvccTxId_ = txManager_.beginTx(isolationLevel_);
     }
 
     // COMMIT: alle gepufferten Ops auf Tabellen anwenden,
-    //         Puffer leeren, Transaktion beenden, WAL löschen.
-    //         Persistierung (save) muss der Aufrufer danach selbst machen.
+    //         Puffer leeren, Transaktion beenden.
+    //         Phase 72: TX_COMMIT in WAL schreiben; WAL wird erst nach persist gelöscht.
+    //         Persistierung (save) + deleteWal() muss der Aufrufer danach selbst machen.
     void applyAndCommit() {
         if (!inTransaction_)
             throw std::runtime_error("Keine aktive Transaktion.");
@@ -1852,12 +1857,18 @@ public:
         savepointStack_.clear();         // Phase 64
         g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
         // Phase 71: MVCC commit — mark tx as committed, then clear txId
+        uint64_t commitId = mvccTxId_;
         if (mvccTxId_ != 0) {
             txManager_.commitTx(mvccTxId_);
             mvccTxId_ = 0;
         }
         inTransaction_ = false;
-        deleteWal();
+        // Phase 72: Write TX_COMMIT to WAL so recovery knows this tx was committed.
+        // WAL is deleted by caller (dispatch) AFTER successful persist.
+        if (!walPath_.empty() && commitId != 0) {
+            std::ofstream wal(walPath_, std::ios::app);
+            if (wal) wal << "TX_COMMIT:" << commitId << "\n";
+        }
     }
 
     // ROLLBACK: Puffer verwerfen, Transaktion abbrechen, WAL löschen.
@@ -1869,11 +1880,17 @@ public:
         savepointStack_.clear();         // Phase 64
         g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
         // Phase 71: MVCC rollback — remove tx from active set (not committed)
+        uint64_t rollbackId = mvccTxId_;
         if (mvccTxId_ != 0) {
             txManager_.rollbackTx(mvccTxId_);
             mvccTxId_ = 0;
         }
         inTransaction_ = false;
+        // Phase 72: Write TX_ROLLBACK, then clean up WAL
+        if (!walPath_.empty() && rollbackId != 0) {
+            std::ofstream wal(walPath_, std::ios::app);
+            if (wal) wal << "TX_ROLLBACK:" << rollbackId << "\n";
+        }
         deleteWal();
     }
 
@@ -5403,6 +5420,172 @@ public:
         return getTable(name).prunePartitions(col, op, val);
     }
 
+    // ── Phase 72: Public op-apply for WAL recovery ───────────────
+    void applyBufferedOp(const BufferedOp& op) { applyOp(op); }
+
+    // ── Phase 72: Recovery status ─────────────────────────────────
+    struct RecoveryStatus {
+        bool hadWal          = false;
+        int  recoveredTxCount = 0;
+        int  discardedTxCount = 0;
+        int  replayedOpCount  = 0;
+    };
+
+    void setRecoveryStatus(bool hadWal, int recovered, int discarded, int ops) {
+        recoveryStatus_ = {hadWal, recovered, discarded, ops};
+    }
+
+    void showRecoveryStatus() const {
+        std::cout << "\n";
+        if (!recoveryStatus_.hadWal) {
+            std::cout << "  Kein WAL bei Startup gefunden — kein Recovery nötig.\n\n";
+            return;
+        }
+        std::cout << "  WAL Recovery Status:\n";
+        std::cout << "  ┌──────────────────────────────────────┐\n";
+        std::cout << "  │ WAL gefunden beim Start    JA         │\n";
+        std::cout << "  │ Committete Transaktionen   "
+                  << recoveryStatus_.recoveredTxCount;
+        for (int sp = static_cast<int>(std::to_string(recoveryStatus_.recoveredTxCount).size());
+             sp < 10; ++sp) std::cout << " ";
+        std::cout << "│\n";
+        std::cout << "  │ Verworfen (kein COMMIT)    "
+                  << recoveryStatus_.discardedTxCount;
+        for (int sp = static_cast<int>(std::to_string(recoveryStatus_.discardedTxCount).size());
+             sp < 10; ++sp) std::cout << " ";
+        std::cout << "│\n";
+        std::cout << "  │ Wiederhergestellte Ops     "
+                  << recoveryStatus_.replayedOpCount;
+        for (int sp = static_cast<int>(std::to_string(recoveryStatus_.replayedOpCount).size());
+             sp < 10; ++sp) std::cout << " ";
+        std::cout << "│\n";
+        std::cout << "  └──────────────────────────────────────┘\n\n";
+    }
+
+    // ── Phase 72: Materialized Views ─────────────────────────────
+
+    struct MaterializedViewDef {
+        std::string          name;
+        std::string          sql;
+        std::string          lastRefresh;   // "YYYY-MM-DD HH:MM:SS"
+        std::vector<Column>  columns;
+        std::vector<Row>     data;
+    };
+
+    void createMaterializedView(const std::string& name,
+                                const std::string& sql,
+                                const std::vector<Column>& cols,
+                                const std::vector<Row>& data) {
+        if (materializedViews_.count(name))
+            throw std::runtime_error("Materialized View '" + name + "' existiert bereits.");
+        MaterializedViewDef mv;
+        mv.name        = name;
+        mv.sql         = sql;
+        mv.lastRefresh = currentTimestamp();
+        mv.columns     = cols;
+        mv.data        = data;
+        materializedViews_[name] = std::move(mv);
+    }
+
+    void setMaterializedViewData(const std::string& name,
+                                  const std::vector<Column>& cols,
+                                  const std::vector<Row>& data) {
+        auto it = materializedViews_.find(name);
+        if (it == materializedViews_.end())
+            throw std::runtime_error("Materialized View '" + name + "' nicht gefunden.");
+        it->second.columns     = cols;
+        it->second.data        = data;
+        it->second.lastRefresh = currentTimestamp();
+    }
+
+    // Create with empty data (used on load before refresh)
+    void createMaterializedViewEmpty(const std::string& name, const std::string& sql) {
+        if (materializedViews_.count(name)) return;  // already loaded
+        MaterializedViewDef mv;
+        mv.name = name;
+        mv.sql  = sql;
+        materializedViews_[name] = std::move(mv);
+    }
+
+    void dropMaterializedView(const std::string& name) {
+        if (!materializedViews_.erase(name))
+            throw std::runtime_error("Materialized View '" + name + "' nicht gefunden.");
+    }
+
+    bool isMaterializedView(const std::string& nameRaw) const {
+        auto key = resolveTableName(nameRaw);
+        return materializedViews_.count(key) > 0 ||
+               materializedViews_.count(nameRaw) > 0;
+    }
+
+    const MaterializedViewDef& getMaterializedView(const std::string& nameRaw) const {
+        // Try exact name first, then resolved
+        auto it = materializedViews_.find(nameRaw);
+        if (it != materializedViews_.end()) return it->second;
+        auto key = resolveTableName(nameRaw);
+        auto it2 = materializedViews_.find(key);
+        if (it2 != materializedViews_.end()) return it2->second;
+        throw std::runtime_error("Materialized View '" + nameRaw + "' nicht gefunden.");
+    }
+
+    const std::map<std::string, MaterializedViewDef>& getAllMaterializedViews() const {
+        return materializedViews_;
+    }
+
+    void showMaterializedViews() const {
+        std::cout << "\n";
+        if (materializedViews_.empty()) {
+            std::cout << "  (Keine Materialized Views vorhanden)\n\n";
+            return;
+        }
+        // Column widths
+        size_t wName = 4, wSql = 3, wRef = 19;
+        for (const auto& [n, mv] : materializedViews_) {
+            wName = std::max(wName, n.size());
+            wSql  = std::max(wSql,  mv.sql.size() > 40 ? (size_t)40 : mv.sql.size());
+            wRef  = std::max(wRef,  mv.lastRefresh.size());
+        }
+        auto hline = [&](const char* l, const char* m, const char* r, const char* f) {
+            std::cout << l;
+            for (size_t j = 0; j < wName + 2; ++j) std::cout << f;
+            std::cout << m;
+            for (size_t j = 0; j < wRef + 2;  ++j) std::cout << f;
+            std::cout << m;
+            for (size_t j = 0; j < 6;          ++j) std::cout << f;  // Rows
+            std::cout << m;
+            for (size_t j = 0; j < wSql + 2;   ++j) std::cout << f;
+            std::cout << r << "\n";
+        };
+        auto cell = [](const std::string& s, size_t w) {
+            std::cout << " " << s;
+            for (size_t j = s.size(); j < w; ++j) std::cout << " ";
+            std::cout << " \u2502";
+        };
+
+        hline("\u250c", "\u252c", "\u2510", "\u2500");
+        std::cout << "\u2502";
+        cell("Name",         wName);
+        cell("Zuletzt aktual.", wRef);
+        cell("Rows", 4);
+        cell("SQL",          wSql);
+        std::cout << "\n";
+        hline("\u251c", "\u253c", "\u2524", "\u2500");
+
+        for (const auto& [n, mv] : materializedViews_) {
+            std::string sqlShort = mv.sql.size() > 40 ? mv.sql.substr(0, 37) + "..." : mv.sql;
+            std::string rowsStr  = std::to_string(mv.data.size());
+            std::cout << "\u2502";
+            cell(n,               wName);
+            cell(mv.lastRefresh,  wRef);
+            cell(rowsStr,         4);
+            cell(sqlShort,        wSql);
+            std::cout << "\n";
+        }
+
+        hline("\u2514", "\u2534", "\u2518", "\u2500");
+        std::cout << "  " << materializedViews_.size() << " Materialized View(s)\n\n";
+    }
+
     // ── Phase 71: MVCC public API ─────────────────────────────
 
     // VACUUM: physically remove logically-deleted rows from all tables
@@ -5450,6 +5633,20 @@ private:
 
     // Phase 63: INFORMATION_SCHEMA virtual table cache (mutable for const access)
     mutable std::map<std::string, Table> infoSchemaCache_;
+
+    // Phase 72: Materialized Views
+    std::map<std::string, MaterializedViewDef> materializedViews_;
+
+    // Phase 72: Recovery status (set by main.cpp after startup recovery)
+    RecoveryStatus recoveryStatus_;
+
+    // Phase 72: timestamp helper
+    static std::string currentTimestamp() {
+        std::time_t t = std::time(nullptr);
+        char buf[20] = {};
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+        return buf;
+    }
 };
 
 } // namespace milansql

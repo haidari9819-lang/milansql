@@ -28,6 +28,9 @@
 // Phase 61: Event Scheduler
 #include "scheduler/event_scheduler.hpp"
 
+// Phase 72: WAL Crash Recovery
+#include "wal/wal_recovery.hpp"
+
 // ============================================================
 // main.cpp — REPL für MilanSQL (Phase 47)
 // Neu: --server / --client / --port N Modi
@@ -36,7 +39,7 @@
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v2.3.0 ===           \u2551\n"
+              << "  \u2551        === MilanSQL v2.4.0 ===           \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -185,9 +188,8 @@ int main(int argc, char* argv[]) {
     milansql::MilanBinaryStorage storage;
     std::string                  eingabe;
 
-    // WAL-Cleanup beim Start (Crash-Recovery: unvollständige Transaktion verwerfen)
-    std::remove("database.milan.wal");
-
+    // ── Phase 72: WAL Crash Recovery ─────────────────────────────
+    // Step 1: Load binary database (last persisted state)
     try {
         std::size_t tableCount = storage.loadWithCount(engine);
         if (tableCount == 0) {
@@ -203,6 +205,29 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& ex) {
         std::cout << "  WARNUNG: Laden fehlgeschlagen: " << ex.what()
                   << "\n  Starte mit leerer Datenbank.\n\n";
+    }
+
+    // Step 2: WAL Recovery — replay committed ops not yet persisted
+    {
+        milansql::WalRecovery walRecovery;
+        auto wr = walRecovery.recover(engine, "database.milan.wal");
+        engine.setRecoveryStatus(wr.hadWal, wr.recoveredTxCount,
+                                 wr.discardedTxCount, wr.replayedOpCount);
+        if (wr.hadWal) {
+            if (wr.recoveredTxCount > 0) {
+                std::cout << "  WAL Recovery: " << wr.recoveredTxCount
+                          << " Transaktion(en) wiederhergestellt ("
+                          << wr.replayedOpCount << " Op(s)), "
+                          << wr.discardedTxCount << " verworfen.\n";
+                // Persist recovered state
+                try { storage.save(engine); }
+                catch (...) {}
+                std::cout << "  Datenbank nach Recovery gespeichert.\n\n";
+            } else if (wr.discardedTxCount > 0) {
+                std::cout << "  WAL Recovery: " << wr.discardedTxCount
+                          << " uncommittete Transaktion(en) verworfen.\n\n";
+            }
+        }
     }
 
     // Phase 51: Load schemas from separate file
@@ -286,6 +311,32 @@ int main(int argc, char* argv[]) {
 
     // Phase 62: Load partitions from separate file
     milansql::dispatch_loadPartitions(engine, "database.partitions");
+
+    // Phase 72: Load Materialized View definitions and rebuild data
+    {
+        std::ifstream mf("database.matviews");
+        if (mf) {
+            std::string line;
+            while (std::getline(mf, line)) {
+                if (line.empty()) continue;
+                size_t tab = line.find('\t');
+                if (tab == std::string::npos) continue;
+                std::string mvName = line.substr(0, tab);
+                std::string mvSql  = line.substr(tab + 1);
+                if (mvName.empty() || mvSql.empty()) continue;
+                engine.createMaterializedViewEmpty(mvName, mvSql);
+                // Refresh: execute the SQL to populate data
+                try {
+                    milansql::ParsedCommand inner = parser.parse(mvSql);
+                    milansql::Table result = milansql::dispatch_executeSelectToTable(
+                        engine, parser, inner);
+                    engine.setMaterializedViewData(mvName, result.columns(), result.rows());
+                } catch (...) {
+                    // If refresh fails (e.g. table doesn't exist yet), leave data empty
+                }
+            }
+        }
+    }
 
     // Helper lambda: save procedures to file
     auto saveProcedures = [&]() {

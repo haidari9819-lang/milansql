@@ -1,10 +1,10 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v2.3.0-gold)
+![Version](https://img.shields.io/badge/version-v2.4.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![Phases](https://img.shields.io/badge/phases-71-brightgreen)
+![Phases](https://img.shields.io/badge/phases-72-brightgreen)
 
 > **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
@@ -19,7 +19,8 @@ Developed by **Mirwais Haidari**, built phase by phase from a blank file to a fu
 | **SQL** | SELECT/INSERT/UPDATE/DELETE, INNER/LEFT/RIGHT/FULL OUTER JOIN, correlated Subqueries, CTEs (`WITH`), Window Functions, `CASE WHEN`, `UNION`/`INTERSECT`/`EXCEPT` |
 | **DDL** | `CREATE`/`DROP`/`ALTER TABLE`, Views, Triggers (`BEFORE`/`AFTER`), Stored Procedures with Cursors, B-Tree Indexes, Full-Text Search |
 | **Constraints** | `PRIMARY KEY`, `FOREIGN KEY` (CASCADE/SET NULL/RESTRICT), `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `AUTO_INCREMENT` |
-| **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, WAL-based crash recovery, `SELECT FOR UPDATE`, `LOCK TABLE READ\|WRITE`, MVCC (xmin/xmax), `VACUUM`, `SET TRANSACTION ISOLATION LEVEL`, `SHOW TRANSACTIONS` |
+| **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, WAL-based crash recovery, `SELECT FOR UPDATE`, `LOCK TABLE READ\|WRITE`, MVCC (xmin/xmax), `VACUUM`, `SET TRANSACTION ISOLATION LEVEL`, `SHOW TRANSACTIONS`, `SHOW RECOVERY STATUS` |
+| **Materialized Views** | `CREATE MATERIALIZED VIEW AS SELECT ...`, `SELECT` (cached), `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `SHOW MATERIALIZED VIEWS`, persisted in `database.matviews` |
 | **Data Types** | `INT`, `TEXT`, `REAL`, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `JSON` |
 | **Functions** | String (`UPPER`/`LOWER`/`CONCAT`/`SUBSTR`/`REPLACE`/`TRIM`), Math (`ABS`/`ROUND`/`SQRT`/`POWER`), Date (`NOW`/`DATEDIFF`/`DATE_ADD`/`DATE_FORMAT`), JSON (`JSON_EXTRACT`/`JSON_SET`/`JSON_KEYS`), Regex (`REGEXP_REPLACE`/`REGEXP_EXTRACT`), Null (`COALESCE`/`IFNULL`), Window (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) |
 | **Server** | TCP/IP multi-threaded server (port 4406), REST API (port 8080), connection pool, multi-statement queries |
@@ -54,7 +55,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v2.3.0 ===           ║
+  ║        === MilanSQL v2.4.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -181,6 +182,17 @@ CREATE TABLE produkte (
 INSERT INTO produkte VALUES (NULL, 'Laptop', 1000);
 SELECT * FROM produkte;
 -- brutto: 1190  |  mwst: 190  (auto-computed)
+
+-- WAL Crash Recovery (Phase 72)
+SHOW RECOVERY STATUS;
+-- WAL found: yes | Recovered TX: 2 | Discarded TX: 1 | Replayed ops: 5
+
+-- Materialized Views (Phase 72)
+CREATE MATERIALIZED VIEW mv_stats AS SELECT dept, COUNT(*) FROM emp GROUP BY dept;
+SELECT * FROM mv_stats;               -- uses cached data
+REFRESH MATERIALIZED VIEW mv_stats;   -- re-execute query, update cache
+SHOW MATERIALIZED VIEWS;
+DROP MATERIALIZED VIEW mv_stats;
 
 -- MVCC (Phase 71)
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
@@ -318,6 +330,8 @@ milansql/
 │   │   ├── master_repl.hpp        # Master replication server
 │   │   ├── slave_repl.hpp         # Slave polling client
 │   │   └── repl_state.hpp         # Global replication state
+│   ├── wal/
+│   │   └── wal_recovery.hpp       # WAL crash recovery (scan + replay)
 │   ├── scheduler/
 │   │   └── event_scheduler.hpp    # Event scheduler (CREATE EVENT)
 │   ├── backup/
@@ -390,6 +404,7 @@ GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on
 | **69** | **Query Profiler (PROFILE ON/OFF, SHOW PROFILES, SHOW PROFILE FOR QUERY n)** |
 | **70** | **Spatial Index (POINT type, ST_DISTANCE/Haversine, ST_X/ST_Y/ST_WITHIN/ST_ASTEXT, CREATE SPATIAL INDEX)** |
 | **71** | **MVCC (xmin/xmax versioned rows, TransactionManager, VACUUM, SET TRANSACTION ISOLATION LEVEL, SHOW TRANSACTIONS)** |
+| **72** | **WAL Crash Recovery (TX_BEGIN/TX_COMMIT/TX_ROLLBACK markers, replay on startup, SHOW RECOVERY STATUS) + Materialized Views (CREATE/REFRESH/DROP/SHOW, persistence in database.matviews)** |
 
 ---
 

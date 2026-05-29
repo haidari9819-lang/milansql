@@ -1,164 +1,50 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.10.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v2.0.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
+![Phases](https://img.shields.io/badge/phases-67-brightgreen)
 
-Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **67 Features, 0 externe Abhängigkeiten.**
+> **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
----
-
-## What's new in v1.10.0
-
-| Phase | Feature |
-|-------|---------|
-| **67** | **Multi-Statement Queries**: `SELECT 1; SELECT 2; SELECT 3;` — alle Ergebnisse in einem Aufruf |
-| | REPL: mehrere `;`-getrennte Statements in einer Zeile → sequenziell ausgeführt |
-| | REST API: `POST /query` mit mehreren Statements → `{"success":true,"results":[...]}` |
-| | `splitStatements()`: respektiert `BEGIN...END`, Strings, `--` und `/* */` Kommentare |
+Developed by **Mirwais Haidari**, built phase by phase from a blank file to a full-featured database server. Every byte of SQL parsing, query optimization, transaction management, replication, and network protocol is hand-written C++17.
 
 ---
 
-## What's new in v1.9.0
+## Feature Overview
 
-| Phase | Feature |
-|-------|---------|
-| **66** | **DECLARE CURSOR**: `DECLARE name CURSOR FOR SELECT ...` — Cursor in Stored Procedures |
-| | **OPEN / FETCH / CLOSE**: Cursor öffnen, Zeilen lesen, schließen |
-| | **DECLARE CONTINUE HANDLER FOR NOT FOUND**: EOF-Handler für Cursors |
-| | **DECLARE var TYPE [DEFAULT val]**: lokale Variablen in Procedures |
-| | **SET var = expr**: Variablen setzen (arithmetische Ausdrücke) |
-| | **label: LOOP … END LOOP / LEAVE**: Schleifen mit Labels |
-| | **IF cond THEN … ELSE … END IF**: bedingte Ausführung (verschachtelbar) |
-
----
-
-## What's new in v1.8.0
-
-| Phase | Feature |
-|-------|---------|
-| **65** | **SELECT FOR UPDATE**: `SELECT … FROM t WHERE … FOR UPDATE` — Row-Level WRITE-Locks |
-| | Locks automatisch freigegeben bei `COMMIT` / `ROLLBACK`, 5s Timeout |
-| | **LOCK TABLE**: `LOCK TABLE name READ\|WRITE` — exklusive Tabellensperre |
-| | `UNLOCK TABLES` — alle Tabellensperren des aktuellen Threads freigeben |
-| | `SHOW LOCKS` — aktive Row- und Table-Locks anzeigen |
-| | DML-Schutz: `INSERT`/`UPDATE`/`DELETE` respektieren `LOCK TABLE READ`-Sperren |
-
----
-
-## What's new in v1.7.0
-
-| Phase | Feature |
-|-------|---------|
-| **64** | **REGEXP/RLIKE**: `WHERE col REGEXP 'pattern'` / `WHERE col NOT REGEXP 'pattern'` |
-| | `RLIKE` als Alias für REGEXP |
-| | `REGEXP_REPLACE(col, pattern, repl)` — Regex-Ersetzung in SELECT |
-| | `REGEXP_EXTRACT(col, pattern)` — erstes Match extrahieren |
-| | **SAVEPOINT**: `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` / `RELEASE SAVEPOINT name` |
-| | Verschachtelte Transaktionen via txBuffer_-Größen-Snapshot |
-
----
-
-## What's new in v1.6.0
-
-| Phase | Feature |
-|-------|---------|
-| **63** | **INFORMATION_SCHEMA**: 10 virtuelle Read-Only-Meta-Tabellen |
-| | `information_schema.tables` — alle Tabellen & Views (TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS) |
-| | `information_schema.columns` — alle Spalten (ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA) |
-| | `information_schema.indexes` — alle B-Tree-Indizes (INDEX_NAME, COLUMN_NAME, INDEX_TYPE) |
-| | `information_schema.views` — alle Views mit VIEW_DEFINITION |
-| | `information_schema.triggers` — alle Trigger (EVENT_MANIPULATION, ACTION_TIMING, ACTION_STATEMENT) |
-| | `information_schema.routines` — alle Stored Procedures |
-| | `information_schema.schemata` — alle Schemas |
-| | `information_schema.partitions` — partitionierte Tabellen (PARTITION_METHOD, PARTITION_EXPRESSION) |
-| | `information_schema.events` — alle Events (INTERVAL_VALUE, STATUS) |
-| | `information_schema.user_privileges` — Benutzerrechte (GRANTEE, PRIVILEGE_TYPE) |
-| | WHERE-Filter und JOINs vollständig unterstützt; INSERT/UPDATE/DELETE → FEHLER (read-only) |
-
----
-
-## What's new in v1.5.0
-
-| Phase | Feature |
-|-------|---------|
-| **62** | **Partitionierung**: `CREATE TABLE … PARTITION BY RANGE\|LIST\|HASH (col) (…)` |
-| | `SHOW PARTITIONS FROM table` — Name, Typ, Beschreibung, Zeilenanzahl je Partition |
-| | `ALTER TABLE t ADD PARTITION (…)` / `ALTER TABLE t DROP PARTITION name` |
-| | Partition Pruning in `EXPLAIN`: zeigt welche Partitionen gescannt werden |
-| | Persistenz (`database.partitions`), automatisch geladen beim Start |
-
----
-
-## What's new in v1.4.0
-
-| Phase | Feature |
-|-------|---------|
-| **61** | **Event Scheduler**: `CREATE EVENT name ON SCHEDULE EVERY n UNIT DO sql` |
-| | `CREATE EVENT name ON SCHEDULE AT 'YYYY-MM-DD HH:MM:SS' DO sql` — einmalig |
-| | `SHOW EVENTS`, `DROP EVENT`, `ALTER EVENT ENABLE\|DISABLE` |
-| | `SET EVENT_SCHEDULER = ON\|OFF` — Scheduler global steuern |
-| | Persistenz (`database.events`), Thread-sicher, automatischer Start beim REPL/Server |
-
----
-
-## What's new in v1.3.0
-
-| Phase | Feature |
-|-------|---------|
-| **60** | **CSV Import/Export**: `LOAD DATA INFILE 'file.csv' INTO TABLE t [SEPARATOR ','] [SKIP HEADER]` |
-| | `SELECT … INTO OUTFILE 'file.csv' [SEPARATOR ',']` — Abfrageergebnis als CSV exportieren |
-| | `SHOW DATAFILES` — listet alle `.csv`/`.tsv`-Dateien mit Größe |
-| | RFC-4180 Quoting, Auto-Separator-Erkennung, Tab-Separator (`\t`) |
-
----
-
-## What's new in v1.2.0
-
-| Phase | Feature |
-|-------|---------|
-| **59** | **Master/Slave Replikation**: `--master --repl-port N`, `--slave --master-host H --master-port N`, Binlog (`database.binlog`), Auto-Sync alle 500ms, Auto-Reconnect |
-| | `SHOW MASTER STATUS`, `SHOW SLAVE STATUS`, `SHOW BINLOG`, `STOP SLAVE`, `START SLAVE` |
-| | Slave ist read-only — schreibende Operationen werden abgelehnt |
-
----
-
-## What's new in v1.1.0
-
-| Phase | Feature |
-|-------|---------|
-| **54** | **Query Cache** (LRU/TTL), `EXPLAIN ANALYZE`, Web Dashboard (`--http`), `SHOW PROCESSLIST` |
-| **55** | **DATE/TIME** Datentypen: `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `NOW()`, `CURDATE()`, `DATEDIFF()`, `DATE_ADD()`, `DATE_FORMAT()` |
-| **56** | **JSON** Datentyp: `JSON_EXTRACT`, `JSON_SET`, `JSON_KEYS`, `JSON_LENGTH`, `JSON_CONTAINS`, `JSON_TYPE`, `JSON_VALID` |
-| **57** | **Backup/Restore**: `BACKUP DATABASE/TABLE TO 'file'`, `RESTORE DATABASE FROM 'file'`, `SHOW BACKUPS`, SQL-Dump Format, Topological Sort (FK) |
-| **58** | **Connection Pooling** (Thread Pool, `--pool-size N`, `--max-queue N`), `BENCHMARK N sql`, `SHOW STATUS` mit Pool-Metriken |
-
-> **Python & Node.js Client Libraries** (Phase 53) wurden ebenfalls in v1.1.0 aufgenommen.
+| Category | Features |
+|----------|---------|
+| **SQL** | SELECT/INSERT/UPDATE/DELETE, INNER/LEFT/RIGHT/FULL OUTER JOIN, correlated Subqueries, CTEs (`WITH`), Window Functions, `CASE WHEN`, `UNION`/`INTERSECT`/`EXCEPT` |
+| **DDL** | `CREATE`/`DROP`/`ALTER TABLE`, Views, Triggers (`BEFORE`/`AFTER`), Stored Procedures with Cursors, B-Tree Indexes, Full-Text Search |
+| **Constraints** | `PRIMARY KEY`, `FOREIGN KEY` (CASCADE/SET NULL/RESTRICT), `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `AUTO_INCREMENT` |
+| **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, WAL-based crash recovery, `SELECT FOR UPDATE`, `LOCK TABLE READ\|WRITE` |
+| **Data Types** | `INT`, `TEXT`, `REAL`, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `JSON` |
+| **Functions** | String (`UPPER`/`LOWER`/`CONCAT`/`SUBSTR`/`REPLACE`/`TRIM`), Math (`ABS`/`ROUND`/`SQRT`/`POWER`), Date (`NOW`/`DATEDIFF`/`DATE_ADD`/`DATE_FORMAT`), JSON (`JSON_EXTRACT`/`JSON_SET`/`JSON_KEYS`), Regex (`REGEXP_REPLACE`/`REGEXP_EXTRACT`), Null (`COALESCE`/`IFNULL`), Window (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) |
+| **Server** | TCP/IP multi-threaded server (port 4406), REST API (port 8080), connection pool, multi-statement queries |
+| **Replication** | Master/Slave, Binlog, auto-sync every 500ms, auto-reconnect, read-only slave |
+| **Admin** | `BACKUP`/`RESTORE`, CSV import/export, Event Scheduler, Partitioning (RANGE/LIST/HASH), `INFORMATION_SCHEMA`, User Management (`GRANT`/`REVOKE`) |
+| **Performance** | Cost-based query optimizer, B-Tree index lookup, `EXPLAIN`/`EXPLAIN ANALYZE`, Query Cache (LRU/TTL), `BENCHMARK` command |
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Repository klonen
+# Clone & build (Linux/macOS)
 git clone https://github.com/haidari9819-lang/milansql
 cd milansql
-
-# 2. Bauen (Linux/macOS)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-
-# 3. Starten
 ./build/milansql
 ```
 
-```powershell
+```bash
 # Windows (MSYS2 UCRT64)
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-.\build\milansql.exe
+./build/milansql.exe
 ```
 
 ---
@@ -167,7 +53,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v1.2.0 ===           ║
+  ║        === MilanSQL v2.0.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -175,125 +61,75 @@ cmake --build build
 milansql> CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, score INT)
   Tabelle 'users' erstellt.
 
-milansql> INSERT INTO users VALUES (NULL, Alice, 95)
+milansql> INSERT INTO users VALUES (NULL, Alice, 95); INSERT INTO users VALUES (NULL, Bob, 82); SELECT * FROM users;
   1 Zeile(n) eingefuegt.
-
-milansql> SELECT * FROM users WHERE score > 80 ORDER BY score DESC
+  1 Zeile(n) eingefuegt.
   ┌────┬───────┬───────┐
   │ id │ name  │ score │
   ├────┼───────┼───────┤
   │ 1  │ Alice │ 95    │
+  │ 2  │ Bob   │ 82    │
   └────┴───────┴───────┘
-  1 Zeile(n).
-
-milansql> STATUS
+  2 Zeile(n).
 ```
 
 ---
 
-## Features
+## Server Modes
 
-### SQL Core
-| Kategorie | Befehle |
-|-----------|---------|
-| **DDL** | `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN), `TRUNCATE TABLE` |
-| **DML** | `INSERT INTO` (single, multi-row, `INSERT INTO … SELECT`), `INSERT OR REPLACE`, `INSERT OR IGNORE`, `ON CONFLICT DO NOTHING`, `UPDATE SET`, `DELETE FROM` |
-| **SELECT** | `WHERE`, `ORDER BY col [ASC\|DESC], …`, `LIMIT n [OFFSET m]`, `DISTINCT`, `LIKE`, `IS NULL`, `BETWEEN`, `IN`, `EXISTS` |
-| **Aggregation** | `COUNT(*)`, `MIN`, `MAX`, `AVG`, `SUM` mit `GROUP BY` und `HAVING` |
-| **JOINs** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, mehrfache JOINs |
-| **Mengen** | `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT` |
-| **Subqueries** | Correlated Subqueries, Scalar Subquery in SELECT, `IN`/`NOT IN`, `EXISTS` |
-
-### Funktionen & Ausdrücke
-| Kategorie | Befehle |
-|-----------|---------|
-| **String** | `UPPER`, `LOWER`, `LENGTH`, `CONCAT`, `SUBSTR`, `TRIM`, `REPLACE` |
-| **Math** | `ABS`, `ROUND`, `MOD`, `POWER`, `SQRT`, `CEIL`, `FLOOR` |
-| **NULL** | `COALESCE(v1, v2, …)`, `IFNULL(col, default)` |
-| **Typumwandlung** | `CAST(expr AS INT\|REAL\|TEXT)` in SELECT und WHERE |
-| **CASE** | `CASE WHEN … THEN … ELSE … END` in SELECT |
-| **Window Functions** | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `SUM/AVG/COUNT/MIN/MAX() OVER (PARTITION BY … ORDER BY …)` |
-| **CTE** | `WITH name AS (SELECT …), … SELECT …` — mehrere CTEs, UNION |
-
-### Constraints & Integrität
-| Feature | Details |
-|---------|---------|
-| **Constraints** | `NOT NULL`, `UNIQUE`, `DEFAULT`, `PRIMARY KEY`, `AUTO_INCREMENT`, `CHECK` |
-| **Foreign Keys** | `FOREIGN KEY … REFERENCES` mit `ON DELETE CASCADE / SET NULL / RESTRICT` |
-| **Transaktionen** | `BEGIN / COMMIT / ROLLBACK` (WAL-basiert) |
-
-### Erweiterte Features
-| Feature | Details |
-|---------|---------|
-| **Trigger** | `CREATE TRIGGER BEFORE/AFTER INSERT/UPDATE/DELETE … FOR EACH ROW BEGIN … END`, `SIGNAL`, `NEW`/`OLD`, `DROP TRIGGER`, `SHOW TRIGGERS` |
-| **Stored Procedures** | `CREATE PROCEDURE / CALL / DROP PROCEDURE / SHOW PROCEDURES` |
-| **Prepared Statements** | `PREPARE / EXECUTE / DEALLOCATE PREPARE / SHOW PREPARED` |
-| **Views** | `CREATE VIEW … AS SELECT`, `DROP VIEW`, `SELECT * FROM view` |
-| **Indizes** | `CREATE INDEX` / `DROP INDEX` (B-Tree, T=3), mehrspaltige Indizes |
-| **Full-Text Search** | `CREATE FULLTEXT INDEX`, `MATCH(col) AGAINST ('term')`, TF-Ranking |
-| **Query Optimizer** | Cost-based Join-Reihenfolge, Index-Auswahl, Predicate Pushdown |
-| **EXPLAIN** | `EXPLAIN SELECT …` — Query-Plan mit Optimizer-Entscheidungen |
-| **Schemas** | `CREATE SCHEMA`, `USE schema`, Cross-Schema JOINs (`shop.produkte`) |
-| **Benutzerverwaltung** | `CREATE USER`, `GRANT/REVOKE priv ON tbl TO/FROM user`, `CONNECT user pwd` |
-
-### Server & Clients
-| Modus | Befehl |
-|-------|--------|
-| **TCP Server** | `milansql --server --port 4406` — Multi-Client, Thread-Safe |
-| **REST API** | `milansql --http --port 8080` — HTTP/JSON Interface |
-| **Python Client** | DB-API 2.0 (PEP 249), TCP + HTTP, `pip install -e clients/python` |
-| **Node.js Client** | HTTP REST, 0 externe Deps, `require('milansql')` |
-
-### Introspection & Persistenz
-| Feature | Details |
-|---------|---------|
-| **Introspection** | `DESCRIBE`, `SHOW TABLES`, `SHOW CREATE TABLE`, `SHOW INDEXES`, `STATUS` |
-| **Persistenz** | Eigenes Binärformat (`database.milan`, Format v7) mit XOR-Checksumme |
-
----
-
-## Server-Modi
-
-### TCP Server + Client
+### TCP Server
 
 ```bash
-# Server starten
-./build/milansql --server --port 4406
-
-# In zweitem Terminal: Client verbinden
-./build/milansql --client --port 4406
+./build/milansql --server --port 4406 --pool-size 20
+./build/milansql --client --port 4406   # connect from another terminal
 ```
 
-### REST API (HTTP)
+### REST API
 
 ```bash
-# Server starten
 ./build/milansql --http --port 8080
 ```
 
-```powershell
-# SQL ausführen (POST)
-Invoke-WebRequest -Uri "http://localhost:8080/query" `
-  -Method POST -ContentType "application/json" `
-  -Body '{"sql":"SELECT * FROM users"}'
+```bash
+# Single statement
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT * FROM users"}'
 
-# SQL ausführen (GET)
-Invoke-WebRequest -Uri "http://localhost:8080/query?sql=SELECT+*+FROM+users"
-
-# Metadaten
-Invoke-WebRequest -Uri "http://localhost:8080/tables"
-Invoke-WebRequest -Uri "http://localhost:8080/status"
+# Multi-statement (Phase 67)
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"INSERT INTO users VALUES (NULL, Alice, 95); INSERT INTO users VALUES (NULL, Bob, 82); SELECT * FROM users;"}'
 ```
 
-JSON-Antwort bei SELECT:
+**Single-statement response:**
 ```json
 {
   "success": true,
   "columns": ["id", "name", "score"],
   "rows": [[1, "Alice", 95], [2, "Bob", 82]],
-  "rowCount": 2,
-  "executionTime": "0.1ms"
+  "rowCount": 2
 }
+```
+
+**Multi-statement response:**
+```json
+{
+  "success": true,
+  "count": 3,
+  "results": [
+    {"statement": "INSERT ...", "result": {"success": true, "rowsAffected": 1}},
+    {"statement": "INSERT ...", "result": {"success": true, "rowsAffected": 1}},
+    {"statement": "SELECT ...", "result": {"success": true, "columns": [...], "rows": [...]}}
+  ]
+}
+```
+
+### Master/Slave Replication
+
+```bash
+./build/milansql --server --master --repl-port 4407
+./build/milansql --server --slave --master-host localhost --master-port 4407
 ```
 
 ---
@@ -309,269 +145,212 @@ pip install -e clients/python
 ```python
 import milansql
 
-# TCP Client (DB-API 2.0)
 with milansql.connect(host='localhost', port=4406) as conn:
     cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS produkte (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, preis INT)")
-    cur.execute("INSERT INTO produkte VALUES (NULL, %s, %s)", ("Laptop", 1200))
-    cur.execute("INSERT INTO produkte VALUES (NULL, %s, %s)", ("Maus", 25))
-    cur.execute("SELECT * FROM produkte WHERE preis > %s", (100,))
+    cur.execute("INSERT INTO users VALUES (NULL, %s, %s)", ("Alice", 95))
+    cur.execute("SELECT * FROM users WHERE score > %s", (80,))
     for row in cur.fetchall():
-        print(row)   # (1, 'Laptop', 1200)
-
-# HTTP Client
-with milansql.connect_http(host='localhost', port=8080) as conn:
-    result = conn.query("SELECT * FROM produkte")
-    print(result.columns)   # ['id', 'name', 'preis']
-    print(result.rows)      # [[1, 'Laptop', 1200], ...]
+        print(row)  # (1, 'Alice', 95)
 ```
 
 ### Node.js
 
-```bash
-# Kein npm install nötig — 0 Dependencies
-node clients/nodejs/examples/basic.js
-```
-
 ```js
 const milansql = require('./clients/nodejs');
-
 const conn = milansql.connect({ host: 'localhost', port: 8080 });
 
 const result = await conn.query('SELECT * FROM users ORDER BY score DESC');
 console.log(result.columns);  // ['id', 'name', 'score']
 console.log(result.rows);     // [[1, 'Alice', 95], ...]
-
-const tables  = await conn.tables();
-const status  = await conn.status();
 ```
 
 ---
 
-## Projektstruktur
+## SQL Reference
+
+```sql
+-- Multi-Statement (Phase 67)
+CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT);
+INSERT INTO t VALUES (NULL, Alice); INSERT INTO t VALUES (NULL, Bob); SELECT * FROM t;
+
+-- Transactions & Locking
+BEGIN;
+  SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+  UPDATE orders SET status = 'processed' WHERE id = 1;
+COMMIT;
+
+LOCK TABLE inventory WRITE;
+UPDATE inventory SET qty = qty - 1 WHERE sku = 'X100';
+UNLOCK TABLES;
+
+SAVEPOINT sp1;
+INSERT INTO log VALUES (NULL, 'step1');
+ROLLBACK TO SAVEPOINT sp1;
+
+-- Stored Procedure with Cursor (Phase 66)
+CREATE PROCEDURE process_kids(p_age INT)
+BEGIN
+  DECLARE done INT DEFAULT 0;
+  DECLARE kid INT;
+  DECLARE cur CURSOR FOR SELECT id FROM kinder WHERE age > p_age;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+  OPEN cur;
+  myloop: LOOP
+    FETCH cur INTO kid;
+    IF done = 1 THEN LEAVE myloop END IF;
+    INSERT INTO result_log VALUES (NULL, kid);
+  END LOOP;
+  CLOSE cur;
+END
+CALL process_kids(10)
+
+-- Window Functions
+SELECT name, score,
+  ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rank
+FROM employees;
+
+-- CTE
+WITH top_sales AS (
+  SELECT seller_id, SUM(amount) AS total FROM sales GROUP BY seller_id
+)
+SELECT s.name, t.total FROM sellers s INNER JOIN top_sales t ON s.id = t.seller_id
+ORDER BY t.total DESC LIMIT 10;
+
+-- JSON
+SELECT JSON_EXTRACT(meta, '$.city') AS city FROM users WHERE JSON_EXTRACT(meta, '$.age') > 25;
+
+-- Regex
+SELECT * FROM products WHERE name REGEXP '^[A-Z][a-z]+';
+SELECT REGEXP_REPLACE(description, '\s+', ' ') AS clean FROM articles;
+
+-- Partitioning
+CREATE TABLE sales (id INT, amount INT, region TEXT)
+  PARTITION BY LIST (region) (
+    PARTITION p_eu VALUES IN ('DE', 'FR', 'AT'),
+    PARTITION p_us VALUES IN ('NY', 'CA', 'TX')
+  );
+SHOW PARTITIONS FROM sales;
+
+-- INFORMATION_SCHEMA
+SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.tables;
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.columns WHERE TABLE_NAME = 'users';
+
+-- Backup / Restore
+BACKUP DATABASE TO 'backup_2026.sql';
+RESTORE DATABASE FROM 'backup_2026.sql';
+
+-- CSV
+LOAD DATA INFILE 'data.csv' INTO TABLE users SEPARATOR ',' SKIP HEADER;
+SELECT * FROM users INTO OUTFILE 'export.csv' SEPARATOR ',';
+
+-- Event Scheduler
+CREATE EVENT cleanup ON SCHEDULE EVERY 1 DAY DO DELETE FROM log WHERE created < DATE_SUB(NOW(), INTERVAL 30 DAY);
+SET EVENT_SCHEDULER = ON;
+```
+
+---
+
+## Project Structure
 
 ```
 milansql/
 ├── CMakeLists.txt
-├── .github/workflows/ci.yml    # GitHub Actions (Ubuntu + Windows)
+├── .github/workflows/ci.yml       # GitHub Actions (Ubuntu + Windows)
 ├── src/
-│   ├── main.cpp                # REPL + Argument-Parsing (--server/--client/--http)
-│   ├── dispatch.hpp            # SQL Command Dispatcher
+│   ├── main.cpp                   # REPL + CLI argument parsing
+│   ├── dispatch.hpp               # SQL command dispatcher + splitStatements()
 │   ├── engine/
-│   │   ├── engine.hpp          # Kern-Engine: Tabellen, Constraints, JOINs,
-│   │   │                       # Transaktionen (WAL), Views, Trigger, Procedures,
-│   │   │                       # Window Functions, Full-Text Search, Schemas
-│   │   └── btree.hpp           # B-Tree Index (In-Memory, T=3)
+│   │   ├── engine.hpp             # Core engine: tables, constraints, joins,
+│   │   │                          # transactions (WAL), views, triggers,
+│   │   │                          # procedures, window functions, partitions,
+│   │   │                          # full-text search, schemas, locking
+│   │   └── btree.hpp              # B-Tree index (in-memory, T=3)
 │   ├── parser/
-│   │   └── parser.hpp          # SQL-Tokenizer & Parser → ParsedCommand
+│   │   └── parser.hpp             # SQL tokenizer & parser → ParsedCommand
 │   ├── storage/
-│   │   └── storage.hpp         # Binärformat MilanBinaryStorage (Format v7)
+│   │   └── storage.hpp            # Binary format v7 (XOR checksum)
 │   ├── optimizer/
-│   │   └── optimizer.hpp       # Cost-Based Query Optimizer
+│   │   └── optimizer.hpp          # Cost-based query optimizer
+│   ├── locking/
+│   │   └── lock_manager.hpp       # Row-level + table-level locking
+│   ├── replication/
+│   │   ├── binlog.hpp             # Binary log writer/reader
+│   │   ├── master_repl.hpp        # Master replication server
+│   │   ├── slave_repl.hpp         # Slave polling client
+│   │   └── repl_state.hpp         # Global replication state
+│   ├── scheduler/
+│   │   └── event_scheduler.hpp    # Event scheduler (CREATE EVENT)
+│   ├── backup/
+│   │   └── backup.hpp             # SQL dump backup/restore
+│   ├── utils/
+│   │   └── csv_utils.hpp          # CSV import/export (RFC-4180)
 │   ├── server/
-│   │   ├── server.hpp          # TCP Server (Winsock2/POSIX, Multi-Thread)
-│   │   ├── client.hpp          # TCP Client (REPL über Netzwerk)
-│   │   └── http_server.hpp     # HTTP/JSON REST API Server
+│   │   ├── server.hpp             # TCP server (Winsock2/POSIX, thread pool)
+│   │   ├── client.hpp             # TCP client REPL
+│   │   ├── http_server.hpp        # HTTP/JSON REST API server
+│   │   └── pool_stats.hpp         # Connection pool statistics
 │   └── tests/
-│       ├── milansql_tests.cpp  # 41 automatisierte Tests
-│       └── benchmark.cpp       # Performance-Benchmark
+│       ├── milansql_tests.cpp     # 41 automated tests
+│       └── benchmark.cpp          # Performance benchmark
 └── clients/
-    ├── python/                 # Python Package (DB-API 2.0 / PEP 249)
-    │   ├── milansql/
-    │   │   ├── connection.py   # TCP Client + Cursor
-    │   │   ├── http_client.py  # HTTP Client
-    │   │   └── exceptions.py
-    │   ├── setup.py
-    │   └── examples/
-    └── nodejs/                 # Node.js Client (HTTP)
-        ├── index.js
-        └── examples/
+    ├── python/                    # Python package (DB-API 2.0 / PEP 249)
+    └── nodejs/                    # Node.js client (HTTP, 0 dependencies)
 ```
 
 ---
 
-## Bauen
+## Build & Test
 
-### Voraussetzungen
+### Prerequisites
 
 - **CMake** ≥ 3.16
-- **C++17**-Compiler (GCC ≥ 7, Clang ≥ 5, MSVC 2017+)
-- Windows: [MSYS2](https://www.msys2.org/) UCRT64 empfohlen
-
-### Linux / macOS
+- **C++17** compiler (GCC ≥ 7, Clang ≥ 5, MSVC 2017+)
+- Windows: [MSYS2](https://www.msys2.org/) UCRT64 recommended
 
 ```bash
+# Build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/milansql
-```
 
-### Windows (MSYS2 UCRT64)
-
-```bash
-pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake ninja
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/milansql.exe
-```
-
----
-
-## Testing & CI
-
-```bash
-# Test-Suite (41 Tests)
+# Run tests (41 tests)
 ./build/milansql_tests
 
 # Benchmark
 ./build/milansql_bench
 ```
 
-| Messung | Zeit |
-|---------|------|
-| 10.000 INSERTs | ~120ms |
-| SELECT Full Scan | ~2ms |
-| SELECT mit B-Tree Index | <1ms |
-| 10.000 Index-SELECTs | ~8ms |
+| Benchmark | Time |
+|-----------|------|
+| 10,000 INSERTs | ~120ms |
+| Full scan SELECT | ~2ms |
+| B-Tree index SELECT | <1ms |
+| 10,000 indexed SELECTs | ~8ms |
 
-GitHub Actions führt Build und Tests automatisch auf **Ubuntu** und **Windows** aus bei jedem Push auf `main`.
-
----
-
-## SQL-Kurzreferenz
-
-```sql
--- DDL
-CREATE TABLE name (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL, preis INT DEFAULT 0)
-ALTER TABLE name ADD COLUMN col TYP
-DROP TABLE name
-
--- DML
-INSERT INTO name VALUES (NULL, 'Wert', 100)
-INSERT INTO name VALUES (NULL, 'A', 1), (NULL, 'B', 2)   -- Multi-Row
-INSERT OR REPLACE INTO name VALUES (...)
-UPDATE name SET col=val WHERE id=1
-DELETE FROM name WHERE col=val
-
--- SELECT
-SELECT DISTINCT col1, col2 FROM t WHERE col > 10
-SELECT * FROM t ORDER BY col1 DESC, col2 ASC LIMIT 10 OFFSET 20
-SELECT COUNT(*), AVG(preis), MAX(preis) FROM t GROUP BY kategorie HAVING COUNT(*) > 1
-SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.fk_id
-SELECT * FROM t1 LEFT JOIN t2 ON t1.id = t2.id
-
--- Erweitert
-WITH cte AS (SELECT * FROM t WHERE val > 100)
-SELECT * FROM cte ORDER BY val
-
-SELECT name, ROW_NUMBER() OVER (PARTITION BY kategorie ORDER BY preis DESC) AS rang FROM produkte
-
-SELECT CAST(preis AS TEXT) AS preis_str, UPPER(name), COALESCE(notiz, 'k.A.') FROM t
-
--- Trigger
-CREATE TRIGGER before_insert BEFORE INSERT ON orders FOR EACH ROW
-BEGIN
-  IF NEW.preis < 0 THEN SIGNAL 'Preis darf nicht negativ sein' END IF
-END
-
--- Prozeduren
-CREATE PROCEDURE add_user(p_name TEXT, p_score INT)
-BEGIN
-  INSERT INTO users VALUES (NULL, p_name, p_score)
-END
-CALL add_user(Alice, 100)
-
--- Server
-SHOW TABLES
-SHOW CREATE TABLE name
-SHOW INDEXES FROM name
-SHOW TRIGGERS ON name
-SHOW PROCEDURES
-STATUS
-```
+GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on every push to `main`.
 
 ---
 
-## Binärformat (`database.milan`)
+## Development Phases (v1.0 → v2.0)
 
-| Offset | Größe | Inhalt |
-|--------|-------|--------|
-| 0–7 | 8 B | Magic `MILANDB1` |
-| 8–9 | 2 B | Format-Version (v7) |
-| 10–13 | 4 B | Page Count (reserviert) |
-| 14–15 | 2 B | XOR-Checksumme |
-| 16+ | — | Tabellen + Views |
-
----
-
-## Entwicklungs-Phasen
-
-| Phase | Feature |
-|-------|---------|
-| 1 | Grundstruktur, REPL, CREATE TABLE, INSERT, SELECT |
-| 2 | Binäres Dateiformat (MilanBinaryStorage) |
-| 3 | WHERE-Filter, DELETE |
-| 4 | UPDATE SET |
-| 5 | DESCRIBE, DROP TABLE |
-| 6 | ALTER TABLE (ADD/DROP/RENAME COLUMN) |
-| 7 | SHOW TABLES, SHOW INDEXES |
-| 8 | ORDER BY, LIMIT |
-| 9 | Multi-WHERE (AND/OR), LIKE |
-| 10 | COUNT(*), MIN, MAX, AVG, SUM |
-| 11 | SELECT mit Spaltenauswahl, DISTINCT |
-| 12 | B-Tree Index (CREATE INDEX / DROP INDEX) |
-| 13 | INNER JOIN, LEFT JOIN |
-| 14 | GROUP BY + HAVING |
-| 15 | Subqueries (IN/NOT IN) |
-| 16 | NULL-Unterstützung (IS NULL / IS NOT NULL) |
-| 17 | Transaktionen (BEGIN / COMMIT / ROLLBACK, WAL) |
-| 18 | DEFAULT, UNIQUE, NOT NULL, PRIMARY KEY Constraints |
-| 19 | AUTO_INCREMENT |
-| 20 | Foreign Keys (FOREIGN KEY … REFERENCES) |
-| 21 | ON DELETE CASCADE / SET NULL / RESTRICT |
-| 22 | TRUNCATE TABLE, Multi-Column UPDATE |
-| 23 | CHECK Constraints |
-| 24 | Views (CREATE VIEW / DROP VIEW / SELECT FROM view) |
-| 25 | SHOW TABLES tabellarisch, STATUS, SHOW CREATE TABLE |
-| 26 | README + GitHub |
-| 27 | Multi-row INSERT — `INSERT INTO t VALUES (...),(...),...` |
-| 28 | INSERT INTO ... SELECT — Ergebnis einer Abfrage einfügen |
-| 29 | RIGHT JOIN + FULL OUTER JOIN |
-| 30 | UNION / UNION ALL / INTERSECT / EXCEPT |
-| 31 | CASE WHEN THEN ELSE END in SELECT |
-| 32 | String-Funktionen: UPPER, LOWER, LENGTH, CONCAT, SUBSTR, TRIM, REPLACE |
-| 33 | Math-Funktionen: ABS, ROUND, MOD, POWER, SQRT, CEIL, FLOOR |
-| 34 | NULL-Funktionen: COALESCE, IFNULL |
-| 35 | Composite Indexes: mehrspaltige Indizes |
-| 36 | EXPLAIN: Query-Plan (SCAN/INDEX/FILTER/JOIN/GROUP/SORT/LIMIT/PROJECT) |
-| 37 | Correlated Subqueries, Scalar Subquery in SELECT, EXISTS |
-| 38 | Multi-Column ORDER BY, LIMIT mit OFFSET |
-| 39 | UPSERT: INSERT OR REPLACE / INSERT OR IGNORE / ON CONFLICT DO NOTHING |
-| 39.5 | Stabilisierung: Compiler-Warnings, 41 Tests, GitHub Actions CI, Benchmark |
-| 40 | CAST: `CAST(expr AS INT\|REAL\|TEXT)` in SELECT und WHERE |
-| 41 | WITH / CTE: Common Table Expressions, mehrere CTEs |
-| 42 | Window Functions: ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX OVER |
-| 43 | Trigger: BEFORE/AFTER INSERT/UPDATE/DELETE, SIGNAL, NEW/OLD |
-| 44 | Stored Procedures: CREATE PROCEDURE / CALL / DROP PROCEDURE |
-| 45 | Prepared Statements: PREPARE / EXECUTE / DEALLOCATE PREPARE |
-| 46 | Benutzerverwaltung: CREATE USER / GRANT / REVOKE / CONNECT / DISCONNECT |
-| 47 | TCP/IP Server: `--server/--client --port N`, Multi-Thread, Winsock2/POSIX |
-| 48 | Cost-Based Query Optimizer: Join-Reihenfolge, Index-Auswahl, EXPLAIN |
-| 49/50 | Full-Text Search: FULLTEXT INDEX, MATCH AGAINST, TF-Ranking |
-| 51 | SCHEMA / Namespaces: CREATE/DROP/SHOW/USE SCHEMA, Cross-Schema JOINs |
-| 52 | REST API: `--http --port 8080`, GET/POST /query, /tables, /schemas, /status |
-| 53 | Client Libraries: Python (DB-API 2.0/PEP 249, TCP+HTTP), Node.js (HTTP) |
-| 54 | Query Cache (LRU/TTL), EXPLAIN ANALYZE, Web Dashboard, SHOW PROCESSLIST |
-| 55 | DATE/TIME Datentypen: DATE, TIME, DATETIME, TIMESTAMP, NOW(), CURDATE(), DATEDIFF(), DATE_ADD(), DATE_FORMAT() |
-| 56 | JSON Datentyp: JSON_EXTRACT, JSON_SET, JSON_KEYS, JSON_LENGTH, JSON_CONTAINS, JSON_TYPE |
-| 57 | Backup/Restore: BACKUP DATABASE/TABLE TO, RESTORE FROM, SHOW BACKUPS, SQL-Dump Format |
-| 58 | Connection Pooling (Thread Pool, --pool-size), BENCHMARK Command, SHOW STATUS erweitert |
-| 59 | Master/Slave Replikation: Binlog, Auto-Sync, Read-Only Slave, SHOW MASTER/SLAVE STATUS |
-| 60 | CSV Import/Export: LOAD DATA INFILE, SELECT INTO OUTFILE, SHOW DATAFILES, RFC-4180 |
-| 61 | Event Scheduler: CREATE EVENT, ON SCHEDULE EVERY/AT, DO, SHOW/DROP/ALTER EVENT, SET EVENT_SCHEDULER |
+| Phases | Milestone |
+|--------|-----------|
+| 1–12 | SQL core: DDL/DML/SELECT, WHERE, ORDER BY, LIMIT, B-Tree index, binary storage |
+| 13–16 | JOINs (INNER/LEFT/RIGHT/FULL), GROUP BY, Subqueries, NULL support |
+| 17–23 | Transactions (WAL), Constraints (PK/FK/UNIQUE/DEFAULT/CHECK/AUTO_INCREMENT) |
+| 24–36 | Views, SHOW TABLES, Multi-row INSERT, UNION/INTERSECT/EXCEPT, CASE WHEN, String/Math functions |
+| 37–42 | Correlated subqueries, UPSERT, CAST, CTE, Window Functions |
+| 43–46 | Triggers, Stored Procedures, Prepared Statements, User Management (GRANT/REVOKE) |
+| 47–53 | TCP Server, Cost-Based Optimizer, Full-Text Search, Schemas, REST API, Client Libraries |
+| 54–58 | Query Cache, EXPLAIN ANALYZE, Web Dashboard, DATE/TIME/JSON types, Backup/Restore, Connection Pool |
+| 59–61 | Master/Slave Replication (Binlog), CSV Import/Export, Event Scheduler |
+| 62–63 | Partitioning (RANGE/LIST/HASH), INFORMATION_SCHEMA |
+| 64–65 | REGEXP/RLIKE, SAVEPOINT, SELECT FOR UPDATE, LOCK TABLE |
+| **66–67** | **Cursors in Stored Procedures (DECLARE/OPEN/FETCH/CLOSE/LOOP/IF), Multi-Statement Queries** |
 
 ---
 
-## Lizenz
+## License
 
-MIT License — frei verwendbar für Lern- und Demozwecke.
+MIT License — free for learning, research, and demo purposes.
+
+*MilanSQL — A relational database engine in C++17, built from scratch by Mirwais Haidari.*

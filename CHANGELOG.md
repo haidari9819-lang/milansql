@@ -4,6 +4,30 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v2.0.0] — 2026-05-29
+
+### Major Release — 67 Phases, production-grade SQL engine in C++17
+
+Version 2.0.0 marks the completion of the initial development roadmap. All features from Phase 1 through Phase 67 are fully implemented, tested, and documented.
+
+**Summary of capabilities:**
+- Full SQL: SELECT/INSERT/UPDATE/DELETE, all JOIN types, CTEs, Window Functions, Subqueries
+- Complete DDL: Tables, Views, Triggers, Stored Procedures (with Cursors), Indexes, Partitioning
+- Transactions: WAL-based ACID, SAVEPOINT, SELECT FOR UPDATE, LOCK TABLE
+- Data types: INT/TEXT/REAL/DATE/TIME/DATETIME/TIMESTAMP/JSON
+- Server: TCP multi-threaded server, REST API, Connection Pool, Multi-Statement Queries
+- Replication: Master/Slave Binlog, Auto-Sync, Read-Only Slave
+- Admin: Backup/Restore, CSV Import/Export, Event Scheduler, INFORMATION_SCHEMA, User Management
+- Performance: Cost-Based Optimizer, B-Tree Indexes, Query Cache, EXPLAIN ANALYZE
+- Zero external dependencies — pure C++17
+
+### Version bumps
+- CMakeLists.txt, main.cpp, dispatch.hpp, http_server.hpp → v2.0.0
+- clients/python/setup.py, clients/nodejs/package.json → 2.0.0
+- README fully rewritten for v2.0.0 release
+
+---
+
 ## [v1.10.0] — 2026-05-29
 
 ### Added

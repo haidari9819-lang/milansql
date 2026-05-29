@@ -4,6 +4,73 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v2.5.0] — 2026-05-29
+
+### Phase 73 — Buffer Pool Manager (LRU + Write-Behind + Hit Rate)
+
+**Features:**
+- `src/buffer/buffer_pool.hpp`: `BufferPool` class with LRU eviction, dirty page tracking, hit/miss counters, pin/unpin support
+- Each "page" = one table; pool size in MB determines max page capacity
+- `selectAll()` / `selectWhere()` → `bufferPool_.access()` for hit tracking
+- `insertRow()` / `updateWhere()` / `deleteWhere()` → `bufferPool_.markDirty()`
+- Background Write-Behind thread (REPL mode): flushes dirty pages to disk every 5 seconds
+- `SHOW BUFFER POOL STATUS` — ASCII table with Pool Size, Used/Dirty Pages, Hit Rate, Requests, Hits, Misses, Evictions
+- `SET BUFFER_POOL_SIZE = N` — resize pool at runtime (in MB)
+- `FLUSH BUFFER POOL` — force flush all dirty pages to disk immediately
+
+**Example:**
+```sql
+SHOW BUFFER POOL STATUS;
+SET BUFFER_POOL_SIZE = 256;
+FLUSH BUFFER POOL;
+```
+
+**Technical changes:**
+- `src/buffer/buffer_pool.hpp`: `PageMeta` struct, `BufferPool` class, `Status` struct, LRU eviction, atomic hit/miss counters
+- `engine.hpp`: `mutable BufferPool bufferPool_` member; public API `setBufferPoolSize()`, `showBufferPoolStatus()`, `flushBufferPool()`, `getDirtyBufferPages()`, `markBufferPageClean()`
+- `parser.hpp`: `SHOW_BUFFER_POOL_STATUS`, `SET_BUFFER_POOL_SIZE`, `FLUSH_BUFFER_POOL` command types
+- `dispatch.hpp`: Phase 73 command handlers
+- `main.cpp`: background write-behind thread (every 5s)
+
+---
+
+### Phase 74 — MySQL Wire Protocol (COM_QUERY + Resultset + Handshake)
+
+**Features:**
+- `src/server/mysql_server.hpp`: full MySQL Protocol v10 implementation
+- Standard MySQL clients connect without any driver changes: `mysql -h 127.0.0.1 -P 4407 -u root --skip-ssl`
+- Handshake: sends MySQL v10 greeting with capabilities, charset, auth-plugin-data
+- Auth: accepts any password (simulated `mysql_native_password`)
+- COM_QUERY (0x03): executes SQL, returns resultset (column defs + rows + EOF) or OK/ERR
+- COM_QUIT (0x01): clean disconnect
+- COM_PING (0x0e): returns OK
+- COM_INIT_DB (0x02): USE database (always OK)
+- Special handling for MySQL management queries: `SET NAMES`, `@@version`, `SHOW DATABASES`, `SELECT DATABASE()`, `SELECT USER()`, `SELECT 1`
+- Thread-per-connection with engine mutex for concurrent access
+
+**Example:**
+```bash
+# Start MySQL-compatible server
+.\build\milansql.exe --mysql --mysql-port 4407
+
+# Connect with MySQL CLI
+mysql -h 127.0.0.1 -P 4407 -u root --skip-ssl
+
+# Or Python socket test
+python3 -c "
+import socket
+s = socket.socket(); s.connect(('localhost', 4407))
+greeting = s.recv(4096)
+print('Handshake:', len(greeting), 'bytes')
+"
+```
+
+**Technical changes:**
+- `src/server/mysql_server.hpp`: `MysqlServer` class with `run()`, `handleClient()`, `sendHandshake()`, `sendResultSet()`, `sendOK()`, `sendERR()`, `sendEOF()`, packet I/O helpers
+- `main.cpp`: `--mysql` and `--mysql-port N` CLI flags; starts `MysqlServer` in dedicated mode
+
+---
+
 ## [v2.4.0] — 2026-05-29
 
 ### Phase 72 — WAL Crash Recovery + Materialized Views

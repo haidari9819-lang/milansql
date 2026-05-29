@@ -3,6 +3,7 @@
 #include "server/server.hpp"
 #include "server/client.hpp"
 #include "server/http_server.hpp"
+#include "server/mysql_server.hpp"  // Phase 74: MySQL Wire Protocol
 
 #include <iostream>
 #include <fstream>
@@ -39,7 +40,7 @@
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v2.4.0 ===           \u2551\n"
+              << "  \u2551        === MilanSQL v2.5.0 ===           \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -51,31 +52,44 @@ int main(int argc, char* argv[]) {
     bool serverMode = false;
     bool clientMode = false;
     bool httpMode   = false;
+    bool mysqlMode  = false;   // Phase 74: MySQL Wire Protocol
     int  port       = 4406;
     int  httpPort   = 8080;
+    int  mysqlPort  = 4407;    // Phase 74: MySQL protocol port
     int  poolSize   = 10;   // Phase 58: Connection Pool Größe
     int  maxQueue   = 100;  // Phase 58: max. Queue-Länge
     // Phase 59: Replication
     bool masterMode  = false;
     bool slaveMode   = false;
     std::string masterHost = "localhost";
-    int  masterPort  = 4407;
-    int  replPort    = 4407;
+    int  masterPort  = 4408;   // Replication port (shifted to avoid conflict with mysql)
+    int  replPort    = 4408;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--server")     serverMode = true;
-        else if (arg == "--client")     clientMode = true;
-        else if (arg == "--http")       httpMode   = true;
-        else if (arg == "--master")     masterMode = true;
-        else if (arg == "--slave")      slaveMode  = true;
-        else if (arg == "--port"         && i + 1 < argc) port       = std::stoi(argv[++i]);
-        else if (arg == "--http-port"    && i + 1 < argc) httpPort   = std::stoi(argv[++i]);
-        else if (arg == "--pool-size"    && i + 1 < argc) poolSize   = std::stoi(argv[++i]);
-        else if (arg == "--max-queue"    && i + 1 < argc) maxQueue   = std::stoi(argv[++i]);
-        else if (arg == "--master-host"  && i + 1 < argc) masterHost = argv[++i];
-        else if (arg == "--master-port"  && i + 1 < argc) masterPort = std::stoi(argv[++i]);
-        else if (arg == "--repl-port"    && i + 1 < argc) replPort   = std::stoi(argv[++i]);
+        if      (arg == "--server")      serverMode = true;
+        else if (arg == "--client")      clientMode = true;
+        else if (arg == "--http")        httpMode   = true;
+        else if (arg == "--mysql")       mysqlMode  = true;
+        else if (arg == "--master")      masterMode = true;
+        else if (arg == "--slave")       slaveMode  = true;
+        else if (arg == "--port"          && i + 1 < argc) port        = std::stoi(argv[++i]);
+        else if (arg == "--http-port"     && i + 1 < argc) httpPort    = std::stoi(argv[++i]);
+        else if (arg == "--mysql-port"    && i + 1 < argc) mysqlPort   = std::stoi(argv[++i]);
+        else if (arg == "--pool-size"     && i + 1 < argc) poolSize    = std::stoi(argv[++i]);
+        else if (arg == "--max-queue"     && i + 1 < argc) maxQueue    = std::stoi(argv[++i]);
+        else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
+        else if (arg == "--master-port"   && i + 1 < argc) masterPort  = std::stoi(argv[++i]);
+        else if (arg == "--repl-port"     && i + 1 < argc) replPort    = std::stoi(argv[++i]);
+    }
+
+    // ── MySQL Wire Protocol mode (Phase 74) ───────────────────
+    if (mysqlMode) {
+        std::cout << "MilanSQL MySQL-Protocol Server startet auf Port "
+                  << mysqlPort << "...\n";
+        milansql::MysqlServer mysqlServer(mysqlPort, "database.milan");
+        mysqlServer.run();
+        return 0;
     }
 
     // ── HTTP mode (Phase 52) ──────────────────────────────────

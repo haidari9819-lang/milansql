@@ -1,10 +1,10 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v2.4.0-gold)
+![Version](https://img.shields.io/badge/version-v2.5.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![Phases](https://img.shields.io/badge/phases-72-brightgreen)
+![Phases](https://img.shields.io/badge/phases-74-brightgreen)
 
 > **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
@@ -21,9 +21,11 @@ Developed by **Mirwais Haidari**, built phase by phase from a blank file to a fu
 | **Constraints** | `PRIMARY KEY`, `FOREIGN KEY` (CASCADE/SET NULL/RESTRICT), `NOT NULL`, `UNIQUE`, `DEFAULT`, `CHECK`, `AUTO_INCREMENT` |
 | **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT`, WAL-based crash recovery, `SELECT FOR UPDATE`, `LOCK TABLE READ\|WRITE`, MVCC (xmin/xmax), `VACUUM`, `SET TRANSACTION ISOLATION LEVEL`, `SHOW TRANSACTIONS`, `SHOW RECOVERY STATUS` |
 | **Materialized Views** | `CREATE MATERIALIZED VIEW AS SELECT ...`, `SELECT` (cached), `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `SHOW MATERIALIZED VIEWS`, persisted in `database.matviews` |
+| **Buffer Pool** | LRU page manager, `SHOW BUFFER POOL STATUS` (hit rate, dirty pages, evictions), `SET BUFFER_POOL_SIZE = N`, `FLUSH BUFFER POOL`, Write-Behind background thread |
+| **MySQL Protocol** | MySQL Wire Protocol v10 (`--mysql --mysql-port 4407`), COM_QUERY/QUIT/PING/INIT_DB, resultset format, `mysql` CLI compatible |
 | **Data Types** | `INT`, `TEXT`, `REAL`, `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`, `JSON` |
 | **Functions** | String (`UPPER`/`LOWER`/`CONCAT`/`SUBSTR`/`REPLACE`/`TRIM`), Math (`ABS`/`ROUND`/`SQRT`/`POWER`), Date (`NOW`/`DATEDIFF`/`DATE_ADD`/`DATE_FORMAT`), JSON (`JSON_EXTRACT`/`JSON_SET`/`JSON_KEYS`), Regex (`REGEXP_REPLACE`/`REGEXP_EXTRACT`), Null (`COALESCE`/`IFNULL`), Window (`ROW_NUMBER`/`RANK`/`DENSE_RANK`) |
-| **Server** | TCP/IP multi-threaded server (port 4406), REST API (port 8080), connection pool, multi-statement queries |
+| **Server** | TCP/IP multi-threaded server (port 4406), REST API (port 8080), MySQL Wire Protocol (port 4407), connection pool, multi-statement queries |
 | **Replication** | Master/Slave, Binlog, auto-sync every 500ms, auto-reconnect, read-only slave |
 | **Admin** | `BACKUP`/`RESTORE`, CSV import/export, Event Scheduler, Partitioning (RANGE/LIST/HASH), `INFORMATION_SCHEMA`, User Management (`GRANT`/`REVOKE`) |
 | **Performance** | Cost-based query optimizer, B-Tree index lookup, `EXPLAIN`/`EXPLAIN ANALYZE`, Query Cache (LRU/TTL), `BENCHMARK` command, Query Profiler (`PROFILE ON/OFF`, `SHOW PROFILES`) |
@@ -55,7 +57,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v2.4.0 ===           ║
+  ║        === MilanSQL v2.5.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -127,11 +129,25 @@ curl -s -X POST http://localhost:8080/query \
 }
 ```
 
+### MySQL Wire Protocol (Phase 74)
+
+```bash
+./build/milansql --mysql --mysql-port 4407
+
+# Connect with standard MySQL CLI:
+mysql -h 127.0.0.1 -P 4407 -u root --skip-ssl
+
+# Or Python mysql-connector:
+# pip install mysql-connector-python
+# import mysql.connector
+# conn = mysql.connector.connect(host='localhost', port=4407, user='root')
+```
+
 ### Master/Slave Replication
 
 ```bash
-./build/milansql --server --master --repl-port 4407
-./build/milansql --server --slave --master-host localhost --master-port 4407
+./build/milansql --server --master --repl-port 4408
+./build/milansql --server --slave --master-host localhost --master-port 4408
 ```
 
 ---
@@ -330,6 +346,8 @@ milansql/
 │   │   ├── master_repl.hpp        # Master replication server
 │   │   ├── slave_repl.hpp         # Slave polling client
 │   │   └── repl_state.hpp         # Global replication state
+│   ├── buffer/
+│   │   └── buffer_pool.hpp        # Buffer Pool Manager (LRU + write-behind)
 │   ├── wal/
 │   │   └── wal_recovery.hpp       # WAL crash recovery (scan + replay)
 │   ├── scheduler/
@@ -342,6 +360,7 @@ milansql/
 │   │   ├── server.hpp             # TCP server (Winsock2/POSIX, thread pool)
 │   │   ├── client.hpp             # TCP client REPL
 │   │   ├── http_server.hpp        # HTTP/JSON REST API server
+│   │   ├── mysql_server.hpp       # MySQL Wire Protocol v10 server (Phase 74)
 │   │   └── pool_stats.hpp         # Connection pool statistics
 │   └── tests/
 │       ├── milansql_tests.cpp     # 41 automated tests
@@ -405,6 +424,8 @@ GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on
 | **70** | **Spatial Index (POINT type, ST_DISTANCE/Haversine, ST_X/ST_Y/ST_WITHIN/ST_ASTEXT, CREATE SPATIAL INDEX)** |
 | **71** | **MVCC (xmin/xmax versioned rows, TransactionManager, VACUUM, SET TRANSACTION ISOLATION LEVEL, SHOW TRANSACTIONS)** |
 | **72** | **WAL Crash Recovery (TX_BEGIN/TX_COMMIT/TX_ROLLBACK markers, replay on startup, SHOW RECOVERY STATUS) + Materialized Views (CREATE/REFRESH/DROP/SHOW, persistence in database.matviews)** |
+| **73** | **Buffer Pool Manager (LRU eviction, dirty page tracking, hit/miss counters, SHOW BUFFER POOL STATUS, SET BUFFER_POOL_SIZE, FLUSH BUFFER POOL, Write-Behind thread)** |
+| **74** | **MySQL Wire Protocol v10 (COM_QUERY/QUIT/PING/INIT_DB, handshake, resultset, `--mysql --mysql-port 4407`, compatible with `mysql` CLI and Python mysql-connector)** |
 
 ---
 

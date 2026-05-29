@@ -26,6 +26,7 @@
 #include "../locking/lock_manager.hpp"
 #include "../spatial/spatial.hpp"      // Phase 70: Spatial Index
 #include "../mvcc/transaction_manager.hpp"  // Phase 71: MVCC
+#include "../buffer/buffer_pool.hpp"   // Phase 73: Buffer Pool Manager
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1007,6 +1008,7 @@ public:
             return;
         }
         t.insert(Row(vals));
+        bufferPool_.markDirty(tbl);  // Phase 73: mark page dirty
 
         // Phase 49: Update fulltext indexes for this table
         for (auto& [n, fi] : fulltextIndices_) {
@@ -1068,7 +1070,9 @@ public:
     };
 
     const Table& selectAll(const std::string& tbl) const {
-        return getTable(resolveTableName(tbl));
+        auto key = resolveTableName(tbl);
+        bufferPool_.access(key);  // Phase 73: Buffer Pool tracking
+        return getTable(key);
     }
 
     // SELECT mit WHERE (AND / OR, alle Operatoren inkl. LIKE)
@@ -1076,6 +1080,7 @@ public:
                             const std::vector<WhereCondition>& conds,
                             const std::string& logic = "AND") const {
         auto tblName = resolveTableName(tblNameRaw);
+        bufferPool_.access(tblName);  // Phase 73: Buffer Pool tracking
         const Table& src = getTable(tblName);
         Table result(tblName, src.columns());
         bool usedIndex = false;
@@ -1571,7 +1576,9 @@ public:
             return 0;
         }
         Table& t = getTable(tbl);
-        return t.updateWhere(colIdx(t, setCol), setVal, colIdx(t, wCol), wVal);
+        auto n = t.updateWhere(colIdx(t, setCol), setVal, colIdx(t, wCol), wVal);
+        bufferPool_.markDirty(tbl);  // Phase 73
+        return n;
     }
 
     std::size_t updateAll(const std::string& tblRaw,
@@ -1591,7 +1598,9 @@ public:
             return 0;
         }
         Table& t = getTable(tbl);
-        return t.updateAll(colIdx(t, setCol), setVal);
+        auto n = t.updateAll(colIdx(t, setCol), setVal);
+        bufferPool_.markDirty(tbl);  // Phase 73
+        return n;
     }
 
     std::size_t deleteWhere(const std::string& tblRaw,
@@ -1641,6 +1650,7 @@ public:
         }
         Table& t = getTable(tbl);
         std::size_t deleted = t.deleteWhere(colIdx(t, wCol), wVal);
+        bufferPool_.markDirty(tbl);  // Phase 73
 
         // Phase 49: Update fulltext indexes for this table
         for (auto& [n, fi] : fulltextIndices_) {
@@ -5627,6 +5637,35 @@ public:
 
     const std::string& getIsolationLevel() const { return isolationLevel_; }
 
+    // ── Phase 73: Buffer Pool Manager API ────────────────────────
+
+    void setBufferPoolSize(int mb) {
+        bufferPool_.setSizeMB(mb);
+    }
+
+    int getBufferPoolSizeMB() const {
+        return bufferPool_.getSizeMB();
+    }
+
+    void showBufferPoolStatus() const {
+        bufferPool_.showStatus();
+    }
+
+    // Flush all dirty pages via persist callback
+    void flushBufferPool(const std::function<void(const std::string&)>& flushFn) {
+        bufferPool_.flushAll(flushFn);
+    }
+
+    // Get dirty page list (for background thread)
+    std::vector<std::string> getDirtyBufferPages() const {
+        return bufferPool_.getDirtyPages();
+    }
+
+    // Mark a page clean (called after successful save)
+    void markBufferPageClean(const std::string& tableName) {
+        bufferPool_.markClean(tableName);
+    }
+
 private:
     // Phase 54A: Query Cache instance
     QueryCache queryCache_;
@@ -5636,6 +5675,9 @@ private:
 
     // Phase 72: Materialized Views
     std::map<std::string, MaterializedViewDef> materializedViews_;
+
+    // Phase 73: Buffer Pool (mutable so const methods like selectWhere can track hits)
+    mutable BufferPool bufferPool_;
 
     // Phase 72: Recovery status (set by main.cpp after startup recovery)
     RecoveryStatus recoveryStatus_;

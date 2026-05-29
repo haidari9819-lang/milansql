@@ -129,6 +129,10 @@ enum class CommandType {
     REFRESH_MATERIALIZED_VIEW,
     DROP_MATERIALIZED_VIEW,
     SHOW_MATERIALIZED_VIEWS,
+    // Phase 73: Buffer Pool Manager
+    SHOW_BUFFER_POOL_STATUS,
+    SET_BUFFER_POOL_SIZE,
+    FLUSH_BUFFER_POOL,
     UNKNOWN
 };
 
@@ -1543,6 +1547,10 @@ public:
             // Phase 72: SHOW MATERIALIZED VIEWS
             } else if (kw1 == "MATERIALIZED" && tokens.size() >= 3 && toUpper(tokens[2]) == "VIEWS") {
                 cmd.type = CommandType::SHOW_MATERIALIZED_VIEWS;
+            // Phase 73: SHOW BUFFER POOL STATUS
+            } else if (kw1 == "BUFFER" && tokens.size() >= 4 &&
+                       toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {
+                cmd.type = CommandType::SHOW_BUFFER_POOL_STATUS;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1597,6 +1605,24 @@ public:
                    toUpper(tokens[2]) == "VIEW") {
             cmd.matViewName = tokens[3];
             cmd.type = CommandType::DROP_MATERIALIZED_VIEW;
+
+        // ── Phase 73: SHOW BUFFER POOL STATUS ────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "BUFFER" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {
+            cmd.type = CommandType::SHOW_BUFFER_POOL_STATUS;
+
+        // ── Phase 73: FLUSH BUFFER POOL ──────────────────────────
+        } else if (kw0 == "FLUSH" && kw1 == "BUFFER" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "POOL") {
+            cmd.type = CommandType::FLUSH_BUFFER_POOL;
+
+        // ── Phase 73: SET BUFFER_POOL_SIZE = N ───────────────────
+        } else if (kw0 == "SET" && kw1 == "BUFFER_POOL_SIZE" && tokens.size() >= 3) {
+            // tokens: SET BUFFER_POOL_SIZE = 256  OR  SET BUFFER_POOL_SIZE 256
+            std::string valTok = tokens[2];
+            if (valTok == "=" && tokens.size() >= 4) valTok = tokens[3];
+            cmd.type = CommandType::SET_BUFFER_POOL_SIZE;
+            cmd.values.push_back(valTok);
 
         // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
         // SET TRANSACTION ISOLATION LEVEL READ COMMITTED

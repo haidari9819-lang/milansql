@@ -439,6 +439,23 @@ int main(int argc, char* argv[]) {
     eventScheduler.loadEvents();
     eventScheduler.start();
 
+    // ── Phase 73: Buffer Pool Write-Behind Thread ─────────────
+    // Flushes dirty pages to disk every 5 seconds (background)
+    std::atomic<bool> bufferPoolStop{false};
+    std::thread bufferPoolThread([&]() {
+        while (!bufferPoolStop.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (bufferPoolStop.load()) break;
+            auto dirty = engine.getDirtyBufferPages();
+            if (!dirty.empty()) {
+                try { storage.save(engine); }
+                catch (...) {}
+                for (const auto& pg : dirty)
+                    engine.markBufferPageClean(pg);
+            }
+        }
+    });
+
     while (true) {
         std::cout << "milansql> " << std::flush;
         if (!std::getline(std::cin, eingabe)) {
@@ -676,11 +693,17 @@ int main(int argc, char* argv[]) {
             bool doExit = milansql::dispatchCommand(
                 cmd, engine, parser, eingabe,
                 persist, saveProcedures, saveTriggers);
-            if (doExit) return 0;
+            if (doExit) {
+                bufferPoolStop.store(true);
+                bufferPoolThread.detach();
+                return 0;
+            }
         } catch (const std::exception& ex) {
             std::cout << "  FEHLER: " << ex.what() << "\n\n";
         }
     }
 
+    bufferPoolStop.store(true);
+    bufferPoolThread.detach();
     return 0;
 }

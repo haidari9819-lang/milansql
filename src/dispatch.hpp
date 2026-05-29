@@ -3545,6 +3545,38 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 73: Buffer Pool Manager ────────────────────────────
+
+    case milansql::CommandType::SHOW_BUFFER_POOL_STATUS:
+        engine.showBufferPoolStatus();
+        break;
+
+    case milansql::CommandType::FLUSH_BUFFER_POOL: {
+        // Flush all dirty pages to disk via storage save
+        // We flush by calling persistFn (which saves the whole DB).
+        // Also mark all pages clean via the engine.
+        auto dirtyPages = engine.getDirtyBufferPages();
+        persistFn();
+        for (const auto& pg : dirtyPages)
+            engine.markBufferPageClean(pg);
+        std::cout << "  Buffer Pool geleert: " << dirtyPages.size()
+                  << " Dirty Page(s) auf Disk geschrieben.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SET_BUFFER_POOL_SIZE: {
+        if (cmd.values.empty()) {
+            std::cout << "  Fehler: SET BUFFER_POOL_SIZE = <MB>\n\n";
+            break;
+        }
+        int mb = 128;
+        try { mb = std::stoi(cmd.values[0]); } catch (...) {}
+        if (mb < 1) mb = 1;
+        engine.setBufferPoolSize(mb);
+        std::cout << "  Buffer Pool Groesse gesetzt: " << mb << " MB\n\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

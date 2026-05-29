@@ -1,0 +1,22 @@
+CREATE USER alice IDENTIFIED BY '';
+CREATE USER bob IDENTIFIED BY '';
+CREATE TABLE bestellungen (id INT, user_id VARCHAR, produkt VARCHAR);
+INSERT INTO bestellungen VALUES (1, 'alice', 'Buch');
+INSERT INTO bestellungen VALUES (2, 'bob', 'Stift');
+INSERT INTO bestellungen VALUES (3, 'alice', 'Heft');
+GRANT SELECT ON bestellungen TO alice;
+GRANT SELECT ON bestellungen TO bob;
+ALTER TABLE bestellungen ENABLE ROW LEVEL SECURITY;
+CREATE POLICY alice_policy ON bestellungen FOR SELECT TO alice USING (user_id = CURRENT_USER_ID());
+CREATE POLICY bob_policy ON bestellungen FOR SELECT TO bob USING (user_id = CURRENT_USER_ID());
+SHOW POLICIES ON bestellungen;
+CONNECT USER alice PASSWORD '';
+SELECT * FROM bestellungen;
+CONNECT USER bob PASSWORD '';
+SELECT * FROM bestellungen;
+CONNECT USER root PASSWORD '';
+SELECT * FROM bestellungen;
+DROP POLICY alice_policy ON bestellungen;
+SHOW POLICIES ON bestellungen;
+ALTER TABLE bestellungen DISABLE ROW LEVEL SECURITY;
+EXIT

@@ -323,6 +323,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Phase 75: Load RLS policies
+    engine.loadRls("database.rls");
+
     // Phase 62: Load partitions from separate file
     milansql::dispatch_loadPartitions(engine, "database.partitions");
 
@@ -385,6 +388,7 @@ int main(int argc, char* argv[]) {
         catch (const std::exception& ex) {
             std::cout << "  WARNUNG: Speichern fehlgeschlagen: " << ex.what() << "\n";
         }
+        engine.saveRls("database.rls");
     };
 
     // ── Phase 59: REPL-mode Replication setup ─────────────────

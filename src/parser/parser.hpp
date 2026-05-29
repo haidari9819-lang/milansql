@@ -133,6 +133,10 @@ enum class CommandType {
     SHOW_BUFFER_POOL_STATUS,
     SET_BUFFER_POOL_SIZE,
     FLUSH_BUFFER_POOL,
+    // Phase 75: Row-Level Security
+    CREATE_POLICY,
+    DROP_POLICY,
+    SHOW_POLICIES_ON,
     UNKNOWN
 };
 
@@ -342,6 +346,12 @@ struct ParsedCommand {
     // Phase 72: Materialized Views
     std::string matViewName;           // CREATE/REFRESH/DROP MATERIALIZED VIEW name
     std::string matViewSql;            // CREATE MATERIALIZED VIEW ... AS <sql>
+
+    // Phase 75: Row-Level Security
+    std::string policyName;
+    std::string policyCommand;
+    std::string policyUser;
+    std::string policyUsingExpr;
 };
 
 class Parser {
@@ -1551,6 +1561,12 @@ public:
             } else if (kw1 == "BUFFER" && tokens.size() >= 4 &&
                        toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {
                 cmd.type = CommandType::SHOW_BUFFER_POOL_STATUS;
+            // Phase 75: SHOW POLICIES ON table
+            } else if (kw1 == "POLICIES") {
+                cmd.type = CommandType::SHOW_POLICIES_ON;
+                for (size_t i = 2; i < tokens.size(); ++i)
+                    if (toUpper(tokens[i]) == "ON" && i + 1 < tokens.size())
+                        cmd.tableName = tokens[i + 1];
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1605,6 +1621,64 @@ public:
                    toUpper(tokens[2]) == "VIEW") {
             cmd.matViewName = tokens[3];
             cmd.type = CommandType::DROP_MATERIALIZED_VIEW;
+
+        // ── Phase 75: CREATE POLICY name ON table FOR cmd TO user USING (expr) ──
+        } else if (kw0 == "CREATE" && kw1 == "POLICY") {
+            cmd.type = CommandType::CREATE_POLICY;
+            if (tokens.size() > 2) cmd.policyName = tokens[2];
+            // tokens = tokenize(beforeParen) — parens already stripped, so iterate
+            // all tokens for ON/FOR/TO; USING expr extracted from raw input below.
+            for (size_t i = 3; i < tokens.size(); ++i) {
+                std::string t = toUpper(tokens[i]);
+                if (t == "ON" && i + 1 < tokens.size())
+                    cmd.tableName = tokens[i + 1];
+                else if (t == "FOR" && i + 1 < tokens.size())
+                    cmd.policyCommand = toUpper(tokens[i + 1]);
+                else if (t == "TO" && i + 1 < tokens.size())
+                    cmd.policyUser = tokens[i + 1];
+            }
+            // Extract USING expression from raw input using paren-depth matching
+            {
+                std::string upIn = input;
+                for (auto& c : upIn) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                auto upos = upIn.find("USING");
+                if (upos != std::string::npos) {
+                    std::string after = input.substr(upos + 5);
+                    // skip whitespace
+                    size_t start = 0;
+                    while (start < after.size() && after[start] == ' ') ++start;
+                    if (start < after.size() && after[start] == '(') {
+                        // paren-depth match
+                        int depth = 0; size_t end = start;
+                        for (size_t k = start; k < after.size(); ++k) {
+                            if (after[k] == '(') ++depth;
+                            else if (after[k] == ')') { --depth; if (depth == 0) { end = k; break; } }
+                        }
+                        cmd.policyUsingExpr = after.substr(start + 1, end - start - 1);
+                    } else {
+                        cmd.policyUsingExpr = after.substr(start);
+                    }
+                    while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.front() == ' ')
+                        cmd.policyUsingExpr.erase(cmd.policyUsingExpr.begin());
+                    while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.back() == ' ')
+                        cmd.policyUsingExpr.pop_back();
+                }
+            }
+
+        // ── Phase 75: DROP POLICY name ON table ──────────────────
+        } else if (kw0 == "DROP" && kw1 == "POLICY") {
+            cmd.type = CommandType::DROP_POLICY;
+            if (tokens.size() > 2) cmd.policyName = tokens[2];
+            for (size_t i = 3; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "ON" && i + 1 < tokens.size())
+                    cmd.tableName = tokens[i + 1];
+
+        // ── Phase 75: SHOW POLICIES ON table ─────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "POLICIES") {
+            cmd.type = CommandType::SHOW_POLICIES_ON;
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "ON" && i + 1 < tokens.size())
+                    cmd.tableName = tokens[i + 1];
 
         // ── Phase 73: SHOW BUFFER POOL STATUS ────────────────────
         } else if (kw0 == "SHOW" && kw1 == "BUFFER" && tokens.size() >= 4 &&
@@ -1815,12 +1889,16 @@ public:
         // ── Phase 46: CREATE USER ─────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "USER") {
             cmd.type = CommandType::CREATE_USER;
-            // Tokens: CREATE USER name IDENTIFIED BY password
+            // Tokens: CREATE USER name IDENTIFIED BY 'password'
             auto toks46 = tokenizeFull(input);
             if (toks46.size() >= 3) cmd.userName = toks46[2];
             for (size_t i = 3; i < toks46.size(); ++i)
                 if (toUpper(toks46[i]) == "BY" && i + 1 < toks46.size()) {
-                    cmd.userPassword = toks46[i + 1]; break;
+                    std::string pw = toks46[i + 1];
+                    if (pw.size() >= 2 && pw.front() == '\'' && pw.back() == '\'')
+                        pw = pw.substr(1, pw.size() - 2);
+                    cmd.userPassword = pw;
+                    break;
                 }
 
         // ── Phase 46: DROP USER ────────────────────────────────────
@@ -1865,10 +1943,28 @@ public:
             }
 
         // ── Phase 46: CONNECT ──────────────────────────────────────
+        // Supports: CONNECT user pwd
+        //       and CONNECT USER user PASSWORD pwd
         } else if (kw0 == "CONNECT") {
             cmd.type = CommandType::CONNECT_USER;
-            if (tokens.size() >= 2) cmd.userName = tokens[1];
-            if (tokens.size() >= 3) cmd.userPassword = tokens[2];
+            if (tokens.size() >= 2 && toUpper(tokens[1]) == "USER") {
+                // CONNECT USER alice PASSWORD 'pwd'
+                if (tokens.size() >= 3) cmd.userName = tokens[2];
+                // Find PASSWORD keyword
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    if (toUpper(tokens[i]) == "PASSWORD" && i + 1 < tokens.size()) {
+                        std::string pw = tokens[i + 1];
+                        // strip surrounding quotes
+                        if (pw.size() >= 2 && pw.front() == '\'' && pw.back() == '\'')
+                            pw = pw.substr(1, pw.size() - 2);
+                        cmd.userPassword = pw;
+                        break;
+                    }
+                }
+            } else {
+                if (tokens.size() >= 2) cmd.userName = tokens[1];
+                if (tokens.size() >= 3) cmd.userPassword = tokens[2];
+            }
 
         // ── Phase 46: DISCONNECT ───────────────────────────────────
         } else if (kw0 == "DISCONNECT") {
@@ -2463,6 +2559,19 @@ private:
         } else if (op == "DROP" && kw4 == "PARTITION" && tokens.size() >= 6) {
             cmd.alterOp      = "DROP_PARTITION";
             cmd.partitionName = tokens[5];
+
+        // Phase 75: ALTER TABLE t ENABLE/DISABLE ROW LEVEL SECURITY
+        } else if (op == "ENABLE" && kw4 == "ROW" &&
+                   tokens.size() >= 7 &&
+                   toUpper(tokens[5]) == "LEVEL" &&
+                   toUpper(tokens[6]) == "SECURITY") {
+            cmd.alterOp = "ENABLE_RLS";
+
+        } else if (op == "DISABLE" && kw4 == "ROW" &&
+                   tokens.size() >= 7 &&
+                   toUpper(tokens[5]) == "LEVEL" &&
+                   toUpper(tokens[6]) == "SECURITY") {
+            cmd.alterOp = "DISABLE_RLS";
 
         } else if (tokens.size() < 5) {
             cmd.type = CommandType::UNKNOWN;

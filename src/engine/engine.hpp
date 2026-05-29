@@ -931,6 +931,15 @@ class Engine {
 public:
     Engine() = default;
 
+    // ── Phase 75: Row-Level Security ──────────────────────────
+    struct RlsPolicy {
+        std::string name;
+        std::string table;
+        std::string command;
+        std::string role;
+        std::string usingExpr;
+    };
+
     // ── DDL ───────────────────────────────────────────────────
 
     void createTable(const std::string& name, std::vector<Column> cols,
@@ -1075,6 +1084,16 @@ public:
         return getTable(key);
     }
 
+    // Phase 75: selectAll with RLS row filtering (returns Table by value)
+    Table selectAllFiltered(const std::string& tbl) const {
+        auto key = resolveTableName(tbl);
+        bufferPool_.access(key);
+        const auto& src = getTable(key);
+        Table result = src.clone();
+        result.mutableRows() = applyRls_(key, src.rows(), "SELECT");
+        return result;
+    }
+
     // SELECT mit WHERE (AND / OR, alle Operatoren inkl. LIKE)
     WhereResult selectWhere(const std::string& tblNameRaw,
                             const std::vector<WhereCondition>& conds,
@@ -1090,6 +1109,15 @@ public:
                 if (row.xmax != 0) continue;  // Phase 71: skip dead rows
                 result.insert(row);
             }
+            // Phase 75: RLS
+            {
+                auto filtered = applyRls_(tblName, result.rows(), "SELECT");
+                if (filtered.size() != result.rows().size()) {
+                    Table rlsResult(tblName, result.columns());
+                    for (const auto& r : filtered) rlsResult.insert(r);
+                    return {std::move(rlsResult), false};
+                }
+            }
             return {std::move(result), false};
         }
 
@@ -1099,6 +1127,15 @@ public:
             for (size_t ri : src.indexSearch(conds[0].col, conds[0].val))
                 if (ri < src.rows().size() && src.rows()[ri].xmax == 0)  // Phase 71
                     result.insert(src.rows()[ri]);
+            // Phase 75: RLS
+            {
+                auto filtered = applyRls_(tblName, result.rows(), "SELECT");
+                if (filtered.size() != result.rows().size()) {
+                    Table rlsResult(tblName, result.columns());
+                    for (const auto& r : filtered) rlsResult.insert(r);
+                    return {std::move(rlsResult), usedIndex};
+                }
+            }
             return {std::move(result), usedIndex};
         }
 
@@ -1116,6 +1153,15 @@ public:
                 if (row.xmax != 0) continue;  // Phase 71: skip dead rows
                 if (rowMatches(src, row, conds, logic)) result.insert(row);
             }
+            // Phase 75: RLS
+            {
+                auto filtered = applyRls_(tblName, result.rows(), "SELECT");
+                if (filtered.size() != result.rows().size()) {
+                    Table rlsResult(tblName, result.columns());
+                    for (const auto& r : filtered) rlsResult.insert(r);
+                    return {std::move(rlsResult), false};
+                }
+            }
             return {std::move(result), false};
         }
 
@@ -1128,6 +1174,15 @@ public:
             if (row.xmax != 0) continue;  // Phase 71: skip dead rows
             if (rowMatchesByIdx(row, conds, cis, logic))
                 result.insert(row);
+        }
+        // Phase 75: apply Row-Level Security filter
+        {
+            auto filtered = applyRls_(tblName, result.rows(), "SELECT");
+            if (filtered.size() != result.rows().size()) {
+                Table rlsResult(tblName, result.columns());
+                for (const auto& r : filtered) rlsResult.insert(r);
+                return {std::move(rlsResult), usedIndex};
+            }
         }
         return {std::move(result), usedIndex};
     }
@@ -2981,6 +3036,66 @@ public:
             }
         }
         if (inUser) users_[current.name] = current;
+    }
+
+    // ── Phase 75: Row-Level Security public methods ───────────
+    void enableRls(const std::string& table) { rlsEnabled_.insert(resolveTableName(table)); }
+    void disableRls(const std::string& table) { rlsEnabled_.erase(resolveTableName(table)); }
+    bool isRlsEnabled(const std::string& table) const { return rlsEnabled_.count(table) > 0; }
+
+    void createRlsPolicy(const RlsPolicy& pin) {
+        RlsPolicy p = pin;
+        p.table = resolveTableName(p.table);
+        rlsPolicies_[p.table].push_back(p);
+    }
+    void dropRlsPolicy(const std::string& policyName, const std::string& table) {
+        auto key = resolveTableName(table);
+        auto it = rlsPolicies_.find(key);
+        if (it == rlsPolicies_.end()) return;
+        auto& v = it->second;
+        v.erase(std::remove_if(v.begin(), v.end(),
+            [&](const RlsPolicy& p){ return p.name == policyName; }), v.end());
+    }
+    void showPolicies(const std::string& table) const {
+        auto key = resolveTableName(table);
+        auto it = rlsPolicies_.find(key);
+        std::cout << "Policies on " << table << ":\n";
+        if (it == rlsPolicies_.end() || it->second.empty()) {
+            std::cout << "  (none)\n";
+            return;
+        }
+        for (const auto& p : it->second)
+            std::cout << "  " << p.name << " | " << p.command
+                      << " | TO " << p.role
+                      << " | USING (" << p.usingExpr << ")\n";
+    }
+    void saveRls(const std::string& path) const {
+        std::ofstream f(path);
+        for (const auto& tbl : rlsEnabled_)
+            f << "ENABLED " << tbl << "\n";
+        for (const auto& [tbl, policies] : rlsPolicies_)
+            for (const auto& p : policies)
+                f << "POLICY " << p.name << "|" << p.table << "|"
+                  << p.command << "|" << p.role << "|" << p.usingExpr << "\n";
+    }
+    void loadRls(const std::string& path) {
+        std::ifstream f(path);
+        if (!f.is_open()) return;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.rfind("ENABLED ", 0) == 0)
+                rlsEnabled_.insert(line.substr(8));
+            else if (line.rfind("POLICY ", 0) == 0) {
+                auto parts = splitPipe_(line.substr(7));
+                if (parts.size() >= 5) {
+                    RlsPolicy p;
+                    p.name = parts[0]; p.table = parts[1];
+                    p.command = parts[2]; p.role = parts[3];
+                    p.usingExpr = parts[4];
+                    rlsPolicies_[p.table].push_back(p);
+                }
+            }
+        }
     }
 
     // Returns SQL with ? replaced by args in order
@@ -5282,6 +5397,10 @@ public:
     std::map<std::string, UserDef> users_;
     std::string currentUser_ = "root";
 
+    // Phase 75: Row-Level Security
+    std::map<std::string, std::vector<RlsPolicy>> rlsPolicies_;
+    std::set<std::string> rlsEnabled_;
+
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
 
@@ -5688,6 +5807,85 @@ private:
         char buf[20] = {};
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
         return buf;
+    }
+
+    // Phase 75: RLS private helpers
+    static std::vector<std::string> splitPipe_(const std::string& s) {
+        std::vector<std::string> parts;
+        std::stringstream ss(s);
+        std::string tok;
+        while (std::getline(ss, tok, '|')) parts.push_back(tok);
+        return parts;
+    }
+
+    bool evaluateRlsExpr_(const std::string& expr, const Row& row,
+                          const std::vector<std::string>& colNames) const {
+        if (expr == "1 = 1" || expr == "1=1") return true;
+        if (expr == "1 = 0" || expr == "1=0") return false;
+
+        std::string e = expr;
+        size_t p;
+        while ((p = e.find("CURRENT_USER_ID()")) != std::string::npos)
+            e.replace(p, 17, currentUser_);
+
+        auto eqPos = e.find('=');
+        if (eqPos == std::string::npos) return true;
+        std::string lhs = e.substr(0, eqPos);
+        std::string rhs = e.substr(eqPos + 1);
+        auto trim = [](std::string& s) {
+            while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+            while (!s.empty() && s.back()  == ' ') s.pop_back();
+        };
+        trim(lhs); trim(rhs);
+        if (rhs.size() >= 2 && rhs.front() == '\'' && rhs.back() == '\'')
+            rhs = rhs.substr(1, rhs.size() - 2);
+
+        for (size_t i = 0; i < colNames.size(); ++i) {
+            if (colNames[i] == lhs) {
+                if (i >= row.values.size()) return false;
+                std::string cellVal = row.values[i];
+                // Strip surrounding single quotes stored by the engine
+                if (cellVal.size() >= 2 && cellVal.front() == '\'' && cellVal.back() == '\'')
+                    cellVal = cellVal.substr(1, cellVal.size() - 2);
+                return cellVal == rhs;
+            }
+        }
+        return true;
+    }
+
+    std::vector<Row> applyRls_(const std::string& table,
+                               const std::vector<Row>& rows,
+                               const std::string& cmd = "SELECT") const {
+        if (!isRlsEnabled(table)) return rows;
+        if (currentUser_ == "root" || currentUser_.empty()) return rows;
+
+        auto pit = rlsPolicies_.find(table);
+        if (pit == rlsPolicies_.end() || pit->second.empty()) return {};
+
+        std::vector<std::string> colNames;
+        try {
+            const auto& cols = getTable(table).columns();
+            colNames.reserve(cols.size());
+            for (const auto& c : cols) colNames.push_back(c.name);
+        } catch (...) {
+            return {};
+        }
+
+        std::vector<Row> result;
+        for (const auto& row : rows) {
+            if (row.xmax != 0) continue;  // skip dead rows
+            bool allowed = false;
+            for (const auto& pol : pit->second) {
+                if (pol.command != "ALL" && pol.command != cmd) continue;
+                if (pol.role != "PUBLIC" && pol.role != currentUser_) continue;
+                if (evaluateRlsExpr_(pol.usingExpr, row, colNames)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (allowed) result.push_back(row);
+        }
+        return result;
     }
 };
 

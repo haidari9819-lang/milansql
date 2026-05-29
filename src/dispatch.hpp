@@ -600,7 +600,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
         auto qr = engine.selectWhere(cmd.tableName, cmd.whereConds, cmd.whereLogic);
         result = std::move(qr.table);
     } else {
-        result = engine.selectAll(cmd.tableName).clone();
+        result = engine.selectAllFiltered(cmd.tableName); // Phase 75: RLS
     }
 
     if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
@@ -1616,7 +1616,7 @@ inline bool dispatchCommand(
                 usedIdx = qr.usedIndex;
                 result  = std::move(qr.table);
             } else {
-                result = engine.selectAll(cmd.tableName).clone();
+                result = engine.selectAllFiltered(cmd.tableName); // Phase 75: RLS
             }
             auto t1 = clk::now();
             double scanMs = fms(t1 - t0).count();
@@ -1918,7 +1918,10 @@ inline bool dispatchCommand(
         {
             auto& qc = engine.getQueryCache();
             if (qc.isEnabled()) {
-                auto cached = qc.get(eingabe);
+                // Phase 75: include current user in cache key so RLS results
+                // are not shared across different users
+                std::string cacheKey = engine.getCurrentUser() + "\x01" + eingabe;
+                auto cached = qc.get(cacheKey);
                 if (cached) {
                     std::cout << *cached << "  [CACHE HIT]\n\n";
                     break;
@@ -1956,7 +1959,7 @@ inline bool dispatchCommand(
                 if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             } else {
                 if (g_profiler.isEnabled()) g_profiler.addStep("Table scan");
-                result = engine.selectAll(cmd.tableName).clone();
+                result = engine.selectAllFiltered(cmd.tableName); // Phase 75: RLS
                 if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             }
 
@@ -2020,7 +2023,9 @@ inline bool dispatchCommand(
             if (oldBuf) {
                 std::cout.rdbuf(oldBuf);
                 std::string captured = captureStream.str();
-                qc.put(eingabe, captured, cmd.tableName);
+                // Phase 75: user-scoped cache key for RLS correctness
+                std::string cacheKey = engine.getCurrentUser() + "\x01" + eingabe;
+                qc.put(cacheKey, captured, cmd.tableName);
                 std::cout << captured;
             }
 
@@ -2369,6 +2374,16 @@ inline bool dispatchCommand(
             } catch (const std::exception& e) {
                 std::cout << "  Fehler: " << e.what() << "\n\n";
             }
+            break;
+        }
+        // Phase 75: RLS enable/disable via ALTER TABLE
+        if (cmd.alterOp == "ENABLE_RLS") {
+            engine.enableRls(cmd.tableName);
+            std::cout << "  RLS enabled on " << cmd.tableName << ".\n\n";
+            break;
+        } else if (cmd.alterOp == "DISABLE_RLS") {
+            engine.disableRls(cmd.tableName);
+            std::cout << "  RLS disabled on " << cmd.tableName << ".\n\n";
             break;
         }
         engine.alterTable(cmd.tableName, cmd.alterOp,
@@ -3576,6 +3591,27 @@ inline bool dispatchCommand(
         std::cout << "  Buffer Pool Groesse gesetzt: " << mb << " MB\n\n";
         break;
     }
+
+    // ── Phase 75: Row-Level Security ─────────────────────────
+    case milansql::CommandType::CREATE_POLICY: {
+        milansql::Engine::RlsPolicy p;
+        p.name      = cmd.policyName;
+        p.table     = cmd.tableName;
+        p.command   = cmd.policyCommand.empty() ? "ALL" : cmd.policyCommand;
+        p.role      = cmd.policyUser.empty()    ? "PUBLIC" : cmd.policyUser;
+        p.usingExpr = cmd.policyUsingExpr;
+        engine.createRlsPolicy(p);
+        std::cout << "  Policy " << p.name << " created.\n\n";
+        break;
+    }
+    case milansql::CommandType::DROP_POLICY:
+        engine.dropRlsPolicy(cmd.policyName, cmd.tableName);
+        std::cout << "  Policy " << cmd.policyName << " dropped.\n\n";
+        break;
+    case milansql::CommandType::SHOW_POLICIES_ON:
+        engine.showPolicies(cmd.tableName);
+        std::cout << "\n";
+        break;
 
     case milansql::CommandType::UNKNOWN:
     default:

@@ -392,7 +392,7 @@ private:
 class MilanBinaryStorage : public StorageEngine {
 public:
     // Magic Bytes und Versionskonstanten
-    static constexpr uint16_t FORMAT_VERSION = 7;
+    static constexpr uint16_t FORMAT_VERSION = 8;  // Phase 68: Generated Columns
     static constexpr const char* MAGIC = "MILANDB1";  // 8 Bytes
 
     explicit MilanBinaryStorage(std::string path = "database.milan")
@@ -452,7 +452,7 @@ public:
         rU32(buf, pos);                        // Bytes 10..13  (Page Count, reserviert)
         uint16_t storedCs = rU16(buf, pos);   // Bytes 14..15
 
-        if (version != FORMAT_VERSION)
+        if (version != FORMAT_VERSION && version != 7)
             throw std::runtime_error(
                 "Inkompatible Version: gespeichert=" + std::to_string(version) +
                 ", erwartet=" + std::to_string(FORMAT_VERSION));
@@ -465,7 +465,7 @@ public:
 
         // ── Deserialisieren ───────────────────────────────────
         std::size_t dataPos = 0;
-        return deserializeData(data, dataPos, engine);
+        return deserializeData(data, dataPos, engine, version);
     }
 
     void load(Engine& engine) override { loadWithCount(engine); }
@@ -508,6 +508,12 @@ private:
                     writeStrN(o, cc.op);
                     writeStrN(o, cc.val);
                 }
+                // Phase 68: Generated Columns
+                writeU8(o, col.isGenerated ? 1 : 0);
+                if (col.isGenerated) {
+                    writeStrV(o, col.generatedExpr);
+                    writeU8(o, col.isStored ? 1 : 0);
+                }
             }
 
             const auto& rows = tbl.rows();
@@ -542,7 +548,8 @@ private:
     // DESERIALIZER (Binär-Puffer → Engine)
     // ============================================================
     static std::size_t deserializeData(const std::string& d,
-                                       std::size_t& pos, Engine& engine) {
+                                       std::size_t& pos, Engine& engine,
+                                       uint16_t version = FORMAT_VERSION) {
         uint16_t tableCount = rU16(d, pos);
 
         for (uint16_t ti = 0; ti < tableCount; ++ti) {
@@ -573,6 +580,14 @@ private:
                     cc.op  = rStrN(d, pos);
                     cc.val = rStrN(d, pos);
                     col.checks.push_back(cc);
+                }
+                // Phase 68: Generated Columns (version >= 8)
+                if (version >= 8) {
+                    col.isGenerated = (rU8(d, pos) != 0);
+                    if (col.isGenerated) {
+                        col.generatedExpr = rStrV(d, pos);
+                        col.isStored      = (rU8(d, pos) != 0);
+                    }
                 }
                 cols.push_back(std::move(col));
             }

@@ -1,10 +1,10 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v2.0.0-gold)
+![Version](https://img.shields.io/badge/version-v2.1.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![Phases](https://img.shields.io/badge/phases-67-brightgreen)
+![Phases](https://img.shields.io/badge/phases-68-brightgreen)
 
 > **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
@@ -53,7 +53,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v2.0.0 ===           ║
+  ║        === MilanSQL v2.1.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -169,6 +169,18 @@ console.log(result.rows);     // [[1, 'Alice', 95], ...]
 ## SQL Reference
 
 ```sql
+-- Generated Columns (Phase 68)
+CREATE TABLE produkte (
+  id     INT  PRIMARY KEY AUTO_INCREMENT,
+  name   TEXT NOT NULL,
+  netto  REAL,
+  brutto REAL GENERATED ALWAYS AS (netto * 1.19) STORED,
+  mwst   REAL GENERATED ALWAYS AS (netto * 0.19) VIRTUAL
+);
+INSERT INTO produkte VALUES (NULL, 'Laptop', 1000);
+SELECT * FROM produkte;
+-- brutto: 1190  |  mwst: 190  (auto-computed)
+
 -- Multi-Statement (Phase 67)
 CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT);
 INSERT INTO t VALUES (NULL, Alice); INSERT INTO t VALUES (NULL, Bob); SELECT * FROM t;
@@ -346,6 +358,7 @@ GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on
 | 62–63 | Partitioning (RANGE/LIST/HASH), INFORMATION_SCHEMA |
 | 64–65 | REGEXP/RLIKE, SAVEPOINT, SELECT FOR UPDATE, LOCK TABLE |
 | **66–67** | **Cursors in Stored Procedures (DECLARE/OPEN/FETCH/CLOSE/LOOP/IF), Multi-Statement Queries** |
+| **68** | **Virtual/Generated Columns (GENERATED ALWAYS AS (expr) STORED/VIRTUAL)** |
 
 ---
 

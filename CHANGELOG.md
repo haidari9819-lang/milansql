@@ -4,6 +4,47 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v2.1.0] — 2026-05-28
+
+### Phase 68 — Virtual/Generated Columns
+
+Implemented MySQL-compatible `GENERATED ALWAYS AS (expr) STORED | VIRTUAL` columns.
+
+**Features:**
+- `STORED`: value computed from expression and stored in the row at INSERT/UPDATE
+- `VIRTUAL`: same computation, value not persisted (recomputed transparently)
+- Arithmetic expression evaluator: column refs, numeric literals, `+`, `-`, `*`, `/`, parentheses
+- Auto-recomputed on UPDATE for both STORED and VIRTUAL columns
+- `DESCRIBE` output shows `GENERATED` column with `STORED AS (expr)` or `VIRTUAL AS (expr)`
+- `BACKUP`/`RESTORE` preserves generated column definitions via SQL dump
+
+**Example:**
+```sql
+CREATE TABLE produkte (
+  id     INT  PRIMARY KEY AUTO_INCREMENT,
+  name   TEXT NOT NULL,
+  netto  REAL,
+  brutto REAL GENERATED ALWAYS AS (netto * 1.19) STORED,
+  mwst   REAL GENERATED ALWAYS AS (netto * 0.19) VIRTUAL
+);
+INSERT INTO produkte VALUES (NULL, 'Laptop', 1000);
+SELECT * FROM produkte;  -- brutto: 1190, mwst: 190
+```
+
+**Technical changes:**
+- `Column` struct: `isGenerated`, `generatedExpr`, `isStored` fields
+- `Engine::evaluateGenExpr()` + `ArithEval` recursive descent evaluator
+- `Engine::applyGeneratedCols()` called after INSERT/UPDATE
+- `FORMAT_VERSION` bumped 7 → 8 (backward-compatible load of v7 files)
+- Parser: `GENERATED ALWAYS AS (expr) STORED|VIRTUAL` in `CREATE TABLE`
+- `dispatch_printDescribe`: new `GENERATED` column in output table
+
+### Version bumps
+- CMakeLists.txt, main.cpp, http_server.hpp → v2.1.0
+- README.md, CHANGELOG.md, docs/index.html → v2.1.0 / 68 phases
+
+---
+
 ## [v2.0.0] — 2026-05-29
 
 ### Major Release — 67 Phases, production-grade SQL engine in C++17

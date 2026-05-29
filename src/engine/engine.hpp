@@ -50,6 +50,10 @@ struct Column {
     bool        isPrimaryKey   = false;  // PRIMARY KEY (impliziert NOT NULL + UNIQUE)
     bool        autoIncrement  = false;  // AUTO_INCREMENT
     std::vector<CheckConstraint> checks; // Phase 23: CHECK constraints
+    // Phase 68: Generated Columns
+    bool        isGenerated    = false;  // GENERATED ALWAYS AS
+    std::string generatedExpr  = "";     // expression string
+    bool        isStored       = false;  // STORED (true) or VIRTUAL (false)
     Column(std::string n, std::string t)
         : name(std::move(n)), type(std::move(t)) {}
 };
@@ -913,6 +917,7 @@ public:
         Table& t = getTable(tbl);       // wirft wenn Tabelle fehlt
         applyDefaults(t, vals);         // fehlende Werte mit DEFAULT/NULL füllen
         applyAutoInc(t, vals);          // AUTO_INCREMENT-Spalten befüllen
+        applyGeneratedCols(t, vals);    // Phase 68: Generated Columns berechnen
         checkInsertFK(tbl, vals);       // FOREIGN KEY prüfen
         checkAllConstraints(tbl, vals); // Phase 23: CHECK constraints prüfen
         checkJsonColumns(t, vals);      // Phase 56: JSON-Validierung
@@ -967,6 +972,7 @@ public:
         Table& t = getTable(tbl);
         applyDefaults(t, vals);
         applyAutoInc(t, vals);
+        applyGeneratedCols(t, vals);    // Phase 68
         checkInsertFK(tbl, vals);
         checkAllConstraints(tbl, vals);
         auto conflicts = t.conflictRows(vals);
@@ -986,8 +992,8 @@ public:
         Table& t = getTable(tbl);
         applyDefaults(t, vals);
         applyAutoInc(t, vals);
+        applyGeneratedCols(t, vals);    // Phase 68
         checkInsertFK(tbl, vals);
-        checkAllConstraints(tbl, vals);
         if (!t.conflictRows(vals).empty()) return false;  // ignorieren
         t.insert(Row(vals));
         return true;
@@ -1609,6 +1615,8 @@ public:
                             row.values[setCIs[k]] = resolved;
                         }
                     }
+                    // Phase 68: recompute generated cols after row update
+                    applyGeneratedCols(tblRef, row.values);
                     ++n;
                 }
             }
@@ -1652,6 +1660,12 @@ public:
 
         std::size_t n = tblRef.updateWhere(setCIs2, setVals, wCI, wVal);
 
+        // Phase 68: recompute generated cols for affected rows
+        for (auto& row : tblRef.mutableRows())
+            if (wCI < row.values.size() && row.values[wCI] == wVal)
+                applyGeneratedCols(tblRef, row.values);
+        if (n) tblRef.rebuildIndexes();
+
         // Phase 49: Update fulltext indexes for this table
         for (auto& [fn, fi] : fulltextIndices_) {
             if (fi.tableName == tbl) {
@@ -1689,7 +1703,12 @@ public:
         std::vector<std::size_t> setCIs;
         for (const auto& col : setCols)
             setCIs.push_back(colIdx(t, col));
-        return t.updateAll(setCIs, setVals);
+        std::size_t n = t.updateAll(setCIs, setVals);
+        // Phase 68: recompute generated cols for all rows
+        for (auto& row : t.mutableRows())
+            applyGeneratedCols(t, row.values);
+        if (n) t.rebuildIndexes();
+        return n;
     }
 
     std::size_t deleteAll(const std::string& tblRaw) {
@@ -4571,6 +4590,100 @@ private:
         }
     }
 
+    // ── Phase 68: Generated Columns ──────────────────────────
+
+    // Arithmetic evaluator for generated column expressions.
+    // Supports: column refs, numeric literals, +, -, *, /, parentheses.
+    struct ArithEval {
+        const std::vector<Column>& cols;
+        const std::vector<std::string>& vals;
+        const std::string& expr;
+        size_t pos;
+
+        double resolveCol(const std::string& name) const {
+            for (size_t i = 0; i < cols.size() && i < vals.size(); ++i)
+                if (cols[i].name == name) {
+                    try { return std::stod(vals[i]); } catch (...) { return 0.0; }
+                }
+            return 0.0;
+        }
+
+        double parseFactor() {
+            while (pos < expr.size() && expr[pos] == ' ') ++pos;
+            if (pos < expr.size() && expr[pos] == '(') {
+                ++pos;
+                double v = parseExpr();
+                while (pos < expr.size() && expr[pos] == ' ') ++pos;
+                if (pos < expr.size() && expr[pos] == ')') ++pos;
+                return v;
+            }
+            // Read token: number or identifier
+            size_t start = pos;
+            if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
+            while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
+            if (pos > start) {
+                try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
+            }
+            pos = start;
+            // identifier
+            while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
+            if (pos > start) {
+                std::string tok = expr.substr(start, pos - start);
+                // check if numeric
+                try { return std::stod(tok); } catch (...) {}
+                return resolveCol(tok);
+            }
+            ++pos;
+            return 0.0;
+        }
+
+        double parseTerm() {
+            double lhs = parseFactor();
+            while (pos < expr.size()) {
+                while (pos < expr.size() && expr[pos] == ' ') ++pos;
+                if (pos < expr.size() && expr[pos] == '*') { ++pos; lhs *= parseFactor(); }
+                else if (pos < expr.size() && expr[pos] == '/') { ++pos; double r = parseFactor(); lhs = (r != 0.0 ? lhs / r : 0.0); }
+                else break;
+            }
+            return lhs;
+        }
+
+        double parseExpr() {
+            double lhs = parseTerm();
+            while (pos < expr.size()) {
+                while (pos < expr.size() && expr[pos] == ' ') ++pos;
+                if (pos < expr.size() && expr[pos] == '+') { ++pos; lhs += parseTerm(); }
+                else if (pos < expr.size() && expr[pos] == '-') { ++pos; lhs -= parseTerm(); }
+                else break;
+            }
+            return lhs;
+        }
+
+        double eval() { pos = 0; return parseExpr(); }
+    };
+
+    static std::string evaluateGenExpr(const std::string& expr,
+                                       const std::vector<Column>& cols,
+                                       const std::vector<std::string>& vals) {
+        ArithEval ev{cols, vals, expr, 0};
+        double result = ev.eval();
+        // Format: if integer, no decimal point; else up to 6 significant digits
+        if (result == std::floor(result) && std::abs(result) < 1e15)
+            return std::to_string(static_cast<long long>(result));
+        std::ostringstream oss;
+        oss << result;
+        return oss.str();
+    }
+
+    // Compute all generated columns (STORED + VIRTUAL) for a row of vals.
+    static void applyGeneratedCols(const Table& t, std::vector<std::string>& vals) {
+        const auto& cols = t.columns();
+        for (size_t i = 0; i < cols.size() && i < vals.size(); ++i) {
+            if (!cols[i].isGenerated) continue;
+            vals[i] = evaluateGenExpr(cols[i].generatedExpr, cols, vals);
+        }
+    }
+
     // ── Phase 23: CHECK Constraint Prüfung ───────────────────
 
     // INSERT: prüft alle CHECK-Bedingungen für alle Spalten.
@@ -4727,13 +4840,22 @@ private:
             }
             case BufferedOp::Type::UPDATE_WHERE: {
                 Table& t = getTable(op.tableName);
-                t.updateWhere(colIdx(t, op.setCol), op.setVal,
-                              colIdx(t, op.whereCol), op.whereVal);
+                size_t wCI = colIdx(t, op.whereCol);
+                t.updateWhere(colIdx(t, op.setCol), op.setVal, wCI, op.whereVal);
+                // Phase 68: recompute generated cols for affected rows
+                for (auto& row : t.mutableRows())
+                    if (wCI < row.values.size() && row.values[wCI] == op.whereVal)
+                        applyGeneratedCols(t, row.values);
+                t.rebuildIndexes();
                 break;
             }
             case BufferedOp::Type::UPDATE_ALL: {
                 Table& t = getTable(op.tableName);
                 t.updateAll(colIdx(t, op.setCol), op.setVal);
+                // Phase 68: recompute generated cols for all rows
+                for (auto& row : t.mutableRows())
+                    applyGeneratedCols(t, row.values);
+                t.rebuildIndexes();
                 break;
             }
             case BufferedOp::Type::DELETE_WHERE: {

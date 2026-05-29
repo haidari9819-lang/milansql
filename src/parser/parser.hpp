@@ -1304,6 +1304,44 @@ public:
                             ++i;
                         } else if (u == "AUTO_INCREMENT") {
                             col.autoIncrement = true;
+                        // Phase 68: GENERATED ALWAYS AS (expr) STORED|VIRTUAL
+                        } else if (u == "GENERATED" && i + 2 < parts.size() &&
+                                   toUpper(parts[i+1]) == "ALWAYS" && toUpper(parts[i+2]) == "AS") {
+                            col.isGenerated = true;
+                            i += 3; // skip ALWAYS AS
+                            // collect tokens inside balanced parentheses
+                            std::string exprTokens;
+                            int depth = 0;
+                            while (i < parts.size()) {
+                                std::string pu = toUpper(parts[i]);
+                                if (parts[i].front() == '(') { depth++; }
+                                if (parts[i].back()  == ')') {
+                                    // may be the closing paren
+                                    if (!exprTokens.empty()) exprTokens += " ";
+                                    exprTokens += parts[i];
+                                    ++i;
+                                    depth--;
+                                    if (depth <= 0) break;
+                                    continue;
+                                }
+                                if (!exprTokens.empty()) exprTokens += " ";
+                                exprTokens += parts[i];
+                                ++i;
+                            }
+                            // strip outer parens
+                            while (!exprTokens.empty() && exprTokens.front() == '(') exprTokens = exprTokens.substr(1);
+                            while (!exprTokens.empty() && exprTokens.back()  == ')') exprTokens.pop_back();
+                            // trim
+                            size_t es = exprTokens.find_first_not_of(" ");
+                            size_t ee = exprTokens.find_last_not_of(" ");
+                            col.generatedExpr = (es == std::string::npos) ? "" : exprTokens.substr(es, ee - es + 1);
+                            // check for STORED or VIRTUAL keyword
+                            if (i < parts.size()) {
+                                std::string kw = toUpper(parts[i]);
+                                if (kw == "STORED")  { col.isStored = true;  ++i; }
+                                else if (kw == "VIRTUAL") { col.isStored = false; ++i; }
+                            }
+                            --i; // loop will ++i
                         // Phase 23: CHECK (colname op val)
                         } else if (u == "CHECK" && i + 3 < parts.size()) {
                             // parts[i+1] = "(colname"  (führende Klammer anhaftend)

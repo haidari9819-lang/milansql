@@ -340,9 +340,9 @@ static inline void dispatch_printDescribe(const milansql::Table& tbl) {
     const auto& cols = tbl.columns();
     if (cols.empty()) { std::cout << "  (Keine Spalten)\n\n"; return; }
 
-    std::vector<std::string> hdr = {"Name", "Typ", "NOT NULL", "UNIQUE", "DEFAULT", "PK", "AI", "CHECK"};
-    std::vector<size_t> w(8);
-    for (size_t i = 0; i < 8; ++i) w[i] = hdr[i].size();
+    std::vector<std::string> hdr = {"Name", "Typ", "NOT NULL", "UNIQUE", "DEFAULT", "PK", "AI", "CHECK", "GENERATED"};
+    std::vector<size_t> w(9);
+    for (size_t i = 0; i < 9; ++i) w[i] = hdr[i].size();
     for (const auto& col : cols) {
         w[0] = std::max(w[0], col.name.size());
         w[1] = std::max(w[1], col.type.size());
@@ -355,14 +355,19 @@ static inline void dispatch_printDescribe(const milansql::Table& tbl) {
             }
             w[7] = std::max(w[7], cs.size());
         }
+        if (col.isGenerated) {
+            std::string gs = (col.isStored ? "STORED" : "VIRTUAL");
+            gs += " AS (" + col.generatedExpr + ")";
+            w[8] = std::max(w[8], gs.size());
+        }
     }
 
     auto hline = [&](const std::string& l, const std::string& m,
                      const std::string& r, const std::string& f) {
         std::cout << l;
-        for (size_t i = 0; i < 8; ++i) {
+        for (size_t i = 0; i < 9; ++i) {
             for (size_t j = 0; j < w[i] + 2; ++j) std::cout << f;
-            if (i + 1 < 8) std::cout << m;
+            if (i + 1 < 9) std::cout << m;
         }
         std::cout << r << "\n";
     };
@@ -375,7 +380,7 @@ static inline void dispatch_printDescribe(const milansql::Table& tbl) {
     std::cout << "\n  Tabelle: " << tbl.name() << "\n";
     hline("  \u250c", "\u252c", "\u2510", "\u2500");
     std::cout << "  \u2502";
-    for (size_t i = 0; i < 8; ++i) cell(hdr[i], w[i]);
+    for (size_t i = 0; i < 9; ++i) cell(hdr[i], w[i]);
     std::cout << "\n";
     hline("  \u251c", "\u253c", "\u2524", "\u2500");
 
@@ -388,6 +393,10 @@ static inline void dispatch_printDescribe(const milansql::Table& tbl) {
                 checkStr += cc.op + cc.val;
             }
         }
+        std::string genStr = "-";
+        if (col.isGenerated)
+            genStr = (col.isStored ? "STORED" : "VIRTUAL") +
+                     std::string(" AS (") + col.generatedExpr + ")";
         std::cout << "  \u2502";
         cell(col.name,                               w[0]);
         cell(col.type,                               w[1]);
@@ -397,6 +406,7 @@ static inline void dispatch_printDescribe(const milansql::Table& tbl) {
         cell(col.isPrimaryKey ? "YES" : "NO",        w[5]);
         cell(col.autoIncrement? "YES" : "NO",        w[6]);
         cell(checkStr,                               w[7]);
+        cell(genStr,                                 w[8]);
         std::cout << "\n";
     }
     hline("  \u2514", "\u2534", "\u2518", "\u2500");
@@ -458,6 +468,9 @@ static inline std::string dispatch_buildCreateTableSql(const milansql::Table& tb
         if (c.hasDefault)    sql += " DEFAULT " + c.defaultValue;
         for (const auto& cc : c.checks)
             sql += " CHECK (" + c.name + " " + cc.op + " " + cc.val + ")";
+        if (c.isGenerated)
+            sql += " GENERATED ALWAYS AS (" + c.generatedExpr + ")" +
+                   (c.isStored ? " STORED" : " VIRTUAL");
     }
     for (const auto& fk : fks) {
         sql += ", FOREIGN KEY (" + fk.fromCol + ") REFERENCES "

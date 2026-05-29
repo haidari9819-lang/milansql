@@ -29,6 +29,8 @@
   #include <arpa/inet.h>
   #include <unistd.h>
   using sock_t = int;
+  // Guard: both master_repl.hpp and slave_repl.hpp define this;
+  // #define (not constexpr) so #ifndef works across translation units.
   #ifndef INVALID_SOCKET
   #define INVALID_SOCKET (-1)
   #endif

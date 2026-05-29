@@ -31,6 +31,7 @@
   #include <netdb.h>
   #include <unistd.h>
   using slave_sock_t = int;
+  // Guard: master_repl.hpp may define this first; #ifndef prevents redefinition.
   #ifndef INVALID_SOCKET
   #define INVALID_SOCKET (-1)
   #endif

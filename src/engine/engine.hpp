@@ -944,11 +944,26 @@ public:
     // ── DDL ───────────────────────────────────────────────────
 
     void createTable(const std::string& name, std::vector<Column> cols,
-                     std::vector<ForeignKeyDef> fks = {}) {
+                     std::vector<ForeignKeyDef> fks = {},
+                     const std::string& inherits = "") {
         auto key = resolveTableName(name);
         if (tables_.count(key))
             throw std::runtime_error("Tabelle '" + key + "' existiert bereits.");
-        tables_.emplace(key, Table(key, std::move(cols)));
+        if (!inherits.empty()) {
+            // Phase 78: INHERITS — prepend parent columns to child columns
+            auto parentKey = resolveTableName(inherits);
+            if (!tables_.count(parentKey))
+                throw std::runtime_error(
+                    "Eltern-Tabelle '" + parentKey + "' nicht gefunden.");
+            const auto& parentCols = tables_.at(parentKey).columns();
+            std::vector<Column> allCols(parentCols.begin(), parentCols.end());
+            for (const auto& c : cols) allCols.push_back(c);
+            tables_.emplace(key, Table(key, std::move(allCols)));
+            tableParent_[key] = parentKey;
+            tableChildren_[parentKey].push_back(key);
+        } else {
+            tables_.emplace(key, Table(key, std::move(cols)));
+        }
         for (const auto& fk : fks)
             tables_.at(key).addForeignKey(fk);
     }
@@ -968,6 +983,14 @@ public:
         auto key = resolveTableName(name);
         if (!tables_.erase(key))
             throw std::runtime_error("Tabelle '" + key + "' nicht gefunden.");
+        // Phase 78: clean up inheritance maps
+        auto pit = tableParent_.find(key);
+        if (pit != tableParent_.end()) {
+            auto& siblings = tableChildren_[pit->second];
+            siblings.erase(std::remove(siblings.begin(), siblings.end(), key), siblings.end());
+            tableParent_.erase(pit);
+        }
+        tableChildren_.erase(key);
     }
 
     // AUTO_INCREMENT-Zähler setzen (wird beim Laden aus Datei aufgerufen)
@@ -1085,20 +1108,26 @@ public:
         return getTable(key);
     }
 
-    // Phase 75: selectAll with RLS row filtering (returns Table by value)
-    Table selectAllFiltered(const std::string& tbl) const {
+    // Phase 75/78: selectAll with RLS + inheritance (returns Table by value)
+    Table selectAllFiltered(const std::string& tbl, bool fromOnly = false) const {
         auto key = resolveTableName(tbl);
         bufferPool_.access(key);
         const auto& src = getTable(key);
         Table result = src.clone();
         result.mutableRows() = applyRls_(key, src.rows(), "SELECT");
+        // Phase 78: include rows from child tables (projected to parent columns)
+        if (!fromOnly) {
+            size_t parentColCount = src.columns().size();
+            collectInheritedRows_(key, parentColCount, {}, {}, "AND", result, true);
+        }
         return result;
     }
 
     // SELECT mit WHERE (AND / OR, alle Operatoren inkl. LIKE)
     WhereResult selectWhere(const std::string& tblNameRaw,
                             const std::vector<WhereCondition>& conds,
-                            const std::string& logic = "AND") const {
+                            const std::string& logic = "AND",
+                            bool fromOnly = false) const {
         auto tblName = resolveTableName(tblNameRaw);
         bufferPool_.access(tblName);  // Phase 73: Buffer Pool tracking
         const Table& src = getTable(tblName);
@@ -1188,6 +1217,11 @@ public:
                 }
             }
         }
+        // Phase 78: include matching rows from child tables (WHERE on parent cols)
+        if (!fromOnly) {
+            collectInheritedRows_(tblName, src.columns().size(),
+                                  conds, cis, logic, result, false);
+        }
         // Phase 75: apply Row-Level Security filter
         {
             auto filtered = applyRls_(tblName, result.rows(), "SELECT");
@@ -1201,15 +1235,20 @@ public:
     }
 
     // COUNT(*) [mit optionalem WHERE]
-    std::size_t countRows(const std::string& tbl) const {
-        return getTable(resolveTableName(tbl)).rowCount();
+    std::size_t countRows(const std::string& tbl, bool fromOnly = false) const {
+        auto key = resolveTableName(tbl);
+        size_t n = getTable(key).rowCount();
+        // Phase 78: count child rows recursively
+        if (!fromOnly) n += countInheritedRows_(key);
+        return n;
     }
 
     std::size_t countWhere(const std::string& tblName,
                            const std::vector<WhereCondition>& conds,
-                           const std::string& logic = "AND") const {
-        if (conds.empty()) return countRows(tblName);
-        return selectWhere(tblName, conds, logic).table.rowCount();
+                           const std::string& logic = "AND",
+                           bool fromOnly = false) const {
+        if (conds.empty()) return countRows(tblName, fromOnly);
+        return selectWhere(tblName, conds, logic, fromOnly).table.rowCount();
     }
 
     // Aggregatfunktion ohne GROUP BY
@@ -2935,6 +2974,38 @@ public:
     }
 
     const std::string& getCurrentUser() const { return currentUser_; }
+
+    // ── Phase 78: Table Inheritance ──────────────────────────────
+    bool tableHasParent(const std::string& tbl) const {
+        return tableParent_.count(resolveTableName(tbl)) > 0;
+    }
+    std::string tableParentName(const std::string& tbl) const {
+        auto it = tableParent_.find(resolveTableName(tbl));
+        return it != tableParent_.end() ? it->second : "";
+    }
+    // Called by storage layer to restore inheritance maps without touching columns
+    void registerInheritance(const std::string& child, const std::string& parent) {
+        auto ck = resolveTableName(child);
+        auto pk = resolveTableName(parent);
+        tableParent_[ck] = pk;
+        auto& vec = tableChildren_[pk];
+        if (std::find(vec.begin(), vec.end(), ck) == vec.end())
+            vec.push_back(ck);
+    }
+
+    void showInheritance() const {
+        std::cout << "\n  Table Inheritance:\n";
+        // Print roots that have children
+        bool any = false;
+        for (const auto& [key, children] : tableChildren_) {
+            if (children.empty()) continue;
+            any = true;
+            std::cout << "  " << key << "\n";
+            printInheritanceTree_(key, 1);
+        }
+        if (!any) std::cout << "  (keine Vererbung definiert)\n";
+        std::cout << "\n";
+    }
 
     // ── Phase 77: Parallel Query ──────────────────────────────
     void setParallelThreshold(long long t) { if (t >= 1) parallelExec_.threshold = t; }
@@ -5440,6 +5511,10 @@ public:
     // Phase 77: Parallel Query Execution
     ParallelExecutor parallelExec_;
 
+    // Phase 78: Table Inheritance
+    std::map<std::string, std::string>              tableParent_;    // child key → parent key
+    std::map<std::string, std::vector<std::string>> tableChildren_;  // parent key → child keys
+
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
 
@@ -5472,7 +5547,21 @@ public:
     const QueryCache& getQueryCache() const { return queryCache_; }
 
     void invalidateCache(const std::string& tableName) {
+        // Invalidate both raw name (as stored by parser) and resolved key
         queryCache_.invalidate(tableName);
+        auto key = resolveTableName(tableName);
+        queryCache_.invalidate(key);
+        // Phase 78: also invalidate ancestor tables (SELECT FROM parent includes child rows)
+        auto it = tableParent_.find(key);
+        while (it != tableParent_.end()) {
+            const auto& pk = it->second;
+            queryCache_.invalidate(pk);
+            // also invalidate without schema prefix (raw parser name)
+            auto dot = pk.rfind('.');
+            if (dot != std::string::npos)
+                queryCache_.invalidate(pk.substr(dot + 1));
+            it = tableParent_.find(pk);
+        }
     }
 
     // ── Phase 62: Partition management ───────────────────────────
@@ -5890,6 +5979,66 @@ private:
             }
         }
         return true;
+    }
+
+    // ── Phase 78: Inheritance helpers ────────────────────────────
+
+    // Recursively collect rows from child tables, projected to parentColCount columns.
+    // If allRows=true, collect all (no WHERE); otherwise apply conds/cis/logic.
+    void collectInheritedRows_(const std::string& parentKey,
+                               size_t parentColCount,
+                               const std::vector<WhereCondition>& conds,
+                               const std::vector<size_t>& cis,
+                               const std::string& logic,
+                               Table& result,
+                               bool allRows) const {
+        auto childIt = tableChildren_.find(parentKey);
+        if (childIt == tableChildren_.end()) return;
+        for (const auto& childKey : childIt->second) {
+            auto cit = tables_.find(childKey);
+            if (cit == tables_.end()) continue;
+            for (const auto& row : cit->second.rows()) {
+                if (row.xmax != 0) continue;
+                // Project to parent column count
+                std::vector<std::string> proj;
+                proj.reserve(parentColCount);
+                for (size_t i = 0; i < parentColCount && i < row.values.size(); ++i)
+                    proj.push_back(row.values[i]);
+                // Pad with NULL if child has fewer columns than parent (shouldn't happen)
+                while (proj.size() < parentColCount) proj.push_back("NULL");
+                Row projRow(proj);
+                if (allRows || conds.empty() || rowMatchesByIdx(projRow, conds, cis, logic))
+                    result.mutableRows().push_back(projRow); // bypass UNIQUE/PK checks
+            }
+            // Recurse into grandchildren
+            collectInheritedRows_(childKey, parentColCount, conds, cis, logic, result, allRows);
+        }
+    }
+
+    // Recursively count rows in child tables
+    size_t countInheritedRows_(const std::string& parentKey) const {
+        auto childIt = tableChildren_.find(parentKey);
+        if (childIt == tableChildren_.end()) return 0;
+        size_t n = 0;
+        for (const auto& childKey : childIt->second) {
+            auto cit = tables_.find(childKey);
+            if (cit != tables_.end()) {
+                for (const auto& row : cit->second.rows())
+                    if (row.xmax == 0) ++n;
+            }
+            n += countInheritedRows_(childKey);
+        }
+        return n;
+    }
+
+    void printInheritanceTree_(const std::string& parent, int depth) const {
+        auto childIt = tableChildren_.find(parent);
+        if (childIt == tableChildren_.end()) return;
+        for (const auto& child : childIt->second) {
+            for (int i = 0; i < depth; ++i) std::cout << "  ";
+            std::cout << "  → " << child << "\n";
+            printInheritanceTree_(child, depth + 1);
+        }
     }
 
     // ── Phase 77: Parallel filter ─────────────────────────────────

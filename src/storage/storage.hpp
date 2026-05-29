@@ -115,7 +115,14 @@ private:
                 if (ri + 1 < rows.size()) o << ",";
                 o << "\n";
             }
-            o << "      ]\n";
+            o << "      ]";
+            // Phase 78: persist inheritance relationship
+            {
+                std::string parentName = engine.tableParentName(names[ti]);
+                if (!parentName.empty())
+                    o << ",\n      \"inherits\": \"" << esc(parentName) << "\"";
+            }
+            o << "\n";
 
             o << "    }";
             if (ti + 1 < names.size()) o << ",";
@@ -207,6 +214,7 @@ private:
 
         std::vector<Column>                  columns;
         std::vector<std::vector<std::string>> rows;
+        std::string                           inherits;
 
         while (pos < j.size() && j[pos] != '}') {
             skip(j, pos);
@@ -215,8 +223,9 @@ private:
             eat(j, pos, ':');
             skip(j, pos);
 
-            if      (key == "columns") columns = parseCols(j, pos);
-            else if (key == "rows")    rows    = parseRows(j, pos);
+            if      (key == "columns")  columns  = parseCols(j, pos);
+            else if (key == "rows")     rows     = parseRows(j, pos);
+            else if (key == "inherits") inherits = parseStr(j, pos);
             else                        skipVal(j, pos);
 
             skip(j, pos);
@@ -229,6 +238,9 @@ private:
         engine.createTable(tableName, columns);
         for (auto& rv : rows)
             engine.insertRow(tableName, rv);
+        // Phase 78: restore inheritance maps (columns already stored in full)
+        if (!inherits.empty())
+            engine.registerInheritance(tableName, inherits);
     }
 
     // Parst das "columns"-Array: [{"name":"...","type":"..."}, ...]
@@ -392,7 +404,7 @@ private:
 class MilanBinaryStorage : public StorageEngine {
 public:
     // Magic Bytes und Versionskonstanten
-    static constexpr uint16_t FORMAT_VERSION = 8;  // Phase 68: Generated Columns
+    static constexpr uint16_t FORMAT_VERSION = 9;  // Phase 78: Table Inheritance
     static constexpr const char* MAGIC = "MILANDB1";  // 8 Bytes
 
     explicit MilanBinaryStorage(std::string path = "database.milan")
@@ -452,7 +464,7 @@ public:
         rU32(buf, pos);                        // Bytes 10..13  (Page Count, reserviert)
         uint16_t storedCs = rU16(buf, pos);   // Bytes 14..15
 
-        if (version != FORMAT_VERSION && version != 7)
+        if (version != FORMAT_VERSION && version != 8 && version != 7)
             throw std::runtime_error(
                 "Inkompatible Version: gespeichert=" + std::to_string(version) +
                 ", erwartet=" + std::to_string(FORMAT_VERSION));
@@ -537,6 +549,10 @@ private:
                 writeStrN(o, fk.refCol);
                 writeU8(o, encodeOnDelete(fk.onDelete));  // Phase 21
             }
+
+            // Phase 78: Inheritance — persist parent table name (empty = no parent)
+            std::string parentName = engine.tableParentName(tname);
+            writeStrN(o, parentName);
         }
 
         // Phase 24: Views serialisieren
@@ -622,6 +638,13 @@ private:
                 fk.refCol   = rStrN(d, pos);
                 fk.onDelete = decodeOnDelete(rU8(d, pos));  // Phase 21
                 engine.addForeignKey(tname, fk);
+            }
+
+            // Phase 78: Inheritance — restore parent map (version >= 9)
+            if (version >= 9) {
+                std::string parentName = rStrN(d, pos);
+                if (!parentName.empty())
+                    engine.registerInheritance(tname, parentName);
             }
         }
 

@@ -146,6 +146,8 @@ enum class CommandType {
     SET_PARALLEL_THRESHOLD,
     SET_MAX_PARALLEL_WORKERS,
     SHOW_PARALLEL_STATUS,
+    // Phase 78: Table Inheritance
+    SHOW_INHERITANCE,
     UNKNOWN
 };
 
@@ -368,6 +370,10 @@ struct ParsedCommand {
 
     // Phase 77: Parallel query hint
     int parallelHint = 0;  // from /*+ PARALLEL(N) */ comment
+
+    // Phase 78: Table Inheritance
+    std::string tableInherits;  // parent table name for CREATE TABLE ... INHERITS
+    bool        fromOnly = false; // SELECT ... FROM ONLY tbl
 };
 
 class Parser {
@@ -908,6 +914,48 @@ public:
             }
         }
 
+        // ── Phase 78: Pre-process CREATE TABLE ... INHERITS (parent) ──
+        std::string tableInheritsTemp;
+        {
+            std::string ucheck = input;
+            for (auto& c : ucheck) c = static_cast<char>(std::toupper(
+                static_cast<unsigned char>(c)));
+            if (ucheck.size() > 12 && ucheck.substr(0, 12) == "CREATE TABLE") {
+                auto firstLp = input.find('(');
+                if (firstLp != std::string::npos) {
+                    // Find the balanced ')' for the column list
+                    int depth = 0; size_t matchRp = std::string::npos;
+                    for (size_t k = firstLp; k < input.size(); ++k) {
+                        if (input[k] == '(') ++depth;
+                        else if (input[k] == ')') {
+                            --depth;
+                            if (depth == 0) { matchRp = k; break; }
+                        }
+                    }
+                    if (matchRp != std::string::npos && matchRp + 1 < input.size()) {
+                        std::string after = input.substr(matchRp + 1);
+                        std::string afterU = after;
+                        for (auto& c : afterU) c = static_cast<char>(std::toupper(
+                            static_cast<unsigned char>(c)));
+                        auto ipos = afterU.find("INHERITS");
+                        if (ipos != std::string::npos) {
+                            auto lp = after.find('(', ipos);
+                            auto rp = after.find(')', lp != std::string::npos ? lp : 0);
+                            if (lp != std::string::npos && rp != std::string::npos) {
+                                tableInheritsTemp = after.substr(lp + 1, rp - lp - 1);
+                                size_t s = tableInheritsTemp.find_first_not_of(" \t");
+                                size_t e = tableInheritsTemp.find_last_not_of(" \t");
+                                if (s != std::string::npos)
+                                    tableInheritsTemp = tableInheritsTemp.substr(s, e - s + 1);
+                                // Truncate input to just the column defs part
+                                input = input.substr(0, matchRp + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Standard-Parsing (Phasen 1–9) ─────────────────────
 
         std::string parenContent;
@@ -1013,8 +1061,15 @@ public:
                     if (c != "*" && !c.empty())
                         cmd.selectColumns.push_back(c);
 
-                cmd.tableName = tokens[fromIdx + 1];
-                size_t rest = fromIdx + 2;
+                // Phase 78: FROM ONLY tbl
+                if (toUpper(tokens[fromIdx + 1]) == "ONLY" &&
+                    fromIdx + 2 < tokens.size()) {
+                    cmd.fromOnly  = true;
+                    cmd.tableName = tokens[fromIdx + 2];
+                } else {
+                    cmd.tableName = tokens[fromIdx + 1];
+                }
+                size_t rest = fromIdx + (cmd.fromOnly ? 3 : 2);
                 parseWhere(tokens, rest, cmd);
                 parseOrderBy(tokens, rest, cmd);
                 parseLimit(tokens, rest, cmd);
@@ -1465,6 +1520,9 @@ public:
                     }
                     cmd.columns.push_back(std::move(col));
                 }
+                // Phase 78: INHERITS
+                if (!tableInheritsTemp.empty())
+                    cmd.tableInherits = tableInheritsTemp;
             } else { cmd.type = CommandType::UNKNOWN; }
 
         // ── UPDATE ──────────────────────────────────────────────
@@ -1611,6 +1669,9 @@ public:
             } else if (kw1 == "PARALLEL" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_PARALLEL_STATUS;
+            // Phase 78: SHOW INHERITANCE
+            } else if (kw1 == "INHERITANCE") {
+                cmd.type = CommandType::SHOW_INHERITANCE;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;

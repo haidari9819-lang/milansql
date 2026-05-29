@@ -1323,7 +1323,8 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty() || cmd.columns.empty()) {
             std::cout << "  Fehler: CREATE TABLE name (col TYP, ...)\n"; break;
         }
-        engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+        engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys,
+                           cmd.tableInherits); // Phase 78: INHERITS
         // Auto-create BTREE index for PRIMARY KEY column
         for (const auto& col : cmd.columns) {
             if (col.isPrimaryKey) {
@@ -1366,6 +1367,9 @@ inline bool dispatchCommand(
         persistFn();
         dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
+        // Phase 78: if INHERITS, invalidate parent table cache too
+        if (!cmd.tableInherits.empty())
+            engine.invalidateCache(cmd.tableInherits);
         std::cout << "  Tabelle '" << cmd.tableName << "' erstellt ("
                   << cmd.columns.size() << " Spalten";
         if (!cmd.foreignKeys.empty())
@@ -1906,7 +1910,7 @@ inline bool dispatchCommand(
 
         if (cmd.isCount) {
             std::size_t n = engine.countWhere(
-                cmd.tableName, cmd.whereConds, cmd.whereLogic);
+                cmd.tableName, cmd.whereConds, cmd.whereLogic, cmd.fromOnly); // Phase 78: ONLY
             std::cout << "\n  COUNT(*) = " << n
                       << " (Tabelle '" << cmd.tableName << "')";
             if (!cmd.whereConds.empty())
@@ -1961,13 +1965,13 @@ inline bool dispatchCommand(
                 // Phase 69: Table scan step
                 if (g_profiler.isEnabled()) g_profiler.addStep("Table scan");
                 auto qr = engine.selectWhere(
-                    cmd.tableName, cmd.whereConds, cmd.whereLogic);
+                    cmd.tableName, cmd.whereConds, cmd.whereLogic, cmd.fromOnly); // Phase 78: ONLY
                 usedIndex = qr.usedIndex;
                 result    = std::move(qr.table);
                 if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             } else {
                 if (g_profiler.isEnabled()) g_profiler.addStep("Table scan");
-                result = engine.selectAllFiltered(cmd.tableName); // Phase 75: RLS
+                result = engine.selectAllFiltered(cmd.tableName, cmd.fromOnly); // Phase 75/78: RLS+ONLY
                 if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             }
             // Phase 77: restore hint workers
@@ -3680,6 +3684,11 @@ inline bool dispatchCommand(
         }
         break;
     }
+
+    // ── Phase 78: Table Inheritance ──────────────────────────────
+    case milansql::CommandType::SHOW_INHERITANCE:
+        engine.showInheritance();
+        break;
 
     // ── Phase 77: Parallel Query ──────────────────────────────────
     case milansql::CommandType::SHOW_PARALLEL_STATUS:

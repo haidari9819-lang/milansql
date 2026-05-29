@@ -27,6 +27,7 @@
 #include "../spatial/spatial.hpp"      // Phase 70: Spatial Index
 #include "../mvcc/transaction_manager.hpp"  // Phase 71: MVCC
 #include "../buffer/buffer_pool.hpp"   // Phase 73: Buffer Pool Manager
+#include "../parallel/parallel_executor.hpp" // Phase 77: Parallel Query
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1170,10 +1171,22 @@ public:
         for (const auto& cond : conds)
             cis.push_back(colIdx(src, cond.col));
 
-        for (const auto& row : src.rows()) {
-            if (row.xmax != 0) continue;  // Phase 71: skip dead rows
-            if (rowMatchesByIdx(row, conds, cis, logic))
-                result.insert(row);
+        // Phase 77: parallel scan when rows >= threshold
+        {
+            const auto& allRows = src.rows();
+            bool useParallel = parallelExec_.numWorkers > 1 &&
+                               (long long)allRows.size() >= parallelExec_.threshold;
+            if (useParallel) {
+                auto pf = parallelFilter_(allRows, conds, cis, logic,
+                                          parallelExec_.numWorkers);
+                for (const auto& r : pf) result.insert(r);
+            } else {
+                for (const auto& row : allRows) {
+                    if (row.xmax != 0) continue;  // Phase 71: skip dead rows
+                    if (rowMatchesByIdx(row, conds, cis, logic))
+                        result.insert(row);
+                }
+            }
         }
         // Phase 75: apply Row-Level Security filter
         {
@@ -1208,6 +1221,14 @@ public:
         auto tblName = resolveTableName(tblNameRaw);
         const Table& src = getTable(tblName);
         std::size_t ci = colIdx(src, col);
+
+        // Phase 77: parallel aggregate (COUNT uses countRows path, not here)
+        if (parallelExec_.numWorkers > 1 &&
+            (long long)src.rows().size() >= parallelExec_.threshold &&
+            conds.empty()) {
+            return parallelAggregate_(src, func, ci, parallelExec_.numWorkers);
+        }
+
         std::vector<double> nums;
         for (const auto& row : src.rows()) {
             if (row.xmax != 0) continue;  // Phase 71: skip dead rows
@@ -2914,6 +2935,21 @@ public:
     }
 
     const std::string& getCurrentUser() const { return currentUser_; }
+
+    // ── Phase 77: Parallel Query ──────────────────────────────
+    void setParallelThreshold(long long t) { if (t >= 1) parallelExec_.threshold = t; }
+    void setMaxParallelWorkers(int n)      { if (n >= 1 && n <= 64) parallelExec_.numWorkers = n; }
+    long long getParallelThreshold() const { return parallelExec_.threshold; }
+    int  getMaxParallelWorkers() const     { return parallelExec_.numWorkers; }
+    bool isParallelEnabled() const         { return parallelExec_.numWorkers > 1; }
+
+    void showParallelStatus() const {
+        std::cout << "\n  Parallel Query Execution:\n";
+        std::cout << "    PARALLEL_THRESHOLD   = " << parallelExec_.threshold << " rows\n";
+        std::cout << "    MAX_PARALLEL_WORKERS = " << parallelExec_.numWorkers << " threads\n";
+        std::cout << "    Status               = "
+                  << (parallelExec_.numWorkers > 1 ? "ENABLED" : "DISABLED") << "\n\n";
+    }
 
     void grantPrivilege(const std::string& userName, const std::string& tableName,
                         const std::vector<std::string>& privs) {
@@ -5401,6 +5437,9 @@ public:
     std::map<std::string, std::vector<RlsPolicy>> rlsPolicies_;
     std::set<std::string> rlsEnabled_;
 
+    // Phase 77: Parallel Query Execution
+    ParallelExecutor parallelExec_;
+
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
 
@@ -5851,6 +5890,99 @@ private:
             }
         }
         return true;
+    }
+
+    // ── Phase 77: Parallel filter ─────────────────────────────────
+    std::vector<Row> parallelFilter_(
+            const std::vector<Row>& rows,
+            const std::vector<WhereCondition>& conds,
+            const std::vector<size_t>& cis,
+            const std::string& logic,
+            int numWorkers) const {
+        size_t total = rows.size();
+        if (total == 0 || numWorkers <= 1) return {};
+        size_t chunkSize = (total + static_cast<size_t>(numWorkers) - 1)
+                           / static_cast<size_t>(numWorkers);
+        std::vector<std::vector<Row>> partials(static_cast<size_t>(numWorkers));
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<size_t>(numWorkers));
+        for (int w = 0; w < numWorkers; ++w) {
+            size_t start = static_cast<size_t>(w) * chunkSize;
+            if (start >= total) break;
+            size_t end = std::min(start + chunkSize, total);
+            threads.emplace_back([&, w, start, end]() {
+                for (size_t i = start; i < end; ++i) {
+                    const auto& row = rows[i];
+                    if (row.xmax != 0) continue;
+                    if (rowMatchesByIdx(row, conds, cis, logic))
+                        partials[static_cast<size_t>(w)].push_back(row);
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+        std::vector<Row> result;
+        for (auto& p : partials)
+            result.insert(result.end(), p.begin(), p.end());
+        return result;
+    }
+
+    // ── Phase 77: Parallel aggregate ─────────────────────────────
+    std::string parallelAggregate_(
+            const Table& src,
+            const std::string& func,
+            size_t ci,
+            int numWorkers) const {
+        const auto& rows = src.rows();
+        size_t total = rows.size();
+        if (total == 0) return "NULL";
+        size_t chunkSize = (total + static_cast<size_t>(numWorkers) - 1)
+                           / static_cast<size_t>(numWorkers);
+        if (func == "COUNT") {
+            std::vector<size_t> counts(static_cast<size_t>(numWorkers), 0);
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<size_t>(numWorkers));
+            for (int w = 0; w < numWorkers; ++w) {
+                size_t start = static_cast<size_t>(w) * chunkSize;
+                if (start >= total) break;
+                size_t end = std::min(start + chunkSize, total);
+                threads.emplace_back([&, w, start, end]() {
+                    for (size_t i = start; i < end; ++i)
+                        if (rows[i].xmax == 0) ++counts[static_cast<size_t>(w)];
+                });
+            }
+            for (auto& t : threads) t.join();
+            size_t n = 0; for (auto c : counts) n += c;
+            return std::to_string(n);
+        }
+        std::vector<std::vector<double>> partials(static_cast<size_t>(numWorkers));
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<size_t>(numWorkers));
+        for (int w = 0; w < numWorkers; ++w) {
+            size_t start = static_cast<size_t>(w) * chunkSize;
+            if (start >= total) break;
+            size_t end = std::min(start + chunkSize, total);
+            threads.emplace_back([&, w, start, end]() {
+                for (size_t i = start; i < end; ++i) {
+                    const auto& row = rows[i];
+                    if (row.xmax != 0) continue;
+                    if (ci < row.values.size()) {
+                        try { partials[static_cast<size_t>(w)].push_back(
+                            std::stod(row.values[ci])); }
+                        catch (...) {}
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+        std::vector<double> all;
+        for (auto& p : partials) all.insert(all.end(), p.begin(), p.end());
+        if (all.empty()) return "NULL";
+        if (func == "MIN") return formatNum(*std::min_element(all.begin(), all.end()));
+        if (func == "MAX") return formatNum(*std::max_element(all.begin(), all.end()));
+        if (func == "SUM") { double s = 0; for (double v : all) s += v; return formatNum(s); }
+        if (func == "AVG") { double s = 0; for (double v : all) s += v;
+            return formatNum(s / static_cast<double>(all.size())); }
+        return "NULL";
     }
 
     std::vector<Row> applyRls_(const std::string& table,

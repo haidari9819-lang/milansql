@@ -1950,6 +1950,13 @@ inline bool dispatchCommand(
             milansql::Table result;
             bool usedIndex = false;
 
+            // Phase 77: apply /*+ PARALLEL(N) */ hint
+            int p77_savedWorkers = 0;
+            if (cmd.parallelHint > 0) {
+                p77_savedWorkers = engine.getMaxParallelWorkers();
+                engine.setMaxParallelWorkers(cmd.parallelHint);
+            }
+
             if (!cmd.whereConds.empty()) {
                 // Phase 69: Table scan step
                 if (g_profiler.isEnabled()) g_profiler.addStep("Table scan");
@@ -1963,6 +1970,9 @@ inline bool dispatchCommand(
                 result = engine.selectAllFiltered(cmd.tableName); // Phase 75: RLS
                 if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             }
+            // Phase 77: restore hint workers
+            if (cmd.parallelHint > 0)
+                engine.setMaxParallelWorkers(p77_savedWorkers);
 
             // Phase 65: SELECT FOR UPDATE — acquire row-level WRITE locks
             if (cmd.isForUpdate) {
@@ -3667,6 +3677,37 @@ inline bool dispatchCommand(
                 std::cout << chans[i];
             }
             std::cout << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 77: Parallel Query ──────────────────────────────────
+    case milansql::CommandType::SHOW_PARALLEL_STATUS:
+        engine.showParallelStatus();
+        break;
+
+    case milansql::CommandType::SET_PARALLEL_THRESHOLD: {
+        if (!cmd.values.empty()) {
+            try {
+                long long t = std::stoll(cmd.values[0]);
+                engine.setParallelThreshold(t);
+                std::cout << "  PARALLEL_THRESHOLD = " << t << " rows.\n\n";
+            } catch (...) {
+                std::cout << "  Fehler: SET PARALLEL_THRESHOLD = <N>\n\n";
+            }
+        }
+        break;
+    }
+
+    case milansql::CommandType::SET_MAX_PARALLEL_WORKERS: {
+        if (!cmd.values.empty()) {
+            try {
+                int n = std::stoi(cmd.values[0]);
+                engine.setMaxParallelWorkers(n);
+                std::cout << "  MAX_PARALLEL_WORKERS = " << n << " threads.\n\n";
+            } catch (...) {
+                std::cout << "  Fehler: SET MAX_PARALLEL_WORKERS = <N>\n\n";
+            }
         }
         break;
     }

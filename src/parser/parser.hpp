@@ -142,6 +142,10 @@ enum class CommandType {
     UNLISTEN,
     NOTIFY,
     SHOW_LISTEN,
+    // Phase 77: Parallel Query
+    SET_PARALLEL_THRESHOLD,
+    SET_MAX_PARALLEL_WORKERS,
+    SHOW_PARALLEL_STATUS,
     UNKNOWN
 };
 
@@ -361,6 +365,9 @@ struct ParsedCommand {
     // Phase 76: LISTEN / NOTIFY / UNLISTEN
     std::string channelName;
     std::string notifyPayload;
+
+    // Phase 77: Parallel query hint
+    int parallelHint = 0;  // from /*+ PARALLEL(N) */ comment
 };
 
 class Parser {
@@ -929,6 +936,27 @@ public:
         // ── SELECT ──────────────────────────────────────────────
         if (kw0 == "SELECT") {
             cmd.type = CommandType::SELECT;
+            // Phase 77: /*+ PARALLEL(N) */ hint
+            {
+                auto hp = input.find("/*+");
+                if (hp != std::string::npos) {
+                    auto he = input.find("*/", hp);
+                    if (he != std::string::npos) {
+                        std::string h = input.substr(hp + 3, he - hp - 3);
+                        std::string hu = h;
+                        for (auto& c : hu) c = static_cast<char>(std::toupper(
+                            static_cast<unsigned char>(c)));
+                        auto pp = hu.find("PARALLEL");
+                        if (pp != std::string::npos) {
+                            auto lp = h.find('(', pp);
+                            auto rp = h.find(')', pp);
+                            if (lp != std::string::npos && rp != std::string::npos)
+                                try { cmd.parallelHint = std::stoi(h.substr(lp+1, rp-lp-1)); }
+                                catch (...) {}
+                        }
+                    }
+                }
+            }
             size_t idx = 1;
 
             // DISTINCT?
@@ -1579,6 +1607,10 @@ public:
             // Phase 76: SHOW LISTEN
             } else if (kw1 == "LISTEN") {
                 cmd.type = CommandType::SHOW_LISTEN;
+            // Phase 77: SHOW PARALLEL STATUS
+            } else if (kw1 == "PARALLEL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_PARALLEL_STATUS;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1691,6 +1723,24 @@ public:
             for (size_t i = 2; i < tokens.size(); ++i)
                 if (toUpper(tokens[i]) == "ON" && i + 1 < tokens.size())
                     cmd.tableName = tokens[i + 1];
+
+        // ── Phase 77: SET PARALLEL_THRESHOLD = N ─────────────────
+        } else if (kw0 == "SET" && kw1 == "PARALLEL_THRESHOLD") {
+            cmd.type = CommandType::SET_PARALLEL_THRESHOLD;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                if (!val.empty()) cmd.values.push_back(val);
+            }
+
+        // ── Phase 77: SET MAX_PARALLEL_WORKERS = N ───────────────
+        } else if (kw0 == "SET" && kw1 == "MAX_PARALLEL_WORKERS") {
+            cmd.type = CommandType::SET_MAX_PARALLEL_WORKERS;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                if (!val.empty()) cmd.values.push_back(val);
+            }
 
         // ── Phase 76: LISTEN channel ──────────────────────────────
         } else if (kw0 == "LISTEN") {

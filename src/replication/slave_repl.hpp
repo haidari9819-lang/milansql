@@ -32,7 +32,7 @@
   #include <unistd.h>
   using slave_sock_t = int;
   #ifndef INVALID_SOCKET
-  constexpr slave_sock_t INVALID_SOCKET = -1;
+  #define INVALID_SOCKET (-1)
   #endif
   static inline void slave_closesock(slave_sock_t s) { ::close(s); }
 #endif

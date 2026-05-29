@@ -1,12 +1,23 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v1.9.0-brightgreen)
+![Version](https://img.shields.io/badge/version-v1.10.0-brightgreen)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
 
 Eine selbst gebaute relationale Datenbank in **C++17** — inspiriert von MariaDB/SQLite.  
-Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **66 Features, 0 externe Abhängigkeiten.**
+Entwickelt von **Mirwais Haidari**, Phase für Phase aufgebaut. **67 Features, 0 externe Abhängigkeiten.**
+
+---
+
+## What's new in v1.10.0
+
+| Phase | Feature |
+|-------|---------|
+| **67** | **Multi-Statement Queries**: `SELECT 1; SELECT 2; SELECT 3;` — alle Ergebnisse in einem Aufruf |
+| | REPL: mehrere `;`-getrennte Statements in einer Zeile → sequenziell ausgeführt |
+| | REST API: `POST /query` mit mehreren Statements → `{"success":true,"results":[...]}` |
+| | `splitStatements()`: respektiert `BEGIN...END`, Strings, `--` und `/* */` Kommentare |
 
 ---
 

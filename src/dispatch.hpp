@@ -40,6 +40,112 @@ static inline void dispatch_binlogWrite(const std::string& sql) {
         milansql::g_binlogHook(sql);
 }
 
+// ── Phase 67: Split multiple SQL statements ───────────────────
+// Splits input on ';' respecting string literals, -- comments,
+// /* */ block comments, and BEGIN...END depth (for procedures/triggers).
+static inline std::vector<std::string> splitStatements(const std::string& input) {
+    std::vector<std::string> stmts;
+    std::string cur;
+    int beginDepth = 0;
+    bool inStr         = false;
+    bool inLineCmt     = false;
+    bool inBlockCmt    = false;
+
+    auto isWordChar = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    };
+
+    size_t i = 0;
+    while (i < input.size()) {
+        char c = input[i];
+
+        // ── line comment --
+        if (!inStr && !inBlockCmt && !inLineCmt &&
+            c == '-' && i + 1 < input.size() && input[i+1] == '-') {
+            inLineCmt = true; cur += c; i++; continue;
+        }
+        if (inLineCmt) {
+            cur += c; if (c == '\n') inLineCmt = false; i++; continue;
+        }
+
+        // ── block comment /* */
+        if (!inStr && !inBlockCmt &&
+            c == '/' && i + 1 < input.size() && input[i+1] == '*') {
+            inBlockCmt = true; cur += c; i++; continue;
+        }
+        if (inBlockCmt) {
+            cur += c;
+            if (c == '*' && i + 1 < input.size() && input[i+1] == '/') {
+                cur += input[i+1]; i += 2; inBlockCmt = false;
+            } else i++;
+            continue;
+        }
+
+        // ── single-quoted string
+        if (!inStr && c == '\'') { inStr = true; cur += c; i++; continue; }
+        if (inStr) {
+            cur += c;
+            if (c == '\'' && i + 1 < input.size() && input[i+1] == '\'') {
+                cur += input[i+1]; i += 2;   // '' escape
+            } else if (c == '\'') {
+                inStr = false; i++;
+            } else { i++; }
+            continue;
+        }
+
+        // ── BEGIN depth tracking
+        if (i + 5 <= input.size()) {
+            std::string w5;
+            for (size_t j = i; j < i+5; ++j)
+                w5 += static_cast<char>(std::toupper(static_cast<unsigned char>(input[j])));
+            bool lOk = (i == 0 || !isWordChar(input[i-1]));
+            bool rOk = (i+5 >= input.size() || !isWordChar(input[i+5]));
+            if (w5 == "BEGIN" && lOk && rOk) {
+                beginDepth++; cur += input.substr(i, 5); i += 5; continue;
+            }
+        }
+
+        // ── END depth tracking (but not END IF / END LOOP / END WHILE / END CASE)
+        if (beginDepth > 0 && i + 3 <= input.size()) {
+            std::string w3;
+            for (size_t j = i; j < i+3; ++j)
+                w3 += static_cast<char>(std::toupper(static_cast<unsigned char>(input[j])));
+            bool lOk = (i == 0 || !isWordChar(input[i-1]));
+            bool rOk = (i+3 >= input.size() || !isWordChar(input[i+3]));
+            if (w3 == "END" && lOk && rOk) {
+                // peek at next word
+                size_t nx = i + 3;
+                while (nx < input.size() && input[nx] == ' ') ++nx;
+                std::string nw;
+                for (size_t j = nx; j < input.size() && std::isalpha(static_cast<unsigned char>(input[j])); ++j)
+                    nw += static_cast<char>(std::toupper(static_cast<unsigned char>(input[j])));
+                if (nw != "IF" && nw != "LOOP" && nw != "WHILE" && nw != "CASE") {
+                    beginDepth--;
+                }
+                cur += input.substr(i, 3); i += 3; continue;
+            }
+        }
+
+        // ── split on ';' at depth 0
+        if (c == ';' && beginDepth == 0) {
+            std::string s = cur;
+            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+            if (!s.empty()) stmts.push_back(s);
+            cur.clear(); i++;
+        } else {
+            cur += c; i++;
+        }
+    }
+
+    // trailing statement without semicolon
+    while (!cur.empty() && std::isspace(static_cast<unsigned char>(cur.front()))) cur.erase(cur.begin());
+    while (!cur.empty() && std::isspace(static_cast<unsigned char>(cur.back()))) cur.pop_back();
+    if (!cur.empty()) stmts.push_back(cur);
+
+    return stmts;
+}
+
 // ── Forward declarations of helper print functions ───────────
 static inline void dispatch_printTable(const milansql::Table& tbl, int limit = -1, int offset = 0);
 static inline void dispatch_printIndexes(const std::vector<milansql::IndexInfo>& indexes, const std::string& tableName);

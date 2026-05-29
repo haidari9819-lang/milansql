@@ -453,12 +453,11 @@ inline void MilanHttpServer::initEngine() {
 }
 
 // ── MilanHttpServer::handleQuery ──────────────────────────────
+// Phase 67: supports multi-statement input; returns combined results array
+// when more than one statement is present.
 
 inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
     std::lock_guard<std::mutex> lock(engineMutex_);
-
-    std::ostringstream captured;
-    std::streambuf* old = std::cout.rdbuf(captured.rdbuf());
 
     auto persistFn = [this]() {
         if (engine_.isInTransaction()) return;
@@ -491,35 +490,52 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
         }
     };
 
-    bool ok = true;
-    std::string errMsg;
+    // ── helper: execute one statement, return its JSON result ───
+    auto execOne = [&](const std::string& oneSQL) -> std::string {
+        std::ostringstream cap;
+        std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
+        bool ok = true;
+        std::string errMsg;
+        try {
+            milansql::Parser p;
+            auto cmd = p.parse(oneSQL);
+            for (const auto& sq : cmd.subqueries) {
+                if (sq.condIdx < cmd.whereConds.size())
+                    cmd.whereConds[sq.condIdx].inList =
+                        engine_.subqueryValues(sq.subTable, sq.subCol,
+                                               sq.subWhere, sq.subWhereLogic);
+            }
+            milansql::dispatchCommand(cmd, engine_, p, oneSQL,
+                                      persistFn, saveProceduresFn, saveTriggFn);
+        } catch (const std::exception& e) { ok = false; errMsg = e.what(); }
+          catch (...) { ok = false; errMsg = "Unbekannter Fehler"; }
+        std::cout.rdbuf(old);
+        if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
+        return parseOutputToJson(cap.str());
+    };
 
-    try {
-        milansql::Parser parser;
-        auto cmd = parser.parse(sql);
-        for (const auto& sq : cmd.subqueries) {
-            if (sq.condIdx < cmd.whereConds.size())
-                cmd.whereConds[sq.condIdx].inList =
-                    engine_.subqueryValues(sq.subTable, sq.subCol,
-                                           sq.subWhere, sq.subWhereLogic);
-        }
-        milansql::dispatchCommand(cmd, engine_, parser, sql,
-                                  persistFn, saveProceduresFn, saveTriggFn);
-    } catch (const std::exception& e) {
-        ok = false;
-        errMsg = e.what();
-    } catch (...) {
-        ok = false;
-        errMsg = "Unbekannter Fehler";
+    auto stmts = milansql::splitStatements(sql);
+
+    // ── single statement → backward-compatible response ─────────
+    if (stmts.size() <= 1) {
+        return execOne(stmts.empty() ? sql : stmts[0]);
     }
 
-    std::cout.rdbuf(old);
-
-    if (!ok) {
-        return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
+    // ── multi-statement → combined results array ─────────────────
+    std::string json = "{\"success\":true,\"results\":[";
+    bool anyError = false;
+    for (size_t idx = 0; idx < stmts.size(); ++idx) {
+        if (idx > 0) json += ",";
+        std::string res = execOne(stmts[idx]);
+        // Wrap with statement key
+        json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
+        if (res.find("\"success\":false") != std::string::npos) anyError = true;
     }
-
-    return parseOutputToJson(captured.str());
+    json += "],\"count\":" + std::to_string(stmts.size());
+    if (anyError) json += ",\"success\":false";
+    else          json += ",\"success\":true";
+    json += "}";
+    return json;
 }
 
 // ── MilanHttpServer::handleListTables ─────────────────────────

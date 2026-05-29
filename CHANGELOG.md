@@ -4,6 +4,42 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v1.10.0] — 2026-05-29
+
+### Added
+
+#### Phase 67 — Multi-Statement Queries
+
+- Mehrere `;`-getrennte SQL-Statements in einer einzigen Eingabe ausführen
+- REPL: `SELECT 1; SELECT 2; SELECT 3;` → alle 3 Ergebnisse ausgegeben
+- HTTP REST API: `POST /query` mit mehreren Statements → kombiniertes JSON-Ergebnis
+- `splitStatements(sql)` — teilt Input auf `;` auf, respektiert dabei:
+  - `BEGIN...END`-Blöcke (für CREATE TRIGGER / CREATE PROCEDURE)
+  - Single-Quoted Strings (`'...'`, inkl. `''`-Escaping)
+  - Zeilenkommentare (`-- ...`)
+  - Block-Kommentare (`/* ... */`)
+
+**Ergebnis-Format (REST API, mehrere Statements):**
+```json
+{
+  "success": true,
+  "count": 3,
+  "results": [
+    {"statement": "INSERT ...", "result": {"success": true, "rowsAffected": 1}},
+    {"statement": "INSERT ...", "result": {"success": true, "rowsAffected": 1}},
+    {"statement": "SELECT ...", "result": {"success": true, "columns": [...], "rows": [...]}}
+  ]
+}
+```
+
+### Architecture
+- `milansql::splitStatements(input)` — `static inline` in `dispatch.hpp`, nutzbar von REPL und HTTP-Server
+- `BEGIN`-depth-Tracking: depth++ bei `BEGIN`, depth-- bei `END` (außer `END IF`/`END LOOP`/`END WHILE`/`END CASE`)
+- REPL: Multi-Statement-Zweig vor Parser-Aufruf; einzelnes Statement → unverändertes Verhalten (inkl. UPDATE/DELETE-Bestätigungsdialog)
+- HTTP `handleQuery`: `execOne`-Lambda für Einzel-Statement, wrapped in Results-Array bei mehreren Statements; Single-Statement → rückwärtskompatibles Format
+
+---
+
 ## [v1.9.0] — 2026-05-28
 
 ### Added

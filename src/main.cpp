@@ -36,7 +36,7 @@
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v1.9.0 ===           \u2551\n"
+              << "  \u2551        === MilanSQL v1.10.0 ===           \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -549,6 +549,34 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+            }
+        }
+
+        // ── Phase 67: Multi-Statement Support ────────────────────
+        {
+            auto stmts67 = milansql::splitStatements(eingabe);
+            if (stmts67.size() > 1) {
+                // Multiple statements — execute each in order, no interactive prompts
+                bool doExit67 = false;
+                for (const auto& s67 : stmts67) {
+                    if (s67.empty()) continue;
+                    try {
+                        milansql::ParsedCommand sc67 = parser.parse(s67);
+                        for (const auto& sq : sc67.subqueries) {
+                            if (sq.condIdx < sc67.whereConds.size())
+                                sc67.whereConds[sq.condIdx].inList =
+                                    engine.subqueryValues(sq.subTable, sq.subCol,
+                                                          sq.subWhere, sq.subWhereLogic);
+                        }
+                        if (milansql::dispatchCommand(sc67, engine, parser, s67,
+                                persist, saveProcedures, saveTriggers))
+                            doExit67 = true;
+                    } catch (const std::exception& ex) {
+                        std::cout << "  FEHLER: " << ex.what() << "\n\n";
+                    }
+                }
+                if (doExit67) return 0;
+                continue;
             }
         }
 

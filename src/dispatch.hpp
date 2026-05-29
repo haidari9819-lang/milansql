@@ -25,8 +25,12 @@
 #include "replication/repl_state.hpp"
 #include "utils/csv_utils.hpp"
 #include "scheduler/event_scheduler.hpp"
+#include "profiler/query_profiler.hpp"  // Phase 69: Query Profiler
 
 namespace milansql {
+
+// ── Phase 69: Global Query Profiler ──────────────────────────
+static QueryProfiler g_profiler;
 
 // ── Phase 59: Replication helpers ────────────────────────────
 // Returns true if the current operation should be blocked (slave read-only)
@@ -1905,6 +1909,9 @@ inline bool dispatchCommand(
 
         // Execute and optionally capture for caching
         {
+            // Phase 69: Profiler start
+            if (g_profiler.isEnabled()) g_profiler.startQuery(eingabe);
+
             auto& qc = engine.getQueryCache();
             // Redirect cout to ostringstream when cache is active
             std::ostringstream captureStream;
@@ -1913,17 +1920,25 @@ inline bool dispatchCommand(
                 oldBuf = std::cout.rdbuf(captureStream.rdbuf());
             }
 
+            // Phase 69: Optimization step
+            if (g_profiler.isEnabled()) g_profiler.addStep("Optimization");
+
             std::cout << "\n";
             milansql::Table result;
             bool usedIndex = false;
 
             if (!cmd.whereConds.empty()) {
+                // Phase 69: Table scan step
+                if (g_profiler.isEnabled()) g_profiler.addStep("Table scan");
                 auto qr = engine.selectWhere(
                     cmd.tableName, cmd.whereConds, cmd.whereLogic);
                 usedIndex = qr.usedIndex;
                 result    = std::move(qr.table);
+                if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             } else {
+                if (g_profiler.isEnabled()) g_profiler.addStep("Table scan");
                 result = engine.selectAll(cmd.tableName).clone();
+                if (g_profiler.isEnabled()) g_profiler.addStep("Result filtering");
             }
 
             // Phase 65: SELECT FOR UPDATE — acquire row-level WRITE locks
@@ -1932,6 +1947,7 @@ inline bool dispatchCommand(
                     engine.acquireForUpdateLocks(cmd.tableName, result);
                 } catch (const std::exception& ex) {
                     if (oldBuf) std::cout.rdbuf(oldBuf);
+                    if (g_profiler.isEnabled()) g_profiler.endQuery();
                     std::cout << "  FEHLER (FOR UPDATE): " << ex.what() << "\n\n";
                     break;
                 }
@@ -1944,10 +1960,12 @@ inline bool dispatchCommand(
                 std::cout << "  " << lbl << " 0 Zeilen gefunden (WHERE "
                           << dispatch_whereDesc(cmd) << ")\n\n";
                 if (oldBuf) { std::cout.rdbuf(oldBuf); std::cout << captureStream.str(); }
+                if (g_profiler.isEnabled()) g_profiler.endQuery();
                 break;
             }
 
             if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
+                if (g_profiler.isEnabled()) g_profiler.addStep("Result projection");
                 bool hasWin = false;
                 for (const auto& si : cmd.selectItems)
                     if (si.isWindowFunc) { hasWin = true; break; }
@@ -1955,13 +1973,19 @@ inline bool dispatchCommand(
                     result = engine.projectWithWindowItems(result, cmd.selectItems);
                 else
                     result = engine.projectWithItems(result, cmd.selectItems);
-                if (!cmd.orderByCols.empty())
+                if (!cmd.orderByCols.empty()) {
+                    if (g_profiler.isEnabled()) g_profiler.addStep("Sorting");
                     result.sortByMulti(cmd.orderByCols);
+                }
             } else {
-                if (!cmd.orderByCols.empty())
+                if (!cmd.orderByCols.empty()) {
+                    if (g_profiler.isEnabled()) g_profiler.addStep("Sorting");
                     result.sortByMulti(cmd.orderByCols);
-                if (!cmd.selectColumns.empty())
+                }
+                if (!cmd.selectColumns.empty()) {
+                    if (g_profiler.isEnabled()) g_profiler.addStep("Result projection");
                     result = result.project(cmd.selectColumns);
+                }
             }
             if (cmd.isDistinct)
                 result.makeDistinct();
@@ -1980,6 +2004,9 @@ inline bool dispatchCommand(
                 qc.put(eingabe, captured, cmd.tableName);
                 std::cout << captured;
             }
+
+            // Phase 69: Profiler end
+            if (g_profiler.isEnabled()) g_profiler.endQuery();
         }
         break;
     }
@@ -3342,6 +3369,46 @@ inline bool dispatchCommand(
                       << (cmd.eventSchedulerOn ? "aktiviert" : "deaktiviert") << ".\n\n";
         } else {
             std::cout << "  Event Scheduler nicht verfuegbar.\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 69: Query Profiler ──────────────────────────────────
+    case milansql::CommandType::PROFILE_ON:
+        g_profiler.enable();
+        std::cout << "  Query Profiler aktiviert.\n\n";
+        break;
+
+    case milansql::CommandType::PROFILE_OFF:
+        g_profiler.disable();
+        std::cout << "  Query Profiler deaktiviert.\n\n";
+        break;
+
+    case milansql::CommandType::SHOW_PROFILES:
+        g_profiler.showProfiles();
+        break;
+
+    case milansql::CommandType::SHOW_PROFILE_FOR_QUERY:
+        if (cmd.profileQueryId <= 0)
+            std::cout << "  Fehler: SHOW PROFILE FOR QUERY n\n\n";
+        else
+            g_profiler.showProfile(cmd.profileQueryId);
+        break;
+
+    // ── Phase 70: Spatial Index ───────────────────────────────────
+    case milansql::CommandType::CREATE_SPATIAL_INDEX: {
+        if (cmd.indexName.empty() || cmd.tableName.empty() || cmd.indexColumns.empty()) {
+            std::cout << "  Fehler: CREATE SPATIAL INDEX name ON table (col)\n\n";
+            break;
+        }
+        try {
+            engine.createIndex(cmd.tableName, cmd.indexColumns, cmd.indexName, "SPATIAL");
+            persistFn();
+            std::cout << "  Spatial-Index '" << cmd.indexName
+                      << "' auf Tabelle '" << cmd.tableName
+                      << "' (" << cmd.indexColumns[0] << ") erstellt.\n\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
         }
         break;
     }

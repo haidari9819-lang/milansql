@@ -111,6 +111,13 @@ enum class CommandType {
     LOCK_TABLE,
     UNLOCK_TABLES,
     SHOW_LOCKS,
+    // Phase 69: Query Profiler
+    PROFILE_ON,
+    PROFILE_OFF,
+    SHOW_PROFILES,
+    SHOW_PROFILE_FOR_QUERY,
+    // Phase 70: Spatial Index
+    CREATE_SPATIAL_INDEX,
     UNKNOWN
 };
 
@@ -310,6 +317,9 @@ struct ParsedCommand {
     // Phase 65: SELECT FOR UPDATE / LOCK TABLE
     bool        isForUpdate = false;   // SELECT ... FOR UPDATE
     std::string lockType;              // "READ" or "WRITE" for LOCK TABLE
+
+    // Phase 69: Query Profiler
+    int         profileQueryId = 0;    // SHOW PROFILE FOR QUERY n
 };
 
 class Parser {
@@ -675,7 +685,9 @@ public:
                  "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
                  "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
                  // Phase 64: REGEXP-Funktionen
-                 "REGEXP_REPLACE", "REGEXP_EXTRACT"};
+                 "REGEXP_REPLACE", "REGEXP_EXTRACT",
+                 // Phase 70: Spatial-Funktionen
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -1229,6 +1241,24 @@ public:
                 if (i < toks.size()) cmd.tableName = toks[i];
             }
 
+        // ── Phase 70: CREATE SPATIAL INDEX ───────────────────────
+        // Syntax: CREATE SPATIAL INDEX name ON table (col)
+        } else if (kw0 == "CREATE" && kw1 == "SPATIAL" && kw2 == "INDEX") {
+            cmd.type = CommandType::CREATE_SPATIAL_INDEX;
+            {
+                auto toks = tokenizeFull(input);
+                // CREATE SPATIAL INDEX name ON table ( col )
+                size_t i = 3;
+                if (i < toks.size()) cmd.indexName = toks[i++];
+                if (i < toks.size() && toUpper(toks[i]) == "ON") ++i;
+                if (i < toks.size()) cmd.tableName = toks[i++];
+                if (i < toks.size() && toks[i] == "(") ++i;
+                while (i < toks.size() && toks[i] != ")") {
+                    if (toks[i] != ",") cmd.indexColumns.push_back(toks[i]);
+                    ++i;
+                }
+            }
+
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
             cmd.type = CommandType::CREATE_INDEX;
@@ -1416,6 +1446,12 @@ public:
                 cmd.tableName = tokens[4];
             } else { cmd.type = CommandType::UNKNOWN; }
 
+        // ── Phase 69: PROFILE ON / PROFILE OFF ───────────────────
+        } else if (kw0 == "PROFILE") {
+            if (kw1 == "ON")  cmd.type = CommandType::PROFILE_ON;
+            else if (kw1 == "OFF") cmd.type = CommandType::PROFILE_OFF;
+            else cmd.type = CommandType::UNKNOWN;
+
         // ── SHOW ─────────────────────────────────────────────────
         } else if (kw0 == "SHOW") {
             if (kw1 == "INDEXES" || kw1 == "INDICES") {
@@ -1469,6 +1505,17 @@ public:
             } else if (kw1 == "PARTITIONS" && tokens.size() >= 4 && toUpper(tokens[2]) == "FROM") {
                 cmd.type = CommandType::SHOW_PARTITIONS;
                 cmd.tableName = tokens[3];
+            // Phase 69: SHOW PROFILES / SHOW PROFILE FOR QUERY n
+            } else if (kw1 == "PROFILES") {
+                cmd.type = CommandType::SHOW_PROFILES;
+            } else if (kw1 == "PROFILE") {
+                // SHOW PROFILE FOR QUERY n
+                cmd.type = CommandType::SHOW_PROFILE_FOR_QUERY;
+                // tokens: SHOW PROFILE FOR QUERY n
+                if (tokens.size() >= 5 &&
+                    toUpper(tokens[2]) == "FOR" && toUpper(tokens[3]) == "QUERY") {
+                    try { cmd.profileQueryId = std::stoi(tokens[4]); } catch (...) {}
+                }
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -2380,7 +2427,9 @@ private:
                  "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
                  "DATE", "TIME", "NOW", "CURDATE", "CURTIME",
                  "UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM",
-                 "REPLACE", "ABS", "ROUND", "MOD", "COALESCE", "IFNULL"};
+                 "REPLACE", "ABS", "ROUND", "MOD", "COALESCE", "IFNULL",
+                 // Phase 70: Spatial-Funktionen in WHERE
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
             bool isFuncLhsCandidate = false;
             for (const auto& fn : FUNC_LHS_NAMES)
                 if (u == fn) { isFuncLhsCandidate = true; break; }
@@ -2859,7 +2908,9 @@ private:
                  "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
                  "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
                  // Phase 64: REGEXP-Funktionen
-                 "REGEXP_REPLACE", "REGEXP_EXTRACT"};
+                 "REGEXP_REPLACE", "REGEXP_EXTRACT",
+                 // Phase 70: Spatial-Funktionen
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -3013,7 +3064,9 @@ private:
                  "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
                  "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
                  // Phase 64: REGEXP-Funktionen
-                 "REGEXP_REPLACE", "REGEXP_EXTRACT"};
+                 "REGEXP_REPLACE", "REGEXP_EXTRACT",
+                 // Phase 70: Spatial-Funktionen
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 

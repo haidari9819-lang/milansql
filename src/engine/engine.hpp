@@ -24,6 +24,7 @@
 #include "../utils/json_utils.hpp"
 #include "../scheduler/event_scheduler.hpp"
 #include "../locking/lock_manager.hpp"
+#include "../spatial/spatial.hpp"      // Phase 70: Spatial Index
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -307,6 +308,7 @@ public:
         std::string              name;  // Index-Name (= Map-Schlüssel)
         std::vector<std::string> cols;  // alle Spalten; cols[0] = führende Spalte
         std::unique_ptr<BTree>   tree;  // BTree, nach cols[0]-Wert indiziert
+        std::string              type = "BTREE";  // Phase 70: "BTREE" or "SPATIAL"
     };
 
     Table() = default;
@@ -487,7 +489,8 @@ public:
 
     // ── Index-Operationen ─────────────────────────────────────
 
-    void createIndex(const std::vector<std::string>& cols, const std::string& idxName) {
+    void createIndex(const std::vector<std::string>& cols, const std::string& idxName,
+                     const std::string& idxType = "BTREE") {
         if (cols.empty())
             throw std::runtime_error("CREATE INDEX: Keine Spalten angegeben.");
         int ci = colOf(cols[0]);
@@ -500,7 +503,12 @@ public:
         for (size_t ri = 0; ri < rows_.size(); ++ri)
             if (static_cast<size_t>(ci) < rows_[ri].values.size())
                 tree->insert(rows_[ri].values[ci], ri);
-        indices_[idxName] = IndexEntry{idxName, cols, std::move(tree)};
+        IndexEntry entry;
+        entry.name = idxName;
+        entry.cols = cols;
+        entry.tree = std::move(tree);
+        entry.type = idxType;
+        indices_[idxName] = std::move(entry);
     }
 
     void dropIndex(const std::string& idxName) {
@@ -531,7 +539,7 @@ public:
                 if (i > 0) colList += ", ";
                 colList += entry.cols[i];
             }
-            result.push_back({entry.name, colList, "BTREE"});
+            result.push_back({entry.name, colList, entry.type});
         }
         return result;
     }
@@ -882,8 +890,9 @@ public:
 
     void createIndex(const std::string& tbl,
                      const std::vector<std::string>& cols,
-                     const std::string& idxName) {
-        getTable(resolveTableName(tbl)).createIndex(cols, idxName);
+                     const std::string& idxName,
+                     const std::string& idxType = "BTREE") {
+        getTable(resolveTableName(tbl)).createIndex(cols, idxName, idxType);
     }
 
     void dropIndex(const std::string& tbl, const std::string& idxName) {
@@ -3968,6 +3977,56 @@ private:
             return "";
         }
 
+        // ── Phase 70: Spatial Functions ─────────────────────────
+        // Resolve a POINT argument: either column value or literal POINT(...)
+        auto resolvePointArg = [&](const std::string& a) -> std::string {
+            // First try as a space-separated token expression (POINT ( lat lng ))
+            // Reconstruct if it looks like a POINT call
+            std::string val = resolveArg(a);
+            if (SpatialUtils::isPointLiteral(val)) return val;
+            // If the arg itself contains POINT(, rebuild it
+            // Check if a is a multi-token "POINT ( lat lng )" style
+            if (a.find("POINT") != std::string::npos || a.find("point") != std::string::npos) {
+                // rebuild: strip spaces to form POINT(lat lng)
+                std::string rebuilt;
+                bool inWord = false;
+                for (char c : a) {
+                    if (c == ' ' || c == '\t') { if (!inWord) continue; rebuilt += c; }
+                    else { inWord = true; rebuilt += c; }
+                }
+                return rebuilt;
+            }
+            return val;
+        };
+
+        if (fn == "ST_DISTANCE") {
+            if (args.size() < 2) return "0";
+            std::string p1 = resolvePointArg(args[0]);
+            std::string p2 = resolvePointArg(args[1]);
+            return SpatialUtils::stDistance(p1, p2);
+        }
+        if (fn == "ST_X") {
+            if (args.empty()) return "0";
+            return SpatialUtils::stX(resolvePointArg(args[0]));
+        }
+        if (fn == "ST_Y") {
+            if (args.empty()) return "0";
+            return SpatialUtils::stY(resolvePointArg(args[0]));
+        }
+        if (fn == "ST_ASTEXT") {
+            if (args.empty()) return "";
+            return SpatialUtils::stAsText(resolvePointArg(args[0]));
+        }
+        if (fn == "ST_WITHIN") {
+            // ST_WITHIN(point, center, radius_km)
+            if (args.size() < 3) return "0";
+            std::string p      = resolvePointArg(args[0]);
+            std::string center = resolvePointArg(args[1]);
+            double radius = 0.0;
+            try { radius = std::stod(resolveArg(args[2])); } catch (...) {}
+            return SpatialUtils::stWithin(p, center, radius);
+        }
+
         return "";
     }
 
@@ -4013,7 +4072,9 @@ private:
              "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
              // Phase 56: JSON
              "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
-             "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID"};
+             "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
+             // Phase 70: Spatial
+             "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
 
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;

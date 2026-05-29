@@ -137,6 +137,11 @@ enum class CommandType {
     CREATE_POLICY,
     DROP_POLICY,
     SHOW_POLICIES_ON,
+    // Phase 76: LISTEN / NOTIFY / UNLISTEN
+    LISTEN,
+    UNLISTEN,
+    NOTIFY,
+    SHOW_LISTEN,
     UNKNOWN
 };
 
@@ -352,6 +357,10 @@ struct ParsedCommand {
     std::string policyCommand;
     std::string policyUser;
     std::string policyUsingExpr;
+
+    // Phase 76: LISTEN / NOTIFY / UNLISTEN
+    std::string channelName;
+    std::string notifyPayload;
 };
 
 class Parser {
@@ -1567,6 +1576,9 @@ public:
                 for (size_t i = 2; i < tokens.size(); ++i)
                     if (toUpper(tokens[i]) == "ON" && i + 1 < tokens.size())
                         cmd.tableName = tokens[i + 1];
+            // Phase 76: SHOW LISTEN
+            } else if (kw1 == "LISTEN") {
+                cmd.type = CommandType::SHOW_LISTEN;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;
@@ -1679,6 +1691,50 @@ public:
             for (size_t i = 2; i < tokens.size(); ++i)
                 if (toUpper(tokens[i]) == "ON" && i + 1 < tokens.size())
                     cmd.tableName = tokens[i + 1];
+
+        // ── Phase 76: LISTEN channel ──────────────────────────────
+        } else if (kw0 == "LISTEN") {
+            cmd.type = CommandType::LISTEN;
+            if (tokens.size() > 1) {
+                cmd.channelName = tokens[1];
+                // strip trailing semicolon or comma (e.g. "LISTEN orders;")
+                while (!cmd.channelName.empty() &&
+                       (cmd.channelName.back() == ';' || cmd.channelName.back() == ','))
+                    cmd.channelName.pop_back();
+            }
+
+        // ── Phase 76: UNLISTEN channel | UNLISTEN * ───────────────
+        } else if (kw0 == "UNLISTEN") {
+            cmd.type = CommandType::UNLISTEN;
+            if (tokens.size() > 1) {
+                cmd.channelName = tokens[1];
+                while (!cmd.channelName.empty() &&
+                       (cmd.channelName.back() == ';' || cmd.channelName.back() == ','))
+                    cmd.channelName.pop_back();
+            }
+
+        // ── Phase 76: NOTIFY channel [, 'payload'] ────────────────
+        } else if (kw0 == "NOTIFY") {
+            cmd.type = CommandType::NOTIFY;
+            if (tokens.size() > 1) {
+                cmd.channelName = tokens[1];
+                // strip trailing comma (e.g. "NOTIFY orders, 'msg'")
+                while (!cmd.channelName.empty() &&
+                       (cmd.channelName.back() == ';' || cmd.channelName.back() == ','))
+                    cmd.channelName.pop_back();
+            }
+            // Optional payload after comma: NOTIFY chan, 'msg'
+            {
+                auto commaPos = input.find(',');
+                if (commaPos != std::string::npos) {
+                    std::string payStr = input.substr(commaPos + 1);
+                    while (!payStr.empty() && payStr.front() == ' ') payStr.erase(payStr.begin());
+                    while (!payStr.empty() && payStr.back()  == ' ') payStr.pop_back();
+                    if (payStr.size() >= 2 && payStr.front() == '\'' && payStr.back() == '\'')
+                        payStr = payStr.substr(1, payStr.size() - 2);
+                    cmd.notifyPayload = payStr;
+                }
+            }
 
         // ── Phase 73: SHOW BUFFER POOL STATUS ────────────────────
         } else if (kw0 == "SHOW" && kw1 == "BUFFER" && tokens.size() >= 4 &&

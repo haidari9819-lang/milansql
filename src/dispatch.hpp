@@ -26,6 +26,7 @@
 #include "utils/csv_utils.hpp"
 #include "scheduler/event_scheduler.hpp"
 #include "profiler/query_profiler.hpp"  // Phase 69: Query Profiler
+#include "pubsub/pubsub.hpp"           // Phase 76: LISTEN/NOTIFY
 
 namespace milansql {
 
@@ -3612,6 +3613,63 @@ inline bool dispatchCommand(
         engine.showPolicies(cmd.tableName);
         std::cout << "\n";
         break;
+
+    // ── Phase 76: LISTEN / NOTIFY / UNLISTEN ─────────────────────
+    case milansql::CommandType::LISTEN: {
+        if (cmd.channelName.empty()) {
+            std::cout << "  Fehler: LISTEN braucht einen Channel-Namen.\n\n";
+            break;
+        }
+        g_pubsub().listen(cmd.channelName, engine.getCurrentUser());
+        std::cout << "  Listening on channel '" << cmd.channelName << "'.\n\n";
+        break;
+    }
+    case milansql::CommandType::UNLISTEN: {
+        if (cmd.channelName == "*") {
+            g_pubsub().unlistenAll(engine.getCurrentUser());
+            std::cout << "  Unlistened all channels.\n\n";
+        } else if (cmd.channelName.empty()) {
+            std::cout << "  Fehler: UNLISTEN braucht einen Channel-Namen oder '*'.\n\n";
+        } else {
+            g_pubsub().unlisten(cmd.channelName, engine.getCurrentUser());
+            std::cout << "  Unlistened channel '" << cmd.channelName << "'.\n\n";
+        }
+        break;
+    }
+    case milansql::CommandType::NOTIFY: {
+        if (cmd.channelName.empty()) {
+            std::cout << "  Fehler: NOTIFY braucht einen Channel-Namen.\n\n";
+            break;
+        }
+        size_t n = g_pubsub().notify(cmd.channelName, cmd.notifyPayload);
+        std::cout << "  Notification sent on '" << cmd.channelName << "'";
+        if (!cmd.notifyPayload.empty())
+            std::cout << " payload='" << cmd.notifyPayload << "'";
+        std::cout << "  (" << n << " listener(s) notified).\n\n";
+        // Drain own notifications (single-session REPL: print them inline)
+        auto msgs = g_pubsub().pending(engine.getCurrentUser());
+        for (const auto& m : msgs) {
+            std::cout << "  NOTIFY " << m.channel;
+            if (!m.payload.empty()) std::cout << " '" << m.payload << "'";
+            std::cout << "\n";
+        }
+        if (!msgs.empty()) std::cout << "\n";
+        break;
+    }
+    case milansql::CommandType::SHOW_LISTEN: {
+        auto chans = g_pubsub().activeChannels(engine.getCurrentUser());
+        if (chans.empty()) {
+            std::cout << "  Not listening on any channels.\n\n";
+        } else {
+            std::cout << "  Listening on: ";
+            for (size_t i = 0; i < chans.size(); ++i) {
+                if (i) std::cout << ", ";
+                std::cout << chans[i];
+            }
+            std::cout << "\n\n";
+        }
+        break;
+    }
 
     case milansql::CommandType::UNKNOWN:
     default:

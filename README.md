@@ -1,10 +1,10 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v2.1.0-gold)
+![Version](https://img.shields.io/badge/version-v2.2.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![Phases](https://img.shields.io/badge/phases-68-brightgreen)
+![Phases](https://img.shields.io/badge/phases-70-brightgreen)
 
 > **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
@@ -25,7 +25,8 @@ Developed by **Mirwais Haidari**, built phase by phase from a blank file to a fu
 | **Server** | TCP/IP multi-threaded server (port 4406), REST API (port 8080), connection pool, multi-statement queries |
 | **Replication** | Master/Slave, Binlog, auto-sync every 500ms, auto-reconnect, read-only slave |
 | **Admin** | `BACKUP`/`RESTORE`, CSV import/export, Event Scheduler, Partitioning (RANGE/LIST/HASH), `INFORMATION_SCHEMA`, User Management (`GRANT`/`REVOKE`) |
-| **Performance** | Cost-based query optimizer, B-Tree index lookup, `EXPLAIN`/`EXPLAIN ANALYZE`, Query Cache (LRU/TTL), `BENCHMARK` command |
+| **Performance** | Cost-based query optimizer, B-Tree index lookup, `EXPLAIN`/`EXPLAIN ANALYZE`, Query Cache (LRU/TTL), `BENCHMARK` command, Query Profiler (`PROFILE ON/OFF`, `SHOW PROFILES`) |
+| **Spatial** | `POINT(lat,lng)` type, `ST_DISTANCE` (Haversine), `ST_X`/`ST_Y`/`ST_WITHIN`/`ST_ASTEXT`, `CREATE SPATIAL INDEX` |
 
 ---
 
@@ -53,7 +54,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v2.1.0 ===           ║
+  ║        === MilanSQL v2.2.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -180,6 +181,21 @@ CREATE TABLE produkte (
 INSERT INTO produkte VALUES (NULL, 'Laptop', 1000);
 SELECT * FROM produkte;
 -- brutto: 1190  |  mwst: 190  (auto-computed)
+
+-- Spatial (Phase 70)
+CREATE TABLE staedte (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, pos TEXT);
+INSERT INTO staedte VALUES (NULL, 'Berlin', 'POINT(52.52, 13.40)');
+INSERT INTO staedte VALUES (NULL, 'Hamburg', 'POINT(53.55, 10.00)');
+SELECT name, ST_DISTANCE(pos, 'POINT(52.52, 13.40)') FROM staedte;
+SELECT * FROM staedte WHERE ST_DISTANCE(pos, 'POINT(52.52, 13.40)') < 300;
+CREATE SPATIAL INDEX idx_pos ON staedte (pos);
+
+-- Query Profiler (Phase 69)
+PROFILE ON;
+SELECT * FROM staedte WHERE ST_X(pos) > 50;
+SHOW PROFILES;
+SHOW PROFILE FOR QUERY 1;
+PROFILE OFF;
 
 -- Multi-Statement (Phase 67)
 CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT);
@@ -359,6 +375,8 @@ GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on
 | 64–65 | REGEXP/RLIKE, SAVEPOINT, SELECT FOR UPDATE, LOCK TABLE |
 | **66–67** | **Cursors in Stored Procedures (DECLARE/OPEN/FETCH/CLOSE/LOOP/IF), Multi-Statement Queries** |
 | **68** | **Virtual/Generated Columns (GENERATED ALWAYS AS (expr) STORED/VIRTUAL)** |
+| **69** | **Query Profiler (PROFILE ON/OFF, SHOW PROFILES, SHOW PROFILE FOR QUERY n)** |
+| **70** | **Spatial Index (POINT type, ST_DISTANCE/Haversine, ST_X/ST_Y/ST_WITHIN/ST_ASTEXT, CREATE SPATIAL INDEX)** |
 
 ---
 

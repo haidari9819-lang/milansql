@@ -4,6 +4,63 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v2.2.0] — 2026-05-29
+
+### Phase 70 — Spatial Index (POINT + ST_DISTANCE + Haversine)
+
+**Features:**
+- `POINT(lat, lng)` data type stored as canonical string `"POINT(lat lng)"`
+- `ST_DISTANCE(p1, p2)` → Haversine great-circle distance in km
+- `ST_X(point)` → latitude, `ST_Y(point)` → longitude
+- `ST_WITHIN(point, center, radius_km)` → `"1"` or `"0"`
+- `ST_ASTEXT(point)` → canonical `"POINT(lat lng)"` string
+- `WHERE ST_DISTANCE(col, POINT(x,y)) < n` filter support
+- `CREATE SPATIAL INDEX name ON table (col)` — creates index with type `SPATIAL`
+- `SHOW INDEXES` now shows `BTREE` vs `SPATIAL` type
+
+**Example:**
+```sql
+CREATE TABLE staedte (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, pos TEXT);
+INSERT INTO staedte VALUES (NULL, 'Berlin', 'POINT(52.52, 13.40)');
+SELECT name, ST_DISTANCE(pos, 'POINT(52.52, 13.40)') FROM staedte;
+SELECT * FROM staedte WHERE ST_DISTANCE(pos, 'POINT(52.52, 13.40)') < 300;
+CREATE SPATIAL INDEX idx_pos ON staedte (pos);
+```
+
+**Technical changes:**
+- New `src/spatial/spatial.hpp`: `SpatialUtils` with `parsePoint`, `haversine`, `stDistance`, `stX`, `stY`, `stAsText`, `stWithin`
+- `IndexEntry`: added `type` field (`"BTREE"` or `"SPATIAL"`)
+- `Table::createIndex()` accepts optional `idxType` parameter
+- Parser: `CREATE SPATIAL INDEX`, `ST_*` in FUNC_LHS_NAMES and all ALLFUNCS lists
+- Engine: `evaluateFunc` handles ST_* calls; `evalExprStr` KNOWN_FUNCS updated
+
+---
+
+### Phase 69 — Query Profiler (PROFILE ON/OFF + SHOW PROFILES)
+
+**Features:**
+- `PROFILE ON` / `PROFILE OFF` — enable/disable query profiling
+- `SHOW PROFILES` — table listing all saved profiles (ID, SQL, Duration)
+- `SHOW PROFILE FOR QUERY n` — per-step breakdown with durations
+- Steps: Optimization, Table scan, Result filtering, Result projection, Sorting
+- Profiles stored globally per session (max 100, oldest dropped)
+
+**Example:**
+```sql
+PROFILE ON;
+SELECT * FROM staedte WHERE ST_X(pos) > 50;
+SHOW PROFILES;
+SHOW PROFILE FOR QUERY 1;
+PROFILE OFF;
+```
+
+**Technical changes:**
+- New `src/profiler/query_profiler.hpp`: `ProfileStep`, `ProfileEntry`, `QueryProfiler` class
+- Global `g_profiler` in `dispatch.hpp`; hooks in main SELECT execution path
+- Parser: `PROFILE_ON`, `PROFILE_OFF`, `SHOW_PROFILES`, `SHOW_PROFILE_FOR_QUERY` commands
+
+---
+
 ## [v2.1.0] — 2026-05-28
 
 ### Phase 68 — Virtual/Generated Columns

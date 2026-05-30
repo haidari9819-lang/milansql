@@ -1,14 +1,25 @@
 # MilanSQL
 
-![Version](https://img.shields.io/badge/version-v2.5.0-gold)
+![Version](https://img.shields.io/badge/version-v3.0.0-gold)
 ![CI](https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Language](https://img.shields.io/badge/language-C%2B%2B17-orange)
-![Phases](https://img.shields.io/badge/phases-74-brightgreen)
+![Phases](https://img.shields.io/badge/phases-82-brightgreen)
 
 > **A production-grade relational database engine built from scratch in C++17 — zero external dependencies.**
 
 Developed by **Mirwais Haidari**, built phase by phase from a blank file to a full-featured database server. Every byte of SQL parsing, query optimization, transaction management, replication, and network protocol is hand-written C++17.
+
+---
+
+## What's New in v3.0.0
+
+| Phase | Feature |
+|-------|---------|
+| **79** | **Connection String Parser** — `milansql://user:pass@host:port/db`, `mysql://`, `jdbc:milansql://` DSN support |
+| **80** | **Column Store Engine (OLAP)** — `CREATE COLUMN TABLE`, columnar SUM/AVG/COUNT/MIN/MAX, `SHOW STORAGE FORMAT` |
+| **81** | **Logical Replication** — `CREATE PUBLICATION … FOR TABLE`, `CREATE SUBSCRIPTION … CONNECTION`, `SHOW LOGICAL LOG` |
+| **82** | **Adaptive Query Optimizer** — Query rewriting (WHERE 1=1, redundant predicates), adaptive index suggestions, `EXPLAIN REWRITTEN`, `SHOW QUERY STATS` |
 
 ---
 
@@ -30,6 +41,14 @@ Developed by **Mirwais Haidari**, built phase by phase from a blank file to a fu
 | **Admin** | `BACKUP`/`RESTORE`, CSV import/export, Event Scheduler, Partitioning (RANGE/LIST/HASH), `INFORMATION_SCHEMA`, User Management (`GRANT`/`REVOKE`) |
 | **Performance** | Cost-based query optimizer, B-Tree index lookup, `EXPLAIN`/`EXPLAIN ANALYZE`, Query Cache (LRU/TTL), `BENCHMARK` command, Query Profiler (`PROFILE ON/OFF`, `SHOW PROFILES`) |
 | **Spatial** | `POINT(lat,lng)` type, `ST_DISTANCE` (Haversine), `ST_X`/`ST_Y`/`ST_WITHIN`/`ST_ASTEXT`, `CREATE SPATIAL INDEX` |
+| **Row-Level Security** | `ENABLE/DISABLE ROW LEVEL SECURITY`, `CREATE/DROP POLICY`, `SHOW POLICIES ON`, `CURRENT_USER_ID()` in expressions |
+| **Pub/Sub** | `LISTEN`/`UNLISTEN`/`NOTIFY` channel pub/sub, payload support, `SHOW LISTEN` |
+| **Parallel Queries** | `SET PARALLEL_THRESHOLD`, `SET MAX_PARALLEL_WORKERS`, `/*+ PARALLEL(N) */` hint, `SHOW PARALLEL STATUS` |
+| **Table Inheritance** | `CREATE TABLE child INHERITS (parent)`, inherited SELECT, `SELECT FROM ONLY`, `SHOW INHERITANCE` |
+| **Column Store** | `CREATE COLUMN TABLE` (OLAP), columnar aggregation (SUM/AVG/MIN/MAX/COUNT), `SHOW STORAGE FORMAT` |
+| **Logical Replication** | `CREATE/DROP PUBLICATION FOR TABLE`, `CREATE/DROP SUBSCRIPTION CONNECTION`, `ALTER SUBSCRIPTION ENABLE/DISABLE`, `SHOW LOGICAL LOG` |
+| **Adaptive Optimizer** | Query rewriting (1=1 removal, redundant predicates, subquery notes), `SHOW QUERY STATS`, `SHOW INDEX SUGGESTIONS`, `EXPLAIN REWRITTEN`, `ANALYZE TABLE` |
+| **Connection Strings** | `milansql://user:pass@host:port/db`, `mysql://`, `jdbc:milansql://` DSN support |
 
 ---
 
@@ -57,7 +76,7 @@ cmake --build build
 
 ```
   ╔══════════════════════════════════════════╗
-  ║        === MilanSQL v2.5.0 ===           ║
+  ║        === MilanSQL v3.0.0 ===           ║
   ║   Built with <3 by Mirwais Haidari       ║
   ║  Type 'help' for commands, 'exit' to quit║
   ╚══════════════════════════════════════════╝
@@ -314,6 +333,47 @@ SELECT * FROM users INTO OUTFILE 'export.csv' SEPARATOR ',';
 -- Event Scheduler
 CREATE EVENT cleanup ON SCHEDULE EVERY 1 DAY DO DELETE FROM log WHERE created < DATE_SUB(NOW(), INTERVAL 30 DAY);
 SET EVENT_SCHEDULER = ON;
+
+-- Row-Level Security (Phase 75)
+ENABLE ROW LEVEL SECURITY ON orders;
+CREATE POLICY user_orders ON orders FOR SELECT TO alice USING (user_id = CURRENT_USER_ID());
+SHOW POLICIES ON orders;
+
+-- LISTEN / NOTIFY (Phase 76)
+LISTEN updates;
+NOTIFY updates, 'new row inserted';
+SHOW LISTEN;
+
+-- Table Inheritance (Phase 78)
+CREATE TABLE fahrzeug (id INT PRIMARY KEY AUTO_INCREMENT, marke TEXT);
+CREATE TABLE pkw (tueren INT) INHERITS (fahrzeug);
+SELECT * FROM fahrzeug;   -- includes rows from pkw
+SELECT * FROM ONLY fahrzeug;
+SHOW INHERITANCE;
+
+-- Column Store (OLAP) (Phase 80)
+CREATE COLUMN TABLE sales (region TEXT, umsatz INT, quartal INT);
+INSERT INTO sales VALUES (DE, 50000, 1);
+SELECT SUM(umsatz) FROM sales;
+SELECT AVG(umsatz) FROM sales WHERE quartal = 1;
+SHOW STORAGE FORMAT;
+
+-- Logical Replication (Phase 81)
+CREATE PUBLICATION pub_orders FOR TABLE orders;
+CREATE SUBSCRIPTION sub1 CONNECTION 'milansql://localhost:4406' PUBLICATION pub_orders;
+SHOW PUBLICATIONS;
+SHOW LOGICAL LOG;
+
+-- Adaptive Query Optimizer (Phase 82)
+SET QUERY_REWRITE = ON;
+SELECT COUNT(*) FROM users WHERE 1=1;   -- WHERE 1=1 auto-removed
+SHOW QUERY STATS;
+SHOW INDEX SUGGESTIONS;
+ANALYZE TABLE users;
+EXPLAIN REWRITTEN SELECT * FROM orders WHERE user_id IN (SELECT id FROM users WHERE active = 1);
+
+-- Connection String (Phase 79)
+./build/milansql milansql://alice:secret@localhost:4406/mydb
 ```
 
 ---
@@ -338,14 +398,17 @@ milansql/
 │   ├── storage/
 │   │   └── storage.hpp            # Binary format v7 (XOR checksum)
 │   ├── optimizer/
-│   │   └── optimizer.hpp          # Cost-based query optimizer
+│   │   ├── optimizer.hpp          # Cost-based query optimizer
+│   │   ├── query_rewriter.hpp     # Phase 82: rule-based query rewriting
+│   │   └── adaptive_stats.hpp     # Phase 82: adaptive index suggestions
 │   ├── locking/
 │   │   └── lock_manager.hpp       # Row-level + table-level locking
 │   ├── replication/
 │   │   ├── binlog.hpp             # Binary log writer/reader
 │   │   ├── master_repl.hpp        # Master replication server
 │   │   ├── slave_repl.hpp         # Slave polling client
-│   │   └── repl_state.hpp         # Global replication state
+│   │   ├── repl_state.hpp         # Global replication state
+│   │   └── logical_repl.hpp       # Phase 81: logical replication log
 │   ├── buffer/
 │   │   └── buffer_pool.hpp        # Buffer Pool Manager (LRU + write-behind)
 │   ├── wal/
@@ -355,7 +418,15 @@ milansql/
 │   ├── backup/
 │   │   └── backup.hpp             # SQL dump backup/restore
 │   ├── utils/
-│   │   └── csv_utils.hpp          # CSV import/export (RFC-4180)
+│   │   ├── csv_utils.hpp          # CSV import/export (RFC-4180)
+│   │   └── connection_string.hpp  # Phase 79: DSN parser (milansql:// etc.)
+│   ├── storage/
+│   │   ├── storage.hpp            # Binary format v9
+│   │   └── column_store.hpp       # Phase 80: columnar storage (OLAP)
+│   ├── pubsub/
+│   │   └── pubsub.hpp             # Phase 76: LISTEN/NOTIFY/UNLISTEN
+│   ├── parallel/
+│   │   └── parallel_executor.hpp  # Phase 77: parallel query config
 │   ├── server/
 │   │   ├── server.hpp             # TCP server (Winsock2/POSIX, thread pool)
 │   │   ├── client.hpp             # TCP client REPL
@@ -426,6 +497,14 @@ GitHub Actions runs build + tests automatically on **Ubuntu** and **Windows** on
 | **72** | **WAL Crash Recovery (TX_BEGIN/TX_COMMIT/TX_ROLLBACK markers, replay on startup, SHOW RECOVERY STATUS) + Materialized Views (CREATE/REFRESH/DROP/SHOW, persistence in database.matviews)** |
 | **73** | **Buffer Pool Manager (LRU eviction, dirty page tracking, hit/miss counters, SHOW BUFFER POOL STATUS, SET BUFFER_POOL_SIZE, FLUSH BUFFER POOL, Write-Behind thread)** |
 | **74** | **MySQL Wire Protocol v10 (COM_QUERY/QUIT/PING/INIT_DB, handshake, resultset, `--mysql --mysql-port 4407`, compatible with `mysql` CLI and Python mysql-connector)** |
+| **75** | **Row-Level Security (ENABLE/DISABLE RLS, CREATE/DROP POLICY, SHOW POLICIES ON, CURRENT_USER_ID() in USING expressions, policy persistence in database.rls)** |
+| **76** | **LISTEN/NOTIFY/UNLISTEN Pub/Sub (channel subscriptions, payload support, cross-session delivery, SHOW LISTEN, thread-safe PubSub global)** |
+| **77** | **Parallel Query Execution (std::thread-based parallelFilter/parallelAggregate, SET PARALLEL_THRESHOLD/MAX_PARALLEL_WORKERS, `/*+ PARALLEL(N) */` hint)** |
+| **78** | **Table Inheritance PostgreSQL-style (CREATE TABLE child INHERITS (parent), inherited rows in SELECT, SELECT FROM ONLY, SHOW INHERITANCE, binary format v9)** |
+| **79** | **Connection String Parser (milansql://user:pass@host:port/db, mysql://, jdbc:milansql://, auto-CONNECT+USE on startup, Python/Node.js DSN support)** |
+| **80** | **Column Store Engine OLAP (CREATE COLUMN TABLE, columnar SUM/AVG/COUNT/MIN/MAX, GROUP BY fallback via temp table, SHOW STORAGE FORMAT)** |
+| **81** | **Logical Replication Publication/Subscription (CREATE PUBLICATION FOR TABLE/ALL TABLES, CREATE SUBSCRIPTION CONNECTION, ALTER SUBSCRIPTION ENABLE/DISABLE, SHOW LOGICAL LOG, append-only log)** |
+| **82** | **Adaptive Query Optimizer + Query Rewriting (WHERE 1=1 removal, redundant predicate elimination, subquery-to-JOIN notes, SHOW QUERY STATS, SHOW INDEX SUGGESTIONS, ANALYZE TABLE, EXPLAIN REWRITTEN, database.stats persistence)** |
 
 ---
 

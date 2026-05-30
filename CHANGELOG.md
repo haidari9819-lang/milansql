@@ -4,6 +4,186 @@ All notable changes to MilanSQL are documented in this file.
 
 ---
 
+## [v3.0.0] — 2026-05-30
+
+### Major Release — 82 Phases, Column Store, Logical Replication, Adaptive Optimizer
+
+Version 3.0.0 marks a major milestone: 82 development phases, zero external dependencies, and a new generation of analytical and optimization capabilities.
+
+**New capabilities:**
+- Columnar storage for OLAP workloads (Column Store Engine)
+- Logical publication/subscription replication with append-only change log
+- Adaptive query optimizer with automatic index suggestions and query rewriting
+- Connection string (DSN) parser with milansql://, mysql://, and jdbc:milansql:// protocols
+- Table Inheritance (PostgreSQL-style) with inherited SELECTs and `FROM ONLY`
+- Parallel query execution with thread-based aggregation
+- Row-Level Security with policy expressions and CURRENT_USER_ID()
+- LISTEN/NOTIFY/UNLISTEN pub/sub messaging
+
+---
+
+### Phase 82 — Adaptive Query Optimizer + Query Rewriting
+
+**Features:**
+- `src/optimizer/query_rewriter.hpp`: `QueryRewriter` class — rule-based rewrites before execution
+  - **B) WHERE 1=1 removal** — always-true conditions stripped automatically
+  - **C) Redundant predicate elimination** — `WHERE col > 100 AND col > 50` → `WHERE col > 100`
+  - **A) Subquery-to-JOIN notes** — `IN (SELECT …)` flagged as JOIN candidate (inList resolution active)
+- `src/optimizer/adaptive_stats.hpp`: `AdaptiveStats` class — tracks table/column access patterns
+  - `recordQuery(ParsedCommand)` — counts per-table accesses and per-column WHERE frequency
+  - Index suggestions triggered at ≥20% query frequency for a column
+  - Persistent: `database.stats` (loaded on startup, saved on ANALYZE/exit)
+- New commands:
+  - `SET QUERY_REWRITE = ON|OFF` — enable/disable automatic rewriting
+  - `SHOW QUERY STATS` — table with access counts and hottest WHERE column per table
+  - `SHOW INDEX SUGGESTIONS` — `CREATE INDEX …` statements for high-frequency filter columns
+  - `ANALYZE TABLE name` — reset statistics for a table (fresh baseline)
+  - `EXPLAIN REWRITTEN SELECT …` — show original query, applied rewrites, and execution plan
+- `g_queryRewriter` + `g_adaptiveStats` globals in `dispatch.hpp`; integrated before every dispatch
+
+**Example:**
+```sql
+SET QUERY_REWRITE = ON;
+SELECT COUNT(*) FROM users WHERE 1=1;              -- WHERE 1=1 silently removed
+SELECT * FROM users WHERE active = 1;
+SELECT * FROM orders WHERE user_id = 1;
+SHOW QUERY STATS;
+SHOW INDEX SUGGESTIONS;
+-- CREATE INDEX idx_orders_user_id ON orders(user_id)  -- 80% der Queries filtern nach user_id
+EXPLAIN REWRITTEN SELECT * FROM orders WHERE user_id IN (SELECT id FROM users WHERE active = 1);
+```
+
+**Technical changes:**
+- `src/optimizer/query_rewriter.hpp`: new file — `QueryRewriter` class; uses `WhereCondition.col`/`.val`
+- `src/optimizer/adaptive_stats.hpp`: new file — `AdaptiveStats` class with load/save ctor/dtor
+- `parser.hpp`: 5 new `CommandType` values; `queryRewriteFlag` field; `EXPLAIN REWRITTEN` parsed before generic EXPLAIN strip; `SET QUERY_REWRITE` and `ANALYZE TABLE` branches; SHOW QUERY STATS / SHOW INDEX SUGGESTIONS in SHOW block
+- `dispatch.hpp`: includes for new headers; `g_queryRewriter` + `g_adaptiveStats` statics; `recordQuery` + `rewrite` called at top of `dispatchCommand`; 5 new cases
+- `main.cpp`: v3.0.0 banner
+- `CMakeLists.txt`: VERSION 3.0.0
+
+---
+
+### Phase 81 — Logical Replication (Publication/Subscription)
+
+**Features:**
+- `src/replication/logical_repl.hpp`: `LogChange` struct + `LogicalReplLog` class (append-only log at `database.logical.log`)
+- `CREATE PUBLICATION name FOR TABLE t1, t2` / `FOR ALL TABLES`
+- `DROP PUBLICATION name` / `SHOW PUBLICATIONS`
+- `CREATE SUBSCRIPTION name CONNECTION 'dsn' PUBLICATION pub`
+- `DROP SUBSCRIPTION name` / `SHOW SUBSCRIPTIONS`
+- `ALTER SUBSCRIPTION name ENABLE|DISABLE`
+- `SHOW LOGICAL LOG` — shows all entries from log file
+- `insertRow` hooks into `logicalLog_WriteIfPublished_` after every successful insert
+- Persistence: `database.publications` + `database.subscriptions`
+
+**Example:**
+```sql
+CREATE PUBLICATION pub_orders FOR TABLE orders;
+SHOW PUBLICATIONS;
+INSERT INTO orders VALUES (NULL, 1, 500);  -- automatically logged
+SHOW LOGICAL LOG;
+CREATE SUBSCRIPTION sub1 CONNECTION 'milansql://localhost:4406' PUBLICATION pub_orders;
+ALTER SUBSCRIPTION sub1 DISABLE;
+DROP SUBSCRIPTION sub1;
+DROP PUBLICATION pub_orders;
+```
+
+---
+
+### Phase 80 — Column Store Engine (OLAP Analytics)
+
+**Features:**
+- `src/storage/column_store.hpp`: `ColumnTable` with `map<colName, vector<string>>` columnar storage
+- `CREATE COLUMN TABLE name (cols…)` — separate from row-store tables
+- Fast aggregation: `SELECT SUM/AVG/COUNT/MIN/MAX(col) FROM col_table` → single column scan
+- WHERE filters on column tables supported
+- GROUP BY falls back to row conversion via temp table `__cs_tmp__`
+- `SHOW STORAGE FORMAT` — lists all tables with ROW STORE or COLUMN STORE label
+
+**Example:**
+```sql
+CREATE COLUMN TABLE sales (region TEXT, umsatz INT, quartal INT);
+INSERT INTO sales VALUES (DE, 50000, 1);
+INSERT INTO sales VALUES (AT, 30000, 1);
+SELECT SUM(umsatz) FROM sales;
+SELECT AVG(umsatz) FROM sales WHERE quartal = 1;
+SHOW STORAGE FORMAT;
+```
+
+---
+
+### Phase 79 — Connection String Parser
+
+**Features:**
+- `src/utils/connection_string.hpp`: `ConnectionString` struct with `parse()`, `isDsn()`, `validate()`, `toDisplayString()`
+- Protocols: `milansql://`, `mysql://`, `jdbc:milansql://`; defaults: host=localhost, port=4406, db=public, user=root
+- `main.cpp`: detect DSN CLI arg, auto-execute CONNECT + USE before REPL
+- Python client: `connect()` accepts DSN string + `parse_dsn(dsn)` function
+- Node.js client: `parseDsn()` + `connect()` accepts string DSN
+
+**Example:**
+```bash
+./build/milansql milansql://alice:secret@localhost:4406/mydb
+./build/milansql mysql://root@localhost:4407/public
+```
+
+---
+
+### Phase 78 — Table Inheritance (PostgreSQL-style)
+
+**Features:**
+- `CREATE TABLE child (col TYPE) INHERITS (parent)` — child prepends parent columns
+- `SELECT * FROM parent` — includes rows from all descendants
+- `SELECT * FROM ONLY parent` — only parent rows
+- `SELECT COUNT(*) FROM parent` — counts all descendants recursively
+- `SHOW INHERITANCE` — prints tree of all inheritance relationships
+- Binary format v9: stores `parentName` per table
+
+**Example:**
+```sql
+CREATE TABLE fahrzeug (id INT PRIMARY KEY AUTO_INCREMENT, marke TEXT);
+CREATE TABLE pkw (tueren INT) INHERITS (fahrzeug);
+INSERT INTO pkw VALUES (NULL, BMW, 4);
+SELECT * FROM fahrzeug;       -- includes pkw rows
+SELECT * FROM ONLY fahrzeug;  -- only direct rows
+SHOW INHERITANCE;
+```
+
+---
+
+### Phase 77 — Parallel Query Execution
+
+**Features:**
+- `src/parallel/parallel_executor.hpp`: `ParallelExecutor` with configurable threshold and worker count
+- `parallelFilter_()` splits rows into N chunks using `std::thread`
+- `parallelAggregate_()` for COUNT/SUM/MIN/MAX/AVG with partial results merged
+- `SET PARALLEL_THRESHOLD = N` / `SET MAX_PARALLEL_WORKERS = N` / `SHOW PARALLEL STATUS`
+- `/*+ PARALLEL(N) */` hint in SELECT overrides worker count for that query
+
+---
+
+### Phase 76 — LISTEN/NOTIFY/UNLISTEN Pub/Sub
+
+**Features:**
+- `src/pubsub/pubsub.hpp`: thread-safe `PubSub` class + `g_pubsub()` global singleton
+- `LISTEN channel` — subscribe current user to channel
+- `UNLISTEN channel` / `UNLISTEN *` — unsubscribe
+- `NOTIFY channel [, 'payload']` — deliver to all listeners
+- `SHOW LISTEN` — list active subscriptions
+
+---
+
+### Phase 75 — Row-Level Security (RLS)
+
+**Features:**
+- `ENABLE/DISABLE ROW LEVEL SECURITY` per table
+- `CREATE POLICY name ON table FOR cmd TO user USING (expr)`
+- `DROP POLICY`, `SHOW POLICIES ON table`
+- `CURRENT_USER_ID()` in USING expressions substituted at eval time
+- Persisted to `database.rls`; query cache key scoped per user
+
+---
+
 ## [v2.5.0] — 2026-05-29
 
 ### Phase 73 — Buffer Pool Manager (LRU + Write-Behind + Hit Rate)

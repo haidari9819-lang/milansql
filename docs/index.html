@@ -62,24 +62,24 @@
 
 <section class="hero">
   <div class="badges">
-    <img src="https://img.shields.io/badge/version-v2.0.0-gold" alt="version">
+    <img src="https://img.shields.io/badge/version-v3.0.0-gold" alt="version">
     <img src="https://img.shields.io/badge/language-C%2B%2B17-orange" alt="C++17">
     <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="zero deps">
-    <img src="https://img.shields.io/badge/phases-68-blue" alt="68 phases">
+    <img src="https://img.shields.io/badge/phases-82-blue" alt="82 phases">
     <img src="https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg" alt="CI">
   </div>
   <h1>MilanSQL</h1>
-  <span class="version">v2.1.0</span>
+  <span class="version">v3.0.0</span>
   <p>A production-grade relational database engine built from scratch in C++17 — zero external dependencies.</p>
   <div class="buttons">
-    <a href="https://github.com/haidari9819-lang/milansql/releases" class="btn btn-primary">⬇ Download v2.1.0</a>
+    <a href="https://github.com/haidari9819-lang/milansql/releases" class="btn btn-primary">⬇ Download v3.0.0</a>
     <a href="https://github.com/haidari9819-lang/milansql" class="btn btn-secondary">⭐ GitHub</a>
   </div>
 </section>
 
 <section class="stats">
   <div class="stats-grid">
-    <div class="stat"><div class="number">68</div><div class="label">Development Phases</div></div>
+    <div class="stat"><div class="number">82</div><div class="label">Development Phases</div></div>
     <div class="stat"><div class="number">0</div><div class="label">External Dependencies</div></div>
     <div class="stat"><div class="number">41</div><div class="label">Automated Tests</div></div>
     <div class="stat"><div class="number">2</div><div class="label">Platforms (Linux + Windows)</div></div>
@@ -148,6 +148,46 @@
       <div class="icon">🐍</div>
       <h3>Python + Node.js Clients</h3>
       <p>DB-API 2.0 compatible Python client and Node.js HTTP client — zero dependencies, stdlib only.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">🔐</div>
+      <h3>Row-Level Security</h3>
+      <p>ENABLE/DISABLE RLS per table, CREATE POLICY with USING expressions, CURRENT_USER_ID() predicate substitution.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">📡</div>
+      <h3>LISTEN / NOTIFY Pub/Sub</h3>
+      <p>Channel-based pub/sub messaging with payload support, LISTEN/UNLISTEN/NOTIFY commands, thread-safe delivery.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">⚙️</div>
+      <h3>Parallel Query Execution</h3>
+      <p>std::thread-based parallelFilter and parallelAggregate, configurable threshold and worker count, PARALLEL(N) hint.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">🧬</div>
+      <h3>Table Inheritance</h3>
+      <p>PostgreSQL-style CREATE TABLE child INHERITS (parent), inherited SELECT, FROM ONLY, SHOW INHERITANCE tree.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">📈</div>
+      <h3>Column Store Engine (OLAP)</h3>
+      <p>CREATE COLUMN TABLE for OLAP workloads — columnar SUM/AVG/COUNT/MIN/MAX scans, GROUP BY fallback, SHOW STORAGE FORMAT.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">🔗</div>
+      <h3>Logical Replication</h3>
+      <p>CREATE PUBLICATION FOR TABLE, CREATE SUBSCRIPTION CONNECTION, append-only change log, ALTER SUBSCRIPTION ENABLE/DISABLE.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">🧠</div>
+      <h3>Adaptive Query Optimizer</h3>
+      <p>Automatic query rewriting (1=1 removal, redundant predicates), adaptive index suggestions from query patterns, EXPLAIN REWRITTEN.</p>
+    </div>
+    <div class="feature-card">
+      <div class="icon">🔌</div>
+      <h3>Connection Strings (DSN)</h3>
+      <p>milansql://user:pass@host:port/db, mysql://, jdbc:milansql:// — auto-connect and USE on startup.</p>
     </div>
   </div>
 </section>
@@ -248,6 +288,31 @@ COMMIT;</span></pre>
       <span class="tag">BACKUP/RESTORE</span><span class="tag">CSV Import/Export</span>
       <span class="tag">Event Scheduler</span><span class="tag">Partitioning</span>
       <span class="tag">INFORMATION_SCHEMA</span><span class="tag">GRANT/REVOKE</span>
+    </td></tr>
+    <tr><td><strong>Row-Level Security</strong></td><td>
+      <span class="tag">ENABLE/DISABLE RLS</span><span class="tag">CREATE/DROP POLICY</span>
+      <span class="tag">SHOW POLICIES ON</span><span class="tag">CURRENT_USER_ID()</span>
+    </td></tr>
+    <tr><td><strong>Pub/Sub</strong></td><td>
+      <span class="tag">LISTEN channel</span><span class="tag">UNLISTEN</span>
+      <span class="tag">NOTIFY channel payload</span><span class="tag">SHOW LISTEN</span>
+    </td></tr>
+    <tr><td><strong>Parallel Queries</strong></td><td>
+      <span class="tag">SET PARALLEL_THRESHOLD</span><span class="tag">SET MAX_PARALLEL_WORKERS</span>
+      <span class="tag">/*+ PARALLEL(N) */</span><span class="tag">SHOW PARALLEL STATUS</span>
+    </td></tr>
+    <tr><td><strong>Column Store (OLAP)</strong></td><td>
+      <span class="tag">CREATE COLUMN TABLE</span><span class="tag">SUM/AVG/COUNT/MIN/MAX</span>
+      <span class="tag">GROUP BY fallback</span><span class="tag">SHOW STORAGE FORMAT</span>
+    </td></tr>
+    <tr><td><strong>Logical Replication</strong></td><td>
+      <span class="tag">CREATE PUBLICATION FOR TABLE</span><span class="tag">CREATE SUBSCRIPTION</span>
+      <span class="tag">ALTER SUBSCRIPTION ENABLE/DISABLE</span><span class="tag">SHOW LOGICAL LOG</span>
+    </td></tr>
+    <tr><td><strong>Adaptive Optimizer</strong></td><td>
+      <span class="tag">SET QUERY_REWRITE</span><span class="tag">SHOW QUERY STATS</span>
+      <span class="tag">SHOW INDEX SUGGESTIONS</span><span class="tag">ANALYZE TABLE</span>
+      <span class="tag">EXPLAIN REWRITTEN</span>
     </td></tr>
   </table>
 </section>

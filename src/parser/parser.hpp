@@ -160,6 +160,12 @@ enum class CommandType {
     SHOW_SUBSCRIPTIONS,
     ALTER_SUBSCRIPTION,
     SHOW_LOGICAL_LOG,
+    // Phase 82: Adaptive Query Optimizer
+    SHOW_QUERY_STATS,
+    SHOW_INDEX_SUGGESTIONS,
+    ANALYZE_TABLE,
+    SET_QUERY_REWRITE,
+    EXPLAIN_REWRITTEN,
     UNKNOWN
 };
 
@@ -386,6 +392,9 @@ struct ParsedCommand {
     // Phase 78: Table Inheritance
     std::string tableInherits;  // parent table name for CREATE TABLE ... INHERITS
     bool        fromOnly = false; // SELECT ... FROM ONLY tbl
+
+    // Phase 82: Query Rewrite
+    std::string queryRewriteFlag;  // "ON" or "OFF" for SET QUERY_REWRITE = ON/OFF
 };
 
 class Parser {
@@ -523,6 +532,22 @@ public:
             while (s < input.size() && (input[s] == ' ' || input[s] == '\t')) ++s;
             for (size_t i = s; i < input.size(); ++i)
                 up += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
+
+            // ── Phase 82: EXPLAIN REWRITTEN SELECT ... (check before generic EXPLAIN)
+            {
+                const std::string erKw = "EXPLAIN REWRITTEN";
+                if (up.size() >= erKw.size() && up.substr(0, erKw.size()) == erKw &&
+                    (up.size() == erKw.size() || up[erKw.size()] == ' ' || up[erKw.size()] == '\t')) {
+                    size_t rpos = s + erKw.size();
+                    while (rpos < input.size() && (input[rpos]==' '||input[rpos]=='\t')) ++rpos;
+                    ParsedCommand explCmd;
+                    explCmd.raw          = input;
+                    explCmd.type         = CommandType::EXPLAIN_REWRITTEN;
+                    explCmd.benchmarkSql = input.substr(rpos);
+                    return explCmd;
+                }
+            }
+
             if (up.size() >= 7 && up.substr(0, 7) == "EXPLAIN" &&
                 (up.size() == 7 || up[7] == ' ' || up[7] == '\t')) {
                 size_t rest = s + 7;
@@ -1719,6 +1744,14 @@ public:
             } else if (kw1 == "LOGICAL" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "LOG") {
                 cmd.type = CommandType::SHOW_LOGICAL_LOG;
+            // Phase 82: SHOW QUERY STATS
+            } else if (kw1 == "QUERY" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATS") {
+                cmd.type = CommandType::SHOW_QUERY_STATS;
+            // Phase 82: SHOW INDEX SUGGESTIONS
+            } else if (kw1 == "INDEX" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "SUGGESTIONS") {
+                cmd.type = CommandType::SHOW_INDEX_SUGGESTIONS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -1904,6 +1937,21 @@ public:
             if (valTok == "=" && tokens.size() >= 4) valTok = tokens[3];
             cmd.type = CommandType::SET_BUFFER_POOL_SIZE;
             cmd.values.push_back(valTok);
+
+        // ── Phase 82: SET QUERY_REWRITE = ON/OFF ─────────────────
+        } else if (kw0 == "SET" && kw1 == "QUERY_REWRITE") {
+            cmd.type = CommandType::SET_QUERY_REWRITE;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                cmd.queryRewriteFlag = toUpper(val);
+            }
+
+        // ── Phase 82: ANALYZE TABLE name ─────────────────────────
+        } else if (kw0 == "ANALYZE" && kw1 == "TABLE") {
+            cmd.type = CommandType::ANALYZE_TABLE;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
 
         // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
         // SET TRANSACTION ISOLATION LEVEL READ COMMITTED

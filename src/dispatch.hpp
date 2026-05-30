@@ -20,6 +20,8 @@
 #include "parser/parser.hpp"
 #include "storage/storage.hpp"
 #include "optimizer/optimizer.hpp"
+#include "optimizer/query_rewriter.hpp"
+#include "optimizer/adaptive_stats.hpp"
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
@@ -32,6 +34,10 @@ namespace milansql {
 
 // ── Phase 69: Global Query Profiler ──────────────────────────
 static QueryProfiler g_profiler;
+
+// ── Phase 82: Query Rewriter + Adaptive Stats ────────────────
+static QueryRewriter g_queryRewriter;
+static AdaptiveStats g_adaptiveStats;
 
 // ── Phase 59: Replication helpers ────────────────────────────
 // Returns true if the current operation should be blocked (slave read-only)
@@ -1209,6 +1215,11 @@ inline bool dispatchCommand(
     std::function<void()> saveTriggFn,
     std::function<std::string()> getProcessListFn = nullptr)
 {
+    // Phase 82: record query statistics + apply rewrites before dispatch
+    g_adaptiveStats.recordQuery(cmd);
+    if (cmd.type == milansql::CommandType::SELECT)
+        g_queryRewriter.rewrite(cmd);
+
     switch (cmd.type) {
 
     case milansql::CommandType::EXIT:
@@ -3872,6 +3883,90 @@ inline bool dispatchCommand(
     case milansql::CommandType::SHOW_LOGICAL_LOG:
         engine.showLogicalLog();
         break;
+
+    // ── Phase 82: Adaptive Query Optimizer ───────────────────────
+
+    case milansql::CommandType::SHOW_QUERY_STATS:
+        g_adaptiveStats.showStats();
+        break;
+
+    case milansql::CommandType::SHOW_INDEX_SUGGESTIONS:
+        g_adaptiveStats.showIndexSuggestions();
+        break;
+
+    case milansql::CommandType::ANALYZE_TABLE: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: ANALYZE TABLE tabellenname\n\n"; break;
+        }
+        g_adaptiveStats.analyzeTable(cmd.tableName);
+        g_adaptiveStats.saveStats();
+        break;
+    }
+
+    case milansql::CommandType::SET_QUERY_REWRITE: {
+        if (cmd.queryRewriteFlag == "ON") {
+            g_queryRewriter.setEnabled(true);
+            std::cout << "  Query Rewriter aktiviert.\n\n";
+        } else if (cmd.queryRewriteFlag == "OFF") {
+            g_queryRewriter.setEnabled(false);
+            std::cout << "  Query Rewriter deaktiviert.\n\n";
+        } else {
+            std::cout << "  Fehler: SET QUERY_REWRITE = ON|OFF\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::EXPLAIN_REWRITTEN: {
+        if (cmd.benchmarkSql.empty()) {
+            std::cout << "  Fehler: EXPLAIN REWRITTEN SELECT ...\n\n"; break;
+        }
+        // Parse inner query
+        milansql::ParsedCommand inner = parser.parse(cmd.benchmarkSql);
+        // Resolve subqueries
+        for (const auto& sq : inner.subqueries) {
+            if (sq.condIdx < inner.whereConds.size())
+                inner.whereConds[sq.condIdx].inList =
+                    engine.subqueryValues(sq.subTable, sq.subCol,
+                                          sq.subWhere, sq.subWhereLogic);
+        }
+        // Apply rewriter (temp enable if disabled)
+        bool wasEnabled = g_queryRewriter.isEnabled();
+        g_queryRewriter.setEnabled(true);
+        bool changed = g_queryRewriter.rewrite(inner);
+        g_queryRewriter.setEnabled(wasEnabled);
+
+        std::cout << "\n  Original Query:\n    " << cmd.benchmarkSql << "\n\n";
+
+        if (!g_queryRewriter.notes().empty()) {
+            std::cout << "  Umschreibungen:\n";
+            for (const auto& n : g_queryRewriter.notes())
+                std::cout << "    * " << n << "\n";
+            std::cout << "\n";
+        } else {
+            std::cout << "  Umschreibungen: (keine angewendet)\n\n";
+        }
+        (void)changed;
+
+        std::cout << "  Ausfuehrungsplan:\n";
+        std::cout << "    Tabelle  : " << (inner.tableName.empty() ? "(unbekannt)" : inner.tableName) << "\n";
+        if (inner.isJoin)
+            std::cout << "    Operation: JOIN (" << inner.joinClauses.size() << " Join(s))\n";
+        else if (inner.isGroupBy)
+            std::cout << "    Operation: GROUP BY " << (inner.groupByCols.empty() ? "" : inner.groupByCols[0]) << "\n";
+        else if (inner.isAggregate)
+            std::cout << "    Operation: " << inner.aggFunc << "(" << inner.aggCol << ")\n";
+        else if (inner.isCount)
+            std::cout << "    Operation: COUNT(*)\n";
+        else
+            std::cout << "    Operation: SELECT\n";
+        if (!inner.whereConds.empty())
+            std::cout << "    WHERE    : " << dispatch_whereDesc(inner) << "\n";
+        std::cout << "    Scan     : " << (inner.whereConds.empty() ? "FULL TABLE SCAN" : "FULL SCAN mit Filter") << "\n";
+        if (inner.limit >= 0)
+            std::cout << "    LIMIT    : " << inner.limit << "\n";
+        std::cout << "\n";
+        break;
+    }
 
     case milansql::CommandType::UNKNOWN:
     default:

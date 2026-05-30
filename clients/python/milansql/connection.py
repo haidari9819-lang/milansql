@@ -8,7 +8,48 @@ Wire protocol:
 """
 
 import socket
+from urllib.parse import urlparse, unquote
 from .exceptions import ConnectionError, MilanSQLError, OperationalError, ProgrammingError
+
+
+# ── Phase 79: DSN / Connection String parser ──────────────────────────────────
+
+def parse_dsn(dsn: str) -> dict:
+    """
+    Parse a MilanSQL DSN string into connection parameters.
+
+    Supported formats::
+
+        milansql://user:password@host:port/database
+        mysql://user@host:port/database
+        jdbc:milansql://host:port/database
+
+    Returns:
+        dict with keys: host, port, user, password, database, protocol
+
+    Raises:
+        ValueError: if the DSN cannot be parsed or uses an unknown protocol.
+    """
+    # Strip jdbc: prefix
+    raw = dsn
+    if raw.startswith("jdbc:"):
+        raw = raw[5:]
+
+    parsed = urlparse(raw)
+    protocol = (parsed.scheme or "milansql").lower()
+    if protocol not in ("milansql", "mysql"):
+        raise ValueError(f"Unsupported protocol: {protocol!r}")
+
+    default_port = 3306 if protocol == "mysql" else 4406
+    return {
+        "protocol": protocol,
+        "host":     parsed.hostname or "localhost",
+        "port":     int(parsed.port or default_port),
+        "user":     unquote(parsed.username or "root"),
+        "password": unquote(parsed.password or ""),
+        "database": (parsed.path or "/public").lstrip("/") or "public",
+    }
+
 
 # ── Parameter substitution ────────────────────────────────────────────────────
 

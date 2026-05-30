@@ -32,6 +32,9 @@
 // Phase 72: WAL Crash Recovery
 #include "wal/wal_recovery.hpp"
 
+// Phase 79: Connection String Parser
+#include "utils/connection_string.hpp"
+
 // ============================================================
 // main.cpp — REPL für MilanSQL (Phase 47)
 // Neu: --server / --client / --port N Modi
@@ -64,10 +67,15 @@ int main(int argc, char* argv[]) {
     std::string masterHost = "localhost";
     int  masterPort  = 4408;   // Replication port (shifted to avoid conflict with mysql)
     int  replPort    = 4408;
+    std::string dsnArg;        // Phase 79: Connection String
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--server")      serverMode = true;
+        // Phase 79: detect DSN as positional argument
+        if (milansql::ConnectionString::isDsn(arg)) {
+            dsnArg = arg;
+        }
+        else if (arg == "--server")      serverMode = true;
         else if (arg == "--client")      clientMode = true;
         else if (arg == "--http")        httpMode   = true;
         else if (arg == "--mysql")       mysqlMode  = true;
@@ -81,6 +89,19 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
         else if (arg == "--master-port"   && i + 1 < argc) masterPort  = std::stoi(argv[++i]);
         else if (arg == "--repl-port"     && i + 1 < argc) replPort    = std::stoi(argv[++i]);
+    }
+
+    // Phase 79: apply DSN to client/server port if given
+    if (!dsnArg.empty()) {
+        try {
+            auto cs = milansql::ConnectionString::parse(dsnArg);
+            if (!clientMode && !serverMode) {
+                // REPL mode: DSN sets the connecting port for --client or just informs user
+                port = cs.port;
+            } else if (clientMode) {
+                port = cs.port;
+            }
+        } catch (...) {}
     }
 
     // ── MySQL Wire Protocol mode (Phase 74) ───────────────────
@@ -456,6 +477,32 @@ int main(int argc, char* argv[]) {
     milansql::g_eventScheduler = &eventScheduler;
     eventScheduler.loadEvents();
     eventScheduler.start();
+
+    // ── Phase 79: Connection String — auto-execute CONNECT + USE ──
+    if (!dsnArg.empty()) {
+        try {
+            auto cs = milansql::ConnectionString::parse(dsnArg);
+            cs.validate();
+            std::cout << "  DSN: " << cs.toDisplayString() << "\n\n";
+            // CONNECT user password (skip if user == "root" with no password)
+            if (cs.user != "root" || !cs.password.empty()) {
+                std::string connectSql = "CONNECT " + cs.user;
+                if (!cs.password.empty()) connectSql += " " + cs.password;
+                milansql::ParsedCommand cc = parser.parse(connectSql);
+                milansql::dispatchCommand(cc, engine, parser, connectSql,
+                    persist, saveProcedures, saveTriggers);
+            }
+            // USE database (skip if default "public")
+            if (!cs.database.empty() && cs.database != "public") {
+                std::string useSql = "USE " + cs.database;
+                milansql::ParsedCommand uc = parser.parse(useSql);
+                milansql::dispatchCommand(uc, engine, parser, useSql,
+                    persist, saveProcedures, saveTriggers);
+            }
+        } catch (const std::exception& ex) {
+            std::cout << "  Fehler im Connection String: " << ex.what() << "\n\n";
+        }
+    }
 
     // ── Phase 73: Buffer Pool Write-Behind Thread ─────────────
     // Flushes dirty pages to disk every 5 seconds (background)

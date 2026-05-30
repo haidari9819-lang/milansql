@@ -188,30 +188,71 @@ class Connection {
   }
 }
 
+// ── Phase 79: DSN parser ──────────────────────────────────────────────────────
+
+/**
+ * Parse a MilanSQL DSN string into connection options.
+ *
+ * Supported formats:
+ *   milansql://user:pass@host:port/database
+ *   mysql://user@host:port/database
+ *   jdbc:milansql://host:port/database
+ *
+ * @param {string} dsn
+ * @returns {{ host: string, port: number, user: string, password: string, database: string, protocol: string }}
+ */
+function parseDsn(dsn) {
+  let raw = dsn;
+  if (raw.startsWith('jdbc:')) raw = raw.slice(5);
+
+  const m = raw.match(/^([a-z]+):\/\/(?:([^:@]*)(?::([^@]*))?@)?([^:/]*)(?::(\d+))?\/?(.*)$/i);
+  if (!m) throw new MilanSQLError(`Invalid DSN: ${dsn}`);
+
+  const protocol = (m[1] || 'milansql').toLowerCase();
+  if (protocol !== 'milansql' && protocol !== 'mysql')
+    throw new MilanSQLError(`Unsupported protocol: ${protocol}`);
+
+  const defaultPort = protocol === 'mysql' ? 3306 : 4406;
+  return {
+    protocol,
+    user:     decodeURIComponent(m[2] || 'root'),
+    password: decodeURIComponent(m[3] || ''),
+    host:     m[4] || 'localhost',
+    port:     m[5] ? parseInt(m[5], 10) : defaultPort,
+    database: m[6] || 'public',
+  };
+}
+
 // ── Module API ────────────────────────────────────────────────────────────────
 
 /**
  * Connect to a MilanSQL HTTP server.
  *
- * @param {object} options
- * @param {string} [options.host='localhost']
- * @param {number} [options.port=8080]
- * @param {number} [options.timeout=30000]  ms
- * @returns {Connection}
+ * Accepts either a DSN string or an options object::
  *
- * @example
- * const milansql = require('milansql');
- * const conn = milansql.connect({ host: 'localhost', port: 8080 });
- * const result = await conn.query('SELECT * FROM users');
- * console.log(result.columns);
- * console.log(result.rows);
+ *   // DSN style (Phase 79)
+ *   const conn = milansql.connect('milansql://root@localhost:8080');
+ *   const conn = milansql.connect('milansql://alice:secret@localhost:8080/shop');
+ *
+ *   // Classic style
+ *   const conn = milansql.connect({ host: 'localhost', port: 8080 });
+ *
+ * @param {string|object} dsnOrOptions  DSN string, or options { host, port, timeout }
+ * @returns {Connection}
  */
-function connect({ host = 'localhost', port = 8080, timeout = 30000 } = {}) {
+function connect(dsnOrOptions = {}) {
+  // Phase 79: support DSN string
+  if (typeof dsnOrOptions === 'string') {
+    const p = parseDsn(dsnOrOptions);
+    return new Connection(p.host, p.port);
+  }
+  const { host = 'localhost', port = 8080, timeout = 30000 } = dsnOrOptions;
   return new Connection(host, port, timeout);
 }
 
 module.exports = {
   connect,
+  parseDsn,
   Connection,
   QueryResult,
   MilanSQLError,

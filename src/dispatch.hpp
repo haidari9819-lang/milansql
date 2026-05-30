@@ -1315,6 +1315,17 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 80: CREATE COLUMN TABLE ────────────────────────────
+    case milansql::CommandType::CREATE_COLUMN_TABLE: {
+        if (cmd.tableName.empty() || cmd.columns.empty()) {
+            std::cout << "  Fehler: CREATE COLUMN TABLE name (col TYP, ...)\n"; break;
+        }
+        engine.createColumnTable(cmd.tableName, cmd.columns);
+        std::cout << "  Column Table '" << cmd.tableName << "' erstellt ("
+                  << cmd.columns.size() << " Spalten, COLUMN STORE).\n\n";
+        break;
+    }
+
     case milansql::CommandType::CREATE_TABLE: {
         if (dispatch_slaveReadOnly()) {
             std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
@@ -1390,6 +1401,23 @@ inline bool dispatchCommand(
         }
         if (milansql::Engine::isInfoSchemaName(cmd.tableName)) {
             std::cout << "  FEHLER: INFORMATION_SCHEMA ist read-only.\n\n"; break;
+        }
+        // Phase 80: route to column store
+        if (engine.isColumnTable(cmd.tableName)) {
+            auto& ct = engine.getColumnTable(cmd.tableName);
+            std::vector<std::vector<std::string>> colRows;
+            if (cmd.multiValues.empty())
+                colRows.push_back(cmd.values);
+            else
+                colRows = cmd.multiValues;
+            for (const auto& vals : colRows)
+                ct.insert(vals);
+            if (colRows.size() == 1)
+                std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "' (COLUMN STORE).\n\n";
+            else
+                std::cout << "  " << colRows.size() << " Zeilen eingefuegt in '"
+                          << cmd.tableName << "' (COLUMN STORE).\n\n";
+            break;
         }
         if (cmd.isInsertSelect) {
             if (cmd.insertSelectSql.empty()) {
@@ -1852,6 +1880,76 @@ inline bool dispatchCommand(
                 result = result.project(cmd.selectColumns);
             if (cmd.isDistinct)
                 result.makeDistinct();
+            dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+            break;
+        }
+
+        // Phase 80: Column Store — route aggregates + full scans
+        if (engine.isColumnTable(cmd.tableName)) {
+            const auto& ct = engine.getColumnTableConst(cmd.tableName);
+            if (cmd.isAggregate) {
+                std::string val;
+                std::string func = cmd.aggFunc;
+                for (char& c : func) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (func == "COUNT")
+                    val = std::to_string(ct.countWhere(cmd.whereConds, cmd.whereLogic));
+                else if (func == "SUM")
+                    val = ct.aggregateSumWhere(cmd.aggCol, cmd.whereConds, cmd.whereLogic);
+                else if (func == "AVG")
+                    val = ct.aggregateAvgWhere(cmd.aggCol, cmd.whereConds, cmd.whereLogic);
+                else if (func == "MIN")
+                    val = ct.aggregateMinWhere(cmd.aggCol, cmd.whereConds, cmd.whereLogic);
+                else if (func == "MAX")
+                    val = ct.aggregateMaxWhere(cmd.aggCol, cmd.whereConds, cmd.whereLogic);
+                else
+                    val = "NULL";
+                std::cout << "\n  " << cmd.aggFunc << "(" << cmd.aggCol << ") = "
+                          << val << " (Column Store '" << cmd.tableName << "')";
+                if (!cmd.whereConds.empty())
+                    std::cout << "  [WHERE " << dispatch_whereDesc(cmd) << "]";
+                std::cout << "\n\n";
+                break;
+            }
+            if (cmd.isCount) {
+                size_t n = ct.countWhere(cmd.whereConds, cmd.whereLogic);
+                std::cout << "\n  COUNT(*) = " << n
+                          << " (Column Store '" << cmd.tableName << "')";
+                if (!cmd.whereConds.empty())
+                    std::cout << "  [WHERE " << dispatch_whereDesc(cmd) << "]";
+                std::cout << "\n\n";
+                break;
+            }
+            if (cmd.isGroupBy) {
+                // Fall back to row-store conversion for GROUP BY
+                milansql::Table rowTable = cmd.whereConds.empty()
+                    ? ct.toRows()
+                    : ct.filterRows(cmd.whereConds, cmd.whereLogic);
+                engine.registerTempTable("__cs_tmp__", std::move(rowTable));
+                try {
+                    auto result = engine.groupBy(
+                        "__cs_tmp__", {}, "AND",
+                        cmd.groupByCols, cmd.selectItems,
+                        cmd.havingConds, cmd.havingLogic);
+                    engine.cleanupTempTables();
+                    std::cout << "\n";
+                    if (!cmd.orderByCols.empty())
+                        result.sortByMulti(cmd.orderByCols);
+                    dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+                } catch (...) {
+                    engine.cleanupTempTables();
+                    throw;
+                }
+                break;
+            }
+            // Full scan / WHERE
+            milansql::Table result = cmd.whereConds.empty()
+                ? ct.toRows()
+                : ct.filterRows(cmd.whereConds, cmd.whereLogic);
+            std::cout << "\n";
+            if (!cmd.orderByCols.empty())
+                result.sortByMulti(cmd.orderByCols);
+            if (!cmd.selectColumns.empty())
+                result = result.project(cmd.selectColumns);
             dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             break;
         }
@@ -3688,6 +3786,11 @@ inline bool dispatchCommand(
     // ── Phase 78: Table Inheritance ──────────────────────────────
     case milansql::CommandType::SHOW_INHERITANCE:
         engine.showInheritance();
+        break;
+
+    // ── Phase 80: Column Store Engine ────────────────────────────
+    case milansql::CommandType::SHOW_STORAGE_FORMAT:
+        engine.showStorageFormat();
         break;
 
     // ── Phase 77: Parallel Query ──────────────────────────────────

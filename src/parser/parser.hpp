@@ -148,6 +148,9 @@ enum class CommandType {
     SHOW_PARALLEL_STATUS,
     // Phase 78: Table Inheritance
     SHOW_INHERITANCE,
+    // Phase 80: Column Store Engine
+    CREATE_COLUMN_TABLE,
+    SHOW_STORAGE_FORMAT,
     UNKNOWN
 };
 
@@ -1399,6 +1402,20 @@ public:
                 }
             } else { cmd.type = CommandType::UNKNOWN; }
 
+        // ── Phase 80: CREATE COLUMN TABLE ────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "COLUMN" &&
+                   tokens.size() >= 3 && toUpper(tokens[2]) == "TABLE") {
+            cmd.type = CommandType::CREATE_COLUMN_TABLE;
+            if (tokens.size() >= 4) {
+                cmd.tableName = tokens[3];
+                for (const auto& colDef : splitTrim(parenContent, ',')) {
+                    auto parts = tokenize(colDef);
+                    if (parts.size() < 2) continue;
+                    Column col(parts[0], toUpper(parts[1]));
+                    cmd.columns.push_back(std::move(col));
+                }
+            } else { cmd.type = CommandType::UNKNOWN; }
+
         // ── CREATE TABLE ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "TABLE") {
             cmd.type = CommandType::CREATE_TABLE;
@@ -1672,6 +1689,10 @@ public:
             // Phase 78: SHOW INHERITANCE
             } else if (kw1 == "INHERITANCE") {
                 cmd.type = CommandType::SHOW_INHERITANCE;
+            // Phase 80: SHOW STORAGE FORMAT
+            } else if (kw1 == "STORAGE" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "FORMAT") {
+                cmd.type = CommandType::SHOW_STORAGE_FORMAT;
             // Phase 59: Replication SHOW commands
             } else if (kw1 == "MASTER" && kw2 == "STATUS") {
                 cmd.type = CommandType::SHOW_MASTER_STATUS;

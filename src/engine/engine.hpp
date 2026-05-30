@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <climits>
+#include <numeric>
 #include <sstream>
 #include <iomanip>
 #include <limits>
@@ -899,6 +901,9 @@ private:
         }
     }
 };
+
+// Phase 80: Column Store Engine (included here so ColumnTable sees Column/Row/Table/WhereCondition)
+#include "../storage/column_store.hpp"
 
 // ── Gepufferte Transaktion-Operation (Phase 17) ───────────────
 struct BufferedOp {
@@ -3005,6 +3010,55 @@ public:
         }
         if (!any) std::cout << "  (keine Vererbung definiert)\n";
         std::cout << "\n";
+    }
+
+    // ── Phase 80: Column Store Engine ────────────────────────
+
+    void createColumnTable(const std::string& name,
+                           const std::vector<Column>& cols) {
+        auto key = resolveTableName(name);
+        if (columnTables_.count(key))
+            throw std::runtime_error("Column Table '" + key + "' existiert bereits.");
+        if (tables_.count(key))
+            throw std::runtime_error("Tabelle '" + key + "' existiert bereits.");
+        columnTables_.emplace(key, ColumnTable(key, cols));
+    }
+
+    bool isColumnTable(const std::string& name) const {
+        return columnTables_.count(resolveTableName(name)) > 0;
+    }
+
+    ColumnTable& getColumnTable(const std::string& name) {
+        auto it = columnTables_.find(resolveTableName(name));
+        if (it == columnTables_.end())
+            throw std::runtime_error("Column Table '" + name + "' nicht gefunden.");
+        return it->second;
+    }
+
+    const ColumnTable& getColumnTableConst(const std::string& name) const {
+        auto it = columnTables_.find(resolveTableName(name));
+        if (it == columnTables_.end())
+            throw std::runtime_error("Column Table '" + name + "' nicht gefunden.");
+        return it->second;
+    }
+
+    void showStorageFormat() const {
+        std::cout << "\n  Storage Format Report:\n";
+        std::cout << "  +-----------------------+---------------+\n";
+        std::cout << "  | Table                 | Format        |\n";
+        std::cout << "  +-----------------------+---------------+\n";
+        // Row-store tables (skip internal temp tables starting with __)
+        for (const auto& [key, tbl] : tables_) {
+            if (key.size() >= 2 && key[0] == '_' && key[1] == '_') continue;
+            std::cout << "  | " << std::left << std::setw(21) << key
+                      << "| ROW STORE     |\n";
+        }
+        // Column-store tables
+        for (const auto& [key, tbl] : columnTables_) {
+            std::cout << "  | " << std::left << std::setw(21) << key
+                      << "| COLUMN STORE  |\n";
+        }
+        std::cout << "  +-----------------------+---------------+\n\n";
     }
 
     // ── Phase 77: Parallel Query ──────────────────────────────
@@ -5514,6 +5568,9 @@ public:
     // Phase 78: Table Inheritance
     std::map<std::string, std::string>              tableParent_;    // child key → parent key
     std::map<std::string, std::vector<std::string>> tableChildren_;  // parent key → child keys
+
+    // Phase 80: Column Store Engine
+    std::map<std::string, ColumnTable> columnTables_;
 
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────

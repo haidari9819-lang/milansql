@@ -906,6 +906,11 @@ private:
 // Phase 80: Column Store Engine (included here so ColumnTable sees Column/Row/Table/WhereCondition)
 #include "../storage/column_store.hpp"
 
+// Phase 83: Join Algorithms (included here inside namespace milansql so they see Row/Table/Column)
+#include "../executor/join_planner.hpp"
+#include "../executor/hash_join.hpp"
+#include "../executor/merge_join.hpp"
+
 // ── Gepufferte Transaktion-Operation (Phase 17) ───────────────
 struct BufferedOp {
     enum class Type {
@@ -1503,9 +1508,6 @@ public:
             for (const auto& c : right.columns())
                 newCols.emplace_back(jc.table + "." + c.name, c.type);
 
-            Table next("", newCols);
-            const size_t rightWidth = right.columns().size();
-
             // ON-Seiten zuordnen: eine Seite gehört zur rechten Tabelle, die andere
             // zum bisherigen Ergebnis. Seiten ggf. tauschen.
             // For schema-qualified refs like "shop.kunden.id", table = "shop.kunden"
@@ -1522,120 +1524,146 @@ public:
             size_t leftCI  = findQualColIdx(current, resultSide);
             size_t rightCI = findRawColIdx (right,   rightSide);
 
-            const size_t leftWidth = current.columns().size();
-
-            if (jc.joinType == "INNER" || jc.joinType == "LEFT") {
-                // ── INNER JOIN / LEFT JOIN ────────────────────────
-                for (const auto& lrow : current.rows()) {
-                    const std::string& lval =
-                        leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
-                    bool matched = false;
-
-                    for (const auto& rrow : right.rows()) {
-                        const std::string& rval =
-                            rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
-                        if (lval != rval) continue;
-
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rrow.values.size());
-                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
-                        next.insert(Row(vals));
-                        matched = true;
-                    }
-
-                    if (!matched && jc.joinType == "LEFT") {
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rightWidth);
-                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                        for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
-                        next.insert(Row(vals));
-                    }
-                }
-
-            } else if (jc.joinType == "RIGHT") {
-                // ── RIGHT JOIN ────────────────────────────────────
-                // Alle rechten Zeilen; linke Seite NULL wenn kein Match
-                for (const auto& rrow : right.rows()) {
-                    const std::string& rval =
-                        rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
-                    bool matched = false;
-
-                    for (const auto& lrow : current.rows()) {
-                        const std::string& lval =
-                            leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
-                        if (lval != rval) continue;
-
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rrow.values.size());
-                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
-                        next.insert(Row(vals));
-                        matched = true;
-                    }
-
-                    if (!matched) {
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rightWidth);
-                        for (size_t k = 0; k < leftWidth;  ++k) vals.push_back("NULL");
-                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
-                        next.insert(Row(vals));
-                    }
-                }
-
-            } else if (jc.joinType == "FULL") {
-                // ── FULL OUTER JOIN ───────────────────────────────
-                // Schritt 1: LEFT JOIN-Teil (alle linken Zeilen)
-                for (const auto& lrow : current.rows()) {
-                    const std::string& lval =
-                        leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
-                    bool matched = false;
-
-                    for (const auto& rrow : right.rows()) {
-                        const std::string& rval =
-                            rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
-                        if (lval != rval) continue;
-
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rrow.values.size());
-                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
-                        next.insert(Row(vals));
-                        matched = true;
-                    }
-
-                    if (!matched) {
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rightWidth);
-                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
-                        for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
-                        next.insert(Row(vals));
-                    }
-                }
-
-                // Schritt 2: Anti-Right — rechte Zeilen ohne Match links
-                for (const auto& rrow : right.rows()) {
-                    const std::string& rval =
-                        rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
-                    bool matched = false;
-
-                    for (const auto& lrow : current.rows()) {
-                        const std::string& lval =
-                            leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
-                        if (lval == rval) { matched = true; break; }
-                    }
-
-                    if (!matched) {
-                        std::vector<std::string> vals;
-                        vals.reserve(leftWidth + rightWidth);
-                        for (size_t k = 0; k < leftWidth;  ++k) vals.push_back("NULL");
-                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
-                        next.insert(Row(vals));
-                    }
+            // ── Phase 83: Choose join algorithm ──────────────────────────
+            auto bareColOf83 = [](const std::string& s) -> std::string {
+                auto p = s.rfind('.'); return p != std::string::npos ? s.substr(p+1) : s;
+            };
+            std::string rightColBare83 = bareColOf83(rightSide);
+            bool rightHasIdx83 = right.hasIndex(rightColBare83);
+            bool leftHasIdx83  = false;
+            {
+                auto p2 = resultSide.rfind('.');
+                if (p2 != std::string::npos) {
+                    std::string lTbl83 = resultSide.substr(0, p2);
+                    if (tables_.count(lTbl83))
+                        leftHasIdx83 = tables_.at(lTbl83).hasIndex(bareColOf83(resultSide));
                 }
             }
+            JoinStrategy strategy83 = JoinPlanner::choose(
+                current.rowCount(), right.rowCount(), leftHasIdx83, rightHasIdx83);
 
-            current = std::move(next);
+            // Dispatch: Hash Join or Merge Join for large tables;
+            // Merge Join only supports INNER — fall back to Hash Join for others.
+            if (strategy83 == JoinStrategy::HASH_JOIN ||
+                (strategy83 == JoinStrategy::MERGE_JOIN && jc.joinType != "INNER")) {
+                current = HashJoin::execute(current, right, leftCI, rightCI, jc.joinType, newCols);
+            } else if (strategy83 == JoinStrategy::MERGE_JOIN) {
+                current = MergeJoin::execute(current, right, leftCI, rightCI, jc.joinType, newCols);
+            } else {
+                // ── NESTED LOOP (original algorithm for small tables) ─────
+                Table next("", newCols);
+                const size_t leftWidth  = current.columns().size();
+                const size_t rightWidth = right.columns().size();
+
+                if (jc.joinType == "INNER" || jc.joinType == "LEFT") {
+                    // ── INNER JOIN / LEFT JOIN ────────────────────
+                    for (const auto& lrow : current.rows()) {
+                        const std::string& lval =
+                            leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                        bool matched = false;
+
+                        for (const auto& rrow : right.rows()) {
+                            const std::string& rval =
+                                rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                            if (lval != rval) continue;
+
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rrow.values.size());
+                            vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                            vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                            next.insert(Row(vals));
+                            matched = true;
+                        }
+
+                        if (!matched && jc.joinType == "LEFT") {
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rightWidth);
+                            vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                            for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
+                            next.insert(Row(vals));
+                        }
+                    }
+
+                } else if (jc.joinType == "RIGHT") {
+                    // ── RIGHT JOIN ────────────────────────────────
+                    for (const auto& rrow : right.rows()) {
+                        const std::string& rval =
+                            rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                        bool matched = false;
+
+                        for (const auto& lrow : current.rows()) {
+                            const std::string& lval =
+                                leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                            if (lval != rval) continue;
+
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rrow.values.size());
+                            vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                            vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                            next.insert(Row(vals));
+                            matched = true;
+                        }
+
+                        if (!matched) {
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rightWidth);
+                            for (size_t k = 0; k < leftWidth;  ++k) vals.push_back("NULL");
+                            vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                            next.insert(Row(vals));
+                        }
+                    }
+
+                } else if (jc.joinType == "FULL") {
+                    // ── FULL OUTER JOIN ───────────────────────────
+                    for (const auto& lrow : current.rows()) {
+                        const std::string& lval =
+                            leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                        bool matched = false;
+
+                        for (const auto& rrow : right.rows()) {
+                            const std::string& rval =
+                                rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                            if (lval != rval) continue;
+
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rrow.values.size());
+                            vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                            vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                            next.insert(Row(vals));
+                            matched = true;
+                        }
+
+                        if (!matched) {
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rightWidth);
+                            vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                            for (size_t k = 0; k < rightWidth; ++k) vals.push_back("NULL");
+                            next.insert(Row(vals));
+                        }
+                    }
+
+                    // Anti-Right: rechte Zeilen ohne Match
+                    for (const auto& rrow : right.rows()) {
+                        const std::string& rval =
+                            rightCI < rrow.values.size() ? rrow.values[rightCI] : "";
+                        bool matched = false;
+                        for (const auto& lrow : current.rows()) {
+                            const std::string& lval =
+                                leftCI < lrow.values.size() ? lrow.values[leftCI] : "";
+                            if (lval == rval) { matched = true; break; }
+                        }
+                        if (!matched) {
+                            std::vector<std::string> vals;
+                            vals.reserve(leftWidth + rightWidth);
+                            for (size_t k = 0; k < leftWidth; ++k) vals.push_back("NULL");
+                            vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                            next.insert(Row(vals));
+                        }
+                    }
+                }
+
+                current = std::move(next);
+            }
         }
 
         // WHERE auf Gesamtergebnis anwenden
@@ -5485,8 +5513,28 @@ public:
             // JOIN: Haupt-Tabelle scannen, dann jede JOIN-Tabelle
             addStep("SCAN", req.tableName, "FULL SCAN", "-");
             for (const auto& jc : req.joinClauses) {
-                std::string det = jc.joinType + " JOIN ON " +
-                                  jc.onLeft + " = " + jc.onRight;
+                // Phase 83: determine join strategy for EXPLAIN output
+                auto xColOf83 = [](const std::string& s) -> std::string {
+                    auto p = s.rfind('.'); return p != std::string::npos ? s.substr(p+1) : s;
+                };
+                std::string rTbl83 = resolveTableName(jc.table);
+                // Determine which ON side belongs to right table (mirror executeJoins logic)
+                bool onRightIsRight83 = tblNamesMatch(
+                    [](const std::string& s){ auto p=s.rfind('.'); return p!=std::string::npos?s.substr(0,p):std::string(); }(jc.onRight),
+                    jc.table);
+                std::string rightCol83 = onRightIsRight83 ? xColOf83(jc.onRight) : xColOf83(jc.onLeft);
+                std::string leftCol83  = onRightIsRight83 ? xColOf83(jc.onLeft)  : xColOf83(jc.onRight);
+                bool rightHasIdx83 = tables_.count(rTbl83) &&
+                                     tables_.at(rTbl83).hasIndex(rightCol83);
+                std::string lTbl83 = resolveTableName(req.tableName);
+                bool leftHasIdx83  = tables_.count(lTbl83) &&
+                                     tables_.at(lTbl83).hasIndex(leftCol83);
+                size_t leftSz83  = tables_.count(lTbl83) ? tables_.at(lTbl83).rowCount() : 0;
+                size_t rightSz83 = tables_.count(rTbl83) ? tables_.at(rTbl83).rowCount() : 0;
+                JoinStrategy strat83 = JoinPlanner::choose(
+                    leftSz83, rightSz83, leftHasIdx83, rightHasIdx83);
+                std::string det = jc.joinType + " JOIN ON " + jc.onLeft + " = " + jc.onRight +
+                    "  [" + JoinPlanner::description(strat83, leftSz83, rightSz83) + "]";
                 addStep("JOIN", jc.table, det, "-");
             }
             // WHERE nach dem JOIN

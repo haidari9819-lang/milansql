@@ -3,340 +3,1314 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MilanSQL — Production-grade SQL Database Engine</title>
+  <title>MilanSQL — Production-grade SQL Database Engine in C++17</title>
   <style>
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body { background:#0d1117; color:#e6edf3; font-family:'Segoe UI',sans-serif; }
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-    /* Hero */
-    .hero { text-align:center; padding:80px 20px; background:linear-gradient(135deg,#161b22,#0d1117); }
-    .hero h1 { font-size:4rem; font-weight:800; color:#58a6ff; margin-bottom:16px; }
-    .hero .version { background:#238636; color:#fff; padding:4px 12px; border-radius:20px; font-size:0.9rem; }
-    .hero p { font-size:1.3rem; color:#8b949e; margin:24px 0; max-width:600px; margin-left:auto; margin-right:auto; }
-    .hero .badges { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin:20px 0; }
-    .hero .buttons { display:flex; gap:16px; justify-content:center; margin-top:32px; }
-    .btn { padding:12px 28px; border-radius:8px; text-decoration:none; font-weight:600; font-size:1rem; }
-    .btn-primary { background:#238636; color:#fff; }
-    .btn-secondary { background:#21262d; color:#e6edf3; border:1px solid #30363d; }
+    :root {
+      --primary:   #2563eb;
+      --accent:    #7c3aed;
+      --cyan:      #06b6d4;
+      --bg:        #020817;
+      --bg-card:   rgba(255,255,255,0.04);
+      --border:    rgba(255,255,255,0.08);
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --max-w:     1400px;
+    }
 
-    /* Features */
-    .features { padding:80px 40px; max-width:1200px; margin:0 auto; }
-    .features h2 { text-align:center; font-size:2rem; color:#e6edf3; margin-bottom:48px; }
-    .feature-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:24px; }
-    .feature-card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:24px; }
-    .feature-card .icon { font-size:2rem; margin-bottom:12px; }
-    .feature-card h3 { color:#58a6ff; margin-bottom:8px; }
-    .feature-card p { color:#8b949e; line-height:1.6; }
+    html { scroll-behavior: smooth; }
 
-    /* Quick Start */
-    .quickstart { background:#161b22; padding:80px 40px; }
-    .quickstart h2 { text-align:center; font-size:2rem; color:#e6edf3; margin-bottom:48px; }
-    .code-block { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:24px; max-width:800px; margin:0 auto 24px; overflow-x:auto; }
-    .code-block pre { color:#e6edf3; font-family:'Courier New',monospace; font-size:0.9rem; line-height:1.6; }
-    .comment { color:#8b949e; }
-    .cmd { color:#79c0ff; }
-    .sql { color:#7ee787; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
 
-    /* Stats */
-    .stats { padding:60px 40px; text-align:center; }
-    .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:32px; max-width:900px; margin:0 auto; }
-    .stat { }
-    .stat .number { font-size:3rem; font-weight:800; color:#58a6ff; }
-    .stat .label { color:#8b949e; margin-top:8px; }
+    /* ── Scrollbar ─────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0f1e; }
+    ::-webkit-scrollbar-thumb { background: #2563eb44; border-radius: 3px; }
 
-    /* Features Table */
-    .table-section { padding:80px 40px; max-width:1100px; margin:0 auto; }
-    .table-section h2 { text-align:center; font-size:2rem; color:#e6edf3; margin-bottom:48px; }
-    table { width:100%; border-collapse:collapse; }
-    th { background:#161b22; color:#58a6ff; padding:12px 16px; text-align:left; border-bottom:2px solid #30363d; }
-    td { padding:12px 16px; border-bottom:1px solid #21262d; color:#e6edf3; vertical-align:top; }
-    tr:hover { background:#161b22; }
-    .tag { background:#21262d; color:#79c0ff; padding:2px 8px; border-radius:4px; font-size:0.8rem; margin:2px; display:inline-block; }
+    /* ── Utility ───────────────────────────────────────────── */
+    .container { max-width: var(--max-w); margin: 0 auto; padding: 0 40px; }
 
-    /* Footer */
-    footer { text-align:center; padding:40px; color:#8b949e; border-top:1px solid #21262d; }
-    footer a { color:#58a6ff; text-decoration:none; }
+    .gradient-text {
+      background: linear-gradient(135deg, #60a5fa, #a78bfa, #22d3ee);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.06);
+      color: #94a3b8;
+      backdrop-filter: blur(8px);
+    }
+
+    .badge .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 6px #22c55e;
+    }
+
+    /* ── Navigation ────────────────────────────────────────── */
+    nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      background: rgba(2, 8, 23, 0.75);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-inner {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 0 40px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-logo {
+      font-size: 1.35rem;
+      font-weight: 800;
+      text-decoration: none;
+      letter-spacing: -0.5px;
+    }
+    .nav-logo .blue  { color: #60a5fa; }
+    .nav-logo .white { color: #f1f5f9; }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: #f1f5f9; }
+
+    .nav-btn {
+      padding: 8px 20px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-decoration: none;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      transition: opacity 0.2s, transform 0.2s;
+    }
+    .nav-btn:hover { opacity: 0.88; transform: translateY(-1px); }
+
+    /* ── Hero ──────────────────────────────────────────────── */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      position: relative;
+      overflow: hidden;
+      padding-top: 64px;
+      background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 50%, #0c1525 100%);
+      background-size: 300% 300%;
+      animation: gradientShift 10s ease infinite;
+    }
+
+    @keyframes gradientShift {
+      0%   { background-position: 0% 50%; }
+      50%  { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    /* grid lines overlay */
+    .hero::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(37,99,235,0.07) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(37,99,235,0.07) 1px, transparent 1px);
+      background-size: 60px 60px;
+      mask-image: radial-gradient(ellipse 80% 60% at 50% 50%, black, transparent);
+      pointer-events: none;
+    }
+
+    /* glow blob */
+    .hero::after {
+      content: '';
+      position: absolute;
+      top: 20%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 800px; height: 500px;
+      background: radial-gradient(ellipse, rgba(124,58,237,0.18) 0%, rgba(37,99,235,0.12) 40%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-inner {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 0 40px;
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 80px;
+      align-items: center;
+      position: relative;
+      z-index: 1;
+    }
+
+    .hero-left { display: flex; flex-direction: column; gap: 28px; }
+
+    .hero-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 16px;
+      border-radius: 999px;
+      border: 1px solid rgba(124,58,237,0.4);
+      background: rgba(124,58,237,0.12);
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #a78bfa;
+      width: fit-content;
+    }
+
+    .hero-eyebrow {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #60a5fa;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .hero-title {
+      font-size: clamp(2.8rem, 5vw, 4.5rem);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      color: #f1f5f9;
+    }
+
+    .hero-tagline {
+      font-size: 1.2rem;
+      color: #94a3b8;
+      max-width: 480px;
+      line-height: 1.7;
+    }
+
+    .hero-buttons {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .btn-hero-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 26px;
+      border-radius: 10px;
+      font-weight: 700;
+      font-size: 0.95rem;
+      text-decoration: none;
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      color: #fff;
+      box-shadow: 0 4px 24px rgba(37,99,235,0.35);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .btn-hero-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(37,99,235,0.45); }
+
+    .btn-hero-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 26px;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      text-decoration: none;
+      background: rgba(255,255,255,0.06);
+      color: #e2e8f0;
+      border: 1px solid rgba(255,255,255,0.12);
+      backdrop-filter: blur(8px);
+      transition: background 0.2s, transform 0.2s;
+    }
+    .btn-hero-secondary:hover { background: rgba(255,255,255,0.1); transform: translateY(-2px); }
+
+    .hero-badges {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding-top: 4px;
+    }
+
+    /* Floating Code Block */
+    .hero-code {
+      background: rgba(13, 17, 31, 0.85);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 16px;
+      overflow: hidden;
+      backdrop-filter: blur(20px);
+      box-shadow: 0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+      animation: floatIn 0.9s cubic-bezier(0.16,1,0.3,1) both;
+      animation-delay: 0.2s;
+    }
+
+    @keyframes floatIn {
+      from { opacity: 0; transform: translateY(30px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .code-titlebar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 18px;
+      border-bottom: 1px solid rgba(255,255,255,0.07);
+      background: rgba(255,255,255,0.03);
+    }
+    .dot-r { width:12px;height:12px;border-radius:50%;background:#ff5f57; }
+    .dot-y { width:12px;height:12px;border-radius:50%;background:#febc2e; }
+    .dot-g { width:12px;height:12px;border-radius:50%;background:#28c840; }
+    .code-filename { margin-left: 10px; font-size: 0.8rem; color: #64748b; font-family: 'Courier New', monospace; }
+
+    .code-body {
+      padding: 24px 26px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.83rem;
+      line-height: 1.85;
+      overflow-x: auto;
+    }
+
+    .kw   { color: #60a5fa; }
+    .str  { color: #86efac; }
+    .cmt  { color: #475569; font-style: italic; }
+    .fn   { color: #c084fc; }
+    .num  { color: #fb923c; }
+    .typ  { color: #67e8f9; }
+
+    /* ── Stats Bar ─────────────────────────────────────────── */
+    .stats-bar {
+      background: linear-gradient(90deg, rgba(37,99,235,0.15) 0%, rgba(124,58,237,0.15) 50%, rgba(6,182,212,0.1) 100%);
+      border-top: 1px solid rgba(255,255,255,0.07);
+      border-bottom: 1px solid rgba(255,255,255,0.07);
+      padding: 60px 40px;
+    }
+
+    .stats-grid {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0;
+    }
+
+    .stat-item {
+      text-align: center;
+      padding: 20px;
+      border-right: 1px solid rgba(255,255,255,0.08);
+    }
+    .stat-item:last-child { border-right: none; }
+
+    .stat-number {
+      font-size: 3.5rem;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      background: linear-gradient(135deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .stat-label {
+      margin-top: 10px;
+      font-size: 0.9rem;
+      color: #64748b;
+      font-weight: 500;
+    }
+
+    /* ── Section Shared ────────────────────────────────────── */
+    .section { padding: 120px 40px; }
+    .section-inner { max-width: var(--max-w); margin: 0 auto; }
+
+    .section-tag {
+      display: inline-block;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      margin-bottom: 14px;
+    }
+
+    .section-title {
+      font-size: clamp(2rem, 3.5vw, 2.8rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: #f1f5f9;
+      line-height: 1.15;
+      margin-bottom: 18px;
+    }
+
+    .section-sub {
+      font-size: 1.05rem;
+      color: #64748b;
+      max-width: 560px;
+      line-height: 1.7;
+      margin-bottom: 64px;
+    }
+
+    /* ── Features ──────────────────────────────────────────── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+    }
+
+    .feature-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      backdrop-filter: blur(10px);
+      transition: border-color 0.25s, transform 0.25s, box-shadow 0.25s;
+      cursor: default;
+    }
+    .feature-card:hover {
+      border-color: rgba(96,165,250,0.35);
+      transform: translateY(-4px);
+      box-shadow: 0 20px 48px rgba(0,0,0,0.4), 0 0 0 1px rgba(96,165,250,0.1);
+    }
+
+    .feature-icon-box {
+      width: 48px;
+      height: 48px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      margin-bottom: 20px;
+    }
+    .ic-blue   { background: rgba(37,99,235,0.18);  border: 1px solid rgba(37,99,235,0.3); }
+    .ic-purple { background: rgba(124,58,237,0.18); border: 1px solid rgba(124,58,237,0.3); }
+    .ic-cyan   { background: rgba(6,182,212,0.18);  border: 1px solid rgba(6,182,212,0.3); }
+    .ic-green  { background: rgba(34,197,94,0.18);  border: 1px solid rgba(34,197,94,0.3); }
+    .ic-orange { background: rgba(249,115,22,0.18); border: 1px solid rgba(249,115,22,0.3); }
+    .ic-pink   { background: rgba(236,72,153,0.18); border: 1px solid rgba(236,72,153,0.3); }
+
+    .feature-card h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 10px;
+    }
+
+    .feature-card p {
+      font-size: 0.9rem;
+      color: #64748b;
+      line-height: 1.7;
+      margin-bottom: 18px;
+    }
+
+    .feature-link {
+      font-size: 0.82rem;
+      color: #60a5fa;
+      text-decoration: none;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: gap 0.2s;
+    }
+    .feature-link:hover { gap: 8px; }
+
+    /* ── Code Showcase ─────────────────────────────────────── */
+    .code-section {
+      padding: 120px 40px;
+      background: linear-gradient(180deg, transparent 0%, rgba(15,23,42,0.6) 50%, transparent 100%);
+    }
+
+    .code-section-inner {
+      max-width: var(--max-w);
+      margin: 0 auto;
+    }
+
+    .code-tabs-wrapper { margin-top: 48px; }
+
+    .code-tab-buttons {
+      display: flex;
+      gap: 4px;
+      padding: 4px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      width: fit-content;
+      margin-bottom: 0;
+    }
+
+    .tab-btn {
+      padding: 8px 18px;
+      border-radius: 7px;
+      border: none;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      background: transparent;
+      color: #64748b;
+      transition: all 0.2s;
+    }
+    .tab-btn.active {
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+    }
+
+    .code-panel {
+      display: none;
+      background: rgba(8, 14, 28, 0.9);
+      border: 1px solid var(--border);
+      border-top: none;
+      border-radius: 0 16px 16px 16px;
+      overflow: hidden;
+    }
+    .code-panel.active { display: block; }
+
+    .code-panel-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 20px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      background: rgba(255,255,255,0.02);
+    }
+
+    .code-panel-dots { display: flex; gap: 7px; }
+
+    .copy-btn {
+      font-size: 0.75rem;
+      color: #475569;
+      background: none;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 5px;
+      padding: 3px 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .copy-btn:hover { color: #94a3b8; border-color: rgba(255,255,255,0.18); }
+
+    .code-panel pre {
+      padding: 28px 32px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.85rem;
+      line-height: 1.9;
+      overflow-x: auto;
+      color: #e2e8f0;
+    }
+
+    /* ── Architecture ──────────────────────────────────────── */
+    .arch-section {
+      padding: 120px 40px;
+    }
+
+    .arch-diagram {
+      margin-top: 56px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 56px 48px;
+      overflow-x: auto;
+    }
+
+    .arch-layers {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .arch-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .arch-label {
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #475569;
+      width: 100px;
+      flex-shrink: 0;
+      text-align: right;
+    }
+
+    .arch-arrow {
+      font-size: 1.2rem;
+      color: #334155;
+    }
+
+    .arch-boxes {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+
+    .arch-box {
+      padding: 10px 20px;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .ab-client {
+      background: rgba(6,182,212,0.12);
+      border: 1px solid rgba(6,182,212,0.3);
+      color: #67e8f9;
+    }
+    .ab-proto {
+      background: rgba(37,99,235,0.12);
+      border: 1px solid rgba(37,99,235,0.3);
+      color: #93c5fd;
+    }
+    .ab-engine {
+      background: rgba(124,58,237,0.12);
+      border: 1px solid rgba(124,58,237,0.3);
+      color: #c4b5fd;
+    }
+    .ab-storage {
+      background: rgba(34,197,94,0.1);
+      border: 1px solid rgba(34,197,94,0.25);
+      color: #86efac;
+    }
+    .ab-optimizer {
+      background: rgba(249,115,22,0.12);
+      border: 1px solid rgba(249,115,22,0.3);
+      color: #fdba74;
+    }
+
+    .arch-divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.07), transparent);
+      margin: 8px 0;
+    }
+
+    /* ── Getting Started ───────────────────────────────────── */
+    .steps-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 24px;
+      margin-top: 56px;
+    }
+
+    .step-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      backdrop-filter: blur(10px);
+      position: relative;
+    }
+
+    .step-number {
+      width: 36px; height: 36px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.85rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      margin-bottom: 18px;
+    }
+
+    .step-card h3 {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 16px;
+    }
+
+    .step-code-block {
+      background: rgba(0,0,0,0.4);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 10px;
+      padding: 16px 18px;
+      position: relative;
+    }
+
+    .step-code-block pre {
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.78rem;
+      line-height: 1.7;
+      color: #cbd5e1;
+      overflow-x: auto;
+    }
+
+    .step-copy {
+      position: absolute;
+      top: 8px; right: 8px;
+      font-size: 0.7rem;
+      color: #475569;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 4px;
+      padding: 2px 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .step-copy:hover { color: #94a3b8; }
+
+    /* ── Footer ────────────────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 64px 40px 40px;
+    }
+
+    .footer-inner {
+      max-width: var(--max-w);
+      margin: 0 auto;
+    }
+
+    .footer-top {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr;
+      gap: 48px;
+      padding-bottom: 48px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+    }
+
+    .footer-brand .nav-logo { display: inline-block; margin-bottom: 14px; }
+
+    .footer-brand p {
+      font-size: 0.9rem;
+      color: #475569;
+      line-height: 1.7;
+      max-width: 340px;
+    }
+
+    .footer-col h4 {
+      font-size: 0.82rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      margin-bottom: 16px;
+    }
+
+    .footer-col ul { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+
+    .footer-col a {
+      font-size: 0.88rem;
+      color: #475569;
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .footer-col a:hover { color: #94a3b8; }
+
+    .footer-bottom {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.83rem;
+      color: #334155;
+    }
+
+    .footer-heart { color: #ec4899; }
+
+    /* ── Responsive ────────────────────────────────────────── */
+    @media (max-width: 1024px) {
+      .hero-inner { grid-template-columns: 1fr; gap: 48px; }
+      .hero-code { max-width: 600px; }
+      .features-grid { grid-template-columns: repeat(2, 1fr); }
+      .footer-top { grid-template-columns: 1fr 1fr; }
+      .footer-brand { grid-column: 1 / -1; }
+    }
+
+    @media (max-width: 768px) {
+      .container, .section, .code-section, .arch-section { padding-left: 20px; padding-right: 20px; }
+      .nav-inner { padding: 0 20px; }
+      .nav-links { display: none; }
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .stat-item { border-right: none; border-bottom: 1px solid rgba(255,255,255,0.08); }
+      .stat-item:nth-child(odd) { border-right: 1px solid rgba(255,255,255,0.08); }
+      .stat-item:last-child, .stat-item:nth-last-child(2):nth-child(odd) { border-bottom: none; }
+      .features-grid { grid-template-columns: 1fr; }
+      .steps-grid { grid-template-columns: 1fr; }
+      .footer-top { grid-template-columns: 1fr; gap: 32px; }
+      .footer-bottom { flex-direction: column; gap: 8px; text-align: center; }
+      .hero-title { font-size: 2.5rem; }
+      .section-title { font-size: 1.8rem; }
+    }
   </style>
 </head>
 <body>
 
+<!-- ═══════════════════════════════════════ NAVIGATION ══ -->
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="nav-logo">
+      <span class="blue">Milan</span><span class="white">SQL</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#code">Docs</a></li>
+      <li><a href="#start">Download</a></li>
+      <li><a href="https://github.com/haidari9819-lang/milansql">GitHub</a></li>
+    </ul>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0" class="nav-btn">Get Started</a>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════ HERO ══ -->
 <section class="hero">
-  <div class="badges">
-    <img src="https://img.shields.io/badge/version-v3.0.0-gold" alt="version">
-    <img src="https://img.shields.io/badge/language-C%2B%2B17-orange" alt="C++17">
-    <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="zero deps">
-    <img src="https://img.shields.io/badge/phases-82-blue" alt="82 phases">
-    <img src="https://github.com/haidari9819-lang/milansql/actions/workflows/ci.yml/badge.svg" alt="CI">
-  </div>
-  <h1>MilanSQL</h1>
-  <span class="version">v3.0.0</span>
-  <p>A production-grade relational database engine built from scratch in C++17 — zero external dependencies.</p>
-  <div class="buttons">
-    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0" class="btn btn-primary">⬇ Download v3.0.0</a>
-    <a href="https://github.com/haidari9819-lang/milansql" class="btn btn-secondary">⭐ GitHub</a>
+  <div class="hero-inner">
+
+    <div class="hero-left">
+      <div class="hero-pill">
+        <span>✦</span> Now at v3.0.0 · 82 Phases Complete
+      </div>
+      <div class="hero-eyebrow">The Database Engine</div>
+      <h1 class="hero-title">
+        Built From<br>
+        <span class="gradient-text">Scratch.</span>
+      </h1>
+      <p class="hero-tagline">
+        82 phases. Zero dependencies. Pure C++17.<br>
+        A production-grade relational database engine with ACID transactions,
+        TCP server, REST API, and adaptive query optimizer.
+      </p>
+      <div class="hero-buttons">
+        <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0" class="btn-hero-primary">
+          ⬇ Download v3.0.0
+        </a>
+        <a href="https://github.com/haidari9819-lang/milansql" class="btn-hero-secondary">
+          📖 View on GitHub →
+        </a>
+      </div>
+      <div class="hero-badges">
+        <span class="badge"><span class="dot"></span> CI passing</span>
+        <span class="badge">C++17</span>
+        <span class="badge">0 dependencies</span>
+        <span class="badge">82 phases</span>
+      </div>
+    </div>
+
+    <div class="hero-code">
+      <div class="code-titlebar">
+        <span class="dot-r"></span>
+        <span class="dot-y"></span>
+        <span class="dot-g"></span>
+        <span class="code-filename">milansql_demo.sql</span>
+      </div>
+      <div class="code-body">
+        <span class="cmt">-- Adaptive Optimizer (Phase 82)</span><br>
+        <span class="kw">SET</span> QUERY_REWRITE = <span class="str">ON</span>;<br>
+        <br>
+        <span class="cmt">-- Column Store for OLAP (Phase 80)</span><br>
+        <span class="kw">CREATE COLUMN TABLE</span> sales (<br>
+        &nbsp;&nbsp;id &nbsp;&nbsp;&nbsp;&nbsp;<span class="typ">INT</span> <span class="kw">PRIMARY KEY</span>,<br>
+        &nbsp;&nbsp;amount <span class="typ">REAL</span>,<br>
+        &nbsp;&nbsp;region <span class="typ">TEXT</span><br>
+        );<br>
+        <br>
+        <span class="cmt">-- Window Functions + Inheritance</span><br>
+        <span class="kw">SELECT</span> region,<br>
+        &nbsp;&nbsp;<span class="fn">SUM</span>(amount) <span class="kw">OVER</span>(<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="kw">PARTITION BY</span> region<br>
+        &nbsp;&nbsp;) <span class="kw">AS</span> total<br>
+        <span class="kw">FROM</span> sales<br>
+        <span class="kw">WHERE</span> amount &gt; <span class="num">100</span>;<br>
+        <br>
+        <span class="cmt">-- SHOW INDEX SUGGESTIONS;</span><br>
+        <span class="cmt">-- → CREATE INDEX idx_sales_region</span><br>
+        <span class="cmt">-- → 85% der Queries filtern nach region</span>
+      </div>
+    </div>
+
   </div>
 </section>
 
-<section class="stats">
+<!-- ═══════════════════════════════════════ STATS BAR ══ -->
+<div class="stats-bar">
   <div class="stats-grid">
-    <div class="stat"><div class="number">82</div><div class="label">Development Phases</div></div>
-    <div class="stat"><div class="number">0</div><div class="label">External Dependencies</div></div>
-    <div class="stat"><div class="number">41</div><div class="label">Automated Tests</div></div>
-    <div class="stat"><div class="number">2</div><div class="label">Platforms (Linux + Windows)</div></div>
+    <div class="stat-item">
+      <div class="stat-number">82</div>
+      <div class="stat-label">Development Phases</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number">0</div>
+      <div class="stat-label">External Dependencies</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number">41</div>
+      <div class="stat-label">Automated Tests</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number">2</div>
+      <div class="stat-label">Supported Platforms</div>
+    </div>
   </div>
-</section>
+</div>
 
-<section class="features">
-  <h2>Features</h2>
-  <div class="feature-grid">
-    <div class="feature-card">
-      <div class="icon">⚡</div>
-      <h3>Zero Dependencies</h3>
-      <p>Pure C++17 with no external libraries. Runs anywhere a C++ compiler exists — Linux, Windows, macOS.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🔒</div>
-      <h3>ACID Transactions</h3>
-      <p>Full BEGIN/COMMIT/ROLLBACK with WAL (Write-Ahead Logging), SAVEPOINT, and SELECT FOR UPDATE row locking.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🌐</div>
-      <h3>TCP/IP + REST API</h3>
-      <p>Built-in TCP server (port 4406) and HTTP/JSON REST API (port 8080) with Web Dashboard.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">📊</div>
-      <h3>Query Optimizer</h3>
-      <p>Cost-based optimizer with join reordering, index selection, EXPLAIN ANALYZE, and query result caching.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🔄</div>
-      <h3>Master/Slave Replication</h3>
-      <p>Binary log replication with automatic sync, auto-reconnect, and read-only slave enforcement.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">📅</div>
-      <h3>Event Scheduler</h3>
-      <p>MySQL-compatible CREATE EVENT with EVERY n SECOND/MINUTE/HOUR/DAY schedules and AT timestamp.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🔍</div>
-      <h3>Full-Text Search</h3>
-      <p>FULLTEXT INDEX with MATCH ... AGAINST and TF-based relevance scoring across multiple columns.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">📦</div>
-      <h3>Partitioning</h3>
-      <p>Table partitioning by RANGE, LIST, and HASH with automatic partition pruning in queries.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🧮</div>
-      <h3>Generated Columns</h3>
-      <p>GENERATED ALWAYS AS (expr) STORED/VIRTUAL — computed columns with arithmetic expressions, auto-updated on INSERT/UPDATE.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🪟</div>
-      <h3>Window Functions</h3>
-      <p>ROW_NUMBER(), RANK(), DENSE_RANK(), SUM/AVG/COUNT OVER (PARTITION BY … ORDER BY …).</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🗂</div>
-      <h3>Stored Procedures + Cursors</h3>
-      <p>DECLARE CURSOR, OPEN/FETCH/CLOSE, CONTINUE HANDLER FOR NOT FOUND, LOOP/LEAVE, IF/ELSE.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🐍</div>
-      <h3>Python + Node.js Clients</h3>
-      <p>DB-API 2.0 compatible Python client and Node.js HTTP client — zero dependencies, stdlib only.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🔐</div>
-      <h3>Row-Level Security</h3>
-      <p>ENABLE/DISABLE RLS per table, CREATE POLICY with USING expressions, CURRENT_USER_ID() predicate substitution.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">📡</div>
-      <h3>LISTEN / NOTIFY Pub/Sub</h3>
-      <p>Channel-based pub/sub messaging with payload support, LISTEN/UNLISTEN/NOTIFY commands, thread-safe delivery.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">⚙️</div>
-      <h3>Parallel Query Execution</h3>
-      <p>std::thread-based parallelFilter and parallelAggregate, configurable threshold and worker count, PARALLEL(N) hint.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🏛️</div>
-      <h3>Table Inheritance</h3>
-      <p>PostgreSQL-style INHERITS — SELECT on parent returns all descendant rows automatically.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">📊</div>
-      <h3>Column Store Engine</h3>
-      <p>CREATE COLUMN TABLE for OLAP analytics — columnar storage for fast SUM/AVG/COUNT.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">📡</div>
-      <h3>Logical Replication</h3>
-      <p>CREATE PUBLICATION/SUBSCRIPTION for selective table replication between instances.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🧠</div>
-      <h3>Adaptive Optimizer</h3>
-      <p>Query rewriting, access statistics, automatic index suggestions via SHOW INDEX SUGGESTIONS.</p>
-    </div>
-    <div class="feature-card">
-      <div class="icon">🔌</div>
-      <h3>Connection Strings (DSN)</h3>
-      <p>milansql://user:pass@host:port/db, mysql://, jdbc:milansql:// — auto-connect and USE on startup.</p>
+<!-- ══════════════════════════════════════ FEATURES ══ -->
+<section class="section" id="features">
+  <div class="section-inner">
+    <span class="section-tag">Why MilanSQL?</span>
+    <h2 class="section-title">
+      Everything a database needs.<br>
+      <span class="gradient-text">Nothing it doesn't.</span>
+    </h2>
+    <p class="section-sub">
+      Built phase-by-phase from the ground up — every feature is hand-crafted in pure C++17
+      without a single external library.
+    </p>
+
+    <div class="features-grid">
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-blue">🔒</div>
+        <h3>ACID Transactions</h3>
+        <p>Full MVCC with Write-Ahead Logging, SAVEPOINT, ROLLBACK TO SAVEPOINT, and SELECT FOR UPDATE row-level locking — battle-tested durability.</p>
+        <a href="#code" class="feature-link">Learn more →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-cyan">⚡</div>
+        <h3>Zero Dependencies</h3>
+        <p>Pure C++17 standard library only. No Boost, no OpenSSL, no third-party headers. Clone, compile, run — on Linux, Windows, or macOS.</p>
+        <a href="https://github.com/haidari9819-lang/milansql" class="feature-link">View source →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-purple">🌐</div>
+        <h3>Network Ready</h3>
+        <p>Built-in TCP server on port 4406 (MySQL protocol compatible), HTTP/JSON REST API on port 8080, Web Dashboard, and DSN connection strings.</p>
+        <a href="#start" class="feature-link">Get started →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-orange">📊</div>
+        <h3>Analytics — Column Store</h3>
+        <p>CREATE COLUMN TABLE for OLAP workloads. Columnar SUM/AVG/COUNT/MIN/MAX scans, GROUP BY fallback, and SHOW STORAGE FORMAT to compare row vs column store.</p>
+        <a href="#code" class="feature-link">See example →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-green">🔄</div>
+        <h3>Physical + Logical Replication</h3>
+        <p>Binary-log master/slave replication with auto-sync, PLUS logical replication via CREATE PUBLICATION / CREATE SUBSCRIPTION with append-only change log.</p>
+        <a href="#code" class="feature-link">Learn more →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-pink">🛡️</div>
+        <h3>Row-Level Security</h3>
+        <p>ENABLE/DISABLE RLS per table, CREATE POLICY with USING expressions, CURRENT_USER_ID() predicate substitution, and persistent policy storage.</p>
+        <a href="#code" class="feature-link">Learn more →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-blue">🔍</div>
+        <h3>Full-Text Search</h3>
+        <p>FULLTEXT INDEX with MATCH … AGAINST syntax and TF-based relevance scoring across multiple columns — no external search engine required.</p>
+        <a href="#code" class="feature-link">See example →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-purple">📅</div>
+        <h3>Event Scheduler</h3>
+        <p>MySQL-compatible CREATE EVENT with EVERY n SECOND/MINUTE/HOUR/DAY schedules and AT timestamp one-shot events — background job execution built in.</p>
+        <a href="#code" class="feature-link">Learn more →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-orange">🧠</div>
+        <h3>Adaptive Query Optimizer</h3>
+        <p>Automatic query rewriting (removes WHERE 1=1, redundant conditions), access statistics tracking, and automatic index suggestions via SHOW INDEX SUGGESTIONS.</p>
+        <a href="#code" class="feature-link">See example →</a>
+      </div>
+
     </div>
   </div>
 </section>
 
-<section class="quickstart">
-  <h2>Quick Start</h2>
-  <div class="code-block">
-    <pre><span class="comment"># Clone and build</span>
-<span class="cmd">git clone https://github.com/haidari9819-lang/milansql</span>
-<span class="cmd">cd milansql &amp;&amp; cmake -B build &amp;&amp; cmake --build build</span>
+<!-- ════════════════════════════════ CODE SHOWCASE ══ -->
+<section class="code-section" id="code">
+  <div class="code-section-inner">
+    <span class="section-tag">Code Examples</span>
+    <h2 class="section-title">
+      SQL you already know.<br>
+      <span class="gradient-text">Features you didn't expect.</span>
+    </h2>
+    <p class="section-sub">
+      MilanSQL speaks standard SQL — and adds table inheritance, column stores, pub/sub, and more.
+    </p>
 
-<span class="comment"># Start REPL</span>
-<span class="cmd">./build/milansql.exe</span>
+    <div class="code-tabs-wrapper">
+      <div class="code-tab-buttons">
+        <button class="tab-btn active" onclick="showTab('sql')">SQL Example</button>
+        <button class="tab-btn" onclick="showTab('python')">Python Client</button>
+        <button class="tab-btn" onclick="showTab('rest')">REST API</button>
+      </div>
 
-<span class="comment"># Start TCP Server</span>
-<span class="cmd">./build/milansql.exe --server --port 4406</span>
+      <!-- SQL Tab -->
+      <div class="code-panel active" id="tab-sql">
+        <div class="code-panel-bar">
+          <div class="code-panel-dots">
+            <span class="dot-r"></span><span class="dot-y"></span><span class="dot-g"></span>
+          </div>
+          <button class="copy-btn" onclick="copyCode('sql-pre')">Copy</button>
+        </div>
+        <pre id="sql-pre"><span class="cmt">-- Phase 78: Table Inheritance</span>
+<span class="kw">CREATE TABLE</span> person (id <span class="typ">INT</span> <span class="kw">PRIMARY KEY</span>, name <span class="typ">TEXT</span>);
+<span class="kw">CREATE TABLE</span> employee (salary <span class="typ">REAL</span>) <span class="kw">INHERITS</span> (person);
 
-<span class="comment"># Start REST API + Web Dashboard</span>
-<span class="cmd">./build/milansql.exe --http --port 8080</span></pre>
-  </div>
-  <div class="code-block">
-    <pre><span class="comment">-- Generated Columns (Phase 68)</span>
-<span class="sql">CREATE TABLE produkte (
-  id    INT  PRIMARY KEY AUTO_INCREMENT,
-  name  TEXT NOT NULL,
-  netto REAL,
-  brutto REAL GENERATED ALWAYS AS (netto * 1.19) STORED,
-  mwst   REAL GENERATED ALWAYS AS (netto * 0.19) VIRTUAL
-);</span>
+<span class="kw">INSERT INTO</span> person   <span class="kw">VALUES</span> (<span class="num">1</span>, <span class="str">'Alice'</span>);
+<span class="kw">INSERT INTO</span> employee <span class="kw">VALUES</span> (<span class="num">2</span>, <span class="str">'Bob'</span>, <span class="num">75000</span>);
 
-<span class="sql">INSERT INTO produkte VALUES (NULL, 'Laptop', 1000);
-INSERT INTO produkte VALUES (NULL, 'Maus',   25);</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> person;          <span class="cmt">-- returns Alice + Bob (inherited)</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM ONLY</span> person;     <span class="cmt">-- returns only Alice</span>
 
-<span class="sql">SELECT * FROM produkte;</span>
-<span class="comment">-- brutto: 1190 / 29.75  |  mwst: 190 / 4.75  (auto-computed)</span>
+<span class="cmt">-- Phase 75: Row-Level Security</span>
+<span class="kw">ENABLE ROW LEVEL SECURITY ON</span> employee;
+<span class="kw">CREATE POLICY</span> own_rows <span class="kw">ON</span> employee
+  <span class="kw">FOR</span> SELECT <span class="kw">TO</span> alice
+  <span class="kw">USING</span> (id = <span class="fn">CURRENT_USER_ID</span>());
 
-<span class="comment">-- Transactions + Savepoints</span>
-<span class="sql">BEGIN;
-  UPDATE produkte SET netto = 800 WHERE name = 'Laptop';
-  SAVEPOINT after_update;
-  UPDATE produkte SET netto = 0 WHERE name = 'Maus';
-  ROLLBACK TO SAVEPOINT after_update;
-COMMIT;</span></pre>
+<span class="cmt">-- Phase 82: Adaptive Optimizer</span>
+<span class="kw">SET</span> QUERY_REWRITE = <span class="str">ON</span>;
+<span class="kw">EXPLAIN REWRITTEN SELECT</span> * <span class="kw">FROM</span> employee <span class="kw">WHERE</span> <span class="num">1</span>=<span class="num">1</span>;
+<span class="cmt">-- Rewrite: removed always-true condition WHERE 1=1</span>
+
+<span class="kw">SHOW INDEX SUGGESTIONS</span>;
+<span class="cmt">-- CREATE INDEX idx_employee_salary ON employee(salary)  -- 78%</span>
+
+<span class="cmt">-- Phase 76: LISTEN / NOTIFY pub/sub</span>
+<span class="kw">LISTEN</span> updates;
+<span class="kw">NOTIFY</span> updates, <span class="str">'new_employee_added'</span>;</pre>
+      </div>
+
+      <!-- Python Tab -->
+      <div class="code-panel" id="tab-python">
+        <div class="code-panel-bar">
+          <div class="code-panel-dots">
+            <span class="dot-r"></span><span class="dot-y"></span><span class="dot-g"></span>
+          </div>
+          <button class="copy-btn" onclick="copyCode('python-pre')">Copy</button>
+        </div>
+        <pre id="python-pre"><span class="cmt"># DB-API 2.0 compatible Python client (stdlib only)</span>
+<span class="kw">import</span> milansql
+
+<span class="cmt"># Connect via DSN (Phase 79)</span>
+conn = milansql.<span class="fn">connect</span>(<span class="str">"milansql://root:pass@localhost:4406/mydb"</span>)
+cursor = conn.<span class="fn">cursor</span>()
+
+<span class="cmt"># Execute SQL</span>
+cursor.<span class="fn">execute</span>(<span class="str">"""
+    CREATE TABLE orders (
+        id    INT PRIMARY KEY AUTO_INCREMENT,
+        item  TEXT NOT NULL,
+        price REAL
+    )
+"""</span>)
+
+cursor.<span class="fn">execute</span>(<span class="str">"INSERT INTO orders VALUES (NULL, 'Laptop', 999.99)"</span>)
+conn.<span class="fn">commit</span>()
+
+<span class="cmt"># Fetch results</span>
+cursor.<span class="fn">execute</span>(<span class="str">"SELECT * FROM orders WHERE price > %s"</span>, (<span class="num">100</span>,))
+rows = cursor.<span class="fn">fetchall</span>()
+<span class="kw">for</span> row <span class="kw">in</span> rows:
+    <span class="fn">print</span>(row)
+
+conn.<span class="fn">close</span>()</pre>
+      </div>
+
+      <!-- REST API Tab -->
+      <div class="code-panel" id="tab-rest">
+        <div class="code-panel-bar">
+          <div class="code-panel-dots">
+            <span class="dot-r"></span><span class="dot-y"></span><span class="dot-g"></span>
+          </div>
+          <button class="copy-btn" onclick="copyCode('rest-pre')">Copy</button>
+        </div>
+        <pre id="rest-pre"><span class="cmt"># Start REST API server</span>
+$ ./build/milansql.exe --http --port <span class="num">8080</span>
+
+<span class="cmt"># Execute a query via HTTP POST</span>
+$ curl -s -X POST http://localhost:<span class="num">8080</span>/query \
+  -H <span class="str">'Content-Type: application/json'</span> \
+  -d <span class="str">'{"sql": "SELECT * FROM orders LIMIT 10"}'</span>
+
+<span class="cmt"># Response (JSON)</span>
+{
+  <span class="str">"columns"</span>: [<span class="str">"id"</span>, <span class="str">"item"</span>, <span class="str">"price"</span>],
+  <span class="str">"rows"</span>: [
+    [<span class="str">"1"</span>, <span class="str">"Laptop"</span>, <span class="str">"999.99"</span>]
+  ],
+  <span class="str">"rowCount"</span>: <span class="num">1</span>,
+  <span class="str">"elapsed_ms"</span>: <span class="num">0.42</span>
+}
+
+<span class="cmt"># Web Dashboard available at:</span>
+$ open http://localhost:<span class="num">8080</span>/
+
+<span class="cmt"># List tables</span>
+$ curl http://localhost:<span class="num">8080</span>/tables
+
+<span class="cmt"># Health check</span>
+$ curl http://localhost:<span class="num">8080</span>/health
+<span class="str">"OK"</span></pre>
+      </div>
+    </div>
   </div>
 </section>
 
-<section class="table-section">
-  <h2>SQL Feature Reference</h2>
-  <table>
-    <tr><th>Category</th><th>Features</th></tr>
-    <tr><td><strong>Queries</strong></td><td>
-      <span class="tag">SELECT</span><span class="tag">WHERE</span><span class="tag">ORDER BY</span>
-      <span class="tag">LIMIT/OFFSET</span><span class="tag">DISTINCT</span><span class="tag">GROUP BY</span>
-      <span class="tag">HAVING</span><span class="tag">UNION/INTERSECT/EXCEPT</span>
-    </td></tr>
-    <tr><td><strong>JOINs</strong></td><td>
-      <span class="tag">INNER JOIN</span><span class="tag">LEFT JOIN</span><span class="tag">RIGHT JOIN</span>
-      <span class="tag">FULL OUTER JOIN</span><span class="tag">Multiple JOINs</span>
-    </td></tr>
-    <tr><td><strong>Subqueries</strong></td><td>
-      <span class="tag">IN (SELECT)</span><span class="tag">EXISTS</span><span class="tag">NOT EXISTS</span>
-      <span class="tag">Correlated Subqueries</span><span class="tag">Scalar Subqueries</span><span class="tag">WITH/CTE</span>
-    </td></tr>
-    <tr><td><strong>Window Functions</strong></td><td>
-      <span class="tag">ROW_NUMBER()</span><span class="tag">RANK()</span><span class="tag">DENSE_RANK()</span>
-      <span class="tag">SUM/AVG/COUNT OVER</span><span class="tag">PARTITION BY</span>
-    </td></tr>
-    <tr><td><strong>Data Types</strong></td><td>
-      <span class="tag">INT</span><span class="tag">TEXT</span><span class="tag">REAL</span>
-      <span class="tag">DATE</span><span class="tag">TIME</span><span class="tag">DATETIME</span>
-      <span class="tag">TIMESTAMP</span><span class="tag">JSON</span>
-    </td></tr>
-    <tr><td><strong>Constraints</strong></td><td>
-      <span class="tag">PRIMARY KEY</span><span class="tag">FOREIGN KEY</span><span class="tag">NOT NULL</span>
-      <span class="tag">UNIQUE</span><span class="tag">DEFAULT</span><span class="tag">CHECK</span>
-      <span class="tag">ON DELETE CASCADE/SET NULL/RESTRICT</span>
-    </td></tr>
-    <tr><td><strong>Generated Columns</strong></td><td>
-      <span class="tag">GENERATED ALWAYS AS (expr)</span><span class="tag">STORED</span>
-      <span class="tag">VIRTUAL</span><span class="tag">Auto-update on INSERT/UPDATE</span>
-    </td></tr>
-    <tr><td><strong>Functions</strong></td><td>
-      <span class="tag">UPPER/LOWER/CONCAT/SUBSTR</span><span class="tag">ABS/ROUND/SQRT</span>
-      <span class="tag">NOW/DATEDIFF/DATE_ADD</span><span class="tag">JSON_EXTRACT/JSON_SET</span>
-      <span class="tag">REGEXP_REPLACE/REGEXP_EXTRACT</span><span class="tag">COALESCE/IFNULL</span>
-      <span class="tag">CAST</span><span class="tag">CASE WHEN</span>
-    </td></tr>
-    <tr><td><strong>Server</strong></td><td>
-      <span class="tag">TCP Server (4406)</span><span class="tag">REST API (8080)</span>
-      <span class="tag">Web Dashboard</span><span class="tag">Connection Pool</span>
-      <span class="tag">Multi-Statement Queries</span>
-    </td></tr>
-    <tr><td><strong>Replication</strong></td><td>
-      <span class="tag">Master/Slave</span>
-      <span class="tag">Logical Replication</span>
-      <span class="tag">Publication/Subscription</span>
-      <span class="tag">Binlog</span>
-    </td></tr>
-    <tr><td><strong>Admin</strong></td><td>
-      <span class="tag">BACKUP/RESTORE</span><span class="tag">CSV Import/Export</span>
-      <span class="tag">Event Scheduler</span><span class="tag">Partitioning</span>
-      <span class="tag">INFORMATION_SCHEMA</span><span class="tag">GRANT/REVOKE</span>
-    </td></tr>
-    <tr><td><strong>Security</strong></td><td>
-      <span class="tag">GRANT/REVOKE</span>
-      <span class="tag">Row-Level Security</span>
-      <span class="tag">Policies</span>
-      <span class="tag">CURRENT_USER_ID()</span>
-    </td></tr>
-    <tr><td><strong>Analytics</strong></td><td>
-      <span class="tag">Column Store</span>
-      <span class="tag">Parallel Queries</span>
-      <span class="tag">Window Functions</span>
-      <span class="tag">EXPLAIN ANALYZE</span>
-    </td></tr>
-    <tr><td><strong>Row-Level Security</strong></td><td>
-      <span class="tag">ENABLE/DISABLE RLS</span><span class="tag">CREATE/DROP POLICY</span>
-      <span class="tag">SHOW POLICIES ON</span><span class="tag">CURRENT_USER_ID()</span>
-    </td></tr>
-    <tr><td><strong>Pub/Sub</strong></td><td>
-      <span class="tag">LISTEN channel</span><span class="tag">UNLISTEN</span>
-      <span class="tag">NOTIFY channel payload</span><span class="tag">SHOW LISTEN</span>
-    </td></tr>
-    <tr><td><strong>Parallel Queries</strong></td><td>
-      <span class="tag">SET PARALLEL_THRESHOLD</span><span class="tag">SET MAX_PARALLEL_WORKERS</span>
-      <span class="tag">/*+ PARALLEL(N) */</span><span class="tag">SHOW PARALLEL STATUS</span>
-    </td></tr>
-    <tr><td><strong>Column Store (OLAP)</strong></td><td>
-      <span class="tag">CREATE COLUMN TABLE</span><span class="tag">SUM/AVG/COUNT/MIN/MAX</span>
-      <span class="tag">GROUP BY fallback</span><span class="tag">SHOW STORAGE FORMAT</span>
-    </td></tr>
-    <tr><td><strong>Logical Replication</strong></td><td>
-      <span class="tag">CREATE PUBLICATION FOR TABLE</span><span class="tag">CREATE SUBSCRIPTION</span>
-      <span class="tag">ALTER SUBSCRIPTION ENABLE/DISABLE</span><span class="tag">SHOW LOGICAL LOG</span>
-    </td></tr>
-    <tr><td><strong>Adaptive Optimizer</strong></td><td>
-      <span class="tag">SET QUERY_REWRITE</span><span class="tag">SHOW QUERY STATS</span>
-      <span class="tag">SHOW INDEX SUGGESTIONS</span><span class="tag">ANALYZE TABLE</span>
-      <span class="tag">EXPLAIN REWRITTEN</span>
-    </td></tr>
-  </table>
+<!-- ══════════════════════════════ ARCHITECTURE ══ -->
+<section class="arch-section" id="architecture">
+  <div class="section-inner">
+    <span class="section-tag">Architecture</span>
+    <h2 class="section-title">
+      Clean layers.<br>
+      <span class="gradient-text">Header-only C++17.</span>
+    </h2>
+    <p class="section-sub">
+      Every component lives in a single .hpp file. No build magic — just CMake and a C++17 compiler.
+    </p>
+
+    <div class="arch-diagram">
+      <div class="arch-layers">
+
+        <div class="arch-row">
+          <div class="arch-label">Clients</div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-boxes">
+            <span class="arch-box ab-client">REPL / CLI</span>
+            <span class="arch-box ab-client">Python Client</span>
+            <span class="arch-box ab-client">Node.js Client</span>
+            <span class="arch-box ab-client">curl / REST</span>
+            <span class="arch-box ab-client">DSN milansql://</span>
+          </div>
+        </div>
+
+        <div class="arch-divider"></div>
+
+        <div class="arch-row">
+          <div class="arch-label">Protocol</div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-boxes">
+            <span class="arch-box ab-proto">TCP Server :4406</span>
+            <span class="arch-box ab-proto">HTTP/REST :8080</span>
+            <span class="arch-box ab-proto">Web Dashboard</span>
+            <span class="arch-box ab-proto">LISTEN / NOTIFY Pub/Sub</span>
+          </div>
+        </div>
+
+        <div class="arch-divider"></div>
+
+        <div class="arch-row">
+          <div class="arch-label">Engine</div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-boxes">
+            <span class="arch-box ab-engine">SQL Parser</span>
+            <span class="arch-box ab-engine">Dispatcher</span>
+            <span class="arch-box ab-engine">DML / DDL Executor</span>
+            <span class="arch-box ab-engine">Transaction Manager</span>
+            <span class="arch-box ab-engine">Query Cache</span>
+          </div>
+        </div>
+
+        <div class="arch-divider"></div>
+
+        <div class="arch-row">
+          <div class="arch-label">Optimizer</div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-boxes">
+            <span class="arch-box ab-optimizer">Query Rewriter</span>
+            <span class="arch-box ab-optimizer">Adaptive Stats</span>
+            <span class="arch-box ab-optimizer">Index Selector</span>
+            <span class="arch-box ab-optimizer">Parallel Executor</span>
+            <span class="arch-box ab-optimizer">Join Reorderer</span>
+          </div>
+        </div>
+
+        <div class="arch-divider"></div>
+
+        <div class="arch-row">
+          <div class="arch-label">Storage</div>
+          <div class="arch-arrow">→</div>
+          <div class="arch-boxes">
+            <span class="arch-box ab-storage">Row Store (Binary v9)</span>
+            <span class="arch-box ab-storage">Column Store (OLAP)</span>
+            <span class="arch-box ab-storage">WAL Journal</span>
+            <span class="arch-box ab-storage">Buffer Pool</span>
+            <span class="arch-box ab-storage">Logical Repl Log</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
 </section>
 
+<!-- ════════════════════════════ GETTING STARTED ══ -->
+<section class="section" id="start">
+  <div class="section-inner">
+    <span class="section-tag">Getting Started</span>
+    <h2 class="section-title">
+      Up and running<br>
+      <span class="gradient-text">in three steps.</span>
+    </h2>
+    <p class="section-sub">
+      No package manager, no Docker, no config files. Just a C++17 compiler and CMake.
+    </p>
+
+    <div class="steps-grid">
+
+      <div class="step-card">
+        <div class="step-number">1</div>
+        <h3>Clone &amp; Build</h3>
+        <div class="step-code-block">
+          <button class="step-copy" onclick="copyText('git clone https://github.com/haidari9819-lang/milansql\ncd milansql\ncmake -B build -G Ninja\ncmake --build build')">Copy</button>
+          <pre>git clone https://github.com/
+  haidari9819-lang/milansql
+cd milansql
+cmake -B build -G Ninja
+cmake --build build</pre>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-number">2</div>
+        <h3>Start the Server</h3>
+        <div class="step-code-block">
+          <button class="step-copy" onclick="copyText('./build/milansql.exe --http --port 8080\n# or TCP server:\n./build/milansql.exe --server --port 4406\n# or interactive REPL:\n./build/milansql.exe')">Copy</button>
+          <pre><span class="cmt"># HTTP + Web Dashboard</span>
+./build/milansql.exe \
+  --http --port 8080
+
+<span class="cmt"># TCP Server</span>
+./build/milansql.exe \
+  --server --port 4406
+
+<span class="cmt"># Interactive REPL</span>
+./build/milansql.exe</pre>
+        </div>
+      </div>
+
+      <div class="step-card">
+        <div class="step-number">3</div>
+        <h3>Connect &amp; Query</h3>
+        <div class="step-code-block">
+          <button class="step-copy" onclick="copyText('curl -X POST http://localhost:8080/query \\\n  -H \"Content-Type: application/json\" \\\n  -d \'{\"sql\": \"SHOW TABLES\"}\'')">Copy</button>
+          <pre><span class="cmt"># Via REST API</span>
+curl -X POST \
+  http://localhost:8080/query \
+  -H 'Content-Type: application/json'\
+  -d '{"sql":"SHOW TABLES"}'
+
+<span class="cmt"># Via DSN (Python)</span>
+import milansql
+conn = milansql.connect(
+  "milansql://root@localhost/db"
+)</pre>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════ FOOTER ══ -->
 <footer>
-  <p>Built with ❤️ by <a href="https://github.com/haidari9819-lang">Mirwais Haidari</a> —
-  <a href="https://github.com/haidari9819-lang/milansql">GitHub</a> ·
-  <a href="https://github.com/haidari9819-lang/milansql/releases">Releases</a> ·
-  MIT License</p>
+  <div class="footer-inner">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <a href="#" class="nav-logo">
+          <span class="blue">Milan</span><span class="white">SQL</span>
+        </a>
+        <p>
+          A production-grade relational database engine built phase-by-phase
+          from scratch in C++17 — zero external dependencies, header-only,
+          binary storage format v9.
+        </p>
+      </div>
+      <div class="footer-col">
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/haidari9819-lang/milansql">GitHub Repository</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0">Download v3.0.0</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/releases">All Releases</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/issues">Issues</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Legal</h4>
+        <ul>
+          <li><a href="https://github.com/haidari9819-lang/milansql/blob/main/LICENSE">MIT License</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/blob/main/CHANGELOG.md">Changelog</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/blob/main/README.md">README</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>Built with <span class="footer-heart">❤️</span> by <a href="https://github.com/haidari9819-lang" style="color:#475569;text-decoration:none;">Mirwais Haidari</a></span>
+      <span>© 2026 MilanSQL · MIT License</span>
+    </div>
+  </div>
 </footer>
+
+<script>
+  function showTab(name) {
+    document.querySelectorAll('.code-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    event.currentTarget.classList.add('active');
+  }
+
+  function copyCode(id) {
+    const el = document.getElementById(id);
+    const text = el.innerText || el.textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      const btn = event.currentTarget;
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1800);
+    });
+  }
+
+  function copyText(text) {
+    navigator.clipboard.writeText(text).then(() => {
+      const btn = event.currentTarget;
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1800);
+    });
+  }
+</script>
 
 </body>
 </html>

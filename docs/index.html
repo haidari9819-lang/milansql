@@ -72,7 +72,7 @@
   <span class="version">v3.0.0</span>
   <p>A production-grade relational database engine built from scratch in C++17 — zero external dependencies.</p>
   <div class="buttons">
-    <a href="https://github.com/haidari9819-lang/milansql/releases" class="btn btn-primary">⬇ Download v3.0.0</a>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0" class="btn btn-primary">⬇ Download v3.0.0</a>
     <a href="https://github.com/haidari9819-lang/milansql" class="btn btn-secondary">⭐ GitHub</a>
   </div>
 </section>
@@ -165,24 +165,24 @@
       <p>std::thread-based parallelFilter and parallelAggregate, configurable threshold and worker count, PARALLEL(N) hint.</p>
     </div>
     <div class="feature-card">
-      <div class="icon">🧬</div>
+      <div class="icon">🏛️</div>
       <h3>Table Inheritance</h3>
-      <p>PostgreSQL-style CREATE TABLE child INHERITS (parent), inherited SELECT, FROM ONLY, SHOW INHERITANCE tree.</p>
+      <p>PostgreSQL-style INHERITS — SELECT on parent returns all descendant rows automatically.</p>
     </div>
     <div class="feature-card">
-      <div class="icon">📈</div>
-      <h3>Column Store Engine (OLAP)</h3>
-      <p>CREATE COLUMN TABLE for OLAP workloads — columnar SUM/AVG/COUNT/MIN/MAX scans, GROUP BY fallback, SHOW STORAGE FORMAT.</p>
+      <div class="icon">📊</div>
+      <h3>Column Store Engine</h3>
+      <p>CREATE COLUMN TABLE for OLAP analytics — columnar storage for fast SUM/AVG/COUNT.</p>
     </div>
     <div class="feature-card">
-      <div class="icon">🔗</div>
+      <div class="icon">📡</div>
       <h3>Logical Replication</h3>
-      <p>CREATE PUBLICATION FOR TABLE, CREATE SUBSCRIPTION CONNECTION, append-only change log, ALTER SUBSCRIPTION ENABLE/DISABLE.</p>
+      <p>CREATE PUBLICATION/SUBSCRIPTION for selective table replication between instances.</p>
     </div>
     <div class="feature-card">
       <div class="icon">🧠</div>
-      <h3>Adaptive Query Optimizer</h3>
-      <p>Automatic query rewriting (1=1 removal, redundant predicates), adaptive index suggestions from query patterns, EXPLAIN REWRITTEN.</p>
+      <h3>Adaptive Optimizer</h3>
+      <p>Query rewriting, access statistics, automatic index suggestions via SHOW INDEX SUGGESTIONS.</p>
     </div>
     <div class="feature-card">
       <div class="icon">🔌</div>
@@ -281,13 +281,27 @@ COMMIT;</span></pre>
       <span class="tag">Multi-Statement Queries</span>
     </td></tr>
     <tr><td><strong>Replication</strong></td><td>
-      <span class="tag">Master/Slave</span><span class="tag">Binlog</span>
-      <span class="tag">Auto-Sync</span><span class="tag">SHOW MASTER/SLAVE STATUS</span>
+      <span class="tag">Master/Slave</span>
+      <span class="tag">Logical Replication</span>
+      <span class="tag">Publication/Subscription</span>
+      <span class="tag">Binlog</span>
     </td></tr>
     <tr><td><strong>Admin</strong></td><td>
       <span class="tag">BACKUP/RESTORE</span><span class="tag">CSV Import/Export</span>
       <span class="tag">Event Scheduler</span><span class="tag">Partitioning</span>
       <span class="tag">INFORMATION_SCHEMA</span><span class="tag">GRANT/REVOKE</span>
+    </td></tr>
+    <tr><td><strong>Security</strong></td><td>
+      <span class="tag">GRANT/REVOKE</span>
+      <span class="tag">Row-Level Security</span>
+      <span class="tag">Policies</span>
+      <span class="tag">CURRENT_USER_ID()</span>
+    </td></tr>
+    <tr><td><strong>Analytics</strong></td><td>
+      <span class="tag">Column Store</span>
+      <span class="tag">Parallel Queries</span>
+      <span class="tag">Window Functions</span>
+      <span class="tag">EXPLAIN ANALYZE</span>
     </td></tr>
     <tr><td><strong>Row-Level Security</strong></td><td>
       <span class="tag">ENABLE/DISABLE RLS</span><span class="tag">CREATE/DROP POLICY</span>

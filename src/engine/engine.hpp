@@ -30,6 +30,7 @@
 #include "../mvcc/transaction_manager.hpp"  // Phase 71: MVCC
 #include "../buffer/buffer_pool.hpp"   // Phase 73: Buffer Pool Manager
 #include "../parallel/parallel_executor.hpp" // Phase 77: Parallel Query
+#include "../replication/logical_repl.hpp"  // Phase 81: Logical Replication
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -930,12 +931,29 @@ struct BufferedOp {
     std::string alterOp, alterColName, alterColType, alterColNew;
 };
 
+// ── Phase 81: Logical Replication Structs ────────────────────
+struct PublicationDef {
+    std::string name;
+    std::vector<std::string> tables;  // empty = all tables
+    bool allTables = false;
+};
+
+struct SubscriptionDef {
+    std::string name;
+    std::string connection;    // DSN string
+    std::string publication;   // publication name on master
+    bool enabled = true;
+};
+
 // ------------------------------------------------------------
 // Engine
 // ------------------------------------------------------------
 class Engine {
 public:
-    Engine() = default;
+    Engine() {
+        loadPublications_();
+        loadSubscriptions_();
+    }
 
     // ── Phase 75: Row-Level Security ──────────────────────────
     struct RlsPolicy {
@@ -1060,6 +1078,17 @@ public:
             std::string signalMsg;
             std::vector<std::string> emptyOld;
             fireAllTriggers("AFTER", "INSERT", tbl, vals, emptyOld, signalMsg);
+        }
+
+        // Phase 81: logical replication log
+        {
+            auto key = resolveTableName(tblRaw);
+            if (tables_.count(key)) {
+                const auto& cols_ref = tables_.at(key).columns();
+                std::vector<std::string> colNames;
+                for (const auto& c : cols_ref) colNames.push_back(c.name);
+                logicalLog_WriteIfPublished_(key, "INSERT", colNames, vals);
+            }
         }
     }
 
@@ -3059,6 +3088,97 @@ public:
                       << "| COLUMN STORE  |\n";
         }
         std::cout << "  +-----------------------+---------------+\n\n";
+    }
+
+    // ── Phase 81: Logical Replication ──────────────────────────
+    void createPublication(const std::string& name,
+                           const std::vector<std::string>& tables,
+                           bool allTables) {
+        if (publications_.count(name))
+            throw std::runtime_error("Publication '" + name + "' existiert bereits.");
+        PublicationDef pd;
+        pd.name = name;
+        pd.tables = tables;
+        pd.allTables = allTables;
+        publications_[name] = std::move(pd);
+        savePublications_();
+    }
+
+    void dropPublication(const std::string& name) {
+        if (!publications_.erase(name))
+            throw std::runtime_error("Publication '" + name + "' nicht gefunden.");
+        savePublications_();
+    }
+
+    void showPublications() const {
+        std::cout << "\n  Publications:\n";
+        if (publications_.empty()) { std::cout << "  (keine)\n\n"; return; }
+        for (const auto& [n, pd] : publications_) {
+            std::cout << "  " << n << ": ";
+            if (pd.allTables) std::cout << "ALL TABLES";
+            else {
+                for (size_t i = 0; i < pd.tables.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << pd.tables[i];
+                }
+            }
+            std::cout << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    void createSubscription(const std::string& name,
+                            const std::string& connection,
+                            const std::string& publication) {
+        if (subscriptions_.count(name))
+            throw std::runtime_error("Subscription '" + name + "' existiert bereits.");
+        SubscriptionDef sd;
+        sd.name = name;
+        sd.connection = connection;
+        sd.publication = publication;
+        sd.enabled = true;
+        subscriptions_[name] = std::move(sd);
+        saveSubscriptions_();
+    }
+
+    void dropSubscription(const std::string& name) {
+        if (!subscriptions_.erase(name))
+            throw std::runtime_error("Subscription '" + name + "' nicht gefunden.");
+        saveSubscriptions_();
+    }
+
+    void showSubscriptions() const {
+        std::cout << "\n  Subscriptions:\n";
+        if (subscriptions_.empty()) { std::cout << "  (keine)\n\n"; return; }
+        for (const auto& [n, sd] : subscriptions_) {
+            std::cout << "  " << n << ": "
+                      << sd.connection << " -> " << sd.publication
+                      << " [" << (sd.enabled ? "ENABLED" : "DISABLED") << "]\n";
+        }
+        std::cout << "\n";
+    }
+
+    void alterSubscription(const std::string& name, bool enable) {
+        auto it = subscriptions_.find(name);
+        if (it == subscriptions_.end())
+            throw std::runtime_error("Subscription '" + name + "' nicht gefunden.");
+        it->second.enabled = enable;
+        saveSubscriptions_();
+    }
+
+    void showLogicalLog() const {
+        auto changes = logicalLog_.readChanges();
+        std::cout << "\n  Logical Replication Log (" << changes.size() << " Eintraege):\n";
+        if (changes.empty()) { std::cout << "  (leer)\n\n"; return; }
+        for (const auto& ch : changes) {
+            std::cout << "  [" << ch.op << "] " << ch.table << ": ";
+            for (size_t i = 0; i < ch.cols.size(); ++i) {
+                if (i) std::cout << ", ";
+                std::cout << ch.cols[i] << "=" << ch.vals[i];
+            }
+            std::cout << "\n";
+        }
+        std::cout << "\n";
     }
 
     // ── Phase 77: Parallel Query ──────────────────────────────
@@ -5572,6 +5692,11 @@ public:
     // Phase 80: Column Store Engine
     std::map<std::string, ColumnTable> columnTables_;
 
+    // Phase 81: Logical Replication
+    std::map<std::string, PublicationDef> publications_;
+    std::map<std::string, SubscriptionDef> subscriptions_;
+    LogicalReplLog logicalLog_;
+
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
 
@@ -6224,6 +6349,83 @@ private:
             if (allowed) result.push_back(row);
         }
         return result;
+    }
+
+    // ── Phase 81: Logical Replication private helpers ────────────
+
+    void logicalLog_WriteIfPublished_(const std::string& tableName,
+                                      const std::string& op,
+                                      const std::vector<std::string>& cols,
+                                      const std::vector<std::string>& vals) {
+        for (const auto& [pn, pd] : publications_) {
+            if (pd.allTables) {
+                logicalLog_.writeChange(tableName, op, cols, vals);
+                return;
+            }
+            for (const auto& t : pd.tables) {
+                if (resolveTableName(t) == tableName || t == tableName) {
+                    logicalLog_.writeChange(tableName, op, cols, vals);
+                    return;
+                }
+            }
+        }
+    }
+
+    void savePublications_() const {
+        std::ofstream f("database.publications");
+        for (const auto& [n, pd] : publications_) {
+            f << n << "|" << (pd.allTables ? "*" : "");
+            for (size_t i = 0; i < pd.tables.size(); ++i) {
+                if (i) f << ",";
+                f << pd.tables[i];
+            }
+            f << "\n";
+        }
+    }
+
+    void loadPublications_() {
+        std::ifstream f("database.publications");
+        std::string line;
+        while (std::getline(f, line)) {
+            auto p = line.find('|');
+            if (p == std::string::npos) continue;
+            PublicationDef pd;
+            pd.name = line.substr(0, p);
+            std::string rest = line.substr(p + 1);
+            if (rest == "*") { pd.allTables = true; }
+            else if (!rest.empty()) {
+                std::istringstream ss(rest);
+                std::string tok;
+                while (std::getline(ss, tok, ','))
+                    if (!tok.empty()) pd.tables.push_back(tok);
+            }
+            publications_[pd.name] = std::move(pd);
+        }
+    }
+
+    void saveSubscriptions_() const {
+        std::ofstream f("database.subscriptions");
+        for (const auto& [n, sd] : subscriptions_) {
+            f << sd.name << "|" << sd.connection << "|" << sd.publication
+              << "|" << (sd.enabled ? "1" : "0") << "\n";
+        }
+    }
+
+    void loadSubscriptions_() {
+        std::ifstream f("database.subscriptions");
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::string parts[4];
+            for (int i = 0; i < 4 && std::getline(ss, parts[i], '|'); ++i) {}
+            if (parts[0].empty()) continue;
+            SubscriptionDef sd;
+            sd.name = parts[0];
+            sd.connection = parts[1];
+            sd.publication = parts[2];
+            sd.enabled = (parts[3] == "1");
+            subscriptions_[sd.name] = std::move(sd);
+        }
     }
 };
 

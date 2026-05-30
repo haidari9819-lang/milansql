@@ -151,6 +151,15 @@ enum class CommandType {
     // Phase 80: Column Store Engine
     CREATE_COLUMN_TABLE,
     SHOW_STORAGE_FORMAT,
+    // Phase 81: Logical Replication
+    CREATE_PUBLICATION,
+    DROP_PUBLICATION,
+    SHOW_PUBLICATIONS,
+    CREATE_SUBSCRIPTION,
+    DROP_SUBSCRIPTION,
+    SHOW_SUBSCRIPTIONS,
+    ALTER_SUBSCRIPTION,
+    SHOW_LOGICAL_LOG,
     UNKNOWN
 };
 
@@ -1700,6 +1709,16 @@ public:
                 cmd.type = CommandType::SHOW_SLAVE_STATUS;
             } else if (kw1 == "BINLOG") {
                 cmd.type = CommandType::SHOW_BINLOG;
+            // Phase 81: SHOW PUBLICATIONS
+            } else if (kw1 == "PUBLICATIONS") {
+                cmd.type = CommandType::SHOW_PUBLICATIONS;
+            // Phase 81: SHOW SUBSCRIPTIONS
+            } else if (kw1 == "SUBSCRIPTIONS") {
+                cmd.type = CommandType::SHOW_SUBSCRIPTIONS;
+            // Phase 81: SHOW LOGICAL LOG
+            } else if (kw1 == "LOGICAL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "LOG") {
+                cmd.type = CommandType::SHOW_LOGICAL_LOG;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2319,6 +2338,84 @@ public:
             cmd.type = CommandType::STOP_SLAVE;
         } else if (kw0 == "START" && kw1 == "SLAVE") {
             cmd.type = CommandType::START_SLAVE;
+
+        // ── Phase 81: CREATE PUBLICATION name FOR TABLE t1, t2 / FOR ALL TABLES ──
+        } else if (kw0 == "CREATE" && kw1 == "PUBLICATION") {
+            cmd.type = CommandType::CREATE_PUBLICATION;
+            if (tokens.size() >= 3) {
+                cmd.tableName = tokens[2];
+                // find FOR keyword
+                std::string kw3 = tokens.size() > 3 ? toUpper(tokens[3]) : "";
+                if (kw3 == "FOR" && tokens.size() > 4) {
+                    std::string kw4 = toUpper(tokens[4]);
+                    if (kw4 == "ALL") {
+                        // FOR ALL TABLES
+                        cmd.values.push_back("*");
+                    } else if (kw4 == "TABLE") {
+                        // FOR TABLE t1, t2, ...
+                        // Use tokenizeFull to get comma-separated names
+                        auto ftToks = tokenizeFull(input);
+                        bool afterTable = false;
+                        for (size_t i = 0; i < ftToks.size(); ++i) {
+                            if (toUpper(ftToks[i]) == "TABLE" && !afterTable) {
+                                afterTable = true;
+                                continue;
+                            }
+                            if (afterTable && ftToks[i] != ",") {
+                                cmd.values.push_back(ftToks[i]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 81: DROP PUBLICATION name ──────────────────────
+        } else if (kw0 == "DROP" && kw1 == "PUBLICATION") {
+            cmd.type = CommandType::DROP_PUBLICATION;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 81: CREATE SUBSCRIPTION name CONNECTION 'dsn' PUBLICATION pub ──
+        } else if (kw0 == "CREATE" && kw1 == "SUBSCRIPTION") {
+            cmd.type = CommandType::CREATE_SUBSCRIPTION;
+            if (tokens.size() >= 3) {
+                cmd.tableName = tokens[2]; // subscription name
+                // Parse full tokens for CONNECTION and PUBLICATION
+                auto ftToks = tokenizeFull(input);
+                std::string conn, pub;
+                for (size_t i = 0; i < ftToks.size(); ++i) {
+                    if (toUpper(ftToks[i]) == "CONNECTION" && i + 1 < ftToks.size()) {
+                        conn = ftToks[i + 1];
+                        if (conn.size() >= 2 && conn.front() == '\'' && conn.back() == '\'')
+                            conn = conn.substr(1, conn.size() - 2);
+                    }
+                    if (toUpper(ftToks[i]) == "PUBLICATION" && i + 1 < ftToks.size()) {
+                        pub = ftToks[i + 1];
+                    }
+                }
+                // Store as conn\x01pub in viewSql
+                cmd.viewSql = conn + "\x01" + pub;
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 81: DROP SUBSCRIPTION name ─────────────────────
+        } else if (kw0 == "DROP" && kw1 == "SUBSCRIPTION") {
+            cmd.type = CommandType::DROP_SUBSCRIPTION;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 81: ALTER SUBSCRIPTION name ENABLE|DISABLE ─────
+        } else if (kw0 == "ALTER" && kw1 == "SUBSCRIPTION") {
+            cmd.type = CommandType::ALTER_SUBSCRIPTION;
+            if (tokens.size() >= 4) {
+                cmd.tableName = tokens[2];
+                cmd.alterOp   = toUpper(tokens[3]);
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

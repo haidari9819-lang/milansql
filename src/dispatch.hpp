@@ -3824,6 +3824,55 @@ inline bool dispatchCommand(
         break;
     }
 
+    case milansql::CommandType::CREATE_PUBLICATION: {
+        bool allTables = (!cmd.values.empty() && cmd.values[0] == "*");
+        std::vector<std::string> tables;
+        if (!allTables) tables = cmd.values;
+        engine.createPublication(cmd.tableName, tables, allTables);
+        if (allTables)
+            std::cout << "  Publication '" << cmd.tableName << "' erstellt (ALL TABLES).\n\n";
+        else
+            std::cout << "  Publication '" << cmd.tableName << "' erstellt ("
+                      << tables.size() << " Tabelle(n)).\n\n";
+        break;
+    }
+    case milansql::CommandType::DROP_PUBLICATION:
+        engine.dropPublication(cmd.tableName);
+        std::cout << "  Publication '" << cmd.tableName << "' geloescht.\n\n";
+        break;
+    case milansql::CommandType::SHOW_PUBLICATIONS:
+        engine.showPublications();
+        break;
+    case milansql::CommandType::CREATE_SUBSCRIPTION: {
+        std::string conn, pub;
+        auto sep = cmd.viewSql.find('\x01');
+        if (sep != std::string::npos) {
+            conn = cmd.viewSql.substr(0, sep);
+            pub  = cmd.viewSql.substr(sep + 1);
+        }
+        engine.createSubscription(cmd.tableName, conn, pub);
+        std::cout << "  Subscription '" << cmd.tableName << "' erstellt ("
+                  << conn << " -> " << pub << ").\n\n";
+        break;
+    }
+    case milansql::CommandType::DROP_SUBSCRIPTION:
+        engine.dropSubscription(cmd.tableName);
+        std::cout << "  Subscription '" << cmd.tableName << "' geloescht.\n\n";
+        break;
+    case milansql::CommandType::SHOW_SUBSCRIPTIONS:
+        engine.showSubscriptions();
+        break;
+    case milansql::CommandType::ALTER_SUBSCRIPTION: {
+        bool enable = (cmd.alterOp == "ENABLE");
+        engine.alterSubscription(cmd.tableName, enable);
+        std::cout << "  Subscription '" << cmd.tableName << "' "
+                  << (enable ? "aktiviert" : "deaktiviert") << ".\n\n";
+        break;
+    }
+    case milansql::CommandType::SHOW_LOGICAL_LOG:
+        engine.showLogicalLog();
+        break;
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

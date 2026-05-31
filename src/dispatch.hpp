@@ -1337,6 +1337,41 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 84: CREATE PAGED TABLE ─────────────────────────
+    case milansql::CommandType::CREATE_PAGED_TABLE: {
+        if (cmd.tableName.empty() || cmd.columns.empty()) {
+            std::cout << "  Fehler: CREATE PAGED TABLE name (col TYP, ...)\n"; break;
+        }
+        engine.createPagedTable(cmd.tableName, cmd.columns);
+        std::cout << "  Paged Table '" << cmd.tableName << "' erstellt ("
+                  << cmd.columns.size() << " Spalten, PAGE STORE, 8KB Pages).\n\n";
+        break;
+    }
+
+    // ── Phase 84: SHOW PAGE STATS ─────────────────────────────
+    case milansql::CommandType::SHOW_PAGE_STATS: {
+        engine.showPageStats();
+        break;
+    }
+
+    // ── Phase 84: FLUSH PAGES ─────────────────────────────────
+    case milansql::CommandType::FLUSH_PAGES: {
+        engine.flushPages();
+        break;
+    }
+
+    // ── Phase 84: SET USE_PAGED_STORAGE ──────────────────────
+    case milansql::CommandType::SET_USE_PAGED_STORAGE: {
+        std::string val = cmd.values.empty() ? "" : cmd.values[0];
+        if (val == "ON")
+            std::cout << "  USE_PAGED_STORAGE = ON (neue Tabellen als Paged Tables anlegen)\n\n";
+        else if (val == "OFF")
+            std::cout << "  USE_PAGED_STORAGE = OFF (neue Tabellen als Row Store anlegen)\n\n";
+        else
+            std::cout << "  Fehler: SET USE_PAGED_STORAGE = ON | OFF\n\n";
+        break;
+    }
+
     case milansql::CommandType::CREATE_TABLE: {
         if (dispatch_slaveReadOnly()) {
             std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
@@ -1412,6 +1447,22 @@ inline bool dispatchCommand(
         }
         if (milansql::Engine::isInfoSchemaName(cmd.tableName)) {
             std::cout << "  FEHLER: INFORMATION_SCHEMA ist read-only.\n\n"; break;
+        }
+        // Phase 84: route to paged table
+        if (engine.isPagedTable(cmd.tableName)) {
+            std::vector<std::vector<std::string>> rows;
+            if (cmd.multiValues.empty())
+                rows.push_back(cmd.values);
+            else
+                rows = cmd.multiValues;
+            for (const auto& vals : rows)
+                engine.insertIntoPagedTable(cmd.tableName, vals);
+            if (rows.size() == 1)
+                std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "' (PAGE STORE).\n\n";
+            else
+                std::cout << "  " << rows.size() << " Zeilen eingefuegt in '"
+                          << cmd.tableName << "' (PAGE STORE).\n\n";
+            break;
         }
         // Phase 80: route to column store
         if (engine.isColumnTable(cmd.tableName)) {
@@ -1884,6 +1935,31 @@ inline bool dispatchCommand(
 
         if (engine.viewExists(cmd.tableName)) {
             milansql::Table result = dispatch_materializeView(engine, parser, cmd.tableName, cmd);
+            std::cout << "\n";
+            if (!cmd.orderByCols.empty())
+                result.sortByMulti(cmd.orderByCols);
+            if (!cmd.selectColumns.empty())
+                result = result.project(cmd.selectColumns);
+            if (cmd.isDistinct)
+                result.makeDistinct();
+            dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+            break;
+        }
+
+        // Phase 84: Paged Table — full scan
+        if (engine.isPagedTable(cmd.tableName)) {
+            if (cmd.isCount) {
+                size_t n = engine.countPagedTable(cmd.tableName);
+                std::cout << "\n  COUNT(*) = " << n
+                          << " (Page Store '" << cmd.tableName << "')";
+                if (!cmd.whereConds.empty())
+                    std::cout << "  [WHERE " << dispatch_whereDesc(cmd) << "]";
+                std::cout << "\n\n";
+                break;
+            }
+            milansql::Table result = engine.selectFromPagedTable(cmd.tableName);
+            if (!cmd.whereConds.empty())
+                result = engine.filterTable(result, cmd.whereConds, cmd.whereLogic);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
                 result.sortByMulti(cmd.orderByCols);

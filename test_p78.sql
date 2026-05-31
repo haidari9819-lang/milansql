@@ -1,0 +1,17 @@
+CREATE TABLE fahrzeug (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, ps INT)
+CREATE TABLE auto (tueren INT) INHERITS (fahrzeug)
+CREATE TABLE motorrad (seitenkoffer INT) INHERITS (fahrzeug)
+INSERT INTO fahrzeug VALUES (NULL, Traktor, 80)
+INSERT INTO auto VALUES (NULL, BMW, 200, 4)
+INSERT INTO auto VALUES (NULL, VW, 150, 5)
+INSERT INTO motorrad VALUES (NULL, Honda, 100, 0)
+INSERT INTO motorrad VALUES (NULL, Ducati, 180, 1)
+SELECT * FROM fahrzeug
+SELECT * FROM ONLY fahrzeug
+SELECT * FROM auto
+SELECT COUNT(*) FROM fahrzeug
+SHOW INHERITANCE
+CREATE TABLE luxusauto (leder INT) INHERITS (auto)
+INSERT INTO luxusauto VALUES (NULL, Porsche, 400, 2, 1)
+SELECT * FROM fahrzeug
+EXIT

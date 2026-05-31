@@ -166,6 +166,11 @@ enum class CommandType {
     ANALYZE_TABLE,
     SET_QUERY_REWRITE,
     EXPLAIN_REWRITTEN,
+    // Phase 84: Page-based I/O
+    CREATE_PAGED_TABLE,
+    SHOW_PAGE_STATS,
+    FLUSH_PAGES,
+    SET_USE_PAGED_STORAGE,
     UNKNOWN
 };
 
@@ -1436,6 +1441,20 @@ public:
                 }
             } else { cmd.type = CommandType::UNKNOWN; }
 
+        // ── Phase 84: CREATE PAGED TABLE ─────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "PAGED" &&
+                   tokens.size() >= 3 && toUpper(tokens[2]) == "TABLE") {
+            cmd.type = CommandType::CREATE_PAGED_TABLE;
+            if (tokens.size() >= 4) {
+                cmd.tableName = tokens[3];
+                for (const auto& colDef : splitTrim(parenContent, ',')) {
+                    auto parts = tokenize(colDef);
+                    if (parts.size() < 2) continue;
+                    Column col(parts[0], toUpper(parts[1]));
+                    cmd.columns.push_back(std::move(col));
+                }
+            } else { cmd.type = CommandType::UNKNOWN; }
+
         // ── Phase 80: CREATE COLUMN TABLE ────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "COLUMN" &&
                    tokens.size() >= 3 && toUpper(tokens[2]) == "TABLE") {
@@ -1752,6 +1771,10 @@ public:
             } else if (kw1 == "INDEX" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "SUGGESTIONS") {
                 cmd.type = CommandType::SHOW_INDEX_SUGGESTIONS;
+            // Phase 84: SHOW PAGE STATS
+            } else if (kw1 == "PAGE" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATS") {
+                cmd.type = CommandType::SHOW_PAGE_STATS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -1937,6 +1960,19 @@ public:
             if (valTok == "=" && tokens.size() >= 4) valTok = tokens[3];
             cmd.type = CommandType::SET_BUFFER_POOL_SIZE;
             cmd.values.push_back(valTok);
+
+        // ── Phase 84: FLUSH PAGES ────────────────────────────────
+        } else if (kw0 == "FLUSH" && kw1 == "PAGES") {
+            cmd.type = CommandType::FLUSH_PAGES;
+
+        // ── Phase 84: SET USE_PAGED_STORAGE = ON/OFF ─────────────
+        } else if (kw0 == "SET" && kw1 == "USE_PAGED_STORAGE") {
+            cmd.type = CommandType::SET_USE_PAGED_STORAGE;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                cmd.values.push_back(toUpper(val));
+            }
 
         // ── Phase 82: SET QUERY_REWRITE = ON/OFF ─────────────────
         } else if (kw0 == "SET" && kw1 == "QUERY_REWRITE") {

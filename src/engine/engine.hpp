@@ -19,6 +19,8 @@
 #include <functional>
 #include <regex>
 #include <thread>
+#include <unordered_map>
+#include <cstring>
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
@@ -911,6 +913,11 @@ private:
 #include "../executor/hash_join.hpp"
 #include "../executor/merge_join.hpp"
 
+// Phase 84: Page-based I/O (included here so they see Row/Table/Column)
+#include "../storage/page.hpp"
+#include "../storage/page_manager.hpp"
+#include "../storage/paged_table.hpp"
+
 // ── Gepufferte Transaktion-Operation (Phase 17) ───────────────
 struct BufferedOp {
     enum class Type {
@@ -958,6 +965,7 @@ public:
     Engine() {
         loadPublications_();
         loadSubscriptions_();
+        loadPagedTableSchemas_();
     }
 
     // ── Phase 75: Row-Level Security ──────────────────────────
@@ -3116,6 +3124,65 @@ public:
                       << "| COLUMN STORE  |\n";
         }
         std::cout << "  +-----------------------+---------------+\n\n";
+    }
+
+    // ── Phase 84: Page-based I/O ─────────────────────────────
+
+    bool isPagedTable(const std::string& name) const {
+        return pagedTables_.count(resolveTableName(name)) > 0;
+    }
+
+    void createPagedTable(const std::string& name,
+                          const std::vector<Column>& cols) {
+        auto key = resolveTableName(name);
+        if (pagedTables_.count(key))
+            throw std::runtime_error("Paged Table '" + key + "' existiert bereits.");
+        if (tables_.count(key))
+            throw std::runtime_error("Tabelle '" + key + "' existiert bereits (ROW STORE).");
+        if (columnTables_.count(key))
+            throw std::runtime_error("Tabelle '" + key + "' existiert bereits (COLUMN STORE).");
+        pagedTables_.emplace(key, PagedTable(key, cols, pagedManager_));
+        savePagedTableSchemas_();
+    }
+
+    void insertIntoPagedTable(const std::string& name,
+                              const std::vector<std::string>& vals) {
+        auto key = resolveTableName(name);
+        auto it = pagedTables_.find(key);
+        if (it == pagedTables_.end())
+            throw std::runtime_error("Paged Table '" + key + "' nicht gefunden.");
+        it->second.insertRow(Row(vals));
+    }
+
+    Table selectFromPagedTable(const std::string& name) const {
+        auto key = resolveTableName(name);
+        auto it = pagedTables_.find(key);
+        if (it == pagedTables_.end())
+            throw std::runtime_error("Paged Table '" + key + "' nicht gefunden.");
+        return it->second.toTable();
+    }
+
+    size_t countPagedTable(const std::string& name) const {
+        auto key = resolveTableName(name);
+        auto it = pagedTables_.find(key);
+        if (it == pagedTables_.end()) return 0;
+        return it->second.getRowCount();
+    }
+
+    void showPageStats() const {
+        std::cout << "\n" << pagedManager_.showStats();
+        if (pagedTables_.empty()) {
+            std::cout << "  (keine Paged Tables vorhanden)\n\n";
+            return;
+        }
+        for (const auto& [key, pt] : pagedTables_)
+            std::cout << pt.pageStats();
+        std::cout << "\n";
+    }
+
+    void flushPages() {
+        pagedManager_.flushAll();
+        std::cout << "  Alle Dirty Pages geschrieben.\n\n";
     }
 
     // ── Phase 81: Logical Replication ──────────────────────────
@@ -5740,6 +5807,10 @@ public:
     // Phase 80: Column Store Engine
     std::map<std::string, ColumnTable> columnTables_;
 
+    // Phase 84: Page-based I/O
+    PageManager pagedManager_;
+    std::map<std::string, PagedTable> pagedTables_;
+
     // Phase 81: Logical Replication
     std::map<std::string, PublicationDef> publications_;
     std::map<std::string, SubscriptionDef> subscriptions_;
@@ -6473,6 +6544,44 @@ private:
             sd.publication = parts[2];
             sd.enabled = (parts[3] == "1");
             subscriptions_[sd.name] = std::move(sd);
+        }
+    }
+
+    // ── Phase 84: Paged Table Schema Persistence ──────────────
+    // Schema file format (one line per table):
+    //   tableName|col1:TYPE1|col2:TYPE2|...
+    void savePagedTableSchemas_() const {
+        std::ofstream f("database.paged_schemas");
+        for (const auto& [key, pt] : pagedTables_) {
+            f << key;
+            for (const auto& col : pt.columns())
+                f << "|" << col.name << ":" << col.type;
+            f << "\n";
+        }
+    }
+
+    void loadPagedTableSchemas_() {
+        std::ifstream f("database.paged_schemas");
+        if (!f.is_open()) return;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::istringstream ss(line);
+            std::string token;
+            std::vector<std::string> parts;
+            while (std::getline(ss, token, '|'))
+                parts.push_back(token);
+            if (parts.empty()) continue;
+            std::string tblName = parts[0];
+            std::vector<Column> cols;
+            for (size_t i = 1; i < parts.size(); ++i) {
+                auto colon = parts[i].find(':');
+                if (colon == std::string::npos) continue;
+                cols.emplace_back(parts[i].substr(0, colon),
+                                  parts[i].substr(colon + 1));
+            }
+            if (!tblName.empty())
+                pagedTables_.emplace(tblName, PagedTable(tblName, cols, pagedManager_));
         }
     }
 };

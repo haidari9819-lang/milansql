@@ -180,6 +180,8 @@ enum class CommandType {
     SET_AUTO_VACUUM_THRESHOLD,
     VACUUM_TABLE,
     VACUUM_FULL,
+    // Phase 86: Statistics-based Query Planner
+    SHOW_STATISTICS_FOR,
     UNKNOWN
 };
 
@@ -1792,6 +1794,11 @@ public:
             } else if (kw1 == "VACUUM" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_VACUUM_STATUS;
+            // Phase 86: SHOW STATISTICS FOR <table>
+            } else if (kw1 == "STATISTICS" && tokens.size() >= 4 &&
+                       toUpper(tokens[2]) == "FOR") {
+                cmd.type = CommandType::SHOW_STATISTICS_FOR;
+                cmd.tableName = tokens[3];
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2043,11 +2050,15 @@ public:
                 cmd.queryRewriteFlag = toUpper(val);
             }
 
-        // ── Phase 82: ANALYZE TABLE name ─────────────────────────
+        // ── Phase 82/86: ANALYZE [TABLE name] ────────────────────
         } else if (kw0 == "ANALYZE" && kw1 == "TABLE") {
             cmd.type = CommandType::ANALYZE_TABLE;
             if (tokens.size() >= 3) cmd.tableName = tokens[2];
             else cmd.type = CommandType::UNKNOWN;
+        } else if (kw0 == "ANALYZE" && tokens.size() == 1) {
+            // ANALYZE without table name → analyze all tables
+            cmd.type = CommandType::ANALYZE_TABLE;
+            cmd.tableName = "*";
 
         // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
         // SET TRANSACTION ISOLATION LEVEL READ COMMITTED

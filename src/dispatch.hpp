@@ -22,6 +22,7 @@
 #include "optimizer/optimizer.hpp"
 #include "optimizer/query_rewriter.hpp"
 #include "optimizer/adaptive_stats.hpp"
+#include "optimizer/table_stats.hpp"   // Phase 86: Column Statistics
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
@@ -38,6 +39,9 @@ static QueryProfiler g_profiler;
 // ── Phase 82: Query Rewriter + Adaptive Stats ────────────────
 static QueryRewriter g_queryRewriter;
 static AdaptiveStats g_adaptiveStats;
+
+// ── Phase 86: Table Statistics Manager ───────────────────────
+static TableStatsManager g_tableStats;
 
 // ── Phase 59: Replication helpers ────────────────────────────
 // Returns true if the current operation should be blocked (slave read-only)
@@ -1871,6 +1875,19 @@ inline bool dispatchCommand(
                 } catch (...) {}
             }
             dispatch_printExplain(plan);
+            // Phase 86: Show statistics-based cardinality estimate if available
+            if (!cmd.tableName.empty() && g_tableStats.hasStats(cmd.tableName)) {
+                size_t est = g_tableStats.estimateRowCount(cmd.tableName, cmd.whereConds);
+                if (!cmd.whereConds.empty()) {
+                    double sel = 1.0;
+                    for (const auto& wc : cmd.whereConds)
+                        sel *= g_tableStats.estimateSelectivity(
+                            cmd.tableName, wc.col, wc.op, wc.val);
+                    std::cout << "  [Statistik] Geschaetzte Zeilen: " << est
+                              << "  Selektivitaet: "
+                              << std::fixed << std::setprecision(4) << sel << "\n\n";
+                }
+            }
             break;
         }
 
@@ -4058,8 +4075,43 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: ANALYZE TABLE tabellenname\n\n"; break;
         }
-        g_adaptiveStats.analyzeTable(cmd.tableName);
-        g_adaptiveStats.saveStats();
+        if (cmd.tableName == "*") {
+            // ANALYZE — all tables
+            const auto& tables = engine.getTables();
+            size_t count = 0;
+            for (const auto& kv : tables) {
+                g_tableStats.analyzeTable(kv.first, kv.second);
+                g_adaptiveStats.analyzeTable(kv.first);
+                ++count;
+            }
+            g_tableStats.saveStats();
+            g_adaptiveStats.saveStats();
+            std::cout << "  ANALYZE: " << count << " Tabelle(n) analysiert.\n\n";
+        } else {
+            // ANALYZE TABLE name
+            g_adaptiveStats.analyzeTable(cmd.tableName);
+            if (engine.tableExists(cmd.tableName)) {
+                const Table& tbl = engine.getTables().at(cmd.tableName);
+                g_tableStats.analyzeTable(cmd.tableName, tbl);
+                g_tableStats.saveStats();
+                std::cout << "  ANALYZE TABLE '" << cmd.tableName
+                          << "': " << tbl.rowCount() << " Zeile(n), "
+                          << tbl.columns().size() << " Spalte(n) analysiert.\n\n";
+            } else {
+                std::cout << "  ANALYZE TABLE '" << cmd.tableName
+                          << "': Statistiken zurueckgesetzt.\n\n";
+            }
+            g_adaptiveStats.saveStats();
+        }
+        break;
+    }
+
+    // ── Phase 86: SHOW STATISTICS FOR <table> ────────────────
+    case milansql::CommandType::SHOW_STATISTICS_FOR: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: SHOW STATISTICS FOR tabellenname\n\n"; break;
+        }
+        g_tableStats.showStatistics(cmd.tableName);
         break;
     }
 

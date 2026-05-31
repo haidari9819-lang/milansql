@@ -5570,6 +5570,9 @@ private:
     }
 
 public:
+    // ── Phase 86: Table map accessor for statistics ───────────
+    const std::map<std::string, Table>& getTables() const { return tables_; }
+
     // ── Phase 36: EXPLAIN ─────────────────────────────────────
     ExplainPlan buildExplain(const ExplainRequest& req) const {
         ExplainPlan plan;

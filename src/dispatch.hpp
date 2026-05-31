@@ -18,6 +18,7 @@
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
 #include "parser/parser.hpp"
+#include "types/array_type.hpp"  // Phase 88: Array Data Type
 #include "storage/storage.hpp"
 #include "optimizer/optimizer.hpp"
 #include "optimizer/query_rewriter.hpp"
@@ -172,6 +173,55 @@ static inline milansql::Table dispatch_materializeView(milansql::Engine& engine,
     const std::string& viewName, const milansql::ParsedCommand& outerCmd);
 static inline milansql::Table dispatch_executeSelectToTable(milansql::Engine& engine, milansql::Parser& parser,
     milansql::ParsedCommand cmd);
+
+// ── Phase 88: UNNEST expansion ───────────────────────────────
+// Expands any UNNEST(...) SelectItem: each row becomes N rows (one per element).
+// Non-UNNEST columns keep their value in every expanded row.
+static inline milansql::Table dispatch_expandUnnestResult(
+        const milansql::Table& src,
+        const std::vector<milansql::SelectItem>& items) {
+    // Find the UNNEST item and its column index in src
+    int unnestItemIdx = -1;
+    for (int k = 0; k < static_cast<int>(items.size()); ++k) {
+        if (items[static_cast<size_t>(k)].isUnnest) { unnestItemIdx = k; break; }
+    }
+    if (unnestItemIdx < 0) return src.clone();  // no UNNEST, nothing to do
+
+    const milansql::SelectItem& unnestItem = items[static_cast<size_t>(unnestItemIdx)];
+    // Determine column name in src (after projectWithItems the col is the alias or unnest col)
+    std::string unnestColName = unnestItem.alias.empty() ? unnestItem.unnestCol : unnestItem.alias;
+
+    // Find index in src columns
+    int srcColIdx = -1;
+    for (int k = 0; k < static_cast<int>(src.columns().size()); ++k) {
+        if (src.columns()[static_cast<size_t>(k)].name == unnestColName) { srcColIdx = k; break; }
+    }
+    if (srcColIdx < 0) return src.clone();
+
+    // Build result table with same columns
+    milansql::Table result("", src.columns());
+    for (const auto& row : src.rows()) {
+        if (row.xmax != 0) continue;
+        std::string arrVal = static_cast<size_t>(srcColIdx) < row.values.size()
+                             ? row.values[static_cast<size_t>(srcColIdx)] : "";
+        auto elems = milansql::ArrayUtils::parse(arrVal);
+        if (elems.empty()) {
+            // Keep the row with NULL for empty arrays
+            milansql::Row newRow = row;
+            if (static_cast<size_t>(srcColIdx) < newRow.values.size())
+                newRow.values[static_cast<size_t>(srcColIdx)] = "NULL";
+            result.insert(newRow);
+        } else {
+            for (const auto& elem : elems) {
+                milansql::Row newRow = row;
+                if (static_cast<size_t>(srcColIdx) < newRow.values.size())
+                    newRow.values[static_cast<size_t>(srcColIdx)] = elem;
+                result.insert(newRow);
+            }
+        }
+    }
+    return result;
+}
 
 // Entfernt äußere einfache Anführungszeichen für die Anzeige
 static inline std::string dispatch_displayVal(const std::string& v) {
@@ -616,12 +666,18 @@ static inline milansql::Table dispatch_executeSelectToTable(
 
     if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
         bool hasWin = false;
-        for (const auto& si : cmd.selectItems)
+        bool hasUnnest = false;
+        for (const auto& si : cmd.selectItems) {
             if (si.isWindowFunc) { hasWin = true; break; }
+            if (si.isUnnest) hasUnnest = true;
+        }
         if (hasWin)
             result = engine.projectWithWindowItems(result, cmd.selectItems);
         else
             result = engine.projectWithItems(result, cmd.selectItems);
+        // Phase 88: expand UNNEST after projection
+        if (hasUnnest)
+            result = dispatch_expandUnnestResult(result, cmd.selectItems);
         if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
     } else {
         if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
@@ -2657,12 +2713,18 @@ inline bool dispatchCommand(
             if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
                 if (g_profiler.isEnabled()) g_profiler.addStep("Result projection");
                 bool hasWin = false;
-                for (const auto& si : cmd.selectItems)
-                    if (si.isWindowFunc) { hasWin = true; break; }
+                bool hasUnnest88 = false;
+                for (const auto& si : cmd.selectItems) {
+                    if (si.isWindowFunc) { hasWin = true; }
+                    if (si.isUnnest) { hasUnnest88 = true; }
+                }
                 if (hasWin)
                     result = engine.projectWithWindowItems(result, cmd.selectItems);
                 else
                     result = engine.projectWithItems(result, cmd.selectItems);
+                // Phase 88: expand UNNEST after projection
+                if (hasUnnest88)
+                    result = dispatch_expandUnnestResult(result, cmd.selectItems);
                 if (!cmd.orderByCols.empty()) {
                     if (g_profiler.isEnabled()) g_profiler.addStep("Sorting");
                     result.sortByMulti(cmd.orderByCols);

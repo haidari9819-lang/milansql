@@ -35,6 +35,7 @@
 #include "../buffer/buffer_pool.hpp"   // Phase 73: Buffer Pool Manager
 #include "../parallel/parallel_executor.hpp" // Phase 77: Parallel Query
 #include "../replication/logical_repl.hpp"  // Phase 81: Logical Replication
+#include "../types/array_type.hpp"          // Phase 88: Array Data Type
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -228,6 +229,10 @@ struct SelectItem {
     std::string windowPartitionBy;   // column name for PARTITION BY, empty = no partition
     std::string windowOrderBy;       // column name for ORDER BY inside OVER
     bool        windowOrderDesc = false;  // true = DESC
+
+    // Phase 88: UNNEST
+    bool        isUnnest    = false;
+    std::string unnestCol;           // column name to unnest
 };
 
 // ── HAVING-Bedingung (Phase 10) ───────────────────────────────
@@ -1397,9 +1402,14 @@ public:
         std::vector<Column> resultCols;
         resultCols.reserve(selectItems.size());
         for (const auto& item : selectItems) {
-            std::string name = item.isAgg
-                ? (item.aggFunc + "(" + item.aggCol + ")")
-                : item.colName;
+            std::string name;
+            if (!item.alias.empty()) {
+                name = item.alias;
+            } else if (item.isAgg) {
+                name = item.aggFunc + "(" + item.aggCol + ")";
+            } else {
+                name = item.colName;
+            }
             resultCols.emplace_back(name, "");
         }
         Table result("", std::move(resultCols));
@@ -2376,7 +2386,11 @@ public:
         // Ergebnis-Schema aufbauen
         std::vector<Column> newCols;
         for (const auto& item : items) {
-            if (item.isMatchAgainst) {
+            if (item.isUnnest) {
+                // Phase 88: UNNEST — use alias if given, else column name
+                std::string cname = item.alias.empty() ? item.unnestCol : item.alias;
+                newCols.emplace_back(cname, "TEXT");
+            } else if (item.isMatchAgainst) {
                 // Phase 49: MATCH AGAINST score column
                 std::string cname = item.alias.empty() ? "score" : item.alias;
                 newCols.emplace_back(cname, "TEXT");
@@ -2417,7 +2431,12 @@ public:
             std::vector<std::string> vals;
             vals.reserve(items.size());
             for (const auto& item : items) {
-                if (item.isMatchAgainst) {
+                if (item.isUnnest) {
+                    // Phase 88: pass array value through; expansion done in dispatch
+                    int ci = findColIdx(src, item.unnestCol);
+                    vals.push_back(ci >= 0 && static_cast<size_t>(ci) < row.values.size()
+                                   ? row.values[static_cast<size_t>(ci)] : "");
+                } else if (item.isMatchAgainst) {
                     // Phase 49: Compute TF score for this row
                     std::string text;
                     for (const auto& col : item.matchCols) {
@@ -4632,6 +4651,38 @@ private:
             return SpatialUtils::stWithin(p, center, radius);
         }
 
+        // ── Phase 88: Array functions ─────────────────────────────
+        if (fn == "ARRAY_LENGTH") {
+            if (args.empty()) return "0";
+            return ArrayUtils::arrayLength(resolveArg(args[0]));
+        }
+        if (fn == "ARRAY_APPEND") {
+            if (args.size() < 2) return args.empty() ? "{}" : resolveArg(args[0]);
+            return ArrayUtils::arrayAppend(resolveArg(args[0]), resolveArg(args[1]));
+        }
+        if (fn == "ARRAY_REMOVE") {
+            if (args.size() < 2) return args.empty() ? "{}" : resolveArg(args[0]);
+            return ArrayUtils::arrayRemove(resolveArg(args[0]), resolveArg(args[1]));
+        }
+        if (fn == "ARRAY_CONTAINS") {
+            if (args.size() < 2) return "0";
+            return ArrayUtils::arrayContains(resolveArg(args[0]), resolveArg(args[1]));
+        }
+        if (fn == "ARRAY_GET") {
+            if (args.size() < 2) return "NULL";
+            int idx = 1;
+            try { idx = std::stoi(resolveArg(args[1])); } catch (...) {}
+            return ArrayUtils::arrayGet(resolveArg(args[0]), idx);
+        }
+        if (fn == "ARRAY_TO_STRING") {
+            if (args.size() < 2) return args.empty() ? "" : resolveArg(args[0]);
+            return ArrayUtils::arrayToString(resolveArg(args[0]), resolveArg(args[1]));
+        }
+        if (fn == "STRING_TO_ARRAY") {
+            if (args.size() < 2) return args.empty() ? "{}" : ArrayUtils::serialize({resolveArg(args[0])});
+            return ArrayUtils::stringToArray(resolveArg(args[0]), resolveArg(args[1]));
+        }
+
         return "";
     }
 
@@ -4679,7 +4730,10 @@ private:
              "JSON_EXTRACT", "JSON_SET", "JSON_KEYS", "JSON_LENGTH",
              "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
              // Phase 70: Spatial
-             "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
+             "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
+             // Phase 88: Array functions
+             "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
+             "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY"};
 
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;
@@ -5082,6 +5136,19 @@ private:
                                            const std::vector<size_t>& riList) {
         if (item.aggFunc == "COUNT")
             return std::to_string(riList.size());
+
+        // Phase 88: ARRAY_AGG
+        if (item.aggFunc == "ARRAY_AGG") {
+            size_t ci = colIdx(src, item.aggCol);
+            std::vector<std::string> vals;
+            vals.reserve(riList.size());
+            for (size_t ri : riList) {
+                const Row& row = src.rows()[ri];
+                if (ci < row.values.size())
+                    vals.push_back(row.values[ci]);
+            }
+            return ArrayUtils::serialize(vals);
+        }
 
         size_t ci = colIdx(src, item.aggCol);
         std::vector<double> nums;

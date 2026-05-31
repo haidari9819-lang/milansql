@@ -804,7 +804,10 @@ public:
                  // Phase 64: REGEXP-Funktionen
                  "REGEXP_REPLACE", "REGEXP_EXTRACT",
                  // Phase 70: Spatial-Funktionen
-                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
+                 // Phase 88: Array functions + UNNEST
+                 "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
+                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -3114,7 +3117,10 @@ private:
                  "UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM",
                  "REPLACE", "ABS", "ROUND", "MOD", "COALESCE", "IFNULL",
                  // Phase 70: Spatial-Funktionen in WHERE
-                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
+                 // Phase 88: Array functions in WHERE
+                 "ARRAY_LENGTH", "ARRAY_CONTAINS", "ARRAY_GET", "ARRAY_TO_STRING",
+                 "ARRAY_APPEND", "ARRAY_REMOVE", "STRING_TO_ARRAY"};
             bool isFuncLhsCandidate = false;
             for (const auto& fn : FUNC_LHS_NAMES)
                 if (u == fn) { isFuncLhsCandidate = true; break; }
@@ -3130,14 +3136,26 @@ private:
                     else if (ft[j] == ")") { --depth; if (depth == 0) { ++j; break; } }
                     ++j;
                 }
-                // j now points to op token
+                // j now points to op token (or end of tokens if no operator follows)
                 cond.isFuncLhs   = true;
                 cond.funcLhsExpr = funcExpr;
                 cond.col         = "";  // no column name
-                // Read op and val
+                // Read op and val; if no comparison op follows, treat as boolean (result != "0")
                 if (j < end) {
-                    cond.op = ft[j]; ++j;
-                    if (j < end) { cond.val = ft[j]; ++j; }
+                    std::string maybeOp = ft[j];
+                    if (maybeOp == "=" || maybeOp == "!=" || maybeOp == "<" ||
+                        maybeOp == ">" || maybeOp == "<=" || maybeOp == ">=" ||
+                        toUpper(maybeOp) == "LIKE" || toUpper(maybeOp) == "REGEXP") {
+                        cond.op = maybeOp; ++j;
+                        if (j < end) { cond.val = ft[j]; ++j; }
+                    } else {
+                        // No explicit op: treat as boolean (truthy when != "0")
+                        cond.op  = "!=";
+                        cond.val = "0";
+                    }
+                } else {
+                    cond.op  = "!=";
+                    cond.val = "0";
                 }
                 i = j;
                 parsed = true;
@@ -3509,7 +3527,10 @@ private:
                          "YEAR","MONTH","DAY","HOUR","MINUTE","SECOND",
                          "DATEDIFF","DATE_ADD","DATE_SUB","DATE_FORMAT",
                  // Phase 64: REGEXP-Funktionen
-                 "REGEXP_REPLACE","REGEXP_EXTRACT"};
+                 "REGEXP_REPLACE","REGEXP_EXTRACT",
+                 // Phase 88: Array functions
+                 "ARRAY_LENGTH","ARRAY_APPEND","ARRAY_REMOVE","ARRAY_CONTAINS",
+                 "ARRAY_GET","ARRAY_TO_STRING","STRING_TO_ARRAY"};
                     if (exprToks.size() >= 3 && exprToks[1] == "(") {
                         std::string fn = toUpper(exprToks[0]);
                         bool isKnown = false;
@@ -3595,7 +3616,12 @@ private:
                  // Phase 64: REGEXP-Funktionen
                  "REGEXP_REPLACE", "REGEXP_EXTRACT",
                  // Phase 70: Spatial-Funktionen
-                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
+                 // Phase 88: Array functions
+                 "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
+                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY",
+                 // Phase 88: UNNEST
+                 "UNNEST"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -3760,7 +3786,10 @@ private:
                  // Phase 64: REGEXP-Funktionen
                  "REGEXP_REPLACE", "REGEXP_EXTRACT",
                  // Phase 70: Spatial-Funktionen
-                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT"};
+                 "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
+                 // Phase 88: Array functions + UNNEST
+                 "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
+                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
@@ -3792,7 +3821,21 @@ private:
                 // Also: SUM/AVG/COUNT/MIN/MAX can appear without OVER (in GROUP BY context)
                 // so only treat as window if OVER follows.
 
-                if (treatAsWindow) {
+                if (u == "UNNEST" && i + 1 < end && ft[i+1] == "(") {
+                    // Phase 88: UNNEST(col) [AS alias]
+                    SelectItem item;
+                    item.isUnnest = true;
+                    i += 2;  // skip UNNEST and (
+                    if (i < end && ft[i] != ")") {
+                        item.unnestCol = ft[i]; ++i;
+                    }
+                    if (i < end && ft[i] == ")") ++i;
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(item);
+                } else if (treatAsWindow) {
                     // Parse window function: FUNC ( [arg] ) OVER ( [PARTITION BY col] [ORDER BY col [DESC]] )
                     SelectItem item;
                     item.isWindowFunc = true;
@@ -4219,6 +4262,7 @@ private:
         std::vector<std::string> tokens;
         std::string cur;
         bool inQuote = false;
+        int braceDepth = 0;  // Phase 88: track {} for array literals
         for (char c : s) {
             if (inQuote) {
                 cur += c;
@@ -4227,6 +4271,18 @@ private:
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
                 cur += c;
                 inQuote = true;
+            } else if (c == '{') {
+                // Phase 88: start of array literal — collect until matching }
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                cur += c;
+                braceDepth = 1;
+            } else if (braceDepth > 0) {
+                cur += c;
+                if (c == '{') ++braceDepth;
+                else if (c == '}') {
+                    --braceDepth;
+                    if (braceDepth == 0) { tokens.push_back(cur); cur.clear(); }
+                }
             } else if (c == ' ' || c == '\t' || c == '\r') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
             } else if (c == '(' || c == ')' || c == ',') {
@@ -4349,7 +4405,8 @@ private:
     static void parseSelectItems(const std::vector<std::string>& ft,
                                   size_t start, size_t end, ParsedCommand& cmd) {
         static const std::vector<std::string> AGGF =
-            {"COUNT", "MIN", "MAX", "AVG", "SUM"};
+            {"COUNT", "MIN", "MAX", "AVG", "SUM",
+             "ARRAY_AGG"  /* Phase 88 */};
 
         size_t i = start;
         while (i < end) {
@@ -4360,15 +4417,21 @@ private:
             bool isAgg = false;
             for (const auto& f : AGGF) if (u == f) { isAgg = true; break; }
 
-            // Aggregatfunktion: FUNC ( col )
+            // Aggregatfunktion: FUNC ( col ) [AS alias]
             if (isAgg && i + 3 < end && ft[i + 1] == "(") {
                 SelectItem item;
                 item.isAgg   = true;
                 item.aggFunc = u;
                 item.aggCol  = ft[i + 2];   // z. B. "*" oder "level"
                 // ft[i+3] sollte ")" sein
+                size_t j = i + 4;
+                // optional AS alias
+                if (j < end && toUpper(ft[j]) == "AS") {
+                    ++j;
+                    if (j < end && ft[j] != ",") { item.alias = ft[j]; ++j; }
+                }
                 cmd.selectItems.push_back(std::move(item));
-                i += 4;
+                i = j;
             } else {
                 // Normale Spalte (oder *)
                 SelectItem item;

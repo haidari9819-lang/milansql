@@ -631,18 +631,37 @@ static inline milansql::Table dispatch_executeSelectToTable(
     }
 
     if (cmd.isJoin) {
-        // Phase 48: silently optimize join order before execution
+        // Phase 89: Register any foreign tables as temp tables before join
         {
-            milansql::QueryOptimizer qopt;
-            qopt.optimize(cmd, engine);
+            std::vector<std::string> fdwToClean;
+            auto registerFdw = [&](const std::string& tbl) {
+                if (engine.isForeignTable(tbl)) {
+                    milansql::Table ft = engine.executeForeignScan(tbl);
+                    engine.registerTempTable(tbl, std::move(ft));
+                    fdwToClean.push_back(tbl);
+                }
+            };
+            registerFdw(cmd.tableName);
+            for (const auto& jc : cmd.joinClauses) registerFdw(jc.table);
+
+            // Phase 48: silently optimize join order before execution
+            {
+                milansql::QueryOptimizer qopt;
+                qopt.optimize(cmd, engine);
+            }
+            auto result = engine.executeJoins(
+                cmd.tableName, cmd.joinClauses,
+                cmd.whereConds, cmd.whereLogic);
+
+            // Clean up foreign table temp registrations
+            for (const auto& tbl : fdwToClean)
+                engine.dropTempTable(tbl);
+
+            if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+            if (!cmd.selectColumns.empty())
+                result = result.project(cmd.selectColumns);
+            return result;
         }
-        auto result = engine.executeJoins(
-            cmd.tableName, cmd.joinClauses,
-            cmd.whereConds, cmd.whereLogic);
-        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
-        if (!cmd.selectColumns.empty())
-            result = result.project(cmd.selectColumns);
-        return result;
     }
 
     if (cmd.isGroupBy) {
@@ -654,6 +673,28 @@ static inline milansql::Table dispatch_executeSelectToTable(
             cmd.havingConds, cmd.havingLogic);
         if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
         return result;
+    }
+
+    // Phase 89: Foreign Data Wrapper — intercept SELECT on foreign tables
+    if (engine.isForeignTable(cmd.tableName)) {
+        milansql::Table foreignResult = engine.executeForeignScan(cmd.tableName);
+        // Apply WHERE filter on the in-memory result
+        if (!cmd.whereConds.empty())
+            foreignResult = engine.filterTable(foreignResult, cmd.whereConds, cmd.whereLogic);
+        if (!cmd.orderByCols.empty()) foreignResult.sortByMulti(cmd.orderByCols);
+        if (!cmd.selectColumns.empty())
+            foreignResult = foreignResult.project(cmd.selectColumns);
+        if (cmd.isDistinct) foreignResult.makeDistinct();
+        if (cmd.limit >= 0) {
+            milansql::Table lim(foreignResult.name(), foreignResult.columns());
+            size_t off = (cmd.limitOffset > 0) ? static_cast<size_t>(cmd.limitOffset) : 0;
+            const auto& allRows = foreignResult.rows();
+            size_t count = 0;
+            for (size_t ri = off; ri < allRows.size() && count < static_cast<size_t>(cmd.limit); ++ri, ++count)
+                lim.insert(allRows[ri]);
+            return lim;
+        }
+        return foreignResult;
     }
 
     milansql::Table result;
@@ -2571,20 +2612,36 @@ inline bool dispatchCommand(
                              "FROM t1 [LEFT|INNER] JOIN t2 ON t1.col = t2.col\n";
                 break;
             }
-            // Phase 48: silently optimize join order before execution
+            // Phase 89: Register any foreign tables as temp tables before join
             {
-                milansql::QueryOptimizer qopt;
-                qopt.optimize(cmd, engine);
+                std::vector<std::string> fdwToClean;
+                auto registerFdwMain = [&](const std::string& tbl) {
+                    if (engine.isForeignTable(tbl)) {
+                        milansql::Table ft = engine.executeForeignScan(tbl);
+                        engine.registerTempTable(tbl, std::move(ft));
+                        fdwToClean.push_back(tbl);
+                    }
+                };
+                registerFdwMain(cmd.tableName);
+                for (const auto& jc : cmd.joinClauses) registerFdwMain(jc.table);
+
+                // Phase 48: silently optimize join order before execution
+                {
+                    milansql::QueryOptimizer qopt;
+                    qopt.optimize(cmd, engine);
+                }
+                auto result = engine.executeJoins(
+                    cmd.tableName, cmd.joinClauses,
+                    cmd.whereConds, cmd.whereLogic);
+                for (const auto& tbl : fdwToClean)
+                    engine.dropTempTable(tbl);
+                std::cout << "\n";
+                if (!cmd.orderByCols.empty())
+                    result.sortByMulti(cmd.orderByCols);
+                if (!cmd.selectColumns.empty())
+                    result = result.project(cmd.selectColumns);
+                dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             }
-            auto result = engine.executeJoins(
-                cmd.tableName, cmd.joinClauses,
-                cmd.whereConds, cmd.whereLogic);
-            std::cout << "\n";
-            if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
-            if (!cmd.selectColumns.empty())
-                result = result.project(cmd.selectColumns);
-            dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             break;
         }
 
@@ -2662,6 +2719,27 @@ inline bool dispatchCommand(
             std::cout << "\n";
             milansql::Table result;
             bool usedIndex = false;
+
+            // Phase 89: Foreign Data Wrapper — intercept SELECT on foreign tables
+            if (engine.isForeignTable(cmd.tableName)) {
+                milansql::Table foreignResult = engine.executeForeignScan(cmd.tableName);
+                if (!cmd.whereConds.empty())
+                    foreignResult = engine.filterTable(foreignResult, cmd.whereConds, cmd.whereLogic);
+                if (!cmd.orderByCols.empty()) foreignResult.sortByMulti(cmd.orderByCols);
+                if (!cmd.selectColumns.empty())
+                    foreignResult = foreignResult.project(cmd.selectColumns);
+                if (cmd.isDistinct) foreignResult.makeDistinct();
+                dispatch_printTable(foreignResult, cmd.limit, cmd.limitOffset);
+                if (oldBuf) {
+                    std::cout.rdbuf(oldBuf);
+                    std::string captured = captureStream.str();
+                    std::string cacheKey = engine.getCurrentUser() + "\x01" + eingabe;
+                    qc.put(cacheKey, captured, cmd.tableName);
+                    std::cout << captured;
+                }
+                if (g_profiler.isEnabled()) g_profiler.endQuery();
+                break;
+            }
 
             // Phase 77: apply /*+ PARALLEL(N) */ hint
             int p77_savedWorkers = 0;
@@ -4641,6 +4719,63 @@ inline bool dispatchCommand(
         }
         break;
     }
+
+    // ── Phase 89: Foreign Data Wrapper ───────────────────────────
+
+    case milansql::CommandType::CREATE_SERVER: {
+        if (cmd.serverName.empty() || cmd.wrapperType.empty()) {
+            std::cout << "  Fehler: CREATE SERVER name FOREIGN DATA WRAPPER type\n\n"; break;
+        }
+        engine.createServer(cmd.serverName, cmd.wrapperType);
+        std::cout << "  Server '" << cmd.serverName
+                  << "' erstellt (FOREIGN DATA WRAPPER: " << cmd.wrapperType << ").\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DROP_SERVER: {
+        if (cmd.serverName.empty()) {
+            std::cout << "  Fehler: DROP SERVER name\n\n"; break;
+        }
+        engine.dropServer(cmd.serverName);
+        std::cout << "  Server '" << cmd.serverName << "' geloescht.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SERVERS:
+        engine.showServers();
+        break;
+
+    case milansql::CommandType::CREATE_FOREIGN_TABLE: {
+        if (cmd.tableName.empty() || cmd.serverName.empty()) {
+            std::cout << "  Fehler: CREATE FOREIGN TABLE name (...) SERVER server OPTIONS (...)\n\n"; break;
+        }
+        milansql::ForeignTableDef ftd;
+        ftd.name = cmd.tableName;
+        ftd.serverName = cmd.serverName;
+        for (const auto& col : cmd.columns) {
+            ftd.colNames.push_back(col.name);
+            ftd.colTypes.push_back(col.type);
+        }
+        ftd.options = cmd.fdwOptions;
+        engine.createForeignTable(std::move(ftd));
+        std::cout << "  Foreign Table '" << cmd.tableName
+                  << "' erstellt (SERVER: " << cmd.serverName << ", "
+                  << cmd.columns.size() << " Spalte(n)).\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DROP_FOREIGN_TABLE: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: DROP FOREIGN TABLE name\n\n"; break;
+        }
+        engine.dropForeignTable(cmd.tableName);
+        std::cout << "  Foreign Table '" << cmd.tableName << "' geloescht.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_FOREIGN_TABLES:
+        engine.showForeignTables();
+        break;
 
     case milansql::CommandType::SET_QUERY_REWRITE: {
         if (cmd.queryRewriteFlag == "ON") {

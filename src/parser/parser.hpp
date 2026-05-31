@@ -184,6 +184,13 @@ enum class CommandType {
     SHOW_STATISTICS_FOR,
     // Phase 87: Recursive CTEs
     SET_RECURSIVE_MAX_ITERATIONS,
+    // Phase 89: Foreign Data Wrapper
+    CREATE_SERVER,
+    DROP_SERVER,
+    SHOW_SERVERS,
+    CREATE_FOREIGN_TABLE,
+    DROP_FOREIGN_TABLE,
+    SHOW_FOREIGN_TABLES,
     UNKNOWN
 };
 
@@ -414,6 +421,11 @@ struct ParsedCommand {
 
     // Phase 82: Query Rewrite
     std::string queryRewriteFlag;  // "ON" or "OFF" for SET QUERY_REWRITE = ON/OFF
+
+    // Phase 89: Foreign Data Wrapper
+    std::string serverName;        // for CREATE SERVER / CREATE FOREIGN TABLE
+    std::string wrapperType;       // for CREATE SERVER: "csv" or "http_json"
+    std::map<std::string,std::string> fdwOptions;  // OPTIONS (key 'val', ...)
 };
 
 class Parser {
@@ -1812,6 +1824,13 @@ public:
                        toUpper(tokens[2]) == "FOR") {
                 cmd.type = CommandType::SHOW_STATISTICS_FOR;
                 cmd.tableName = tokens[3];
+            // Phase 89: SHOW SERVERS
+            } else if (kw1 == "SERVERS") {
+                cmd.type = CommandType::SHOW_SERVERS;
+            // Phase 89: SHOW FOREIGN TABLES
+            } else if (kw1 == "FOREIGN" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "TABLES") {
+                cmd.type = CommandType::SHOW_FOREIGN_TABLES;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2596,6 +2615,122 @@ public:
             } else {
                 cmd.type = CommandType::UNKNOWN;
             }
+
+        // ── Phase 89: CREATE SERVER name FOREIGN DATA WRAPPER type ──
+        } else if (kw0 == "CREATE" && kw1 == "SERVER") {
+            // CREATE SERVER <name> FOREIGN DATA WRAPPER <type>
+            cmd.type = CommandType::CREATE_SERVER;
+            if (tokens.size() >= 3) {
+                cmd.serverName = tokens[2];
+                // Find WRAPPER keyword and grab the type after it
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    if (toUpper(tokens[i]) == "WRAPPER" && i + 1 < tokens.size()) {
+                        cmd.wrapperType = tokens[i + 1];
+                        break;
+                    }
+                }
+                if (cmd.wrapperType.empty()) cmd.type = CommandType::UNKNOWN;
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 89: DROP SERVER name ────────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "SERVER") {
+            cmd.type = CommandType::DROP_SERVER;
+            if (tokens.size() >= 3) cmd.serverName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 89: CREATE FOREIGN TABLE name (...) SERVER s OPTIONS (...) ──
+        } else if (kw0 == "CREATE" && kw1 == "FOREIGN" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "TABLE") {
+            cmd.type = CommandType::CREATE_FOREIGN_TABLE;
+            // Use tokenizeFull to get the full token list including parens
+            auto ftToks = tokenizeFull(input);
+            // Find TABLE keyword position
+            size_t pos = 0;
+            for (size_t i = 0; i < ftToks.size(); ++i) {
+                if (toUpper(ftToks[i]) == "TABLE") { pos = i; break; }
+            }
+            if (pos + 1 < ftToks.size()) {
+                cmd.tableName = ftToks[pos + 1];
+                // Find the column definition block (...)
+                size_t parenOpen = pos + 2;
+                while (parenOpen < ftToks.size() && ftToks[parenOpen] != "(") ++parenOpen;
+                if (parenOpen < ftToks.size()) {
+                    // Collect tokens inside outer parens
+                    std::vector<std::string> colToks;
+                    int depth = 0;
+                    size_t pi = parenOpen;
+                    while (pi < ftToks.size()) {
+                        if (ftToks[pi] == "(") {
+                            if (depth > 0) colToks.push_back(ftToks[pi]);
+                            ++depth;
+                        } else if (ftToks[pi] == ")") {
+                            --depth;
+                            if (depth == 0) { ++pi; break; }
+                            colToks.push_back(ftToks[pi]);
+                        } else if (depth > 0) {
+                            colToks.push_back(ftToks[pi]);
+                        }
+                        ++pi;
+                    }
+                    // Parse col definitions: name TYPE, name TYPE, ...
+                    size_t ci = 0;
+                    while (ci < colToks.size()) {
+                        while (ci < colToks.size() && colToks[ci] == ",") ++ci;
+                        if (ci >= colToks.size()) break;
+                        std::string colName = colToks[ci++];
+                        std::string colType = (ci < colToks.size()) ? colToks[ci++] : "TEXT";
+                        // Skip trailing comma
+                        if (ci < colToks.size() && colToks[ci] == ",") ++ci;
+                        cmd.columns.push_back(Column(colName, colType));
+                    }
+                    // After column block, find SERVER keyword
+                    size_t ai = pi;
+                    while (ai < ftToks.size()) {
+                        if (toUpper(ftToks[ai]) == "SERVER" && ai + 1 < ftToks.size()) {
+                            cmd.serverName = ftToks[ai + 1];
+                            ai += 2;
+                            break;
+                        }
+                        ++ai;
+                    }
+                    // Find OPTIONS keyword and parse key 'val' pairs
+                    while (ai < ftToks.size()) {
+                        if (toUpper(ftToks[ai]) == "OPTIONS") {
+                            ++ai; // skip OPTIONS
+                            // skip opening paren
+                            if (ai < ftToks.size() && ftToks[ai] == "(") ++ai;
+                            // parse: key 'val', key 'val', ...
+                            while (ai < ftToks.size() && ftToks[ai] != ")") {
+                                if (ftToks[ai] == ",") { ++ai; continue; }
+                                std::string optKey = ftToks[ai++];
+                                std::string optVal;
+                                if (ai < ftToks.size() && ftToks[ai] != "," && ftToks[ai] != ")") {
+                                    optVal = ftToks[ai++];
+                                    // Strip surrounding quotes
+                                    if (optVal.size() >= 2 &&
+                                        ((optVal.front()=='\'' && optVal.back()=='\'') ||
+                                         (optVal.front()=='"'  && optVal.back()=='"')))
+                                        optVal = optVal.substr(1, optVal.size() - 2);
+                                }
+                                if (!optKey.empty())
+                                    cmd.fdwOptions[optKey] = optVal;
+                            }
+                            break;
+                        }
+                        ++ai;
+                    }
+                }
+            }
+            if (cmd.tableName.empty() || cmd.serverName.empty())
+                cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 89: DROP FOREIGN TABLE name ────────────────────
+        } else if (kw0 == "DROP" && kw1 == "FOREIGN" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "TABLE") {
+            cmd.type = CommandType::DROP_FOREIGN_TABLE;
+            cmd.tableName = tokens[3];
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

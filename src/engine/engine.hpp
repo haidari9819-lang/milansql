@@ -36,6 +36,9 @@
 #include "../parallel/parallel_executor.hpp" // Phase 77: Parallel Query
 #include "../replication/logical_repl.hpp"  // Phase 81: Logical Replication
 #include "../types/array_type.hpp"          // Phase 88: Array Data Type
+#include "../fdw/foreign_data_wrapper.hpp"  // Phase 89: FDW base
+#include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
+#include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -2997,6 +3000,12 @@ public:
         tempTableNames_.clear();
     }
 
+    // Entfernt eine einzelne Temp-Tabelle (Phase 89: FDW cleanup)
+    void dropTempTable(const std::string& name) {
+        tables_.erase(name);
+        tempTableNames_.erase(name);
+    }
+
     // ── Phase 45: Prepared Statements ────────────────────────────
 
     void prepareStmt(const std::string& name, const std::string& sql) {
@@ -3299,6 +3308,123 @@ public:
             std::cout << "\n";
         }
         std::cout << "\n";
+    }
+
+    // ── Phase 89: Foreign Data Wrapper ───────────────────────
+
+    void createServer(const std::string& name, const std::string& wrapperType) {
+        servers_[name] = ServerDef{name, wrapperType};
+    }
+
+    void dropServer(const std::string& name) {
+        servers_.erase(name);
+    }
+
+    void showServers() const {
+        std::cout << "\n  Servers:\n";
+        if (servers_.empty()) { std::cout << "  (keine)\n\n"; return; }
+        for (const auto& [n, s] : servers_)
+            std::cout << "  " << n << " (FOREIGN DATA WRAPPER: " << s.wrapperType << ")\n";
+        std::cout << "\n";
+    }
+
+    void createForeignTable(ForeignTableDef def) {
+        foreignTables_[def.name] = std::move(def);
+    }
+
+    void dropForeignTable(const std::string& name) {
+        foreignTables_.erase(name);
+    }
+
+    void showForeignTables() const {
+        std::cout << "\n  Foreign Tables:\n";
+        if (foreignTables_.empty()) { std::cout << "  (keine)\n\n"; return; }
+        for (const auto& [n, t] : foreignTables_) {
+            std::cout << "  " << n << " SERVER " << t.serverName << " (";
+            for (size_t i = 0; i < t.colNames.size(); ++i) {
+                if (i) std::cout << ", ";
+                std::cout << t.colNames[i] << " " << t.colTypes[i];
+            }
+            std::cout << ")\n";
+        }
+        std::cout << "\n";
+    }
+
+    bool isForeignTable(const std::string& name) const {
+        return foreignTables_.count(name) > 0;
+    }
+
+    const ForeignTableDef& getForeignTable(const std::string& name) const {
+        return foreignTables_.at(name);
+    }
+
+    const std::map<std::string, ServerDef>& getServers() const {
+        return servers_;
+    }
+
+    // Execute a foreign table scan and return result as a Table.
+    // String values are wrapped in single quotes to match the engine's storage
+    // format (same as INSERT VALUES), enabling JOIN comparisons to work correctly.
+    Table executeForeignScan(const std::string& tableName) {
+        const auto& ftd = foreignTables_.at(tableName);
+        auto srv_it = servers_.find(ftd.serverName);
+        if (srv_it == servers_.end())
+            throw std::runtime_error("Server '" + ftd.serverName + "' nicht gefunden.");
+        const auto& srv = srv_it->second;
+
+        std::vector<std::vector<std::string>> rows;
+        if (srv.wrapperType == "csv") {
+            CsvFdw fdw;
+            rows = fdw.scan(ftd, ftd.colNames);
+        } else if (srv.wrapperType == "http_json") {
+            HttpFdw fdw;
+            rows = fdw.scan(ftd, ftd.colNames);
+        }
+
+        std::vector<Column> cols;
+        for (size_t i = 0; i < ftd.colNames.size(); ++i)
+            cols.emplace_back(ftd.colNames[i],
+                              i < ftd.colTypes.size() ? ftd.colTypes[i] : "TEXT");
+
+        // Helper: determine if a column type is numeric (INT/FLOAT/DOUBLE/etc.)
+        auto isNumericType = [](const std::string& type) -> bool {
+            std::string up = type;
+            for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return up == "INT"     || up == "INTEGER" || up == "BIGINT"  ||
+                   up == "SMALLINT"|| up == "FLOAT"   || up == "DOUBLE"  ||
+                   up == "DECIMAL" || up == "NUMERIC" || up == "REAL";
+        };
+
+        // Helper: check if a value is already quoted or is NULL
+        auto needsQuoting = [](const std::string& val) -> bool {
+            if (val == "NULL") return false;
+            if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'') return false;
+            return true;
+        };
+
+        Table t(tableName, std::move(cols));
+        for (const auto& r : rows) {
+            std::vector<std::string> normalized;
+            normalized.reserve(r.size());
+            for (size_t i = 0; i < r.size(); ++i) {
+                const std::string& colType = (i < ftd.colTypes.size()) ? ftd.colTypes[i] : "TEXT";
+                const std::string& val = r[i];
+                if (!isNumericType(colType) && needsQuoting(val)) {
+                    // Wrap in single quotes (escape any internal quotes)
+                    std::string quoted = "'";
+                    for (char c : val) {
+                        if (c == '\'') quoted += "''";
+                        else           quoted += c;
+                    }
+                    quoted += "'";
+                    normalized.push_back(std::move(quoted));
+                } else {
+                    normalized.push_back(val);
+                }
+            }
+            t.insert(Row(normalized));
+        }
+        return t;
     }
 
     // ── Phase 77: Parallel Query ──────────────────────────────
@@ -5896,6 +6022,10 @@ public:
     std::map<std::string, PublicationDef> publications_;
     std::map<std::string, SubscriptionDef> subscriptions_;
     LogicalReplLog logicalLog_;
+
+    // Phase 89: Foreign Data Wrapper
+    std::map<std::string, ServerDef>       servers_;
+    std::map<std::string, ForeignTableDef> foreignTables_;
 
     // Phase 85: WAL Checkpointing + Auto-Vacuum
     CheckpointManager checkpointMgr_;

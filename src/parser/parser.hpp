@@ -171,6 +171,15 @@ enum class CommandType {
     SHOW_PAGE_STATS,
     FLUSH_PAGES,
     SET_USE_PAGED_STORAGE,
+    // Phase 85: WAL Checkpointing + Auto-Vacuum
+    CHECKPOINT,
+    SHOW_CHECKPOINT_STATUS,
+    SET_AUTO_CHECKPOINT,
+    SHOW_VACUUM_STATUS,
+    SET_AUTO_VACUUM,
+    SET_AUTO_VACUUM_THRESHOLD,
+    VACUUM_TABLE,
+    VACUUM_FULL,
     UNKNOWN
 };
 
@@ -1775,15 +1784,29 @@ public:
             } else if (kw1 == "PAGE" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATS") {
                 cmd.type = CommandType::SHOW_PAGE_STATS;
+            // Phase 85: SHOW CHECKPOINT STATUS
+            } else if (kw1 == "CHECKPOINT" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_CHECKPOINT_STATUS;
+            // Phase 85: SHOW VACUUM STATUS
+            } else if (kw1 == "VACUUM" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_VACUUM_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
 
-        // ── Phase 71: VACUUM / VACUUM ANALYZE ────────────────────
+        // ── Phase 71/85: VACUUM / VACUUM ANALYZE / VACUUM FULL / VACUUM <table>
         } else if (kw0 == "VACUUM") {
             if (tokens.size() >= 2 && toUpper(tokens[1]) == "ANALYZE")
                 cmd.type = CommandType::VACUUM_ANALYZE;
-            else
+            else if (tokens.size() >= 2 && toUpper(tokens[1]) == "FULL")
+                cmd.type = CommandType::VACUUM_FULL;
+            else if (tokens.size() >= 2 && toUpper(tokens[1]) != "ANALYZE" &&
+                     toUpper(tokens[1]) != "FULL") {
+                cmd.type = CommandType::VACUUM_TABLE;
+                cmd.tableName = tokens[1];
+            } else
                 cmd.type = CommandType::VACUUM;
 
         // ── Phase 72: SHOW RECOVERY STATUS ───────────────────────
@@ -1961,6 +1984,10 @@ public:
             cmd.type = CommandType::SET_BUFFER_POOL_SIZE;
             cmd.values.push_back(valTok);
 
+        // ── Phase 85: CHECKPOINT ─────────────────────────────────
+        } else if (kw0 == "CHECKPOINT") {
+            cmd.type = CommandType::CHECKPOINT;
+
         // ── Phase 84: FLUSH PAGES ────────────────────────────────
         } else if (kw0 == "FLUSH" && kw1 == "PAGES") {
             cmd.type = CommandType::FLUSH_PAGES;
@@ -1972,6 +1999,39 @@ public:
                 std::string val = tokens.size() >= 3 ? tokens[2] : "";
                 if (val == "=" && tokens.size() >= 4) val = tokens[3];
                 cmd.values.push_back(toUpper(val));
+            }
+
+        // ── Phase 85: SET AUTO_CHECKPOINT = N ────────────────────
+        } else if (kw0 == "SET" && kw1 == "AUTO_CHECKPOINT") {
+            cmd.type = CommandType::SET_AUTO_CHECKPOINT;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                cmd.values.push_back(val);
+            }
+
+        // ── Phase 85: SET AUTO_VACUUM = ON/OFF ───────────────────
+        } else if (kw0 == "SET" && kw1 == "AUTO_VACUUM" &&
+                   (tokens.size() < 3 || toUpper(tokens[2]) != "THRESHOLD")) {
+            cmd.type = CommandType::SET_AUTO_VACUUM;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                cmd.values.push_back(toUpper(val));
+            }
+
+        // ── Phase 85: SET AUTO_VACUUM_THRESHOLD = N ──────────────
+        } else if (kw0 == "SET" && (kw1 == "AUTO_VACUUM_THRESHOLD" ||
+                   (kw1 == "AUTO_VACUUM" && tokens.size() >= 3 &&
+                    toUpper(tokens[2]) == "THRESHOLD"))) {
+            cmd.type = CommandType::SET_AUTO_VACUUM_THRESHOLD;
+            {
+                // "SET AUTO_VACUUM_THRESHOLD = 50"  or
+                // "SET AUTO_VACUUM THRESHOLD = 50"
+                size_t valIdx = (kw1 == "AUTO_VACUUM_THRESHOLD") ? 2 : 3;
+                std::string val = tokens.size() > valIdx ? tokens[valIdx] : "";
+                if (val == "=" && tokens.size() > valIdx + 1) val = tokens[valIdx + 1];
+                cmd.values.push_back(val);
             }
 
         // ── Phase 82: SET QUERY_REWRITE = ON/OFF ─────────────────

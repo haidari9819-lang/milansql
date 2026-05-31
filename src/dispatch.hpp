@@ -2629,6 +2629,10 @@ inline bool dispatchCommand(
         persistFn();
         engine.deleteWal();             // Phase 72: delete WAL only after successful persist
         std::cout << "  Transaktion erfolgreich abgeschlossen (COMMIT).\n\n";
+        // Phase 85: auto-checkpoint if interval reached
+        if (engine.shouldAutoCheckpoint()) {
+            engine.doCheckpoint();
+        }
         break;
 
     case milansql::CommandType::ROLLBACK:
@@ -3653,12 +3657,92 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::VACUUM:
     case milansql::CommandType::VACUUM_ANALYZE: {
-        size_t cleaned = engine.vacuumAll();
+        size_t cleaned = engine.vacuumAllTracked();
         std::cout << "  VACUUM: " << cleaned << " alte Version(en) bereinigt.\n";
         if (cmd.type == milansql::CommandType::VACUUM_ANALYZE)
             std::cout << "  ANALYZE: Tabellenstatistiken aktualisiert.\n";
         std::cout << "\n";
         persistFn();
+        break;
+    }
+
+    // ── Phase 85: VACUUM <table> ──────────────────────────────
+    case milansql::CommandType::VACUUM_TABLE: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: VACUUM <tabellenname>\n\n"; break;
+        }
+        try {
+            size_t cleaned = engine.vacuumTableTracked(cmd.tableName);
+            std::cout << "  VACUUM '" << cmd.tableName << "': "
+                      << cleaned << " alte Version(en) bereinigt.\n\n";
+            persistFn();
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 85: VACUUM FULL ─────────────────────────────────
+    case milansql::CommandType::VACUUM_FULL: {
+        size_t cleaned = engine.vacuumAllTracked();
+        std::cout << "  VACUUM FULL: " << cleaned << " alte Version(en) bereinigt (aggressive Komprimierung).\n\n";
+        persistFn();
+        break;
+    }
+
+    // ── Phase 85: CHECKPOINT ──────────────────────────────────
+    case milansql::CommandType::CHECKPOINT: {
+        engine.doCheckpoint();
+        break;
+    }
+
+    // ── Phase 85: SHOW CHECKPOINT STATUS ─────────────────────
+    case milansql::CommandType::SHOW_CHECKPOINT_STATUS: {
+        engine.showCheckpointStatus();
+        break;
+    }
+
+    // ── Phase 85: SET AUTO_CHECKPOINT = N ────────────────────
+    case milansql::CommandType::SET_AUTO_CHECKPOINT: {
+        std::string val = cmd.values.empty() ? "" : cmd.values[0];
+        try {
+            uint64_t n = std::stoull(val);
+            engine.setAutoCheckpointInterval(n);
+            std::cout << "  AUTO_CHECKPOINT Intervall gesetzt: " << n << " Transaktionen\n\n";
+        } catch (...) {
+            std::cout << "  Fehler: SET AUTO_CHECKPOINT = <zahl>\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 85: SHOW VACUUM STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_VACUUM_STATUS: {
+        engine.showVacuumStatus();
+        break;
+    }
+
+    // ── Phase 85: SET AUTO_VACUUM = ON/OFF ───────────────────
+    case milansql::CommandType::SET_AUTO_VACUUM: {
+        std::string val = cmd.values.empty() ? "" : cmd.values[0];
+        if (val == "ON" || val == "OFF") {
+            engine.setAutoVacuumEnabled(val == "ON");
+            std::cout << "  AUTO_VACUUM = " << val << "\n\n";
+        } else {
+            std::cout << "  Fehler: SET AUTO_VACUUM = ON | OFF\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 85: SET AUTO_VACUUM_THRESHOLD = N ──────────────
+    case milansql::CommandType::SET_AUTO_VACUUM_THRESHOLD: {
+        std::string val = cmd.values.empty() ? "" : cmd.values[0];
+        try {
+            size_t n = std::stoull(val);
+            engine.setAutoVacuumThreshold(n);
+            std::cout << "  AUTO_VACUUM_THRESHOLD gesetzt: " << n << " Dead Tuples\n\n";
+        } catch (...) {
+            std::cout << "  Fehler: SET AUTO_VACUUM_THRESHOLD = <zahl>\n\n";
+        }
         break;
     }
 

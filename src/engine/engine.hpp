@@ -30,6 +30,8 @@
 #include "../locking/lock_manager.hpp"
 #include "../spatial/spatial.hpp"      // Phase 70: Spatial Index
 #include "../mvcc/transaction_manager.hpp"  // Phase 71: MVCC
+#include "../mvcc/vacuum.hpp"               // Phase 85: Auto-Vacuum
+#include "../wal/checkpoint.hpp"            // Phase 85: WAL Checkpointing
 #include "../buffer/buffer_pool.hpp"   // Phase 73: Buffer Pool Manager
 #include "../parallel/parallel_executor.hpp" // Phase 77: Parallel Query
 #include "../replication/logical_repl.hpp"  // Phase 81: Logical Replication
@@ -1835,6 +1837,7 @@ public:
         }
         Table& t = getTable(tbl);
         std::size_t deleted = t.deleteWhere(colIdx(t, wCol), wVal);
+        if (deleted) vacuumMgr_.addDeadTuples(tbl, deleted);  // Phase 85
         bufferPool_.markDirty(tbl);  // Phase 73
 
         // Phase 49: Update fulltext indexes for this table
@@ -2064,6 +2067,8 @@ public:
             std::ofstream wal(walPath_, std::ios::app);
             if (wal) wal << "TX_COMMIT:" << commitId << "\n";
         }
+        // Phase 85: track committed transaction for checkpointing
+        checkpointMgr_.onCommit();
     }
 
     // ROLLBACK: Puffer verwerfen, Transaktion abbrechen, WAL löschen.
@@ -5525,16 +5530,21 @@ private:
                 Table& t = getTable(op.tableName);
                 if (mvccTxId_ != 0) {
                     // Phase 71: MVCC logical delete — stamp xmax instead of physical remove
-                    t.stampDeleteWhere(colIdx(t, op.whereCol), op.whereVal, mvccTxId_);
+                    std::size_t stamped = t.stampDeleteWhere(colIdx(t, op.whereCol), op.whereVal, mvccTxId_);
+                    if (stamped) vacuumMgr_.addDeadTuples(op.tableName, stamped);  // Phase 85
                 } else {
-                    t.deleteWhere(colIdx(t, op.whereCol), op.whereVal);
+                    std::size_t del = t.deleteWhere(colIdx(t, op.whereCol), op.whereVal);
+                    if (del) vacuumMgr_.addDeadTuples(op.tableName, del);  // Phase 85
                 }
                 break;
             }
             case BufferedOp::Type::DELETE_ALL: {
                 if (mvccTxId_ != 0) {
                     // Phase 71: MVCC logical delete all
-                    getTable(op.tableName).stampDeleteAll(mvccTxId_);
+                    Table& tda = getTable(op.tableName);
+                    std::size_t before = tda.rowCount();
+                    tda.stampDeleteAll(mvccTxId_);
+                    vacuumMgr_.addDeadTuples(op.tableName, before);  // Phase 85
                 } else {
                     getTable(op.tableName).deleteAll();
                 }
@@ -5815,6 +5825,10 @@ public:
     std::map<std::string, PublicationDef> publications_;
     std::map<std::string, SubscriptionDef> subscriptions_;
     LogicalReplLog logicalLog_;
+
+    // Phase 85: WAL Checkpointing + Auto-Vacuum
+    CheckpointManager checkpointMgr_;
+    VacuumManager     vacuumMgr_;
 
 public:
     // ── Phase 55: Öffentliche Hilfsmethoden ─────────────────────────────────────
@@ -6171,6 +6185,73 @@ public:
         for (const auto& [name, tbl] : tables_)
             total += tbl.deadRowCount();
         return total;
+    }
+
+    // ── Phase 85: VACUUM with VacuumManager integration ──────
+    size_t vacuumAllTracked() {
+        size_t total = 0;
+        for (auto& [name, tbl] : tables_) {
+            size_t cleaned = tbl.vacuum([this](uint64_t txId) {
+                return txManager_.isCommitted(txId);
+            });
+            if (cleaned) {
+                total += cleaned;
+                vacuumMgr_.resetDeadTuples(name);
+            }
+        }
+        return total;
+    }
+
+    size_t vacuumTableTracked(const std::string& tblRaw) {
+        auto name = resolveTableName(tblRaw);
+        size_t cleaned = getTable(name).vacuum([this](uint64_t txId) {
+            return txManager_.isCommitted(txId);
+        });
+        if (cleaned) vacuumMgr_.resetDeadTuples(name);
+        return cleaned;
+    }
+
+    // ── Phase 85: Checkpoint API ──────────────────────────────
+    void doCheckpoint() {
+        uint64_t txId = txManager_.currentGlobalId();
+        checkpointMgr_.doCheckpoint(txId);
+    }
+
+    bool shouldAutoCheckpoint() const {
+        return checkpointMgr_.shouldAutoCheckpoint();
+    }
+
+    void setAutoCheckpointInterval(uint64_t n) {
+        checkpointMgr_.setAutoCheckpointInterval(n);
+    }
+
+    void showCheckpointStatus() const {
+        checkpointMgr_.showStatus();
+    }
+
+    // ── Phase 85: Vacuum Manager API ─────────────────────────
+    void showVacuumStatus() const {
+        // sync tracked dead tuples with actual table state
+        vacuumMgr_.showStatus();
+    }
+
+    void setAutoVacuumEnabled(bool on) {
+        vacuumMgr_.setAutoVacuumEnabled(on);
+    }
+
+    void setAutoVacuumThreshold(size_t n) {
+        vacuumMgr_.setAutoVacuumThreshold(n);
+    }
+
+    // Called from main.cpp to start background thread
+    void startAutoVacuum() {
+        vacuumMgr_.startAutoVacuum([this]() {
+            return vacuumAllTracked();
+        });
+    }
+
+    void stopAutoVacuum() {
+        vacuumMgr_.stopAutoVacuum();
     }
 
     // SHOW TRANSACTIONS

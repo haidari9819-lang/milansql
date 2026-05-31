@@ -32,6 +32,9 @@
 // Phase 72: WAL Crash Recovery
 #include "wal/wal_recovery.hpp"
 
+// Phase 85: WAL Checkpointing (header already in engine.hpp, just for clarity)
+// #include "wal/checkpoint.hpp"  — included transitively via engine.hpp
+
 // Phase 79: Connection String Parser
 #include "utils/connection_string.hpp"
 
@@ -43,7 +46,7 @@
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v3.2.0 ===           \u2551\n"
+              << "  \u2551        === MilanSQL v3.3.0 ===           \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -465,6 +468,9 @@ int main(int argc, char* argv[]) {
         std::cout << "  [Slave] Verbinde zu " << masterHost << ":" << masterPort << "...\n\n";
     }
 
+    // ── Phase 85: Start Auto-Vacuum background thread ────────
+    engine.startAutoVacuum();
+
     // ── Phase 61: Event Scheduler (REPL mode) ────────────────
     auto eventExecFn = [&](const std::string& sql) {
         try {
@@ -768,6 +774,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    engine.stopAutoVacuum();        // Phase 85: stop background vacuum thread
     bufferPoolStop.store(true);
     bufferPoolThread.detach();
     return 0;

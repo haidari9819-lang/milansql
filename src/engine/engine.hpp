@@ -240,10 +240,11 @@ struct HavingCondition {
 
 // ── JOIN-Klausel (Phase 12) ───────────────────────────────────
 struct JoinClause {
-    std::string joinType;  // "INNER", "LEFT", "RIGHT", "FULL"
-    std::string table;     // Name der rechten Tabelle
-    std::string onLeft;    // "tabelle.spalte" linke ON-Seite
-    std::string onRight;   // "tabelle.spalte" rechte ON-Seite
+    std::string joinType;   // "INNER", "LEFT", "RIGHT", "FULL"
+    std::string table;      // Name der rechten Tabelle
+    std::string tableAlias; // optionaler Alias der rechten Tabelle (Phase 87)
+    std::string onLeft;     // "tabelle.spalte" linke ON-Seite
+    std::string onRight;    // "tabelle.spalte" rechte ON-Seite
 };
 
 // ── Phase 49: Full-Text Index ─────────────────────────────────

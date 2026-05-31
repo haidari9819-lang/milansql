@@ -182,6 +182,8 @@ enum class CommandType {
     VACUUM_FULL,
     // Phase 86: Statistics-based Query Planner
     SHOW_STATISTICS_FOR,
+    // Phase 87: Recursive CTEs
+    SET_RECURSIVE_MAX_ITERATIONS,
     UNKNOWN
 };
 
@@ -296,6 +298,7 @@ struct ParsedCommand {
     // Phase 41: WITH / CTE — Common Table Expressions
     // Jeder Eintrag: {cte_name, inner_sql}
     std::vector<std::pair<std::string,std::string>> cteList;
+    bool isRecursiveCte = false;  // Phase 87: WITH RECURSIVE
 
     // Phase 43: Trigger fields
     std::string triggerName;
@@ -492,7 +495,13 @@ public:
             auto ftFull = tokenizeFull(input);
             if (!ftFull.empty() && toUpper(ftFull[0]) == "WITH") {
                 std::vector<std::pair<std::string,std::string>> ctes;
+                bool isRecursive = false;
                 size_t i = 1; // skip "WITH"
+                // Phase 87: WITH RECURSIVE
+                if (i < ftFull.size() && toUpper(ftFull[i]) == "RECURSIVE") {
+                    isRecursive = true;
+                    ++i;
+                }
                 while (i < ftFull.size()) {
                     // skip commas between CTEs
                     while (i < ftFull.size() && ftFull[i] == ",") ++i;
@@ -535,6 +544,7 @@ public:
                 if (!ctes.empty() && !mainSql.empty()) {
                     ParsedCommand result = parse(mainSql);
                     result.cteList = ctes;
+                    result.isRecursiveCte = isRecursive;
                     result.raw = input;
                     return result;
                 }
@@ -2036,6 +2046,18 @@ public:
                 // "SET AUTO_VACUUM_THRESHOLD = 50"  or
                 // "SET AUTO_VACUUM THRESHOLD = 50"
                 size_t valIdx = (kw1 == "AUTO_VACUUM_THRESHOLD") ? 2 : 3;
+                std::string val = tokens.size() > valIdx ? tokens[valIdx] : "";
+                if (val == "=" && tokens.size() > valIdx + 1) val = tokens[valIdx + 1];
+                cmd.values.push_back(val);
+            }
+
+        // ── Phase 87: SET RECURSIVE_MAX_ITERATIONS = N ───────────
+        } else if (kw0 == "SET" && (kw1 == "RECURSIVE_MAX_ITERATIONS" ||
+                   (kw1 == "RECURSIVE" && tokens.size() >= 3 &&
+                    toUpper(tokens[2]) == "MAX_ITERATIONS"))) {
+            cmd.type = CommandType::SET_RECURSIVE_MAX_ITERATIONS;
+            {
+                size_t valIdx = (kw1 == "RECURSIVE_MAX_ITERATIONS") ? 2 : 3;
                 std::string val = tokens.size() > valIdx ? tokens[valIdx] : "";
                 if (val == "=" && tokens.size() > valIdx + 1) val = tokens[valIdx + 1];
                 cmd.values.push_back(val);
@@ -3598,14 +3620,23 @@ private:
         if (hasCase || hasFunc || hasScalarSub37 || hasWindowFunc) {
             parseCaseSelectItems(ft, selStart, fromPos, cmd);
         } else {
-            std::string colList;
+            // Group tokens between real commas as single column specs
+            // (preserves "t.depth + 1" and "a AS alias" as single entries)
+            std::string cur;
+            auto pushCur = [&]() {
+                while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
+                while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
+                if (cur != "*" && !cur.empty()) cmd.selectColumns.push_back(cur);
+                cur.clear();
+            };
             for (size_t i = selStart; i < fromPos; ++i) {
-                if (ft[i] == "," || ft[i] == "(" || ft[i] == ")") continue;
-                if (!colList.empty()) colList += ",";
-                colList += ft[i];
+                if (ft[i] == ",") { pushCur(); }
+                else if (ft[i] != "(" && ft[i] != ")") {
+                    if (!cur.empty()) cur += " ";
+                    cur += ft[i];
+                }
             }
-            for (const auto& c : splitTrim(colList, ','))
-                if (c != "*" && !c.empty()) cmd.selectColumns.push_back(c);
+            pushCur();
         }
 
         // WHERE (mit IN-Unterstützung)
@@ -4056,20 +4087,41 @@ private:
 
         cmd.tableName = ft[fromPos + 1];
 
+        // Phase 87: optional alias for the base table (FROM tbl alias JOIN ...)
+        if (fromPos + 2 < N) {
+            std::string next = toUpper(ft[fromPos + 2]);
+            if (next != "INNER" && next != "LEFT" && next != "RIGHT" &&
+                next != "FULL" && next != "JOIN" && next != "ON" &&
+                next != "WHERE" && next != "ORDER" && next != "LIMIT" &&
+                next != "OUTER" && ft[fromPos + 2] != "," &&
+                ft[fromPos + 2] != "(" && ft[fromPos + 2] != ")") {
+                cmd.tableAlias = ft[fromPos + 2];
+            }
+        }
+
         // SELECT-Spalten (zwischen SELECT/DISTINCT und FROM)
         size_t selStart = 1;
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
         }
-        std::string colList;
-        for (size_t i = selStart; i < fromPos; ++i) {
-            if (ft[i] == ",") continue;
-            if (!colList.empty()) colList += ",";
-            colList += ft[i];
+        // Group tokens between real commas as single column specs (handles "t.depth + 1")
+        {
+            std::string cur;
+            auto pushCurJ = [&]() {
+                while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
+                while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
+                if (cur != "*" && !cur.empty()) cmd.selectColumns.push_back(cur);
+                cur.clear();
+            };
+            for (size_t j = selStart; j < fromPos; ++j) {
+                if (ft[j] == ",") { pushCurJ(); }
+                else if (ft[j] != "(" && ft[j] != ")") {
+                    if (!cur.empty()) cur += " ";
+                    cur += ft[j];
+                }
+            }
+            pushCurJ();
         }
-        for (const auto& c : splitTrim(colList, ','))
-            if (c != "*" && !c.empty())
-                cmd.selectColumns.push_back(c);
 
         // JOIN-Klauseln scannen (zwischen Basistabelle und WHERE/ORDER/LIMIT)
         size_t scanEnd = std::min({wherePos, orderPos, limitPos, N});
@@ -4086,31 +4138,38 @@ private:
             if (u == "OUTER") {                    ++i; continue; }  // FULL OUTER JOIN
 
             if (u == "JOIN") {
-                // Erwartet: table ON left = right
+                // Erwartet: table [alias] ON left = right
                 if (i + 3 >= scanEnd) { cmd.type = CommandType::UNKNOWN; return; }
 
                 JoinClause jc;
                 jc.joinType = curType;
                 jc.table    = ft[i + 1];
 
-                if (toUpper(ft[i + 2]) != "ON") {
+                // Optional alias before ON
+                size_t onIdx = i + 2;
+                if (onIdx < scanEnd && toUpper(ft[onIdx]) != "ON") {
+                    jc.tableAlias = ft[onIdx];  // e.g. "t" in "JOIN tree t ON ..."
+                    onIdx++;
+                }
+
+                if (onIdx >= scanEnd || toUpper(ft[onIdx]) != "ON") {
                     cmd.type = CommandType::UNKNOWN; return;
                 }
 
                 // ON-Bedingung: 3 Tokens "left = right" oder 1 Token "left=right"
-                if (i + 5 < scanEnd && ft[i + 4] == "=") {
-                    jc.onLeft  = ft[i + 3];
-                    jc.onRight = ft[i + 5];
-                    i += 6;
-                } else if (i + 3 < scanEnd) {
-                    const std::string& tok = ft[i + 3];
+                if (onIdx + 3 < scanEnd && ft[onIdx + 2] == "=") {
+                    jc.onLeft  = ft[onIdx + 1];
+                    jc.onRight = ft[onIdx + 3];
+                    i = onIdx + 4;
+                } else if (onIdx + 1 < scanEnd) {
+                    const std::string& tok = ft[onIdx + 1];
                     auto eq = tok.find('=');
                     if (eq == std::string::npos) {
                         cmd.type = CommandType::UNKNOWN; return;
                     }
                     jc.onLeft  = tok.substr(0, eq);
                     jc.onRight = tok.substr(eq + 1);
-                    i += 4;
+                    i = onIdx + 2;
                 } else {
                     cmd.type = CommandType::UNKNOWN; return;
                 }

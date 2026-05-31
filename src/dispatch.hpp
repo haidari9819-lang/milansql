@@ -1205,6 +1205,447 @@ struct ProcExec {
 
 } // anonymous namespace
 
+// ── Phase 87: Recursive CTE helpers ──────────────────────────
+
+// Global max iterations guard (default 100, SET RECURSIVE_MAX_ITERATIONS changes it)
+static int g_recursiveMaxIter = 100;
+
+// Evaluate a single expression token against a row.
+// Handles: alias-qualified names (k.id → id), bare column names, literals.
+// aliasMap: user alias → actual table name (e.g. {"n":"t2", "t":"tree"})
+static inline std::string dispatch_evalExprAtom(
+        const std::string& tok,
+        const std::vector<milansql::Column>& cols,
+        const milansql::Row& row,
+        const std::map<std::string,std::string>& aliasMap = {})
+{
+    // Parse token as "alias.col" or "col"
+    std::string userAlias;
+    std::string colName = tok;
+    auto dot = tok.find('.');
+    if (dot != std::string::npos) {
+        userAlias = tok.substr(0, dot);
+        colName   = tok.substr(dot + 1);
+    }
+
+    // If alias is known, resolve to actual table name first (precise match)
+    if (!userAlias.empty()) {
+        auto it = aliasMap.find(userAlias);
+        std::string actualTbl = (it != aliasMap.end()) ? it->second : "";
+        for (size_t ci = 0; ci < cols.size(); ++ci) {
+            if (ci >= row.values.size()) continue;
+            const std::string& cn = cols[ci].name;
+            auto cdot = cn.rfind('.');
+            std::string tblPart  = (cdot != std::string::npos) ? cn.substr(0, cdot) : "";
+            std::string barePart = (cdot != std::string::npos) ? cn.substr(cdot + 1) : cn;
+            if (barePart != colName) continue;
+            // Match against resolved table name (or alias directly if not in map)
+            std::string wantTbl = actualTbl.empty() ? userAlias : actualTbl;
+            if (tblPart == wantTbl) return row.values[ci];
+        }
+        // Fallback: suffix match using resolved table name (e.g. "public.t2" ends with "t2")
+        {
+            std::string wantSuffix = actualTbl.empty() ? userAlias : actualTbl;
+            for (size_t ci = 0; ci < cols.size(); ++ci) {
+                if (ci >= row.values.size()) continue;
+                const std::string& cn = cols[ci].name;
+                auto cdot = cn.rfind('.');
+                std::string tblPart  = (cdot != std::string::npos) ? cn.substr(0, cdot) : "";
+                std::string barePart = (cdot != std::string::npos) ? cn.substr(cdot + 1) : cn;
+                if (barePart != colName) continue;
+                if (tblPart.empty()) return row.values[ci];
+                if (tblPart.size() >= wantSuffix.size() &&
+                    tblPart.substr(tblPart.size() - wantSuffix.size()) == wantSuffix)
+                    return row.values[ci];
+            }
+        }
+        // Last resort: bare column name
+        for (size_t ci = 0; ci < cols.size(); ++ci) {
+            if (ci >= row.values.size()) continue;
+            const std::string& cn = cols[ci].name;
+            auto cdot = cn.rfind('.');
+            std::string bare = (cdot != std::string::npos) ? cn.substr(cdot + 1) : cn;
+            if (bare == colName) return row.values[ci];
+        }
+        return tok;  // literal
+    }
+
+    // No alias: return first matching bare column name
+    for (size_t ci = 0; ci < cols.size(); ++ci) {
+        if (ci >= row.values.size()) continue;
+        const std::string& cn = cols[ci].name;
+        auto cdot = cn.rfind('.');
+        std::string barePart = (cdot != std::string::npos) ? cn.substr(cdot + 1) : cn;
+        if (barePart == colName || cn == colName) return row.values[ci];
+    }
+
+    // Not a column → treat as literal
+    return tok;
+}
+
+// Evaluate a simple binary expression "left op right" or a single atom.
+// Supported ops: +, -, *, /
+static inline std::string dispatch_evalExprFull(
+        const std::string& expr,
+        const std::vector<milansql::Column>& cols,
+        const milansql::Row& row,
+        const std::map<std::string,std::string>& aliasMap = {})
+{
+    // Tokenise by whitespace
+    std::vector<std::string> parts;
+    {
+        std::istringstream ss(expr);
+        std::string t;
+        while (ss >> t) parts.push_back(t);
+    }
+
+    if (parts.size() == 1)
+        return dispatch_evalExprAtom(parts[0], cols, row, aliasMap);
+
+    if (parts.size() == 3) {
+        const std::string& op = parts[1];
+        if (op == "+" || op == "-" || op == "*" || op == "/") {
+            std::string lv = dispatch_evalExprAtom(parts[0], cols, row, aliasMap);
+            std::string rv = dispatch_evalExprAtom(parts[2], cols, row, aliasMap);
+            try {
+                // Try integer arithmetic first
+                bool lInt = true, rInt = true;
+                for (char c : lv) if (c != '-' && !std::isdigit((unsigned char)c)) { lInt = false; break; }
+                for (char c : rv) if (c != '-' && !std::isdigit((unsigned char)c)) { rInt = false; break; }
+                if (lInt && rInt && !lv.empty() && !rv.empty()) {
+                    long long l = std::stoll(lv), r = std::stoll(rv);
+                    long long res = (op == "+") ? l + r
+                                  : (op == "-") ? l - r
+                                  : (op == "*") ? l * r
+                                  : (r != 0 ? l / r : 0);
+                    return std::to_string(res);
+                }
+                // Fall back to double arithmetic
+                double ld = std::stod(lv), rd = std::stod(rv);
+                double res = (op == "+") ? ld + rd
+                            : (op == "-") ? ld - rd
+                            : (op == "*") ? ld * rd
+                            : (rd != 0.0 ? ld / rd : 0.0);
+                std::ostringstream oss;
+                // If result is a whole number, format without decimals
+                if (res == static_cast<long long>(res))
+                    oss << static_cast<long long>(res);
+                else
+                    oss << std::fixed << std::setprecision(6) << res;
+                return oss.str();
+            } catch (...) {}
+        }
+    }
+
+    // Multi-token or unknown: just concatenate evaluated atoms
+    std::string result;
+    for (const auto& p : parts) result += dispatch_evalExprAtom(p, cols, row, aliasMap);
+    return result;
+}
+
+// Custom projector: handles "expr AS alias" and alias-qualified cols.
+// Builds a new Table from src with columns defined by selectCols list.
+// Each entry in selectCols can be:
+//   "colName"           → plain column
+//   "alias.colName"     → alias-qualified column
+//   "expr"              → literal or single-column reference
+//   "expr AS alias"     → expression with AS alias (may span multiple space-separated tokens)
+// aliasMap: user alias → actual table name, forwarded to expression evaluator
+static inline milansql::Table dispatch_projectExprs(
+        const milansql::Table& src,
+        const std::vector<std::string>& selectCols,
+        const std::map<std::string,std::string>& aliasMap = {})
+{
+    // Parse each selectCol into {expr, alias}
+    struct ColSpec { std::string expr; std::string alias; };
+    std::vector<ColSpec> specs;
+    for (const auto& sc : selectCols) {
+        // Find " AS " (case-insensitive)
+        std::string upper = sc;
+        for (char& c : upper) c = static_cast<char>(std::toupper((unsigned char)c));
+        auto asPos = upper.find(" AS ");
+        if (asPos != std::string::npos) {
+            std::string expr  = sc.substr(0, asPos);
+            std::string alias = sc.substr(asPos + 4);
+            // trim
+            while (!expr.empty()  && expr.front()  == ' ') expr.erase(expr.begin());
+            while (!expr.empty()  && expr.back()   == ' ') expr.pop_back();
+            while (!alias.empty() && alias.front() == ' ') alias.erase(alias.begin());
+            while (!alias.empty() && alias.back()  == ' ') alias.pop_back();
+            specs.push_back({expr, alias});
+        } else {
+            // No AS alias: use last component after dot as display name
+            std::string nm = sc;
+            auto dot = nm.rfind('.');
+            if (dot != std::string::npos) nm = nm.substr(dot + 1);
+            specs.push_back({sc, nm});
+        }
+    }
+
+    // Build result schema
+    std::vector<milansql::Column> outCols;
+    for (const auto& sp : specs)
+        outCols.emplace_back(sp.alias, "TEXT");
+    milansql::Table result("__proj", outCols);
+
+    const auto& srcCols = src.columns();
+    for (const auto& row : src.rows()) {
+        std::vector<std::string> vals;
+        for (const auto& sp : specs)
+            vals.push_back(dispatch_evalExprFull(sp.expr, srcCols, row, aliasMap));
+        result.insert(milansql::Row(std::move(vals)));
+    }
+    return result;
+}
+
+// Execute a literal SELECT (no FROM) — e.g. "SELECT 1 AS n, 0 AS a, 1 AS b"
+// Returns a single-row Table with the given literal columns.
+static inline bool dispatch_executeLiteralSelect(
+        const std::string& sql,
+        milansql::Table& result)
+{
+    // Parse: after SELECT, split by comma. Each item: "expr [AS alias]"
+    std::string up = sql;
+    for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+    auto selPos = up.find("SELECT");
+    if (selPos == std::string::npos) return false;
+    // Check no FROM
+    auto fromPos = up.find(" FROM ");
+    if (fromPos != std::string::npos) return false;
+
+    std::string colList = sql.substr(selPos + 6);
+    while (!colList.empty() && colList.front() == ' ') colList.erase(colList.begin());
+
+    // Split by top-level commas
+    std::vector<std::string> items;
+    {
+        int depth = 0;
+        std::string cur;
+        for (char c : colList) {
+            if (c == '(') ++depth;
+            else if (c == ')') --depth;
+            else if (c == ',' && depth == 0) { items.push_back(cur); cur.clear(); continue; }
+            cur += c;
+        }
+        if (!cur.empty()) items.push_back(cur);
+    }
+
+    std::vector<milansql::Column> cols;
+    std::vector<std::string> vals;
+    for (auto& item : items) {
+        // trim
+        while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+        while (!item.empty() && item.back()  == ' ') item.pop_back();
+        std::string upper = item;
+        for (char& c : upper) c = static_cast<char>(std::toupper((unsigned char)c));
+        auto asPos = upper.find(" AS ");
+        std::string expr, alias;
+        if (asPos != std::string::npos) {
+            expr  = item.substr(0, asPos);
+            alias = item.substr(asPos + 4);
+            while (!expr.empty()  && expr.front()  == ' ') expr.erase(expr.begin());
+            while (!expr.empty()  && expr.back()   == ' ') expr.pop_back();
+            while (!alias.empty() && alias.front() == ' ') alias.erase(alias.begin());
+            while (!alias.empty() && alias.back()  == ' ') alias.pop_back();
+        } else {
+            expr = item; alias = item;
+        }
+        cols.emplace_back(alias, "TEXT");
+        vals.push_back(expr);  // literal value
+    }
+
+    result = milansql::Table("__literal", cols);
+    result.insert(milansql::Row(vals));
+    return true;
+}
+
+// Split "anchorSQL UNION ALL recursiveSQL" at top-level UNION ALL.
+// Returns {anchorSql, recursiveSql} or {"",""} if not found.
+static inline std::pair<std::string,std::string>
+dispatch_splitUnionAll(const std::string& sql)
+{
+    // Tokenise and find top-level UNION ALL
+    std::vector<std::string> toks;
+    {
+        std::istringstream ss(sql);
+        std::string t;
+        while (ss >> t) toks.push_back(t);
+    }
+    int depth = 0;
+    for (size_t i = 0; i + 1 < toks.size(); ++i) {
+        std::string up0 = toks[i], up1 = toks[i+1];
+        for (char& c : up0) c = static_cast<char>(std::toupper((unsigned char)c));
+        for (char& c : up1) c = static_cast<char>(std::toupper((unsigned char)c));
+        if (toks[i] == "(") ++depth;
+        else if (toks[i] == ")") --depth;
+        if (depth == 0 && up0 == "UNION" && up1 == "ALL") {
+            // Reconstruct left and right
+            std::string left, right;
+            for (size_t j = 0; j < i; ++j) {
+                if (j > 0) left += " ";
+                left += toks[j];
+            }
+            for (size_t j = i + 2; j < toks.size(); ++j) {
+                if (j > i + 2) right += " ";
+                right += toks[j];
+            }
+            return {left, right};
+        }
+    }
+    return {"", ""};
+}
+
+// Check if a selectColumns list has any expression (AS alias, arithmetic, alias.col)
+static inline bool dispatch_hasExprColumns(const std::vector<std::string>& cols) {
+    for (const auto& sc : cols) {
+        std::string up = sc;
+        for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+        if (up.find(" AS ") != std::string::npos ||
+            up.find('+') != std::string::npos ||
+            up.find('-') != std::string::npos ||
+            up.find('*') != std::string::npos ||
+            up.find('/') != std::string::npos ||
+            up.find('.') != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// Execute a SELECT command that may have expression columns.
+// Falls back to dispatch_projectExprs when project() would fail.
+static inline milansql::Table dispatch_execSelectWithExprs(
+        milansql::Engine& engine,
+        milansql::Parser& parser,
+        milansql::ParsedCommand& cmd,
+        const std::vector<milansql::Column>& targetSchema)
+{
+    bool hasExpr = dispatch_hasExprColumns(cmd.selectColumns);
+
+    if (!hasExpr) {
+        // Safe to use standard path
+        return dispatch_executeSelectToTable(engine, parser, cmd);
+    }
+
+    // Expression path: get raw rows (no projection), then apply dispatch_projectExprs
+    milansql::Table raw;
+    auto selColsSaved = cmd.selectColumns;
+    cmd.selectColumns.clear();  // suppress project() in standard path
+
+    // Build alias map: user alias → actual table name (Phase 87)
+    std::map<std::string,std::string> aliasMap;
+    if (!cmd.tableAlias.empty()) aliasMap[cmd.tableAlias] = cmd.tableName;
+    for (const auto& jc : cmd.joinClauses)
+        if (!jc.tableAlias.empty()) aliasMap[jc.tableAlias] = jc.table;
+
+    if (cmd.isJoin) {
+        milansql::QueryOptimizer qopt;
+        qopt.optimize(cmd, engine);
+
+        // Resolve user aliases in ON conditions before calling executeJoins
+        auto joinClauses = cmd.joinClauses;
+        for (auto& jc : joinClauses) {
+            auto replAlias = [&](std::string& side) {
+                auto dot = side.find('.');
+                if (dot == std::string::npos) return;
+                std::string tbl = side.substr(0, dot);
+                std::string col = side.substr(dot + 1);
+                auto it = aliasMap.find(tbl);
+                if (it != aliasMap.end()) side = it->second + "." + col;
+            };
+            replAlias(jc.onLeft);
+            replAlias(jc.onRight);
+        }
+        raw = engine.executeJoins(cmd.tableName, joinClauses,
+                                  cmd.whereConds, cmd.whereLogic);
+    } else if (!cmd.whereConds.empty()) {
+        auto qr = engine.selectWhere(cmd.tableName, cmd.whereConds, cmd.whereLogic);
+        raw = std::move(qr.table);
+    } else {
+        raw = engine.selectAll(cmd.tableName).clone();
+    }
+    cmd.selectColumns = selColsSaved;
+
+    milansql::Table projected = dispatch_projectExprs(raw, cmd.selectColumns, aliasMap);
+
+    // Rename columns to match target schema if provided
+    if (!targetSchema.empty() && projected.columns().size() == targetSchema.size()) {
+        milansql::Table renamed("__cte_expr", targetSchema);
+        for (const auto& r : projected.rows()) renamed.insert(r);
+        return renamed;
+    }
+    return projected;
+}
+
+// Execute a recursive CTE and return the final accumulated table.
+// cteName: name of the CTE (registered as temp table)
+// innerSql: full body "anchorSQL UNION ALL recursiveSQL"
+static inline milansql::Table dispatch_executeRecursiveCTE(
+        milansql::Engine& engine,
+        milansql::Parser& parser,
+        const std::string& cteName,
+        const std::string& innerSql,
+        int maxIter)
+{
+    auto [anchorSql, recursiveSql] = dispatch_splitUnionAll(innerSql);
+    if (anchorSql.empty())
+        throw std::runtime_error("WITH RECURSIVE: kein UNION ALL in '" + cteName + "'");
+
+    // ── Step 1: Evaluate anchor ───────────────────────────────
+    milansql::Table anchor;
+    milansql::ParsedCommand anchorCmd = parser.parse(anchorSql);
+
+    if (anchorCmd.type == milansql::CommandType::UNKNOWN) {
+        // Literal SELECT (no FROM): e.g. SELECT 1 AS n, 0 AS a, 1 AS b
+        if (!dispatch_executeLiteralSelect(anchorSql, anchor))
+            throw std::runtime_error("WITH RECURSIVE: Anchor konnte nicht ausgewertet werden: " + anchorSql);
+    } else {
+        // Regular SELECT (possibly with expression columns)
+        anchor = dispatch_execSelectWithExprs(engine, parser, anchorCmd, {});
+    }
+
+    // Build output schema from anchor's column names
+    std::vector<milansql::Column> anchorCols = anchor.columns();
+
+    // ── Step 2: Accumulate ────────────────────────────────────
+    milansql::Table accumulated("__cte_" + cteName, anchorCols);
+    for (const auto& r : anchor.rows())
+        accumulated.insert(r);
+
+    // ── Step 3: Iterate ───────────────────────────────────────
+    milansql::Table working = anchor.clone();  // seed = anchor
+
+    for (int iter = 0; iter < maxIter; ++iter) {
+        // Register current working set as the CTE temp table
+        engine.registerTempTable(cteName, working.clone());
+
+        // Parse and execute recursive part against current working set
+        milansql::ParsedCommand recCmd = parser.parse(recursiveSql);
+
+        milansql::Table newRows;
+        if (recCmd.type == milansql::CommandType::UNKNOWN) {
+            // Literal SELECT (rare in recursive part)
+            if (!dispatch_executeLiteralSelect(recursiveSql, newRows)) break;
+        } else {
+            newRows = dispatch_execSelectWithExprs(engine, parser, recCmd, anchorCols);
+        }
+
+        if (newRows.rowCount() == 0) break;
+
+        // Append new rows to accumulated result
+        for (const auto& r : newRows.rows())
+            accumulated.insert(r);
+
+        // New working set = only newly produced rows
+        working = milansql::Table("__cte_" + cteName, anchorCols);
+        for (const auto& r : newRows.rows())
+            working.insert(r);
+    }
+
+    // Register final result as the CTE table for the main query
+    engine.registerTempTable(cteName, accumulated.clone());
+    return accumulated;
+}
+
 // ── dispatchCommand ───────────────────────────────────────────
 // Main dispatch function: takes a parsed command and executes it against the engine.
 // Writes output to std::cout (can be redirected via rdbuf for capture).
@@ -1674,11 +2115,21 @@ inline bool dispatchCommand(
 
         if (!cmd.cteList.empty()) {
             try {
-                for (auto& [cteName, cteInnerSql] : cmd.cteList) {
-                    milansql::ParsedCommand cteParsed = parser.parse(cteInnerSql);
-                    milansql::Table cteResult =
-                        dispatch_executeSelectToTable(engine, parser, cteParsed);
-                    engine.registerTempTable(cteName, std::move(cteResult));
+                if (cmd.isRecursiveCte) {
+                    // ── Phase 87: WITH RECURSIVE ──────────────────
+                    for (auto& [cteName, cteInnerSql] : cmd.cteList) {
+                        dispatch_executeRecursiveCTE(engine, parser,
+                            cteName, cteInnerSql, g_recursiveMaxIter);
+                        // result is already registered as temp table
+                    }
+                } else {
+                    // ── Phase 41: WITH (non-recursive) ────────────
+                    for (auto& [cteName, cteInnerSql] : cmd.cteList) {
+                        milansql::ParsedCommand cteParsed = parser.parse(cteInnerSql);
+                        milansql::Table cteResult =
+                            dispatch_executeSelectToTable(engine, parser, cteParsed);
+                        engine.registerTempTable(cteName, std::move(cteResult));
+                    }
                 }
                 milansql::Table mainResult =
                     dispatch_executeSelectToTable(engine, parser, cmd);
@@ -4112,6 +4563,20 @@ inline bool dispatchCommand(
             std::cout << "  Fehler: SHOW STATISTICS FOR tabellenname\n\n"; break;
         }
         g_tableStats.showStatistics(cmd.tableName);
+        break;
+    }
+
+    // ── Phase 87: SET RECURSIVE_MAX_ITERATIONS = N ───────────
+    case milansql::CommandType::SET_RECURSIVE_MAX_ITERATIONS: {
+        std::string val = cmd.values.empty() ? "" : cmd.values[0];
+        try {
+            int n = std::stoi(val);
+            if (n < 1) n = 1;
+            g_recursiveMaxIter = n;
+            std::cout << "  RECURSIVE_MAX_ITERATIONS gesetzt: " << n << "\n\n";
+        } catch (...) {
+            std::cout << "  Fehler: SET RECURSIVE_MAX_ITERATIONS = <zahl>\n\n";
+        }
         break;
     }
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Projektname und Version
-project(milansql VERSION 3.9.0 LANGUAGES CXX)
+project(milansql VERSION 3.10.0 LANGUAGES CXX)
 
 # C++17 Standard festlegen
 set(CMAKE_CXX_STANDARD 17)
@@ -15,7 +15,7 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src src/server src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries)
+target_include_directories(milansql PRIVATE src src/server src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)

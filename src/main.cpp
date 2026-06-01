@@ -5,6 +5,7 @@
 #include "server/http_server.hpp"
 #include "server/mysql_server.hpp"  // Phase 74: MySQL Wire Protocol
 #include "server/pg_server.hpp"     // Phase 91: PostgreSQL Wire Protocol
+#include "api/graphql_server.hpp"   // Phase 98: GraphQL API
 
 #include <iostream>
 #include <fstream>
@@ -160,7 +161,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v3.9.0 ===           \u2551\n"
+              << "  \u2551        === MilanSQL v3.10.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -169,15 +170,17 @@ static void printBanner() {
 
 int main(int argc, char* argv[]) {
     // ── Phase 47/52: Parse command-line arguments ─────────────
-    bool serverMode = false;
-    bool clientMode = false;
-    bool httpMode   = false;
-    bool mysqlMode  = false;   // Phase 74: MySQL Wire Protocol
-    bool pgMode     = false;   // Phase 91: PostgreSQL Wire Protocol
-    int  port       = 4406;
-    int  httpPort   = 8080;
-    int  mysqlPort  = 4407;    // Phase 74: MySQL protocol port
-    int  pgPort     = 5433;    // Phase 91: PostgreSQL protocol port
+    bool serverMode   = false;
+    bool clientMode   = false;
+    bool httpMode     = false;
+    bool mysqlMode    = false;   // Phase 74: MySQL Wire Protocol
+    bool pgMode       = false;   // Phase 91: PostgreSQL Wire Protocol
+    bool graphqlMode  = false;   // Phase 98: GraphQL API
+    int  port         = 4406;
+    int  httpPort     = 8080;
+    int  mysqlPort    = 4407;    // Phase 74: MySQL protocol port
+    int  pgPort       = 5433;    // Phase 91: PostgreSQL protocol port
+    int  graphqlPort  = 8081;    // Phase 98: GraphQL API port
     int  poolSize   = 10;   // Phase 58: Connection Pool Größe
     int  maxQueue   = 100;  // Phase 58: max. Queue-Länge
     // Phase 59: Replication
@@ -194,17 +197,19 @@ int main(int argc, char* argv[]) {
         if (milansql::ConnectionString::isDsn(arg)) {
             dsnArg = arg;
         }
-        else if (arg == "--server")      serverMode = true;
-        else if (arg == "--client")      clientMode = true;
-        else if (arg == "--http")        httpMode   = true;
-        else if (arg == "--mysql")       mysqlMode  = true;
-        else if (arg == "--pg")          pgMode     = true;
+        else if (arg == "--server")      serverMode  = true;
+        else if (arg == "--client")      clientMode  = true;
+        else if (arg == "--http")        httpMode    = true;
+        else if (arg == "--mysql")       mysqlMode   = true;
+        else if (arg == "--pg")          pgMode      = true;
+        else if (arg == "--graphql")     graphqlMode = true;
         else if (arg == "--master")      masterMode = true;
         else if (arg == "--slave")       slaveMode  = true;
         else if (arg == "--port"          && i + 1 < argc) port        = std::stoi(argv[++i]);
         else if (arg == "--http-port"     && i + 1 < argc) httpPort    = std::stoi(argv[++i]);
         else if (arg == "--mysql-port"    && i + 1 < argc) mysqlPort   = std::stoi(argv[++i]);
         else if (arg == "--pg-port"       && i + 1 < argc) pgPort      = std::stoi(argv[++i]);
+        else if (arg == "--graphql-port"  && i + 1 < argc) graphqlPort = std::stoi(argv[++i]);
         else if (arg == "--pool-size"     && i + 1 < argc) poolSize    = std::stoi(argv[++i]);
         else if (arg == "--max-queue"     && i + 1 < argc) maxQueue    = std::stoi(argv[++i]);
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
@@ -636,6 +641,14 @@ int main(int argc, char* argv[]) {
     milansql::g_eventScheduler = &eventScheduler;
     eventScheduler.loadEvents();
     eventScheduler.start();
+
+    // ── Phase 98: GraphQL Server (optional background thread) ────
+    std::unique_ptr<milansql::GraphQLServer> gqlServer;
+    if (graphqlMode) {
+        std::cout << "  GraphQL API Server starting on port " << graphqlPort << "...\n\n";
+        gqlServer = std::make_unique<milansql::GraphQLServer>(engine, graphqlPort);
+        gqlServer->start();
+    }
 
     // ── Phase 79: Connection String — auto-execute CONNECT + USE ──
     if (!dsnArg.empty()) {

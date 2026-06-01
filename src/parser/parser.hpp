@@ -214,6 +214,10 @@ enum class CommandType {
     SHOW_COMPRESSION_STATS,
     // Phase 97: Time-Series
     SHOW_TIMESERIES_STATUS,
+    // Phase 98: CDC
+    ALTER_TABLE_ENABLE_CDC,
+    ALTER_TABLE_DISABLE_CDC,
+    SHOW_CDC_STATUS,
     UNKNOWN
 };
 
@@ -477,6 +481,9 @@ struct ParsedCommand {
     std::string tsTimeColumn;      // TIME_COLUMN = colname
     std::string tsPartitionBy;     // "DAY", "HOUR", "WEEK", "MONTH"
     int         tsRetentionDays   = -1;
+
+    // Phase 98: CDC
+    long long   cdcAfterSeq       = -1; // for SELECT FROM cdc.xxx AFTER SEQUENCE n
 };
 
 class Parser {
@@ -1358,6 +1365,15 @@ public:
                     cmd.tableName = tokens[fromIdx + 1];
                 }
                 size_t rest = fromIdx + (cmd.fromOnly ? 3 : 2);
+                // Phase 98: AFTER SEQUENCE n (for CDC virtual tables)
+                for (size_t ai = rest; ai + 1 < tokens.size(); ++ai) {
+                    if (toUpper(tokens[ai]) == "AFTER" &&
+                        toUpper(tokens[ai + 1]) == "SEQUENCE" &&
+                        ai + 2 < tokens.size()) {
+                        try { cmd.cdcAfterSeq = std::stoll(tokens[ai + 2]); } catch (...) {}
+                        break;
+                    }
+                }
                 parseWhere(tokens, rest, cmd);
                 parseOrderBy(tokens, rest, cmd);
                 parseLimit(tokens, rest, cmd);
@@ -2082,6 +2098,10 @@ public:
                     cmd.tableName = tokens[4];
                 else
                     cmd.tableName = "";
+            // Phase 98: SHOW CDC STATUS
+            } else if (kw1 == "CDC" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_CDC_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3660,6 +3680,13 @@ private:
             std::string cv = tokens[6];
             for (auto& c : cv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             cmd.compressionType = cv;
+
+        // Phase 98: ALTER TABLE t ENABLE/DISABLE CDC
+        } else if (op == "ENABLE" && kw4 == "CDC") {
+            cmd.type = CommandType::ALTER_TABLE_ENABLE_CDC;
+
+        } else if (op == "DISABLE" && kw4 == "CDC") {
+            cmd.type = CommandType::ALTER_TABLE_DISABLE_CDC;
 
         // Phase 75: ALTER TABLE t ENABLE/DISABLE ROW LEVEL SECURITY
         } else if (op == "ENABLE" && kw4 == "ROW" &&

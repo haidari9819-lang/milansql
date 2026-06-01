@@ -18,6 +18,7 @@
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
 #include "parser/parser.hpp"
+#include "cdc/cdc_manager.hpp"  // Phase 98: CDC
 #include "types/array_type.hpp"  // Phase 88: Array Data Type
 #include "storage/storage.hpp"
 #include "optimizer/optimizer.hpp"
@@ -2245,6 +2246,35 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }
+
+        // ── Phase 98: CDC virtual table SELECT ────────────────────────────────
+        if (cmd.tableName.size() > 4 && cmd.tableName.substr(0, 4) == "cdc.") {
+            std::string rawTable = cmd.tableName.substr(4);
+            // Try to resolve to schema-qualified name
+            const auto& allTbls = engine.getTables();
+            std::string realTable = rawTable;
+            if (!allTbls.count(rawTable)) {
+                // Try schema-qualified versions
+                for (const auto& [k, _] : allTbls) {
+                    auto dotPos = k.rfind('.');
+                    if (dotPos != std::string::npos && k.substr(dotPos + 1) == rawTable) {
+                        realTable = k; break;
+                    }
+                }
+            }
+            auto vt = engine.getCdcManager().buildVirtualTable(realTable, cmd.cdcAfterSeq);
+            // Build a milansql::Table from VirtualTable
+            std::vector<milansql::Column> vtCols;
+            for (const auto& cn : vt.colNames)
+                vtCols.push_back(milansql::Column(cn, "TEXT"));
+            milansql::Table cdcTbl("cdc." + realTable, vtCols);
+            for (const auto& row : vt.rows)
+                cdcTbl.insert(milansql::Row(row));
+            std::cout << "\n";
+            dispatch_printTable(cdcTbl, cmd.limit, cmd.limitOffset);
+            break;
+        }
+
         if (!engine.viewExists(cmd.tableName) && cmd.cteList.empty() &&
             !engine.isPgCatalogTable(cmd.tableName)) {
             engine.checkPrivilege("SELECT", cmd.tableName);
@@ -5204,6 +5234,32 @@ inline bool dispatchCommand(
                 std::cout << "\n" << tsMgr.showAllStatus() << "\n";
             }
         }
+        break;
+    }
+
+    // ── Phase 98: CDC ─────────────────────────────────────────
+    case milansql::CommandType::ALTER_TABLE_ENABLE_CDC: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: ALTER TABLE name ENABLE CDC\n\n";
+            break;
+        }
+        engine.enableCdc(cmd.tableName);
+        std::cout << "  CDC enabled on table '" << cmd.tableName << "'.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::ALTER_TABLE_DISABLE_CDC: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: ALTER TABLE name DISABLE CDC\n\n";
+            break;
+        }
+        engine.disableCdc(cmd.tableName);
+        std::cout << "  CDC disabled on table '" << cmd.tableName << "'.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_CDC_STATUS: {
+        std::cout << "\n" << engine.getCdcManager().showStatus() << "\n";
         break;
     }
 

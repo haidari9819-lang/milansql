@@ -46,6 +46,7 @@
 #include "../compression/dict_compressor.hpp"
 #include "../compression/zstd_compressor.hpp"
 #include "../timeseries/timeseries_manager.hpp" // Phase 97: Time-Series
+#include "../cdc/cdc_manager.hpp"               // Phase 98: CDC
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1126,6 +1127,17 @@ public:
                 logicalLog_WriteIfPublished_(key, "INSERT", colNames, vals);
             }
         }
+
+        // Phase 98: CDC hook for INSERT
+        {
+            auto key = resolveTableName(tblRaw);
+            if (cdcMgr_.isEnabled(key) && tables_.count(key)) {
+                const auto& cols_ref = tables_.at(key).columns();
+                std::vector<std::string> colNames;
+                for (const auto& c : cols_ref) colNames.push_back(c.name);
+                cdcMgr_.recordInsert(key, colNames, vals);
+            }
+        }
     }
 
     // ── Phase 39: UPSERT ──────────────────────────────────────
@@ -1923,6 +1935,15 @@ public:
             fireAllTriggers("AFTER", "DELETE", tbl, emptyNew, rowVals, signalMsg);
         }
 
+        // Phase 98: CDC hook for DELETE
+        if (deleted > 0 && cdcMgr_.isEnabled(tbl)) {
+            const auto& t_ref = getTable(tbl);
+            std::vector<std::string> colNames;
+            for (const auto& c : t_ref.columns()) colNames.push_back(c.name);
+            for (auto& rowVals : matchedRows)
+                cdcMgr_.recordDelete(tbl, colNames, rowVals);
+        }
+
         return deleted;
     }
 
@@ -2027,6 +2048,20 @@ public:
 
             std::string signalMsg;
             fireAllTriggers("AFTER", "UPDATE", tbl, newVals, oldVals, signalMsg);
+        }
+
+        // Phase 98: CDC hook for UPDATE
+        if (n > 0 && cdcMgr_.isEnabled(tbl)) {
+            const auto& cols_ref = tblRef.columns();
+            std::vector<std::string> colNames;
+            for (const auto& c : cols_ref) colNames.push_back(c.name);
+            for (auto& oldVals : oldRows) {
+                std::vector<std::string> newVals2 = oldVals;
+                for (size_t k = 0; k < setCIs2.size() && k < setVals.size(); ++k)
+                    if (setCIs2[k] < newVals2.size())
+                        newVals2[setCIs2[k]] = setVals[k];
+                cdcMgr_.recordUpdate(tbl, colNames, oldVals, newVals2);
+            }
         }
 
         return n;
@@ -5960,6 +5995,22 @@ private:
     }
 
 public:
+    // ── Phase 98: CDC ─────────────────────────────────────────
+    CdcManager& getCdcManager() { return cdcMgr_; }
+    const CdcManager& getCdcManager() const { return cdcMgr_; }
+
+    // Enable/disable CDC using the resolved table name
+    void enableCdc(const std::string& tableRaw) {
+        cdcMgr_.enableTable(resolveTableName(tableRaw));
+    }
+    void disableCdc(const std::string& tableRaw) {
+        cdcMgr_.disableTable(resolveTableName(tableRaw));
+    }
+
+    bool isCdcTable(const std::string& name) const {
+        return name.size() > 4 && name.substr(0, 4) == "cdc.";
+    }
+
     // ── Phase 86: Table map accessor for statistics ───────────
     const std::map<std::string, Table>& getTables() const { return tables_; }
 
@@ -6822,6 +6873,9 @@ private:
 
     // Phase 97: Time-Series Manager
     TimeSeriesManager tsManager_;
+
+    // Phase 98: Change Data Capture
+    CdcManager cdcMgr_;
 
     // Phase 72: timestamp helper
     static std::string currentTimestamp() {

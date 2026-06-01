@@ -303,7 +303,8 @@ int main(int argc, char* argv[]) {
     // Phase 46: Load users from separate file
     engine.loadUsers("database.users");
 
-    // Phase 43: Load triggers from separate file
+    // Phase 43/93: Load triggers from separate file
+    // Format: name TAB timing TAB event TAB tableName TAB [granularity TAB] body
     {
         std::ifstream tf("database.triggers");
         if (tf) {
@@ -312,20 +313,38 @@ int main(int argc, char* argv[]) {
                 if (line.empty()) continue;
                 std::vector<std::string> parts;
                 size_t pos = 0;
-                for (int field = 0; field < 4; ++field) {
+                // Split all tab-separated fields
+                for (;;) {
                     size_t tab = line.find('\t', pos);
-                    if (tab == std::string::npos) { pos = line.size(); break; }
+                    if (tab == std::string::npos) {
+                        parts.push_back(line.substr(pos));
+                        break;
+                    }
                     parts.push_back(line.substr(pos, tab - pos));
                     pos = tab + 1;
                 }
-                parts.push_back(line.substr(pos));
                 if (parts.size() == 5) {
+                    // Old format: name timing event table body
                     milansql::TriggerDef def;
-                    def.name      = parts[0];
-                    def.timing    = parts[1];
-                    def.event     = parts[2];
-                    def.tableName = parts[3];
-                    def.body      = parts[4];
+                    def.name        = parts[0];
+                    def.timing      = parts[1];
+                    def.event       = parts[2];
+                    def.tableName   = parts[3];
+                    def.granularity = "ROW";
+                    def.body        = parts[4];
+                    engine.createTrigger(def);
+                } else if (parts.size() >= 6) {
+                    // New format: name timing event table granularity body
+                    milansql::TriggerDef def;
+                    def.name        = parts[0];
+                    def.timing      = parts[1];
+                    def.event       = parts[2];
+                    def.tableName   = parts[3];
+                    def.granularity = parts[4];
+                    // body is everything from parts[5] onward (re-joined if tabs in body)
+                    def.body = parts[5];
+                    for (size_t pi = 6; pi < parts.size(); ++pi)
+                        def.body += "\t" + parts[pi];
                     engine.createTrigger(def);
                 }
             }
@@ -421,8 +440,9 @@ int main(int argc, char* argv[]) {
         std::ofstream tf("database.triggers");
         if (tf) {
             for (const auto& [n, t] : engine.getAllTriggers()) {
+                std::string gran = t.granularity.empty() ? "ROW" : t.granularity;
                 tf << t.name << "\t" << t.timing << "\t" << t.event
-                   << "\t" << t.tableName << "\t" << t.body << "\n";
+                   << "\t" << t.tableName << "\t" << gran << "\t" << t.body << "\n";
             }
         }
     };
@@ -749,7 +769,17 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        milansql::ParsedCommand cmd = parser.parse(eingabe);
+        // Phase 93: Statement Cache — check cache before parsing
+        milansql::ParsedCommand cmd;
+        {
+            auto cached93 = milansql::g_stmtCache.get(eingabe);
+            if (cached93.has_value()) {
+                cmd = cached93.value();
+            } else {
+                cmd = parser.parse(eingabe);
+                milansql::g_stmtCache.put(eingabe, cmd);
+            }
+        }
 
         // Subqueries auflösen: inList für IN/NOT IN-Bedingungen befüllen
         for (const auto& sq : cmd.subqueries) {

@@ -472,7 +472,17 @@ private:
             };
             auto noopFn = []() {};
 
-            milansql::ParsedCommand cmd = parser_.parse(sql);
+            // Phase 93: Statement Cache
+            milansql::ParsedCommand cmd;
+            {
+                auto cached93 = milansql::g_stmtCache.get(sql);
+                if (cached93.has_value()) {
+                    cmd = cached93.value();
+                } else {
+                    cmd = parser_.parse(sql);
+                    milansql::g_stmtCache.put(sql, cmd);
+                }
+            }
 
             if (cmd.type == CommandType::SELECT) {
                 isSelect = true;

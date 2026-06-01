@@ -272,10 +272,11 @@ struct FullTextIndex {
 // ── Phase 43: Trigger-Definition ─────────────────────────────
 struct TriggerDef {
     std::string name;
-    std::string timing;     // "BEFORE" or "AFTER"
-    std::string event;      // "INSERT", "UPDATE", "DELETE"
+    std::string timing;       // "BEFORE" or "AFTER"
+    std::string event;        // "INSERT", "UPDATE", "DELETE"
     std::string tableName;
-    std::string body;       // raw SQL body text (between BEGIN and END)
+    std::string body;         // raw SQL body text (between BEGIN and END)
+    std::string granularity;  // Phase 93: "ROW" (default) or "STATEMENT"
 };
 
 // ── Phase 44: Stored Procedure Definition ────────────────────
@@ -2875,6 +2876,20 @@ public:
         return triggers_;
     }
 
+    // Phase 93: Fire all AFTER STATEMENT-level triggers for a DML event.
+    void fireStatementTriggers(const std::string& event, const std::string& tableName) {
+        for (auto& [trgName, trg] : triggers_) {
+            if (trgUpper(trg.timing)       != "AFTER")          continue;
+            if (trgUpper(trg.event)        != trgUpper(event))  continue;
+            if (trg.tableName              != tableName)         continue;
+            if (trgUpper(trg.granularity)  != "STATEMENT")      continue;
+            // Execute body without row context (empty OLD/NEW)
+            std::vector<std::string> emptyRow;
+            std::string signalMsg;
+            executeTriggerBody(trg.body, emptyRow, emptyRow, {}, signalMsg, false);
+        }
+    }
+
     // ── Phase 44: Stored Procedure Management ────────────────────
 
     void createProcedure(const ProcedureDef& def) {
@@ -4055,6 +4070,7 @@ private:
 
     // Fire all triggers of the given timing/event for a table.
     // Returns true if operation should proceed, false if SIGNAL aborted.
+    // Only fires ROW-level triggers (granularity == "ROW" or empty).
     bool fireAllTriggers(
             const std::string& timing,
             const std::string& event,
@@ -4071,6 +4087,8 @@ private:
             if (trgUpper(trg.timing)   != trgUpper(timing))   continue;
             if (trgUpper(trg.event)    != trgUpper(event))    continue;
             if (trg.tableName != tableName)                    continue;
+            // Phase 93: skip STATEMENT-level triggers here
+            if (trgUpper(trg.granularity) == "STATEMENT")     continue;
 
             if (!executeTriggerBody(trg.body, newRow, oldRow, cols, signalMsg, false))
                 return false;

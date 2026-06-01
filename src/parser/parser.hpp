@@ -199,6 +199,11 @@ enum class CommandType {
     COPY_FROM,
     COPY_TO,
     SHOW_COPY_STATS,
+    // Phase 93: Statement Cache
+    SHOW_STATEMENT_CACHE,
+    CLEAR_STATEMENT_CACHE,
+    SET_STATEMENT_CACHE,
+    SET_STATEMENT_CACHE_SIZE,
     UNKNOWN
 };
 
@@ -307,6 +312,9 @@ struct ParsedCommand {
     // Phase 54A: SET CACHE ON/OFF
     std::string cacheEnabled;  // "ON" or "OFF"
 
+    // Phase 93: Statement Cache settings
+    std::string stmtCacheValue;   // "ON", "OFF", or a numeric string for SIZE
+
     // Phase 37: Alias der Haupttabelle (z.B. "m" in FROM mitarbeiter m)
     std::string tableAlias;
 
@@ -322,6 +330,7 @@ struct ParsedCommand {
     std::string triggerTable;         // table name the trigger is on
     std::string triggerBody;          // raw body text (between BEGIN and END)
     std::string showTriggersTable;    // for "SHOW TRIGGERS ON tablename"
+    std::string triggerGranularity;   // Phase 93: "ROW" or "STATEMENT"
 
     // Phase 44: Stored Procedure fields
     std::string procedureName;
@@ -1329,7 +1338,19 @@ public:
             // skip ON
             if (ti < ftTrig.size() && toUpper(ftTrig[ti]) == "ON") ++ti;
             if (ti < ftTrig.size()) cmd.triggerTable   = ftTrig[ti++];
-            // skip FOR EACH ROW
+            // detect FOR EACH ROW or FOR EACH STATEMENT
+            {
+                size_t tmp = ti;
+                while (tmp < ftTrig.size() && toUpper(ftTrig[tmp]) != "BEGIN") {
+                    std::string utok = toUpper(ftTrig[tmp]);
+                    if (utok == "STATEMENT") {
+                        cmd.triggerGranularity = "STATEMENT";
+                    }
+                    ++tmp;
+                }
+                if (cmd.triggerGranularity.empty())
+                    cmd.triggerGranularity = "ROW";
+            }
             while (ti < ftTrig.size() && toUpper(ftTrig[ti]) != "BEGIN") ++ti;
             if (ti < ftTrig.size()) ++ti;  // skip BEGIN
             // collect body until final END (not END IF)
@@ -1886,6 +1907,10 @@ public:
             } else if (kw1 == "COPY" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATS") {
                 cmd.type = CommandType::SHOW_COPY_STATS;
+            // Phase 93: SHOW STATEMENT CACHE
+            } else if (kw1 == "STATEMENT" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "CACHE") {
+                cmd.type = CommandType::SHOW_STATEMENT_CACHE;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2210,6 +2235,42 @@ public:
         // ── Phase 54A: CLEAR CACHE ───────────────────────────────
         } else if (kw0 == "CLEAR" && kw1 == "CACHE") {
             cmd.type = CommandType::CLEAR_CACHE;
+
+        // ── Phase 93: CLEAR STATEMENT CACHE ──────────────────────
+        } else if (kw0 == "CLEAR" && kw1 == "STATEMENT" &&
+                   tokens.size() >= 3 && toUpper(tokens[2]) == "CACHE") {
+            cmd.type = CommandType::CLEAR_STATEMENT_CACHE;
+
+        // ── Phase 93: SET STATEMENT_CACHE = ON/OFF ───────────────
+        } else if (kw0 == "SET" && (kw1 == "STATEMENT_CACHE" ||
+                   (kw1 == "STATEMENT" && tokens.size() >= 3 &&
+                    toUpper(tokens[2]) == "CACHE"))) {
+            cmd.type = CommandType::SET_STATEMENT_CACHE;
+            // Accept: SET STATEMENT_CACHE = ON/OFF  or  SET STATEMENT_CACHE ON/OFF
+            {
+                std::string val;
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = toUpper(tokens[si]);
+                    if (t == "=" || t == "CACHE") continue;
+                    val = t; break;
+                }
+                cmd.stmtCacheValue = val;
+            }
+
+        // ── Phase 93: SET STATEMENT_CACHE_SIZE = N ───────────────
+        } else if (kw0 == "SET" && (kw1 == "STATEMENT_CACHE_SIZE" ||
+                   (kw1 == "STATEMENT" && tokens.size() >= 4 &&
+                    toUpper(tokens[2]) == "CACHE_SIZE"))) {
+            cmd.type = CommandType::SET_STATEMENT_CACHE_SIZE;
+            {
+                std::string val;
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = toUpper(tokens[si]);
+                    if (t == "=" || t == "CACHE_SIZE") continue;
+                    val = tokens[si]; break;
+                }
+                cmd.stmtCacheValue = val;
+            }
 
         // ── Phase 54A: SET CACHE ON / SET CACHE OFF ──────────────
         } else if (kw0 == "SET" && kw1 == "CACHE") {

@@ -32,8 +32,12 @@
 #include "profiler/query_profiler.hpp"  // Phase 69: Query Profiler
 #include "pubsub/pubsub.hpp"           // Phase 76: LISTEN/NOTIFY
 #include "copy/copy_manager.hpp"       // Phase 92: COPY FROM/TO
+#include "cache/statement_cache.hpp"   // Phase 93: Prepared Statement Cache
 
 namespace milansql {
+
+// ── Phase 93: Global Statement Cache ─────────────────────────
+static StatementCache g_stmtCache;
 
 // ── Phase 69: Global Query Profiler ──────────────────────────
 static QueryProfiler g_profiler;
@@ -2131,6 +2135,8 @@ inline bool dispatchCommand(
             persistFn();
             dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
+            // Phase 93: fire statement-level AFTER INSERT triggers
+            engine.fireStatementTriggers("INSERT", cmd.tableName);
             if (rows.size() == 1)
                 std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
             else
@@ -2915,6 +2921,8 @@ inline bool dispatchCommand(
             persistFn();
             dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
+            // Phase 93: fire statement-level AFTER UPDATE triggers
+            engine.fireStatementTriggers("UPDATE", cmd.tableName);
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc << ")\n\n";
         } else {
@@ -2926,6 +2934,8 @@ inline bool dispatchCommand(
                 persistFn();
                 dispatch_binlogWrite(eingabe);
                 engine.invalidateCache(cmd.tableName);
+                // Phase 93: fire statement-level AFTER UPDATE triggers
+                engine.fireStatementTriggers("UPDATE", cmd.tableName);
             }
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc
@@ -2969,6 +2979,8 @@ inline bool dispatchCommand(
             persistFn();
             dispatch_binlogWrite(eingabe);
             engine.invalidateCache(cmd.tableName);
+            // Phase 93: fire statement-level AFTER DELETE triggers
+            engine.fireStatementTriggers("DELETE", cmd.tableName);
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
         } else {
             std::size_t n = engine.deleteWhere(
@@ -2977,6 +2989,8 @@ inline bool dispatchCommand(
                 persistFn();
                 dispatch_binlogWrite(eingabe);
                 engine.invalidateCache(cmd.tableName);
+                // Phase 93: fire statement-level AFTER DELETE triggers
+                engine.fireStatementTriggers("DELETE", cmd.tableName);
             }
             std::cout << "  " << n << " Zeile(n) geloescht"
                       << " (WHERE " << cmd.whereColumn
@@ -3343,18 +3357,20 @@ inline bool dispatchCommand(
     case milansql::CommandType::CREATE_TRIGGER: {
         if (cmd.triggerName.empty() || cmd.triggerTiming.empty() ||
             cmd.triggerEvent.empty() || cmd.triggerTable.empty()) {
-            std::cout << "  Fehler: CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl FOR EACH ROW BEGIN ... END\n";
+            std::cout << "  Fehler: CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl FOR EACH ROW|STATEMENT BEGIN ... END\n";
             break;
         }
         milansql::TriggerDef def;
-        def.name      = cmd.triggerName;
-        def.timing    = cmd.triggerTiming;
-        def.event     = cmd.triggerEvent;
-        def.tableName = cmd.triggerTable;
-        def.body      = cmd.triggerBody;
+        def.name        = cmd.triggerName;
+        def.timing      = cmd.triggerTiming;
+        def.event       = cmd.triggerEvent;
+        def.tableName   = cmd.triggerTable;
+        def.body        = cmd.triggerBody;
+        def.granularity = cmd.triggerGranularity.empty() ? "ROW" : cmd.triggerGranularity;
         engine.createTrigger(def);
         saveTriggFn();
-        std::cout << "  Trigger '" << def.name << "' erstellt.\n\n";
+        std::cout << "  Trigger '" << def.name << "' erstellt"
+                  << " (FOR EACH " << def.granularity << ").\n\n";
         break;
     }
 
@@ -3378,8 +3394,10 @@ inline bool dispatchCommand(
         } else {
             std::cout << "\n";
             for (const auto& t : triggers) {
+                std::string gran = t.granularity.empty() ? "ROW" : t.granularity;
                 std::cout << "  " << t.name << " | " << t.timing
-                          << " " << t.event << " ON " << t.tableName << "\n";
+                          << " " << t.event << " ON " << t.tableName
+                          << " | FOR EACH " << gran << "\n";
             }
             std::cout << "\n  " << triggers.size() << " Trigger\n\n";
         }
@@ -4940,6 +4958,54 @@ inline bool dispatchCommand(
     case milansql::CommandType::SHOW_COPY_STATS: {
         std::string stats = g_copyManager.showStats();
         std::cout << "\n  " << stats << "\n\n";
+        break;
+    }
+
+    // ── Phase 93: SHOW STATEMENT CACHE ────────────────────────
+    case milansql::CommandType::SHOW_STATEMENT_CACHE: {
+        std::cout << "\n  " << g_stmtCache.showStats() << "\n";
+        break;
+    }
+
+    // ── Phase 93: CLEAR STATEMENT CACHE ───────────────────────
+    case milansql::CommandType::CLEAR_STATEMENT_CACHE: {
+        g_stmtCache.clear();
+        std::cout << "  Statement Cache geleert.\n\n";
+        break;
+    }
+
+    // ── Phase 93: SET STATEMENT_CACHE = ON/OFF ─────────────────
+    case milansql::CommandType::SET_STATEMENT_CACHE: {
+        if (cmd.stmtCacheValue == "ON") {
+            g_stmtCache.setEnabled(true);
+            std::cout << "  Statement Cache aktiviert.\n\n";
+        } else if (cmd.stmtCacheValue == "OFF") {
+            g_stmtCache.setEnabled(false);
+            std::cout << "  Statement Cache deaktiviert.\n\n";
+        } else {
+            std::cout << "  Fehler: SET STATEMENT_CACHE = ON oder OFF\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 93: SET STATEMENT_CACHE_SIZE = N ─────────────────
+    case milansql::CommandType::SET_STATEMENT_CACHE_SIZE: {
+        if (!cmd.stmtCacheValue.empty()) {
+            try {
+                int n = std::stoi(cmd.stmtCacheValue);
+                if (n > 0) {
+                    g_stmtCache.setMaxSize(n);
+                    std::cout << "  Statement Cache max size auf "
+                              << n << " gesetzt.\n\n";
+                } else {
+                    std::cout << "  Fehler: Groesse muss > 0 sein.\n\n";
+                }
+            } catch (...) {
+                std::cout << "  Fehler: Ungueltige Zahl fuer STATEMENT_CACHE_SIZE.\n\n";
+            }
+        } else {
+            std::cout << "  Fehler: SET STATEMENT_CACHE_SIZE = N\n\n";
+        }
         break;
     }
 

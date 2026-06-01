@@ -1,5 +1,11 @@
 # MilanSQL
 
+## Try It Online
+
+[Live Browser Demo](https://haidari9819-lang.github.io/milansql/demo.html) — Run SQL queries directly in your browser, no installation needed!
+
+Features: Full SQL, table browser, example queries, query sharing, dark theme.
+
 ![Version](https://img.shields.io/badge/version-v4.0.0-gold)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen)

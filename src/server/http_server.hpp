@@ -805,6 +805,57 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
                "\r\n" + html;
     }
 
+    if (req.path == "/ws-playground") {
+        std::string html = R"HTML(<!DOCTYPE html>
+<html>
+<head><title>MilanSQL WebSocket Playground</title>
+<style>body{font-family:monospace;max-width:800px;margin:20px auto;}
+#output{background:#1e1e1e;color:#d4d4d4;padding:10px;height:300px;overflow-y:auto;border-radius:4px;}
+input{width:60%;padding:6px;} button{padding:6px 12px;margin:2px;cursor:pointer;}</style>
+</head>
+<body>
+<h2>MilanSQL WebSocket Playground</h2>
+<p>Connected to: <span id="status">Connecting...</span></p>
+<input id="sql" placeholder="SQL Query or table name to subscribe..." value="SELECT 1">
+<button onclick="sendQuery()">Execute</button>
+<button onclick="subscribe()">Subscribe</button>
+<button onclick="clearOutput()">Clear</button>
+<pre id="output"></pre>
+<script>
+const ws = new WebSocket('ws://localhost:8082');
+ws.onopen = () => { document.getElementById('status').textContent = 'Connected'; log('Connected to MilanSQL WebSocket'); };
+ws.onclose = () => { document.getElementById('status').textContent = 'Disconnected'; };
+ws.onerror = () => { document.getElementById('status').textContent = 'Error'; };
+ws.onmessage = e => { log('<- ' + e.data); };
+function log(msg) {
+  const el = document.getElementById('output');
+  el.textContent += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+function sendQuery() {
+  const sql = document.getElementById('sql').value;
+  const msg = JSON.stringify({type:'query', sql});
+  log('-> ' + msg);
+  ws.send(msg);
+}
+function subscribe() {
+  const table = document.getElementById('sql').value;
+  const msg = JSON.stringify({type:'subscribe', table});
+  log('-> ' + msg);
+  ws.send(msg);
+}
+function clearOutput() { document.getElementById('output').textContent = ''; }
+</script>
+</body>
+</html>)HTML";
+        return "HTTP/1.1 200 OK\r\n"
+               "Content-Type: text/html; charset=utf-8\r\n"
+               "Content-Length: " + std::to_string(html.size()) + "\r\n"
+               "Access-Control-Allow-Origin: *\r\n"
+               "Connection: close\r\n"
+               "\r\n" + html;
+    }
+
     return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");
 }
 

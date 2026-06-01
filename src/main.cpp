@@ -6,6 +6,7 @@
 #include "server/mysql_server.hpp"  // Phase 74: MySQL Wire Protocol
 #include "server/pg_server.hpp"     // Phase 91: PostgreSQL Wire Protocol
 #include "api/graphql_server.hpp"   // Phase 98: GraphQL API
+#include "server/websocket_server.hpp" // Phase 106: WebSocket Server
 
 #include <iostream>
 #include <fstream>
@@ -176,11 +177,13 @@ int main(int argc, char* argv[]) {
     bool mysqlMode    = false;   // Phase 74: MySQL Wire Protocol
     bool pgMode       = false;   // Phase 91: PostgreSQL Wire Protocol
     bool graphqlMode  = false;   // Phase 98: GraphQL API
+    bool wsMode       = false;   // Phase 106: WebSocket Server
     int  port         = 4406;
     int  httpPort     = 8080;
     int  mysqlPort    = 4407;    // Phase 74: MySQL protocol port
     int  pgPort       = 5433;    // Phase 91: PostgreSQL protocol port
     int  graphqlPort  = 8081;    // Phase 98: GraphQL API port
+    int  wsPort       = 8082;    // Phase 106: WebSocket port
     int  poolSize   = 10;   // Phase 58: Connection Pool Größe
     int  maxQueue   = 100;  // Phase 58: max. Queue-Länge
     // Phase 59: Replication
@@ -203,6 +206,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--mysql")       mysqlMode   = true;
         else if (arg == "--pg")          pgMode      = true;
         else if (arg == "--graphql")     graphqlMode = true;
+        else if (arg == "--ws")          wsMode      = true;
         else if (arg == "--master")      masterMode = true;
         else if (arg == "--slave")       slaveMode  = true;
         else if (arg == "--port"          && i + 1 < argc) port        = std::stoi(argv[++i]);
@@ -210,6 +214,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--mysql-port"    && i + 1 < argc) mysqlPort   = std::stoi(argv[++i]);
         else if (arg == "--pg-port"       && i + 1 < argc) pgPort      = std::stoi(argv[++i]);
         else if (arg == "--graphql-port"  && i + 1 < argc) graphqlPort = std::stoi(argv[++i]);
+        else if (arg == "--ws-port"       && i + 1 < argc) wsPort      = std::stoi(argv[++i]);
         else if (arg == "--pool-size"     && i + 1 < argc) poolSize    = std::stoi(argv[++i]);
         else if (arg == "--max-queue"     && i + 1 < argc) maxQueue    = std::stoi(argv[++i]);
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
@@ -650,6 +655,21 @@ int main(int argc, char* argv[]) {
         gqlServer->start();
     }
 
+    // ── Phase 106: WebSocket Server (optional background thread) ─
+    std::unique_ptr<milansql::WebSocketServer> wsServer;
+    if (wsMode) {
+        wsServer = std::make_unique<milansql::WebSocketServer>(engine, wsPort);
+        wsServer->start();
+        milansql::WebSocketServer* wsPtr = wsServer.get();
+        milansql::g_wsNotifyFn() = [wsPtr](const std::string& tbl, const std::string& op,
+                                            const std::vector<std::string>& cols,
+                                            const std::vector<std::string>& vals) {
+            if (wsPtr->isRunning())
+                wsPtr->notifyTableChange(tbl, op, cols, vals);
+        };
+        std::cout << "  WebSocket server on port " << wsPort << "\n\n";
+    }
+
     // ── Phase 79: Connection String — auto-execute CONNECT + USE ──
     if (!dsnArg.empty()) {
         try {
@@ -1001,5 +1021,10 @@ int main(int argc, char* argv[]) {
     engine.stopAutoVacuum();        // Phase 85: stop background vacuum thread
     bufferPoolStop.store(true);
     bufferPoolThread.detach();
+    // Phase 106: stop WebSocket server
+    if (wsServer) {
+        milansql::g_wsNotifyFn() = nullptr;
+        wsServer->stop();
+    }
     return 0;
 }

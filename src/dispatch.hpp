@@ -38,6 +38,21 @@
 #include "monitoring/prometheus.hpp"   // Phase 102: Prometheus Metrics
 #include "federation/federation_manager.hpp"  // Phase 105: Query Federation
 
+// Phase 106: WebSocket notification callback
+// Defined here to avoid circular dependency with websocket_server.hpp.
+// The callback is set by main.cpp when --ws is active.
+#include <functional>
+namespace milansql {
+// Callback type: (tableName, op, colNames, values)
+using WsNotifyFn = std::function<void(const std::string&, const std::string&,
+                                      const std::vector<std::string>&,
+                                      const std::vector<std::string>&)>;
+inline WsNotifyFn& g_wsNotifyFn() {
+    static WsNotifyFn fn;
+    return fn;
+}
+} // namespace milansql (ws callback)
+
 namespace milansql {
 
 // ── Phase 94: Global Connection Pool ─────────────────────────
@@ -2195,6 +2210,16 @@ inline bool dispatchCommand(
             engine.invalidateCache(cmd.tableName);
             // Phase 93: fire statement-level AFTER INSERT triggers
             engine.fireStatementTriggers("INSERT", cmd.tableName);
+            // Phase 106: WebSocket notification
+            if (milansql::g_wsNotifyFn()) {
+                std::vector<std::string> colNames;
+                try {
+                    for (const auto& col : engine.tableColumns(cmd.tableName))
+                        colNames.push_back(col.name);
+                } catch (...) {}
+                for (const auto& vals106 : rows)
+                    milansql::g_wsNotifyFn()(cmd.tableName, "INSERT", colNames, vals106);
+            }
             if (rows.size() == 1)
                 std::cout << "  1 Zeile eingefuegt in '" << cmd.tableName << "'.\n\n";
             else
@@ -3146,6 +3171,9 @@ inline bool dispatchCommand(
             engine.invalidateCache(cmd.tableName);
             // Phase 93: fire statement-level AFTER UPDATE triggers
             engine.fireStatementTriggers("UPDATE", cmd.tableName);
+            // Phase 106: WebSocket notification
+            if (n > 0 && milansql::g_wsNotifyFn())
+                milansql::g_wsNotifyFn()(cmd.tableName, "UPDATE", cmd.updateCols, cmd.updateVals);
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc << ")\n\n";
         } else {
@@ -3159,6 +3187,9 @@ inline bool dispatchCommand(
                 engine.invalidateCache(cmd.tableName);
                 // Phase 93: fire statement-level AFTER UPDATE triggers
                 engine.fireStatementTriggers("UPDATE", cmd.tableName);
+                // Phase 106: WebSocket notification
+                if (milansql::g_wsNotifyFn())
+                    milansql::g_wsNotifyFn()(cmd.tableName, "UPDATE", cmd.updateCols, cmd.updateVals);
             }
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc
@@ -3204,6 +3235,12 @@ inline bool dispatchCommand(
             engine.invalidateCache(cmd.tableName);
             // Phase 93: fire statement-level AFTER DELETE triggers
             engine.fireStatementTriggers("DELETE", cmd.tableName);
+            // Phase 106: WebSocket notification
+            if (n > 0 && milansql::g_wsNotifyFn()) {
+                std::vector<std::string> delCols = {"table"};
+                std::vector<std::string> delVals = {cmd.tableName};
+                milansql::g_wsNotifyFn()(cmd.tableName, "DELETE", delCols, delVals);
+            }
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
         } else {
             std::size_t n = engine.deleteWhere(
@@ -3214,6 +3251,12 @@ inline bool dispatchCommand(
                 engine.invalidateCache(cmd.tableName);
                 // Phase 93: fire statement-level AFTER DELETE triggers
                 engine.fireStatementTriggers("DELETE", cmd.tableName);
+                // Phase 106: WebSocket notification
+                if (milansql::g_wsNotifyFn()) {
+                    std::vector<std::string> delCols = {cmd.whereColumn};
+                    std::vector<std::string> delVals = {cmd.whereValue};
+                    milansql::g_wsNotifyFn()(cmd.tableName, "DELETE", delCols, delVals);
+                }
             }
             std::cout << "  " << n << " Zeile(n) geloescht"
                       << " (WHERE " << cmd.whereColumn

@@ -2191,7 +2191,7 @@ inline bool dispatchCommand(
                 // Wert auswerten
                 std::string val;
                 if (item.isFuncExpr) {
-                    val = milansql::Engine::evalFuncPublic(item.funcName, item.funcArgs);
+                    val = engine.evalFuncPublic(item.funcName, item.funcArgs);
                 } else {
                     val = item.colName;
                 }
@@ -4839,6 +4839,38 @@ inline bool dispatchCommand(
         if (inner.limit >= 0)
             std::cout << "    LIMIT    : " << inner.limit << "\n";
         std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 90: Extension System ────────────────────────────
+    case milansql::CommandType::CREATE_EXTENSION: {
+        bool ok = engine.getExtensionManager().createExtension(cmd.extensionName);
+        if (ok)
+            std::cout << "  Extension '" << cmd.extensionName << "' loaded.\n\n";
+        else
+            std::cout << "  FEHLER: Unknown extension '" << cmd.extensionName
+                      << "'. Available: milansql_math, milansql_crypto, milansql_uuid, milansql_text\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DROP_EXTENSION: {
+        engine.getExtensionManager().dropExtension(cmd.extensionName);
+        std::cout << "  Extension '" << cmd.extensionName << "' dropped.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_EXTENSIONS: {
+        std::string list = engine.getExtensionManager().showExtensions();
+        if (list == "(no extensions loaded)") {
+            std::cout << "  " << list << "\n\n";
+        } else {
+            std::cout << "\n  Loaded extensions:\n";
+            std::istringstream iss(list);
+            std::string line;
+            while (std::getline(iss, line))
+                std::cout << "    - " << line << "\n";
+            std::cout << "\n";
+        }
         break;
     }
 

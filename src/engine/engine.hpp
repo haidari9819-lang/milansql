@@ -39,6 +39,7 @@
 #include "../fdw/foreign_data_wrapper.hpp"  // Phase 89: FDW base
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
+#include "../extensions/extension_manager.hpp" // Phase 90: Extension System
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -2386,6 +2387,8 @@ public:
     // ── Phase 31/32: CASE/Func — Projektion mit Ausdrücken ──────
     Table projectWithItems(const Table& src,
                            const std::vector<SelectItem>& items) const {
+        // Phase 90: make extension manager available to static evaluateFunc
+        ExtMgrGuard extGuard(const_cast<ExtensionManager*>(&extensionMgr_));
         // Ergebnis-Schema aufbauen
         std::vector<Column> newCols;
         for (const auto& item : items) {
@@ -2482,6 +2485,8 @@ public:
     // projects the result. Returns a new Table with all columns.
     Table projectWithWindowItems(const Table& src,
                                   const std::vector<SelectItem>& items) const {
+        // Phase 90: make extension manager available to static evaluateFunc
+        ExtMgrGuard extGuard(const_cast<ExtensionManager*>(&extensionMgr_));
         // Separate window items from non-window items
         std::vector<SelectItem> windowItems, normalItems;
         for (const auto& item : items) {
@@ -4383,11 +4388,29 @@ private:
         return s;
     }
 
+    // Phase 90: Thread-local extension manager pointer for evaluateFunc dispatch
+    // Set before query execution by non-static wrappers.
+    static ExtensionManager*& tl_extMgr() {
+        static thread_local ExtensionManager* ptr = nullptr;
+        return ptr;
+    }
+
     // Phase 32: String-Funktion auswerten
     // Argumente: Spaltenname → Zellwert; 'literal' oder literal → direkt
     static std::string evaluateFunc(const std::string& fn,
                                      const std::vector<std::string>& args,
                                      const Table& tbl, const Row& row) {
+        // Phase 90: Check extension manager first
+        {
+            ExtensionManager* em = tl_extMgr();
+            if (em) {
+                std::string fnUp = fn;
+                for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                auto res = em->tryEvaluate(fnUp, args);
+                if (res.first) return res.second;
+            }
+        }
+
         // Argument auflösen: Spalte → Wert, 'literal' → literal, sonst direkt
         // Phase 40: wenn arg mehrere Tokens enthält (z.B. "CAST ( id AS TEXT )"),
         // via evalExprStr auswerten.
@@ -4864,6 +4887,11 @@ private:
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;
         for (const auto& f : KNOWN_FUNCS) if (fn == f) { isFunc = true; break; }
+        // Phase 90: also recognize functions registered by loaded extensions
+        if (!isFunc) {
+            ExtensionManager* em = tl_extMgr();
+            if (em && em->isExtensionFunc(fn)) isFunc = true;
+        }
 
         if (isFunc && toks.size() >= 2 && toks[1] == "(") {
             // Find matching closing paren
@@ -5190,6 +5218,7 @@ private:
                     const Row& row,
                     const std::vector<WhereCondition>& conds,
                     const std::string& logic) const {
+        ExtMgrGuard extGuard(const_cast<ExtensionManager*>(&extensionMgr_));
         if (conds.empty()) return true;
 
         auto evalOne = [&](const WhereCondition& c) -> bool {
@@ -6051,12 +6080,30 @@ public:
 
     // Öffentlicher Zugriff auf evaluateFunc (für SELECT ohne FROM) ──
     // Erstellt eine temporäre leere Tabelle + leere Zeile und ruft evaluateFunc auf.
-    static std::string evalFuncPublic(const std::string& fn,
-                                      const std::vector<std::string>& args) {
+    std::string evalFuncPublic(const std::string& fn,
+                               const std::vector<std::string>& args) {
+        ExtMgrGuard guard(&extensionMgr_);
         Table tmpTbl("", {Column("_", "TEXT")});
         Row  emptyRow(std::vector<std::string>{"NULL"});
         return evaluateFunc(fn, args, tmpTbl, emptyRow);
     }
+
+    // ── Phase 90: Extension Manager ──────────────────────────
+    ExtensionManager& getExtensionManager() { return extensionMgr_; }
+    const ExtensionManager& getExtensionManager() const { return extensionMgr_; }
+
+    // RAII guard: sets/restores the thread-local extension manager pointer
+    struct ExtMgrGuard {
+        ExtensionManager* prev_;
+        explicit ExtMgrGuard(ExtensionManager* em) {
+            prev_ = Engine::tl_extMgr();
+            Engine::tl_extMgr() = em;
+        }
+        ~ExtMgrGuard() { Engine::tl_extMgr() = prev_; }
+    };
+
+    // Sets TL pointer for the duration of this call (used internally before static calls)
+    void setExtMgrForThread() { tl_extMgr() = &extensionMgr_; }
 
     // ── Phase 54A: Query Cache ────────────────────────────────
     QueryCache& getQueryCache() { return queryCache_; }
@@ -6497,6 +6544,9 @@ public:
     }
 
 private:
+    // Phase 90: Extension Manager
+    ExtensionManager extensionMgr_;
+
     // Phase 54A: Query Cache instance
     QueryCache queryCache_;
 

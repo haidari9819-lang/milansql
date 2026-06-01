@@ -191,6 +191,10 @@ enum class CommandType {
     CREATE_FOREIGN_TABLE,
     DROP_FOREIGN_TABLE,
     SHOW_FOREIGN_TABLES,
+    // Phase 90: Extension System
+    CREATE_EXTENSION,
+    DROP_EXTENSION,
+    SHOW_EXTENSIONS,
     UNKNOWN
 };
 
@@ -426,6 +430,9 @@ struct ParsedCommand {
     std::string serverName;        // for CREATE SERVER / CREATE FOREIGN TABLE
     std::string wrapperType;       // for CREATE SERVER: "csv" or "http_json"
     std::map<std::string,std::string> fdwOptions;  // OPTIONS (key 'val', ...)
+
+    // Phase 90: Extension System
+    std::string extensionName;     // for CREATE/DROP EXTENSION
 };
 
 class Parser {
@@ -852,6 +859,34 @@ public:
                 }
             }
             (void)WFUNCS;  // suppress unused warning
+        }
+
+        // ── Phase 90: Generic function call detection ─────────────
+        // If any token in SELECT looks like WORD(...) or WORD( and there's no FROM,
+        // route to parseSelectFull to handle extension functions (pi(), md5(), etc.)
+        {
+            auto st = tokenize(input);
+            if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                bool hasFrom = false;
+                bool hasFuncTok = false;
+                for (const auto& tok : st) {
+                    if (toUpper(tok) == "FROM") { hasFrom = true; break; }
+                }
+                if (!hasFrom) {
+                    // Check if any token looks like func( or func(...)
+                    for (size_t ti = 1; ti < st.size(); ++ti) {
+                        const std::string& tok = st[ti];
+                        // Token ends with ( or contains (
+                        if (tok.find('(') != std::string::npos) {
+                            hasFuncTok = true; break;
+                        }
+                    }
+                }
+                if (hasFuncTok) {
+                    parseSelectFull(input, cmd);
+                    return cmd;
+                }
+            }
         }
 
         // ── Phase 62: Pre-process CREATE TABLE ... PARTITION BY ... ──
@@ -1831,6 +1866,9 @@ public:
             } else if (kw1 == "FOREIGN" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "TABLES") {
                 cmd.type = CommandType::SHOW_FOREIGN_TABLES;
+            // Phase 90: SHOW EXTENSIONS
+            } else if (kw1 == "EXTENSIONS") {
+                cmd.type = CommandType::SHOW_EXTENSIONS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2731,6 +2769,18 @@ public:
                    toUpper(tokens[2]) == "TABLE") {
             cmd.type = CommandType::DROP_FOREIGN_TABLE;
             cmd.tableName = tokens[3];
+
+        // ── Phase 90: CREATE EXTENSION <name> ────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "EXTENSION") {
+            cmd.type = CommandType::CREATE_EXTENSION;
+            if (tokens.size() >= 3) cmd.extensionName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 90: DROP EXTENSION <name> ──────────────────────
+        } else if (kw0 == "DROP" && kw1 == "EXTENSION") {
+            cmd.type = CommandType::DROP_EXTENSION;
+            if (tokens.size() >= 3) cmd.extensionName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }
@@ -3670,6 +3720,10 @@ private:
                         std::string fn = toUpper(exprToks[0]);
                         bool isKnown = false;
                         for (const auto& f : ALLFUNCS) if (fn == f) { isKnown = true; break; }
+                        // Phase 90: treat any WORD(...) as function call (extension fallback)
+                        if (!isKnown && fn != "SELECT" && fn != "FROM" && fn != "WHERE" &&
+                            fn != "AND" && fn != "OR" && fn != "NOT" && fn != "NULL")
+                            isKnown = true;
                         if (isKnown) {
                             item.isFuncExpr = true; item.funcName = fn;
                             // collect args between outer parens
@@ -3703,8 +3757,16 @@ private:
                             item.colName = expr.substr(0, asPos);
                         }
                     } else {
-                        // Parse AS alias after closing paren
-                        if (i < N && toUpper(ft[i]) == "AS") {
+                        // Parse AS alias: may already be in exprToks or still in ft
+                        // First check inside exprToks (after closing paren at depth 0)
+                        bool aliasFound = false;
+                        for (size_t j = 1; j < exprToks.size(); ++j) {
+                            if (toUpper(exprToks[j]) == "AS" && j + 1 < exprToks.size()) {
+                                item.alias = exprToks[j + 1]; aliasFound = true; break;
+                            }
+                        }
+                        // Also try from ft[i] if not already found
+                        if (!aliasFound && i < N && toUpper(ft[i]) == "AS") {
                             ++i;
                             if (i < N && ft[i] != ",") { item.alias = ft[i]; ++i; }
                         }
@@ -4050,6 +4112,46 @@ private:
                     }
                     cmd.selectItems.push_back(item);
 
+                // Phase 90: Generic function fallback — any WORD(...) not yet matched
+                // This handles extension functions (pi(), md5(), etc.)
+                } else if (!isStrFunc && !treatAsWindow &&
+                           i + 1 < end && ft[i + 1] == "(" &&
+                           u != "SELECT" && u != "FROM" && u != "WHERE" &&
+                           u != "AND" && u != "OR" && u != "NOT" &&
+                           u != "AS" && u != "ON" && u != "IN" &&
+                           u != "NULL" && u != "DISTINCT") {
+                    SelectItem item;
+                    item.isFuncExpr = true;
+                    item.funcName   = u;
+                    i += 2;  // skip WORD and (
+                    {
+                        int depth = 0;
+                        std::string currentArg;
+                        while (i < end) {
+                            if (ft[i] == "(") { depth++; currentArg += ft[i] + " "; i++; continue; }
+                            if (ft[i] == ")") {
+                                if (depth == 0) break;
+                                depth--; currentArg += ft[i] + " "; i++; continue;
+                            }
+                            if (depth == 0 && ft[i] == ",") {
+                                std::string a = currentArg;
+                                while (!a.empty() && a.back() == ' ') a.pop_back();
+                                if (!a.empty()) item.funcArgs.push_back(a);
+                                currentArg = ""; i++; continue;
+                            }
+                            currentArg += ft[i] + " ";
+                            i++;
+                        }
+                        std::string a = currentArg;
+                        while (!a.empty() && a.back() == ' ') a.pop_back();
+                        if (!a.empty()) item.funcArgs.push_back(a);
+                    }
+                    if (i < end && ft[i] == ")") ++i;
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(item);
                 } else if (isStrFunc && (i + 1 >= end || ft[i + 1] != "(") &&
                            (u == "NOW" || u == "CURDATE" || u == "CURTIME" ||
                             u == "CURRENT_TIMESTAMP" || u == "CURRENT_DATE" || u == "CURRENT_TIME")) {

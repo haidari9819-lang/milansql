@@ -29,14 +29,30 @@ if(WIN32)
     target_link_libraries(milansql PRIVATE ws2_32)
 endif()
 
-# ── Test-Suite (Phase 39.5) ──────────────────────────────────
+# ── Test-Suite (Phase 99) ────────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src src/server src/locking src/extensions src/extensions/builtin)
+target_include_directories(milansql_tests PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()
     target_compile_options(milansql_tests PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_tests PRIVATE ws2_32)
+endif()
+
+# ── Stress Test (Phase 99) ───────────────────────────────────
+add_executable(milansql_stress src/tests/stress_test.cpp)
+target_compile_features(milansql_stress PRIVATE cxx_std_17)
+target_include_directories(milansql_stress PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage)
+if(MSVC)
+    target_compile_options(milansql_stress PRIVATE /W4)
+else()
+    target_compile_options(milansql_stress PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_stress PRIVATE ws2_32)
 endif()
 
 # ── Benchmark (Phase 39.5) ───────────────────────────────────

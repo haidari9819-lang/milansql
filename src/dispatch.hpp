@@ -2220,8 +2220,39 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty()) {
             std::cout << "  Fehler: Kein Tabellenname.\n"; break;
         }
-        if (!engine.viewExists(cmd.tableName) && cmd.cteList.empty()) {
+        if (!engine.viewExists(cmd.tableName) && cmd.cteList.empty() &&
+            !engine.isPgCatalogTable(cmd.tableName)) {
             engine.checkPrivilege("SELECT", cmd.tableName);
+        }
+
+        // ── Phase 95: pg_catalog / information_schema virtual tables ──────────
+        if (engine.isPgCatalogTable(cmd.tableName) && cmd.cteList.empty()) {
+            try {
+                milansql::Table vt = engine.buildPgCatalogTable(cmd.tableName);
+                // Apply WHERE filter on virtual table
+                if (!cmd.whereConds.empty()) {
+                    milansql::Table filtered(cmd.tableName, vt.columns());
+                    for (const auto& row : vt.rows()) {
+                        if (row.xmax != 0) continue;
+                        if (engine.rowMatchesPublic(vt, row, cmd.whereConds, cmd.whereLogic))
+                            filtered.insert(row);
+                    }
+                    vt = std::move(filtered);
+                }
+                // Apply column projection
+                if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
+                    vt = engine.projectWithItems(vt, cmd.selectItems);
+                } else if (!cmd.selectColumns.empty()) {
+                    vt = vt.project(cmd.selectColumns);
+                }
+                if (cmd.isDistinct) vt.makeDistinct();
+                if (!cmd.orderByCols.empty()) vt.sortByMulti(cmd.orderByCols);
+                std::cout << "\n";
+                dispatch_printTable(vt, cmd.limit, cmd.limitOffset);
+            } catch (const std::exception& ex) {
+                std::cout << "  FEHLER (pg_catalog): " << ex.what() << "\n\n";
+            }
+            break;
         }
 
         if (!cmd.cteList.empty()) {

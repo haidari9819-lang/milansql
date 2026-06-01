@@ -45,6 +45,118 @@
 // Neu: --server / --client / --port N Modi
 // ============================================================
 
+// ── Phase 95: psql Meta-Command Handler ──────────────────────────────────
+
+static void handleBackslashCommand(const std::string& line,
+    milansql::Engine& engine, milansql::Parser& parser,
+    std::function<void()> persist,
+    std::function<void()> saveProcedures,
+    std::function<void()> saveTriggers,
+    bool& doQuit)
+{
+    // Trim leading whitespace
+    size_t pos = 0;
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+    std::string cmd = line.substr(pos);
+    if (cmd.empty() || cmd[0] != '\\') return;
+
+    // Extract command and optional argument
+    std::string bslCmd;
+    std::string bslArg;
+    size_t i = 1;
+    while (i < cmd.size() && cmd[i] != ' ' && cmd[i] != '\t') { bslCmd += cmd[i]; ++i; }
+    while (i < cmd.size() && (cmd[i] == ' ' || cmd[i] == '\t')) ++i;
+    bslArg = cmd.substr(i);
+
+    if (bslCmd == "q") {
+        doQuit = true;
+        return;
+    }
+    if (bslCmd == "dt") {
+        // List tables — dispatch SHOW TABLES
+        std::string sql = "SHOW TABLES";
+        milansql::ParsedCommand c = parser.parse(sql);
+        milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        return;
+    }
+    if (bslCmd == "l") {
+        // List databases/schemas — dispatch SHOW SCHEMAS
+        std::string sql = "SHOW SCHEMAS";
+        milansql::ParsedCommand c = parser.parse(sql);
+        milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        return;
+    }
+    if (bslCmd == "d") {
+        if (bslArg.empty()) {
+            // List all tables
+            std::string sql = "SHOW TABLES";
+            milansql::ParsedCommand c = parser.parse(sql);
+            milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        } else {
+            // Describe table
+            std::string sql = "DESCRIBE " + bslArg;
+            milansql::ParsedCommand c = parser.parse(sql);
+            milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        }
+        return;
+    }
+    if (bslCmd == "di") {
+        // List indexes
+        std::cout << "\n  Indexes:\n";
+        for (const auto& tblName : engine.getAllTableNames()) {
+            auto idxs = engine.getIndexes(tblName);
+            if (!idxs.empty()) {
+                for (const auto& idx : idxs) {
+                    std::cout << "  " << idx.indexName
+                              << " ON " << tblName
+                              << " (" << idx.colName << ")"
+                              << " [" << idx.type << "]\n";
+                }
+            }
+        }
+        std::cout << "\n";
+        return;
+    }
+    if (bslCmd == "du") {
+        // List users
+        std::string sql = "SHOW USERS";
+        milansql::ParsedCommand c = parser.parse(sql);
+        milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        return;
+    }
+    if (bslCmd == "dn") {
+        // List namespaces/schemas
+        std::string sql = "SHOW SCHEMAS";
+        milansql::ParsedCommand c = parser.parse(sql);
+        milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        return;
+    }
+    if (bslCmd == "df") {
+        // List functions/procedures
+        std::string sql = "SHOW PROCEDURES";
+        milansql::ParsedCommand c = parser.parse(sql);
+        milansql::dispatchCommand(c, engine, parser, sql, persist, saveProcedures, saveTriggers);
+        return;
+    }
+    if (bslCmd == "?") {
+        std::cout << "\n"
+            << "  psql Meta-Commands:\n"
+            << "  \\l          list databases/schemas\n"
+            << "  \\dt         list tables\n"
+            << "  \\d name     describe table\n"
+            << "  \\di         list indexes\n"
+            << "  \\du         list users\n"
+            << "  \\dn         list namespaces/schemas\n"
+            << "  \\df         list functions/procedures\n"
+            << "  \\q          quit\n"
+            << "  \\?          show this help\n"
+            << "\n";
+        return;
+    }
+    std::cout << "  Unknown meta-command: \\" << bslCmd
+              << "  (try \\? for help)\n\n";
+}
+
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
@@ -583,6 +695,26 @@ int main(int argc, char* argv[]) {
             std::cout << "\nAuf Wiedersehen!\n"; break;
         }
         if (eingabe.empty()) continue;
+
+        // ── Phase 95: psql Meta-Commands (backslash commands) ────────────
+        {
+            size_t bspos = 0;
+            while (bspos < eingabe.size() && (eingabe[bspos]==' ' || eingabe[bspos]=='\t'))
+                ++bspos;
+            if (bspos < eingabe.size() && eingabe[bspos] == '\\') {
+                bool doQuit95 = false;
+                handleBackslashCommand(eingabe, engine, parser,
+                    persist, saveProcedures, saveTriggers, doQuit95);
+                if (doQuit95) {
+                    std::cout << "Auf Wiedersehen!\n";
+                    bufferPoolStop.store(true);
+                    bufferPoolThread.detach();
+                    engine.stopAutoVacuum();
+                    return 0;
+                }
+                continue;
+            }
+        }
 
         // Phase 43: Multi-line CREATE TRIGGER — buffer lines until END
         {

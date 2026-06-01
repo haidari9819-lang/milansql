@@ -6943,6 +6943,280 @@ private:
                 pagedTables_.emplace(tblName, PagedTable(tblName, cols, pagedManager_));
         }
     }
+
+public:
+    // ── Phase 95: Public row matching helper ─────────────────────────────
+    bool rowMatchesPublic(const Table& src,
+                          const Row& row,
+                          const std::vector<WhereCondition>& conds,
+                          const std::string& logic) const {
+        return rowMatches(src, row, conds, logic);
+    }
+
+    // ── Phase 95: pg_catalog + information_schema virtual tables ──────────
+
+    bool isPgCatalogTable(const std::string& name) const {
+        static const std::set<std::string> pgCatalogTables = {
+            "pg_catalog.pg_tables",     "pg_tables",
+            "pg_catalog.pg_class",      "pg_class",
+            "pg_catalog.pg_attribute",  "pg_attribute",
+            "pg_catalog.pg_index",      "pg_index",
+            "pg_catalog.pg_user",       "pg_user",
+            "pg_catalog.pg_database",   "pg_database",
+            "pg_catalog.pg_namespace",  "pg_namespace",
+            "pg_catalog.pg_type",       "pg_type",
+            "pg_catalog.pg_proc",       "pg_proc",
+            "information_schema.tables",
+            "information_schema.columns",
+        };
+        std::string lower = name;
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return pgCatalogTables.count(lower) > 0;
+    }
+
+    Table buildPgCatalogTable(const std::string& name) const {
+        std::string lower = name;
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        // Helper: strip schema prefix from internal table name
+        auto bareName = [](const std::string& n) -> std::string {
+            auto dot = n.rfind('.');
+            return dot != std::string::npos ? n.substr(dot + 1) : n;
+        };
+
+        // pg_catalog.pg_tables  — one row per user table
+        if (lower == "pg_catalog.pg_tables" || lower == "pg_tables") {
+            std::vector<Column> cols = {
+                Column("schemaname", "TEXT"),
+                Column("tablename",  "TEXT"),
+                Column("tableowner", "TEXT"),
+                Column("hasindexes", "TEXT"),
+            };
+            Table t("pg_tables", cols);
+            for (const auto& [tname, tbl] : tables_) {
+                bool hasIdx = !tbl.getIndexes().empty();
+                t.insert(Row({"public", bareName(tname), "root", hasIdx ? "t" : "f"}));
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_class  — tables + views + indexes
+        if (lower == "pg_catalog.pg_class" || lower == "pg_class") {
+            std::vector<Column> cols = {
+                Column("relname",   "TEXT"),
+                Column("relkind",   "TEXT"),
+                Column("reltuples", "TEXT"),
+            };
+            Table t("pg_class", cols);
+            for (const auto& [tname, tbl] : tables_) {
+                t.insert(Row({bareName(tname), "r", std::to_string(tbl.rowCount())}));
+                for (const auto& idx : tbl.getIndexes()) {
+                    t.insert(Row({idx.indexName, "i", "0"}));
+                }
+            }
+            for (const auto& [vname, _vsql] : views_) {
+                t.insert(Row({vname, "v", "0"}));
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_attribute  — one row per column per table
+        if (lower == "pg_catalog.pg_attribute" || lower == "pg_attribute") {
+            std::vector<Column> cols = {
+                Column("attrelid",  "TEXT"),
+                Column("attname",   "TEXT"),
+                Column("atttypid",  "TEXT"),
+                Column("attnum",    "TEXT"),
+                Column("attnotnull","TEXT"),
+            };
+            Table t("pg_attribute", cols);
+            for (const auto& [tname, tbl] : tables_) {
+                std::string bname = bareName(tname);
+                const auto& tcols = tbl.columns();
+                for (size_t i = 0; i < tcols.size(); ++i) {
+                    t.insert(Row({
+                        bname,
+                        tcols[i].name,
+                        tcols[i].type,
+                        std::to_string(i + 1),
+                        tcols[i].notNull ? "t" : "f"
+                    }));
+                }
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_index  — one row per index
+        if (lower == "pg_catalog.pg_index" || lower == "pg_index") {
+            std::vector<Column> cols = {
+                Column("indrelid",    "TEXT"),
+                Column("indexrelid",  "TEXT"),
+                Column("indisunique", "TEXT"),
+                Column("indisprimary","TEXT"),
+            };
+            Table t("pg_index", cols);
+            for (const auto& [tname, tbl] : tables_) {
+                std::string bname = bareName(tname);
+                for (const auto& idx : tbl.getIndexes()) {
+                    t.insert(Row({bname, idx.indexName, "f", "f"}));
+                }
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_user  — one row per user
+        if (lower == "pg_catalog.pg_user" || lower == "pg_user") {
+            std::vector<Column> cols = {
+                Column("usename",     "TEXT"),
+                Column("usecreatedb", "TEXT"),
+                Column("usesysid",    "TEXT"),
+            };
+            Table t("pg_user", cols);
+            int sysid = 1;
+            for (const auto& [uname, _udef] : users_) {
+                t.insert(Row({uname, "t", std::to_string(sysid++)}));
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_database  — databases/schemas
+        if (lower == "pg_catalog.pg_database" || lower == "pg_database") {
+            std::vector<Column> cols = {
+                Column("datname",  "TEXT"),
+                Column("datdba",   "TEXT"),
+                Column("encoding", "TEXT"),
+            };
+            Table t("pg_database", cols);
+            t.insert(Row({"public", "root", "UTF8"}));
+            for (const auto& s : schemas_) {
+                if (s != "public") t.insert(Row({s, "root", "UTF8"}));
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_namespace  — namespaces/schemas
+        if (lower == "pg_catalog.pg_namespace" || lower == "pg_namespace") {
+            std::vector<Column> cols = {
+                Column("nspname",  "TEXT"),
+                Column("nspowner", "TEXT"),
+            };
+            Table t("pg_namespace", cols);
+            for (const auto& s : schemas_) {
+                t.insert(Row({s, "root"}));
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_type  — standard SQL types
+        if (lower == "pg_catalog.pg_type" || lower == "pg_type") {
+            std::vector<Column> cols = {
+                Column("typname", "TEXT"),
+                Column("typtype", "TEXT"),
+                Column("typlen",  "TEXT"),
+            };
+            Table t("pg_type", cols);
+            static const std::vector<std::array<std::string,3>> types = {
+                {"int",   "b", "4"},
+                {"int4",  "b", "4"},
+                {"int8",  "b", "8"},
+                {"int2",  "b", "2"},
+                {"text",  "b", "-1"},
+                {"real",  "b", "4"},
+                {"float4","b", "4"},
+                {"float8","b", "8"},
+                {"bool",  "b", "1"},
+                {"date",  "b", "4"},
+                {"json",  "b", "-1"},
+            };
+            for (const auto& tp : types) {
+                t.insert(Row({tp[0], tp[1], tp[2]}));
+            }
+            return t;
+        }
+
+        // pg_catalog.pg_proc  — built-in + extension functions
+        if (lower == "pg_catalog.pg_proc" || lower == "pg_proc") {
+            std::vector<Column> cols = {
+                Column("proname",       "TEXT"),
+                Column("pronamespace",  "TEXT"),
+                Column("pronargs",      "TEXT"),
+                Column("prorettype",    "TEXT"),
+            };
+            Table t("pg_proc", cols);
+            static const std::vector<std::array<std::string,4>> builtins = {
+                {"upper",   "pg_catalog", "1", "text"},
+                {"lower",   "pg_catalog", "1", "text"},
+                {"length",  "pg_catalog", "1", "int4"},
+                {"concat",  "pg_catalog", "-1","text"},
+                {"substr",  "pg_catalog", "3", "text"},
+                {"trim",    "pg_catalog", "1", "text"},
+                {"replace", "pg_catalog", "3", "text"},
+                {"now",     "pg_catalog", "0", "text"},
+                {"count",   "pg_catalog", "1", "int4"},
+                {"sum",     "pg_catalog", "1", "text"},
+                {"avg",     "pg_catalog", "1", "real"},
+                {"min",     "pg_catalog", "1", "text"},
+                {"max",     "pg_catalog", "1", "text"},
+                {"coalesce","pg_catalog", "-1","text"},
+                {"cast",    "pg_catalog", "2", "text"},
+                {"abs",     "pg_catalog", "1", "real"},
+            };
+            for (const auto& f : builtins) {
+                t.insert(Row({f[0], f[1], f[2], f[3]}));
+            }
+            // Add extension functions
+            for (const auto& [pname, proc] : procedures_) {
+                t.insert(Row({pname, "public",
+                              std::to_string(proc.params.size()), "text"}));
+            }
+            return t;
+        }
+
+        // information_schema.tables
+        if (lower == "information_schema.tables") {
+            std::vector<Column> cols = {
+                Column("table_catalog", "TEXT"),
+                Column("table_schema",  "TEXT"),
+                Column("table_name",    "TEXT"),
+                Column("table_type",    "TEXT"),
+            };
+            Table t("information_schema.tables", cols);
+            for (const auto& [tname, _tbl] : tables_) {
+                t.insert(Row({"public", "public", bareName(tname), "BASE TABLE"}));
+            }
+            for (const auto& [vname, _vsql] : views_) {
+                t.insert(Row({"public", "public", vname, "VIEW"}));
+            }
+            return t;
+        }
+
+        // information_schema.columns
+        if (lower == "information_schema.columns") {
+            std::vector<Column> cols = {
+                Column("table_name",      "TEXT"),
+                Column("column_name",     "TEXT"),
+                Column("data_type",       "TEXT"),
+                Column("ordinal_position","TEXT"),
+            };
+            Table t("information_schema.columns", cols);
+            for (const auto& [tname, tbl] : tables_) {
+                std::string bname = bareName(tname);
+                const auto& tcols = tbl.columns();
+                for (size_t i = 0; i < tcols.size(); ++i) {
+                    t.insert(Row({
+                        bname,
+                        tcols[i].name,
+                        tcols[i].type,
+                        std::to_string(i + 1)
+                    }));
+                }
+            }
+            return t;
+        }
+
+        // Fallback: empty table
+        return Table(name, {Column("result", "TEXT")});
+    }
 };
 
 } // namespace milansql

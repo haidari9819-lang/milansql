@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "milansql"
+version = "4.2.0"
+description = "Python client for MilanSQL database (DB-API 2.0 / PEP 249)"
+authors = [{name = "Mirwais Haidari"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+keywords = ["database", "sql", "milansql", "client"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+
+[project.urls]
+Homepage = "https://github.com/haidari9819-lang/milansql"

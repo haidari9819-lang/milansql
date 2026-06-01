@@ -212,6 +212,8 @@ enum class CommandType {
     // Phase 96: Data Compression
     ALTER_TABLE_SET_COMPRESSION,
     SHOW_COMPRESSION_STATS,
+    // Phase 97: Time-Series
+    SHOW_TIMESERIES_STATUS,
     UNKNOWN
 };
 
@@ -469,6 +471,12 @@ struct ParsedCommand {
 
     // Phase 96: Data Compression
     std::string compressionType;   // "lz4", "rle", "dictionary", "zstd", or "none"
+
+    // Phase 97: Time-Series
+    bool        isTimeSeries      = false;
+    std::string tsTimeColumn;      // TIME_COLUMN = colname
+    std::string tsPartitionBy;     // "DAY", "HOUR", "WEEK", "MONTH"
+    int         tsRetentionDays   = -1;
 };
 
 class Parser {
@@ -862,7 +870,9 @@ public:
                  "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
                  // Phase 88: Array functions + UNNEST
                  "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
-                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST"};
+                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST",
+                 // Phase 97: Time-Series
+                 "TIME_BUCKET"};
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 for (const auto& tok : st) {
@@ -1105,7 +1115,8 @@ public:
             }
         }
 
-        // ── Phase 96: Pre-process CREATE TABLE ... WITH (COMPRESSION = xxx) ──
+        // ── Phase 96/97: Pre-process CREATE TABLE ... WITH (...) ──
+        // Handles COMPRESSION, TIMESERIES, TIME_COLUMN, PARTITION_BY, RETENTION
         {
             std::string ucheck2 = input;
             for (auto& c : ucheck2) c = static_cast<char>(std::toupper(
@@ -1126,30 +1137,105 @@ public:
                         std::string afterU2 = after2;
                         for (auto& c : afterU2) c = static_cast<char>(std::toupper(
                             static_cast<unsigned char>(c)));
-                        // Look for WITH ( ... COMPRESSION = value ... )
+                        // Look for WITH ( ... options ... )
                         auto withPos2 = afterU2.find("WITH");
                         if (withPos2 != std::string::npos) {
                             auto lp2 = after2.find('(', withPos2);
                             if (lp2 != std::string::npos) {
                                 auto rp2 = after2.find(')', lp2);
                                 if (rp2 != std::string::npos) {
+                                    std::string opts2raw = after2.substr(lp2 + 1, rp2 - lp2 - 1);
                                     std::string opts2 = afterU2.substr(lp2 + 1, rp2 - lp2 - 1);
-                                    auto compPos2 = opts2.find("COMPRESSION");
-                                    if (compPos2 != std::string::npos) {
-                                        auto eqPos2 = opts2.find('=', compPos2);
-                                        if (eqPos2 != std::string::npos) {
-                                            size_t vStart2 = eqPos2 + 1;
-                                            while (vStart2 < opts2.size() && opts2[vStart2] == ' ') ++vStart2;
-                                            size_t vEnd2 = vStart2;
-                                            while (vEnd2 < opts2.size() && opts2[vEnd2] != ' ' && opts2[vEnd2] != ',') ++vEnd2;
-                                            std::string compVal2 = opts2.substr(vStart2, vEnd2 - vStart2);
-                                            // lowercase
-                                            for (auto& c : compVal2) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                                            cmd.compressionType = compVal2;
-                                            // Truncate input to just the column defs part
-                                            input = input.substr(0, matchRp2 + 1);
+                                    bool hasWithOpts = false;
+
+                                    // Helper: extract value after KEY = in opts2
+                                    auto extractVal = [&](const std::string& key) -> std::string {
+                                        auto kpos = opts2.find(key);
+                                        if (kpos == std::string::npos) return "";
+                                        auto ep = opts2.find('=', kpos);
+                                        if (ep == std::string::npos) return "";
+                                        size_t vs = ep + 1;
+                                        while (vs < opts2.size() && opts2[vs] == ' ') ++vs;
+                                        size_t ve = vs;
+                                        while (ve < opts2.size() && opts2[ve] != ' ' && opts2[ve] != ',') ++ve;
+                                        return opts2.substr(vs, ve - vs);
+                                    };
+
+                                    // COMPRESSION
+                                    {
+                                        std::string v = extractVal("COMPRESSION");
+                                        if (!v.empty()) {
+                                            for (auto& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                            cmd.compressionType = v;
+                                            hasWithOpts = true;
                                         }
                                     }
+                                    // TIMESERIES
+                                    {
+                                        auto tsPos = opts2.find("TIMESERIES");
+                                        if (tsPos != std::string::npos) {
+                                            auto eqp = opts2.find('=', tsPos);
+                                            if (eqp != std::string::npos) {
+                                                size_t vs = eqp + 1;
+                                                while (vs < opts2.size() && opts2[vs] == ' ') ++vs;
+                                                size_t ve = vs;
+                                                while (ve < opts2.size() && opts2[ve] != ' ' && opts2[ve] != ',') ++ve;
+                                                std::string v = opts2.substr(vs, ve - vs);
+                                                if (v == "TRUE" || v == "1") cmd.isTimeSeries = true;
+                                            }
+                                            hasWithOpts = true;
+                                        }
+                                    }
+                                    // TIME_COLUMN (use raw opts for column name, not upper)
+                                    {
+                                        std::string optsRawU = opts2; // already upper
+                                        auto tcPos = optsRawU.find("TIME_COLUMN");
+                                        if (tcPos != std::string::npos) {
+                                            auto eqp = optsRawU.find('=', tcPos);
+                                            if (eqp != std::string::npos) {
+                                                size_t vs = eqp + 1;
+                                                while (vs < opts2raw.size() && opts2raw[vs] == ' ') ++vs;
+                                                size_t ve = vs;
+                                                while (ve < opts2raw.size() && opts2raw[ve] != ' ' && opts2raw[ve] != ',') ++ve;
+                                                cmd.tsTimeColumn = opts2raw.substr(vs, ve - vs);
+                                            }
+                                            hasWithOpts = true;
+                                        }
+                                    }
+                                    // PARTITION_BY
+                                    {
+                                        auto pbPos = opts2.find("PARTITION_BY");
+                                        if (pbPos != std::string::npos) {
+                                            auto eqp = opts2.find('=', pbPos);
+                                            if (eqp != std::string::npos) {
+                                                size_t vs = eqp + 1;
+                                                while (vs < opts2.size() && opts2[vs] == ' ') ++vs;
+                                                size_t ve = vs;
+                                                while (ve < opts2.size() && opts2[ve] != ' ' && opts2[ve] != ',') ++ve;
+                                                cmd.tsPartitionBy = opts2.substr(vs, ve - vs);
+                                            }
+                                            hasWithOpts = true;
+                                        }
+                                    }
+                                    // RETENTION = N DAYS
+                                    {
+                                        auto retPos = opts2.find("RETENTION");
+                                        if (retPos != std::string::npos) {
+                                            auto eqp = opts2.find('=', retPos);
+                                            if (eqp != std::string::npos) {
+                                                size_t vs = eqp + 1;
+                                                while (vs < opts2.size() && opts2[vs] == ' ') ++vs;
+                                                size_t ve = vs;
+                                                while (ve < opts2.size() && opts2[ve] != ' ' && opts2[ve] != ',') ++ve;
+                                                std::string nStr = opts2.substr(vs, ve - vs);
+                                                try { cmd.tsRetentionDays = std::stoi(nStr); } catch (...) {}
+                                            }
+                                            hasWithOpts = true;
+                                        }
+                                    }
+
+                                    if (hasWithOpts)
+                                        input = input.substr(0, matchRp2 + 1);
                                 }
                             }
                         }
@@ -1988,6 +2074,14 @@ public:
                        toUpper(tokens[3]) == "FOR") {
                 cmd.type = CommandType::SHOW_COMPRESSION_STATS;
                 cmd.tableName = tokens[4];
+            // Phase 97: SHOW TIMESERIES STATUS [FOR tablename]
+            } else if (kw1 == "TIMESERIES" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_TIMESERIES_STATUS;
+                if (tokens.size() >= 5 && toUpper(tokens[3]) == "FOR")
+                    cmd.tableName = tokens[4];
+                else
+                    cmd.tableName = "";
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -4175,7 +4269,9 @@ private:
                  "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
                  "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY",
                  // Phase 88: UNNEST
-                 "UNNEST"};
+                 "UNNEST",
+                 // Phase 97: Time-Series
+                 "TIME_BUCKET"};
         bool hasCase = false, hasFunc = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
@@ -4343,7 +4439,9 @@ private:
                  "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
                  // Phase 88: Array functions + UNNEST
                  "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
-                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST"};
+                 "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST",
+                 // Phase 97: Time-Series
+                 "TIME_BUCKET"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 
@@ -5001,6 +5099,9 @@ private:
         static const std::vector<std::string> AGGF =
             {"COUNT", "MIN", "MAX", "AVG", "SUM",
              "ARRAY_AGG"  /* Phase 88 */};
+        // Phase 97: 2-arg aggregates: aggCol stored as "col1,col2"
+        static const std::vector<std::string> AGGF2 =
+            {"FIRST", "LAST", "TIME_WEIGHTED_AVG"};
 
         size_t i = start;
         while (i < end) {
@@ -5010,9 +5111,34 @@ private:
             std::string u = toUpper(t);
             bool isAgg = false;
             for (const auto& f : AGGF) if (u == f) { isAgg = true; break; }
+            bool isAgg2 = false;
+            for (const auto& f : AGGF2) if (u == f) { isAgg2 = true; break; }
 
-            // Aggregatfunktion: FUNC ( col ) [AS alias]
-            if (isAgg && i + 3 < end && ft[i + 1] == "(") {
+            // Phase 97: 2-arg aggregate: FUNC ( col1 , col2 ) [AS alias]
+            if (isAgg2 && i + 1 < end && ft[i + 1] == "(") {
+                SelectItem item;
+                item.isAgg   = true;
+                item.aggFunc = u;
+                // collect args until closing )
+                size_t j = i + 2;
+                std::string arg1, arg2;
+                while (j < end && ft[j] != ")") {
+                    if (ft[j] == ",") { ++j; continue; }
+                    if (arg1.empty()) arg1 = ft[j];
+                    else if (arg2.empty()) arg2 = ft[j];
+                    ++j;
+                }
+                if (j < end && ft[j] == ")") ++j;
+                item.aggCol = arg1 + "," + arg2;
+                // optional AS alias
+                if (j < end && toUpper(ft[j]) == "AS") {
+                    ++j;
+                    if (j < end && ft[j] != ",") { item.alias = ft[j]; ++j; }
+                }
+                cmd.selectItems.push_back(std::move(item));
+                i = j;
+            // Regular aggregate: FUNC ( col ) [AS alias]
+            } else if (isAgg && i + 3 < end && ft[i + 1] == "(") {
                 SelectItem item;
                 item.isAgg   = true;
                 item.aggFunc = u;
@@ -5020,6 +5146,43 @@ private:
                 // ft[i+3] sollte ")" sein
                 size_t j = i + 4;
                 // optional AS alias
+                if (j < end && toUpper(ft[j]) == "AS") {
+                    ++j;
+                    if (j < end && ft[j] != ",") { item.alias = ft[j]; ++j; }
+                }
+                cmd.selectItems.push_back(std::move(item));
+                i = j;
+            // Phase 97: Generic function expression: FUNC ( args... ) [AS alias]
+            // Handles TIME_BUCKET and other non-aggregate functions in GROUP BY SELECT
+            } else if (!isAgg && !isAgg2 && u != "AS" && u != "," &&
+                       i + 1 < end && ft[i + 1] == "(") {
+                SelectItem item;
+                item.isFuncExpr = true;
+                item.funcName   = u;
+                cmd.hasCaseItems = true;
+                size_t j = i + 2;  // skip FUNC and (
+                std::string currentArg;
+                int depth = 0;
+                while (j < end) {
+                    if (ft[j] == "(") { depth++; currentArg += ft[j] + " "; j++; continue; }
+                    if (ft[j] == ")") {
+                        if (depth == 0) break;
+                        depth--; currentArg += ft[j] + " "; j++; continue;
+                    }
+                    if (depth == 0 && ft[j] == ",") {
+                        std::string a = currentArg;
+                        while (!a.empty() && a.back() == ' ') a.pop_back();
+                        if (!a.empty()) item.funcArgs.push_back(a);
+                        currentArg = ""; j++; continue;
+                    }
+                    currentArg += ft[j] + " "; j++;
+                }
+                {
+                    std::string a = currentArg;
+                    while (!a.empty() && a.back() == ' ') a.pop_back();
+                    if (!a.empty()) item.funcArgs.push_back(a);
+                }
+                if (j < end && ft[j] == ")") ++j;
                 if (j < end && toUpper(ft[j]) == "AS") {
                     ++j;
                     if (j < end && ft[j] != ",") { item.alias = ft[j]; ++j; }

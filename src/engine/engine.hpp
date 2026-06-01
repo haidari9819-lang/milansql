@@ -45,6 +45,7 @@
 #include "../compression/lz4_compressor.hpp"
 #include "../compression/dict_compressor.hpp"
 #include "../compression/zstd_compressor.hpp"
+#include "../timeseries/timeseries_manager.hpp" // Phase 97: Time-Series
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1391,10 +1392,45 @@ public:
         }
 
         // Step 2 — GROUP BY-Spaltenindizes vorab auflösen
-        std::vector<size_t> groupCIs;
-        groupCIs.reserve(groupCols.size());
-        for (const auto& gc : groupCols)
-            groupCIs.push_back(colIdx(src, gc));
+        // For each GROUP BY column: find direct column index OR matching selectItem alias
+        // (alias grouping, e.g. GROUP BY tag where tag = time_bucket(...) AS tag)
+        struct GroupByKey {
+            size_t ci = std::string::npos;  // direct column index (if valid)
+            int selectItemIdx = -1;         // selectItem index for alias-based grouping
+        };
+        std::vector<GroupByKey> groupKeys;
+        groupKeys.reserve(groupCols.size());
+        for (const auto& gc : groupCols) {
+            GroupByKey gk;
+            // Try direct column lookup first
+            bool found = false;
+            for (size_t si = 0; si < src.columns().size(); ++si) {
+                if (src.columns()[si].name == gc) {
+                    gk.ci = si;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // Try alias match in selectItems
+                for (size_t si = 0; si < selectItems.size(); ++si) {
+                    if (!selectItems[si].alias.empty() && selectItems[si].alias == gc) {
+                        gk.selectItemIdx = static_cast<int>(si);
+                        break;
+                    }
+                }
+            }
+            groupKeys.push_back(gk);
+        }
+
+        // Phase 97: compute per-row value for a selectItem (handles funcExpr like time_bucket)
+        auto computeItemValue = [&](const SelectItem& item, const Row& row) -> std::string {
+            if (item.isFuncExpr) {
+                return evaluateFunc(item.funcName, item.funcArgs, src, row);
+            }
+            size_t ci2 = colIdx(src, item.colName);
+            return ci2 < row.values.size() ? row.values[ci2] : "";
+        };
 
         // Step 3 — Zeilen gruppieren (Reihenfolge des ersten Auftretens erhalten)
         std::map<std::string, std::vector<size_t>> groupMap;
@@ -1404,9 +1440,13 @@ public:
             const Row& row = src.rows()[ri];
             // Schlüssel: Werte der GROUP BY-Spalten, durch \x01 getrennt
             std::string key;
-            for (size_t ci : groupCIs) {
+            for (const auto& gk : groupKeys) {
                 key += '\x01';
-                key += (ci < row.values.size() ? row.values[ci] : "");
+                if (gk.ci != std::string::npos) {
+                    key += (gk.ci < row.values.size() ? row.values[gk.ci] : "");
+                } else if (gk.selectItemIdx >= 0) {
+                    key += computeItemValue(selectItems[static_cast<size_t>(gk.selectItemIdx)], row);
+                }
             }
             if (!groupMap.count(key)) groupOrder.push_back(key);
             groupMap[key].push_back(ri);
@@ -1438,6 +1478,10 @@ public:
             for (const auto& item : selectItems) {
                 if (item.isAgg) {
                     vals.push_back(computeAggForGroup(src, item, riList));
+                } else if (item.isFuncExpr) {
+                    // Phase 97: function expression (e.g. time_bucket) — evaluate on first row
+                    const Row& firstRow = src.rows()[riList[0]];
+                    vals.push_back(evaluateFunc(item.funcName, item.funcArgs, src, firstRow));
                 } else {
                     size_t ci = colIdx(src, item.colName);
                     const Row& first = src.rows()[riList[0]];
@@ -4868,6 +4912,24 @@ private:
             return ArrayUtils::stringToArray(resolveArg(args[0]), resolveArg(args[1]));
         }
 
+        // ── Phase 97: Time-Series functions ───────────────────────
+        // TIME_BUCKET(interval, ts): truncate timestamp to bucket
+        // args may come as [amount, unit, tsVal] or ["amount unit", tsVal]
+        if (fn == "TIME_BUCKET") {
+            std::string interval, tsVal;
+            if (args.size() >= 3) {
+                // ["1", "DAY", "ts_value"]
+                interval = resolveArg(args[0]) + " " + resolveArg(args[1]);
+                tsVal    = resolveArg(args[2]);
+            } else if (args.size() == 2) {
+                interval = resolveArg(args[0]);
+                tsVal    = resolveArg(args[1]);
+            } else {
+                return "NULL";
+            }
+            return TimeSeriesManager::timeBucket(interval, tsVal);
+        }
+
         return "";
     }
 
@@ -4918,7 +4980,9 @@ private:
              "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
              // Phase 88: Array functions
              "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
-             "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY"};
+             "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY",
+             // Phase 97: Time-Series
+             "TIME_BUCKET"};
 
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;
@@ -5341,6 +5405,72 @@ private:
             return ArrayUtils::serialize(vals);
         }
 
+        // Phase 97: FIRST / LAST — return value with min/max timestamp
+        // Must be checked BEFORE the generic colIdx call below (aggCol = "col1,col2")
+        if (item.aggFunc == "FIRST" || item.aggFunc == "LAST") {
+            // aggCol format: "valueCol,timeCol" (comma-separated)
+            size_t comma = item.aggCol.find(',');
+            std::string valColName = item.aggCol;
+            std::string tsColName;
+            if (comma != std::string::npos) {
+                valColName = item.aggCol.substr(0, comma);
+                tsColName  = item.aggCol.substr(comma + 1);
+            }
+            size_t valCI = colIdx(src, valColName);
+            size_t tsCI  = tsColName.empty() ? valCI : colIdx(src, tsColName);
+            std::string bestVal = "NULL";
+            std::string bestTs;
+            bool firstAgg = (item.aggFunc == "FIRST");
+            for (size_t ri : riList) {
+                const Row& row = src.rows()[ri];
+                std::string tsV = (tsCI < row.values.size()) ? row.values[tsCI] : "";
+                std::string v   = (valCI < row.values.size()) ? row.values[valCI] : "NULL";
+                if (bestTs.empty() || (firstAgg ? tsV < bestTs : tsV > bestTs)) {
+                    bestTs  = tsV;
+                    bestVal = v;
+                }
+            }
+            return bestVal;
+        }
+
+        // Phase 97: TIME_WEIGHTED_AVG — weighted average by time duration
+        // Must be checked BEFORE the generic colIdx call below (aggCol = "col1,col2")
+        if (item.aggFunc == "TIME_WEIGHTED_AVG") {
+            size_t comma = item.aggCol.find(',');
+            std::string valColName = item.aggCol;
+            std::string tsColName;
+            if (comma != std::string::npos) {
+                valColName = item.aggCol.substr(0, comma);
+                tsColName  = item.aggCol.substr(comma + 1);
+            }
+            size_t valCI = colIdx(src, valColName);
+            size_t tsCI  = tsColName.empty() ? valCI : colIdx(src, tsColName);
+            // Collect (ts, val) pairs and sort by ts
+            std::vector<std::pair<std::string,double>> pts;
+            for (size_t ri : riList) {
+                const Row& row = src.rows()[ri];
+                if (valCI < row.values.size() && tsCI < row.values.size()) {
+                    double v = 0.0;
+                    try { v = std::stod(row.values[valCI]); } catch (...) { continue; }
+                    pts.push_back({row.values[tsCI], v});
+                }
+            }
+            if (pts.size() < 2) {
+                if (pts.size() == 1) return formatNum(pts[0].second);
+                return "NULL";
+            }
+            std::sort(pts.begin(), pts.end(),
+                      [](const std::pair<std::string,double>& a,
+                         const std::pair<std::string,double>& b){ return a.first < b.first; });
+            // Use index-based time (treat consecutive points as unit-duration segments)
+            double wsum = 0.0;
+            double totalW = static_cast<double>(pts.size() - 1);
+            for (size_t k = 0; k + 1 < pts.size(); ++k)
+                wsum += (pts[k].second + pts[k + 1].second) / 2.0;
+            if (totalW <= 0.0) return "NULL";
+            return formatNum(wsum / totalW);
+        }
+
         size_t ci = colIdx(src, item.aggCol);
         std::vector<double> nums;
         nums.reserve(riList.size());
@@ -5362,6 +5492,7 @@ private:
             double s = 0; for (double v : nums) s += v;
             return formatNum(s / static_cast<double>(nums.size()));
         }
+
         return "NULL";
     }
 
@@ -6128,6 +6259,10 @@ public:
     ExtensionManager& getExtensionManager() { return extensionMgr_; }
     const ExtensionManager& getExtensionManager() const { return extensionMgr_; }
 
+    // ── Phase 97: Time-Series Manager ────────────────────────
+    TimeSeriesManager& getTimeSeriesManager() { return tsManager_; }
+    const TimeSeriesManager& getTimeSeriesManager() const { return tsManager_; }
+
     // RAII guard: sets/restores the thread-local extension manager pointer
     struct ExtMgrGuard {
         ExtensionManager* prev_;
@@ -6684,6 +6819,9 @@ private:
 
     // Phase 72: Recovery status (set by main.cpp after startup recovery)
     RecoveryStatus recoveryStatus_;
+
+    // Phase 97: Time-Series Manager
+    TimeSeriesManager tsManager_;
 
     // Phase 72: timestamp helper
     static std::string currentTimestamp() {

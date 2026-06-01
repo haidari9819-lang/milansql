@@ -1982,6 +1982,20 @@ inline bool dispatchCommand(
                     milansql::parseCompressionType(cmd.compressionType));
             } catch (...) {}
         }
+        // Phase 97: Register time-series definition if specified
+        if (cmd.isTimeSeries) {
+            milansql::TimeSeriesDef tsDef;
+            tsDef.tableName = cmd.tableName;
+            tsDef.timeColumn = cmd.tsTimeColumn;
+            tsDef.retentionDays = cmd.tsRetentionDays;
+            std::string pb = cmd.tsPartitionBy;
+            for (auto& c : pb) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (pb == "HOUR")       tsDef.partitionBy = milansql::TsPartitionBy::HOUR;
+            else if (pb == "WEEK")  tsDef.partitionBy = milansql::TsPartitionBy::WEEK;
+            else if (pb == "MONTH") tsDef.partitionBy = milansql::TsPartitionBy::MONTH;
+            else                    tsDef.partitionBy = milansql::TsPartitionBy::DAY;
+            engine.getTimeSeriesManager().define(std::move(tsDef));
+        }
         persistFn();
         dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
@@ -1996,6 +2010,8 @@ inline bool dispatchCommand(
             std::cout << ", PARTITION BY " << cmd.partitionType;
         if (!cmd.compressionType.empty())
             std::cout << ", COMPRESSION=" << cmd.compressionType;
+        if (cmd.isTimeSeries)
+            std::cout << ", TIMESERIES";
         std::cout << ").\n\n";
         break;
     }
@@ -5137,6 +5153,56 @@ inline bool dispatchCommand(
             std::cout << "\n";
         } catch (const std::exception& e) {
             std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 97: SHOW TIMESERIES STATUS ─────────────────────
+    case milansql::CommandType::SHOW_TIMESERIES_STATUS: {
+        auto& tsMgr = engine.getTimeSeriesManager();
+        if (cmd.tableName.empty()) {
+            // Show all
+            std::cout << "\n" << tsMgr.showAllStatus() << "\n";
+        } else {
+            // Show for specific table with partition distribution
+            if (!tsMgr.isTimeSeries(cmd.tableName)) {
+                std::cout << "  Not a time-series table: " << cmd.tableName << "\n\n";
+                break;
+            }
+            const milansql::TimeSeriesDef* def = tsMgr.getDef(cmd.tableName);
+            int timeColIdx = -1;
+            const auto& allTbls = engine.getTables();
+            // Table may be stored with schema prefix (e.g. "public.sensor_data")
+            auto tblIt = allTbls.find(cmd.tableName);
+            if (tblIt == allTbls.end()) {
+                // Try schema-qualified name
+                for (auto it2 = allTbls.begin(); it2 != allTbls.end(); ++it2) {
+                    const std::string& k = it2->first;
+                    auto dotPos = k.rfind('.');
+                    if (dotPos != std::string::npos && k.substr(dotPos + 1) == cmd.tableName) {
+                        tblIt = it2; break;
+                    }
+                }
+            }
+            if (def && tblIt != allTbls.end()) {
+                const auto& tbl = tblIt->second;
+                const auto& cols = tbl.columns();
+                for (int k = 0; k < static_cast<int>(cols.size()); ++k) {
+                    if (cols[static_cast<size_t>(k)].name == def->timeColumn) {
+                        timeColIdx = k;
+                        break;
+                    }
+                }
+                // Collect raw row data as vector<vector<string>>
+                const auto& rows = tbl.rows();
+                std::vector<std::vector<std::string>> rawRows;
+                rawRows.reserve(rows.size());
+                for (const auto& r : rows)
+                    if (r.xmax == 0) rawRows.push_back(r.values);
+                std::cout << "\n" << tsMgr.showStatus(cmd.tableName, rawRows, timeColIdx) << "\n";
+            } else {
+                std::cout << "\n" << tsMgr.showAllStatus() << "\n";
+            }
         }
         break;
     }

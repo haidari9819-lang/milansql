@@ -782,7 +782,7 @@
       <li><a href="#start">Download</a></li>
       <li><a href="https://github.com/haidari9819-lang/milansql">GitHub</a></li>
     </ul>
-    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0" class="nav-btn">Get Started</a>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v4.0.0" class="nav-btn">Get Started</a>
   </div>
 </nav>
 
@@ -792,7 +792,7 @@
 
     <div class="hero-left">
       <div class="hero-pill">
-        <span>✦</span> Now at v3.0.0 · 82 Phases Complete
+        <span>✦</span> Now at v4.0.0 · 100 Phases Complete
       </div>
       <div class="hero-eyebrow">The Database Engine</div>
       <h1 class="hero-title">
@@ -800,13 +800,13 @@
         <span class="gradient-text">Scratch.</span>
       </h1>
       <p class="hero-tagline">
-        82 phases. Zero dependencies. Pure C++17.<br>
-        A production-grade relational database engine with ACID transactions,
-        TCP server, REST API, and adaptive query optimizer.
+        100 phases. 5 network protocols. Zero dependencies.<br>
+        A complete relational database engine with ACID transactions,
+        PostgreSQL Wire Protocol, GraphQL API, CDC, and adaptive query optimizer.
       </p>
       <div class="hero-buttons">
-        <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0" class="btn-hero-primary">
-          ⬇ Download v3.0.0
+        <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v4.0.0" class="btn-hero-primary">
+          ⬇ Download v4.0.0
         </a>
         <a href="https://github.com/haidari9819-lang/milansql" class="btn-hero-secondary">
           📖 View on GitHub →
@@ -816,7 +816,7 @@
         <span class="badge"><span class="dot"></span> CI passing</span>
         <span class="badge">C++17</span>
         <span class="badge">0 dependencies</span>
-        <span class="badge">82 phases</span>
+        <span class="badge">100 phases</span>
       </div>
     </div>
 
@@ -859,20 +859,20 @@
 <div class="stats-bar">
   <div class="stats-grid">
     <div class="stat-item">
-      <div class="stat-number">82</div>
+      <div class="stat-number">100</div>
       <div class="stat-label">Development Phases</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number">223</div>
+      <div class="stat-label">Automated Tests</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-number">5</div>
+      <div class="stat-label">Network Protocols</div>
     </div>
     <div class="stat-item">
       <div class="stat-number">0</div>
       <div class="stat-label">External Dependencies</div>
-    </div>
-    <div class="stat-item">
-      <div class="stat-number">41</div>
-      <div class="stat-label">Automated Tests</div>
-    </div>
-    <div class="stat-item">
-      <div class="stat-number">2</div>
-      <div class="stat-label">Supported Platforms</div>
     </div>
   </div>
 </div>
@@ -908,8 +908,8 @@
 
       <div class="feature-card">
         <div class="feature-icon-box ic-purple">🌐</div>
-        <h3>Network Ready</h3>
-        <p>Built-in TCP server on port 4406 (MySQL protocol compatible), HTTP/JSON REST API on port 8080, Web Dashboard, and DSN connection strings.</p>
+        <h3>5 Network Protocols</h3>
+        <p>TCP(4406) + MySQL Wire(4407) + PostgreSQL Wire(5433) + REST/HTTP(8080) + GraphQL(8081). Connect with psql, mysql CLI, curl, or any HTTP client.</p>
         <a href="#start" class="feature-link">Get started →</a>
       </div>
 
@@ -952,6 +952,34 @@
         <div class="feature-icon-box ic-orange">🧠</div>
         <h3>Adaptive Query Optimizer</h3>
         <p>Automatic query rewriting (removes WHERE 1=1, redundant conditions), access statistics tracking, and automatic index suggestions via SHOW INDEX SUGGESTIONS.</p>
+        <a href="#code" class="feature-link">See example →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-cyan">📡</div>
+        <h3>Change Data Capture (CDC)</h3>
+        <p>ALTER TABLE … ENABLE CDC tracks every INSERT/UPDATE/DELETE as a change event. Query CDC streams with AFTER SEQUENCE N for real-time data pipelines.</p>
+        <a href="#code" class="feature-link">Learn more →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-purple">📊</div>
+        <h3>GraphQL API</h3>
+        <p>Built-in GraphQL server on port 8081. Query any table with auto-generated schema, field filtering, and an in-browser GraphQL playground — no config needed.</p>
+        <a href="#start" class="feature-link">Get started →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-green">🗜️</div>
+        <h3>Data Compression</h3>
+        <p>LZ4, RLE, Dictionary, and ZSTD compression engines for page-level storage. Transparent to queries — compresses cold data automatically.</p>
+        <a href="#code" class="feature-link">Learn more →</a>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon-box ic-blue">⏱️</div>
+        <h3>Time-Series Optimizations</h3>
+        <p>time_bucket() aggregation, retention policies, and partitioned time-series tables. Efficient range scans and automatic partition pruning for metrics workloads.</p>
         <a href="#code" class="feature-link">See example →</a>
       </div>
 
@@ -1264,7 +1292,7 @@ conn = milansql.connect(
         <h4>Project</h4>
         <ul>
           <li><a href="https://github.com/haidari9819-lang/milansql">GitHub Repository</a></li>
-          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v3.0.0">Download v3.0.0</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v4.0.0">Download v4.0.0</a></li>
           <li><a href="https://github.com/haidari9819-lang/milansql/releases">All Releases</a></li>
           <li><a href="https://github.com/haidari9819-lang/milansql/issues">Issues</a></li>
         </ul>

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="milansql",
-    version="2.5.0",
+    version="4.0.0",
     description="Python client for MilanSQL database",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",

@@ -386,7 +386,23 @@
       "Bash(printf \"CREATE SERVER csv_srv FOREIGN DATA WRAPPER csv;\\\\nSHOW SERVERS;\\\\nCREATE FOREIGN TABLE ext_employees \\(id INT, name TEXT, dept TEXT\\) SERVER csv_srv OPTIONS \\(file 'employees.csv', delimiter ','\\);\\\\nSHOW FOREIGN TABLES;\\\\nSELECT * FROM ext_employees;\\\\nSELECT * FROM ext_employees WHERE dept = 'Engineering';\\\\nDROP FOREIGN TABLE ext_employees;\\\\nSHOW FOREIGN TABLES;\\\\nDROP SERVER csv_srv;\\\\nSHOW SERVERS;\\\\nEXIT;\\\\n\")",
       "Bash(grep -v \"^\\\\s*$\")",
       "Bash(grep -v \"^  $\")",
-      "Bash(ninja -C /c/Users/Student/MilanSQL/milansql/build)"
+      "Bash(ninja -C /c/Users/Student/MilanSQL/milansql/build)",
+      "Bash(printf \"\\\\\\\\dt\\\\n\\\\\\\\l\\\\n\\\\\\\\du\\\\n\\\\\\\\?\\\\n\\\\\\\\q\\\\n\")",
+      "Bash(printf \"\\\\\\\\?\")",
+      "Bash(xxd)",
+      "Bash(printf '%s\\\\n' '\\\\?')",
+      "Bash(printf '%s\\\\n%s\\\\n%s\\\\n%s\\\\n%s\\\\n' '\\\\dt' '\\\\l' '\\\\du' '\\\\?' '\\\\q')",
+      "Bash(printf '%s\\\\n%s\\\\n' '\\\\d employees' '\\\\q')",
+      "Bash(printf '%s\\\\n%s\\\\n%s\\\\n%s\\\\n' \"SELECT * FROM pg_catalog.pg_class\" \"SELECT * FROM pg_catalog.pg_namespace\" \"SELECT * FROM pg_catalog.pg_type\" \"SELECT indrelid, indexrelid FROM pg_catalog.pg_index\")",
+      "Bash(ninja -C build milansql_tests milansql_stress)",
+      "Bash(ninja -C build milansql_stress)",
+      "Bash(build/milansql_stress.exe)",
+      "Bash(/c/Users/Student/MilanSQL/milansql/build/milansql_stress.exe)",
+      "Bash(gh repo:*)",
+      "Bash(ninja -C build milansql_tests milansql_fuzzer milansql_tpch)",
+      "Bash(/c/Users/Student/MilanSQL/milansql/build/milansql_fuzzer.exe 100)",
+      "Bash(/c/Users/Student/MilanSQL/milansql/build/milansql_tpch.exe)",
+      "Bash(ninja -C build milansql_tpch)"
     ]
   }
 }

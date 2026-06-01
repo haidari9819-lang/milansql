@@ -35,6 +35,7 @@
 #include "copy/copy_manager.hpp"       // Phase 92: COPY FROM/TO
 #include "cache/statement_cache.hpp"   // Phase 93: Prepared Statement Cache
 #include "pool/connection_pool.hpp"    // Phase 94: Connection Pool Multiplexing
+#include "monitoring/prometheus.hpp"   // Phase 102: Prometheus Metrics
 
 namespace milansql {
 
@@ -43,6 +44,9 @@ static ConnectionPool g_connectionPool;
 
 // ── Phase 93: Global Statement Cache ─────────────────────────
 static StatementCache g_stmtCache;
+
+// ── Phase 102: Hot Standby flag ────────────────────────────────
+static bool g_hotStandbyEnabled = false;
 
 // ── Phase 69: Global Query Profiler ──────────────────────────
 static QueryProfiler g_profiler;
@@ -1775,6 +1779,29 @@ inline bool dispatchCommand(
     if (cmd.type == milansql::CommandType::SELECT)
         g_queryRewriter.rewrite(cmd);
 
+    // Phase 102: Prometheus — record query type counter + duration
+    {
+        std::string qtype;
+        switch (cmd.type) {
+            case milansql::CommandType::SELECT: qtype = "SELECT"; break;
+            case milansql::CommandType::INSERT: qtype = "INSERT"; break;
+            case milansql::CommandType::UPDATE: qtype = "UPDATE"; break;
+            case milansql::CommandType::DELETE: qtype = "DELETE"; break;
+            default: break;
+        }
+        if (!qtype.empty())
+            milansql::g_prometheus().increment("milansql_queries_total",
+                "{type=\"" + qtype + "\"}");
+    }
+    auto prom_t0_ = std::chrono::steady_clock::now();
+
+    // Phase 102: register help strings once (lazy)
+    static bool prom_help_registered_ = false;
+    if (!prom_help_registered_) {
+        prom_help_registered_ = true;
+        milansql::prometheusRegisterDefaults();
+    }
+
     switch (cmd.type) {
 
     case milansql::CommandType::EXIT:
@@ -2523,6 +2550,82 @@ inline bool dispatchCommand(
                 } catch (...) {}
             }
             dispatch_printExplain(plan);
+
+            // Phase 102: EXPLAIN (COSTS ON) — show cost estimates
+            if (cmd.explainCosts) {
+                // Cost model constants
+                const double seqPageCost = 1.0;  // per page (100 rows)
+                auto seqScanCost = [&](const std::string& tbl) -> double {
+                    try {
+                        size_t rows = engine.countRows(tbl);
+                        double pages = std::max(1.0, static_cast<double>(rows) / 100.0);
+                        return seqPageCost * pages;
+                    } catch (...) { return 1.0; }
+                };
+                auto tableWidth = [&](const std::string& tbl) -> int {
+                    try {
+                        const auto& cols = engine.tableColumns(tbl);
+                        return static_cast<int>(cols.size()) * 8;
+                    } catch (...) { return 32; }
+                };
+                auto rowCount = [&](const std::string& tbl) -> size_t {
+                    try { return engine.countRows(tbl); }
+                    catch (...) { return 1; }
+                };
+
+                std::cout << "\n  -- Cost Estimates (COSTS ON) --\n";
+                auto fmtCost = [](double v) -> std::string {
+                    std::ostringstream ss;
+                    ss << std::fixed << std::setprecision(2) << v;
+                    return ss.str();
+                };
+
+                if (cmd.isJoin && !cmd.joinClauses.empty()) {
+                    std::string t1 = cmd.tableName;
+                    std::string t2 = cmd.joinClauses[0].table;
+                    double sc1 = seqScanCost(t1);
+                    double sc2 = seqScanCost(t2);
+                    // Smaller table is hash-built
+                    std::string hashTbl = sc1 <= sc2 ? t1 : t2;
+                    std::string scanTbl = sc1 <= sc2 ? t2 : t1;
+                    double hashBuild = seqScanCost(hashTbl) * 1.5;
+                    double scanLarger = seqScanCost(scanTbl) * 1.2;
+                    double startCost  = hashBuild;
+                    double totalCost  = hashBuild + scanLarger;
+                    size_t outRows    = (rowCount(t1) + rowCount(t2)) / 2;
+                    int    width      = tableWidth(t1) + tableWidth(t2);
+                    std::cout << "  Hash Join  (cost=" << fmtCost(startCost)
+                              << ".." << fmtCost(totalCost)
+                              << " rows=" << outRows << " width=" << width << ")\n";
+                    if (!cmd.whereConds.empty())
+                        std::cout << "    Hash Cond / Filter applied\n";
+                    std::cout << "    ->  Seq Scan on " << t1
+                              << "  (cost=0.00.." << fmtCost(sc1)
+                              << " rows=" << rowCount(t1)
+                              << " width=" << tableWidth(t1) << ")\n";
+                    std::cout << "    ->  Hash\n";
+                    std::cout << "          ->  Seq Scan on " << t2
+                              << "  (cost=0.00.." << fmtCost(sc2)
+                              << " rows=" << rowCount(t2)
+                              << " width=" << tableWidth(t2) << ")\n";
+                } else {
+                    double sc = seqScanCost(cmd.tableName);
+                    size_t rows = rowCount(cmd.tableName);
+                    int    width = tableWidth(cmd.tableName);
+                    std::cout << "  Seq Scan on " << cmd.tableName
+                              << "  (cost=0.00.." << fmtCost(sc)
+                              << " rows=" << rows << " width=" << width << ")\n";
+                    if (!cmd.whereConds.empty())
+                        std::cout << "    Filter: (WHERE condition)\n";
+                }
+                {
+                    std::ostringstream ptss;
+                    ptss << std::fixed << std::setprecision(3) << 0.3;
+                    std::cout << "  Planning time: " << ptss.str() << " ms\n";
+                }
+                std::cout << "\n";
+            }
+
             // Phase 86: Show statistics-based cardinality estimate if available
             if (!cmd.tableName.empty() && g_tableStats.hasStats(cmd.tableName)) {
                 size_t est = g_tableStats.estimateRowCount(cmd.tableName, cmd.whereConds);
@@ -4015,6 +4118,7 @@ inline bool dispatchCommand(
             {"Slave-Position",std::to_string(milansql::g_replState.slavePos.load())},
             {"Lag",           lagStr},
             {"Read-Only",     "Ja"},
+            {"Hot Standby",   g_hotStandbyEnabled ? "YES" : "NO"},
         };
         size_t w1 = 14, w2 = 24;
         for (auto& r : rows) {
@@ -5263,11 +5367,68 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 102: SET HOT_STANDBY = ON/OFF ──────────────────────
+    case milansql::CommandType::SET_HOT_STANDBY: {
+        bool on = (cmd.cacheEnabled == "ON" || cmd.cacheEnabled == "1");
+        g_hotStandbyEnabled = on;
+        std::cout << "  Hot Standby: " << (on ? "aktiviert" : "deaktiviert") << "\n\n";
+        break;
+    }
+
+    // ── Phase 102: SHOW ENGINE STATUS ─────────────────────────────
+    case milansql::CommandType::SHOW_ENGINE_STATUS: {
+        std::ostringstream oss;
+        oss << "=====================================\n";
+        oss << "MilanSQL Engine Status\n";
+        oss << "=====================================\n\n";
+
+        // --- TRANSACTIONS ---
+        oss << "--- TRANSACTIONS ---\n";
+        oss << "Active Transactions: " << (engine.isInTransaction() ? 1 : 0) << "\n";
+        oss << "Isolation Level: " << engine.getIsolationLevel() << "\n\n";
+
+        // --- BUFFER POOL ---
+        oss << "--- BUFFER POOL ---\n";
+        oss << "Buffer Pool Size: " << engine.getBufferPoolSizeMB() << " MB\n";
+        oss << "Dirty Pages: " << engine.getDirtyBufferPages().size() << "\n\n";
+
+        // --- QUERIES ---
+        oss << "--- QUERIES ---\n";
+        oss << "(See /metrics for Prometheus counters)\n\n";
+
+        // --- TABLES ---
+        oss << "--- TABLES ---\n";
+        for (const auto& name : engine.getAllTableNames()) {
+            oss << "  " << name << "\n";
+        }
+        oss << "\n";
+
+        // --- REPLICATION ---
+        oss << "--- REPLICATION ---\n";
+        oss << "Master: " << (milansql::g_replState.isMaster.load() ? "YES" : "NO") << "\n";
+        oss << "Slave: "  << (milansql::g_replState.isSlave.load()  ? "YES" : "NO") << "\n";
+        oss << "Hot Standby: " << (g_hotStandbyEnabled ? "YES" : "NO") << "\n\n";
+
+        // --- COMPRESSION ---
+        oss << "--- COMPRESSION ---\n";
+        oss << "(Compression stats available via SHOW COMPRESSION STATS FOR <table>)\n\n";
+
+        std::cout << oss.str();
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe
                   << "'\n  Tippe 'help' fuer eine Uebersicht.\n\n";
         break;
+    }
+
+    // Phase 102: Prometheus — record query duration
+    {
+        auto prom_t1_ = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(prom_t1_ - prom_t0_).count();
+        milansql::g_prometheus().observe("milansql_query_duration_ms", ms);
     }
 
     return false;

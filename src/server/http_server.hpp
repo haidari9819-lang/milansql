@@ -41,6 +41,7 @@
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "../monitoring/prometheus.hpp"
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -597,7 +598,7 @@ inline std::string MilanHttpServer::handleStatus() {
     auto schemas = engine_.showSchemas();
 
     std::string json = "{\"success\":true,\"status\":{";
-    json += "\"version\":\"MilanSQL v4.0.0\",";
+    json += "\"version\":\"MilanSQL v4.1.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tableCount\":" + std::to_string(tables.size()) + ",";
     json += "\"schemaCount\":" + std::to_string(schemas.size());
@@ -659,7 +660,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#128449; MilanSQL v4.0.0 Dashboard</div>
+  <div class="logo">&#128449; MilanSQL v4.1.0 Dashboard</div>
   <div class="status-bar">
     <span id="sv">v1.4.0</span>
     <span>Uptime: <span class="badge" id="su">-</span>s</span>
@@ -774,6 +775,24 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
 
     if (req.path == "/status") {
         return buildHttpResponse(200, handleStatus());
+    }
+
+    if (req.path == "/metrics") {
+        std::lock_guard<std::mutex> lock(engineMutex_);
+        // Update uptime gauge
+        double upSec = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - startTime_).count();
+        milansql::g_prometheus().set("milansql_uptime_seconds", upSec);
+        // Update buffer pool gauge
+        milansql::g_prometheus().set("milansql_buffer_pool_size_mb",
+            static_cast<double>(engine_.getBufferPoolSizeMB()));
+        std::string body = milansql::g_prometheus().exportMetrics();
+        return "HTTP/1.1 200 OK\r\n"
+               "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+               "Content-Length: " + std::to_string(body.size()) + "\r\n"
+               "Access-Control-Allow-Origin: *\r\n"
+               "Connection: close\r\n"
+               "\r\n" + body;
     }
 
     if (req.path == "/dashboard" || req.path == "/") {

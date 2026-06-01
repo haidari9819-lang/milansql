@@ -218,6 +218,9 @@ enum class CommandType {
     ALTER_TABLE_ENABLE_CDC,
     ALTER_TABLE_DISABLE_CDC,
     SHOW_CDC_STATUS,
+    // Phase 102: Prometheus + Hot Standby + SHOW ENGINE STATUS
+    SET_HOT_STANDBY,
+    SHOW_ENGINE_STATUS,
     UNKNOWN
 };
 
@@ -323,6 +326,8 @@ struct ParsedCommand {
     bool isExplain = false;
     // Phase 54B: EXPLAIN ANALYZE — echte Ausführung mit Zeitmessung
     bool isExplainAnalyze = false;
+    // Phase 102: EXPLAIN (COSTS ON) — show cost estimates
+    bool explainCosts = false;
     // Phase 54A: SET CACHE ON/OFF
     std::string cacheEnabled;  // "ON" or "OFF"
 
@@ -651,6 +656,8 @@ public:
                     ++rest;
                 // Phase 54B: check for ANALYZE keyword
                 bool isAnalyze = false;
+                // Phase 102: check for (COSTS ON) or (COSTS OFF) modifier
+                bool isCosts = false;
                 std::string upRest;
                 for (size_t i = rest; i < input.size(); ++i)
                     upRest += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
@@ -660,10 +667,20 @@ public:
                     rest += 7;
                     while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
                         ++rest;
+                } else if (upRest.size() >= 10 && upRest.substr(0, 10) == "(COSTS ON)") {
+                    isCosts = true;
+                    rest += 10;
+                    while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
+                        ++rest;
+                } else if (upRest.size() >= 11 && upRest.substr(0, 11) == "(COSTS OFF)") {
+                    rest += 11;
+                    while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
+                        ++rest;
                 }
                 ParsedCommand inner = parse(input.substr(rest));
                 inner.isExplain = true;
                 if (isAnalyze) inner.isExplainAnalyze = true;
+                if (isCosts)   inner.explainCosts = true;
                 return inner;
             }
         }
@@ -2102,6 +2119,10 @@ public:
             } else if (kw1 == "CDC" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_CDC_STATUS;
+            // Phase 102: SHOW ENGINE STATUS
+            } else if (kw1 == "ENGINE" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_ENGINE_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2503,6 +2524,12 @@ public:
             }
 
         // ── Phase 54A: SET CACHE ON / SET CACHE OFF ──────────────
+        // Phase 102: SET HOT_STANDBY = ON/OFF
+        } else if (kw0 == "SET" && (kw1 == "HOT_STANDBY" || kw1 == "HOT-STANDBY")) {
+            cmd.type = CommandType::SET_HOT_STANDBY;
+            if (tokens.size() >= 3) cmd.cacheEnabled = toUpper(tokens[2]);
+            else cmd.type = CommandType::UNKNOWN;
+
         } else if (kw0 == "SET" && kw1 == "CACHE") {
             cmd.type = CommandType::SET_CACHE;
             if (tokens.size() >= 3) cmd.cacheEnabled = toUpper(tokens[2]);

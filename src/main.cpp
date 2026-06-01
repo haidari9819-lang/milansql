@@ -4,6 +4,7 @@
 #include "server/client.hpp"
 #include "server/http_server.hpp"
 #include "server/mysql_server.hpp"  // Phase 74: MySQL Wire Protocol
+#include "server/pg_server.hpp"     // Phase 91: PostgreSQL Wire Protocol
 
 #include <iostream>
 #include <fstream>
@@ -59,9 +60,11 @@ int main(int argc, char* argv[]) {
     bool clientMode = false;
     bool httpMode   = false;
     bool mysqlMode  = false;   // Phase 74: MySQL Wire Protocol
+    bool pgMode     = false;   // Phase 91: PostgreSQL Wire Protocol
     int  port       = 4406;
     int  httpPort   = 8080;
     int  mysqlPort  = 4407;    // Phase 74: MySQL protocol port
+    int  pgPort     = 5433;    // Phase 91: PostgreSQL protocol port
     int  poolSize   = 10;   // Phase 58: Connection Pool Größe
     int  maxQueue   = 100;  // Phase 58: max. Queue-Länge
     // Phase 59: Replication
@@ -82,11 +85,13 @@ int main(int argc, char* argv[]) {
         else if (arg == "--client")      clientMode = true;
         else if (arg == "--http")        httpMode   = true;
         else if (arg == "--mysql")       mysqlMode  = true;
+        else if (arg == "--pg")          pgMode     = true;
         else if (arg == "--master")      masterMode = true;
         else if (arg == "--slave")       slaveMode  = true;
         else if (arg == "--port"          && i + 1 < argc) port        = std::stoi(argv[++i]);
         else if (arg == "--http-port"     && i + 1 < argc) httpPort    = std::stoi(argv[++i]);
         else if (arg == "--mysql-port"    && i + 1 < argc) mysqlPort   = std::stoi(argv[++i]);
+        else if (arg == "--pg-port"       && i + 1 < argc) pgPort      = std::stoi(argv[++i]);
         else if (arg == "--pool-size"     && i + 1 < argc) poolSize    = std::stoi(argv[++i]);
         else if (arg == "--max-queue"     && i + 1 < argc) maxQueue    = std::stoi(argv[++i]);
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
@@ -113,6 +118,21 @@ int main(int argc, char* argv[]) {
                   << mysqlPort << "...\n";
         milansql::MysqlServer mysqlServer(mysqlPort, "database.milan");
         mysqlServer.run();
+        return 0;
+    }
+
+    // ── PostgreSQL Wire Protocol standalone mode (Phase 91) ───
+    // When --pg is the only mode flag (no REPL flags), run as blocking server.
+    if (pgMode && !serverMode && !clientMode && !httpMode && !mysqlMode) {
+        std::cout << "MilanSQL PostgreSQL-Protocol Server startet auf Port "
+                  << pgPort << "...\n";
+        milansql::PgServer pgStandaloneServer(pgPort, "database.milan");
+        pgStandaloneServer.start();
+        std::cout << "PostgreSQL wire protocol server on port " << pgPort << std::endl;
+        // Block forever (background thread handles connections)
+        while (pgStandaloneServer.isRunning()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         return 0;
     }
 
@@ -508,6 +528,15 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& ex) {
             std::cout << "  Fehler im Connection String: " << ex.what() << "\n\n";
         }
+    }
+
+    // ── Phase 91: PostgreSQL Wire Protocol (background thread) ──
+    std::unique_ptr<milansql::PgServer> pgServer;
+    if (pgMode) {
+        pgServer = std::make_unique<milansql::PgServer>(pgPort, "database.milan");
+        pgServer->start();
+        std::cout << "  [PG] PostgreSQL Wire Protocol server started on port "
+                  << pgPort << "\n\n";
     }
 
     // ── Phase 73: Buffer Pool Write-Behind Thread ─────────────

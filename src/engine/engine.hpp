@@ -47,6 +47,7 @@
 #include "../compression/zstd_compressor.hpp"
 #include "../timeseries/timeseries_manager.hpp" // Phase 97: Time-Series
 #include "../cdc/cdc_manager.hpp"               // Phase 98: CDC
+#include "../federation/federation_manager.hpp" // Phase 105: Query Federation
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -6314,6 +6315,33 @@ public:
     TimeSeriesManager& getTimeSeriesManager() { return tsManager_; }
     const TimeSeriesManager& getTimeSeriesManager() const { return tsManager_; }
 
+    // ── Phase 105: Query Federation ───────────────────────────
+    FederationManager& getFederationManager() { return fedMgr_; }
+    const FederationManager& getFederationManager() const { return fedMgr_; }
+
+    bool isFederatedTable(const std::string& name) const {
+        return fedMgr_.isFederatedTable(name);
+    }
+
+    // Execute a federated SELECT and return a plain Table
+    Table selectFederated(const std::string& name,
+                          const std::string& where = "",
+                          const std::vector<std::string>& cols = {}) {
+        FedTable ft = fedMgr_.executeFederated(name, where, cols);
+        std::vector<Column> tCols;
+        for (const auto& fc : ft.columns)
+            tCols.push_back(Column(fc.name, fc.type));
+        Table t(ft.name, std::move(tCols));
+        for (const auto& fr : ft.rows) {
+            Row r(fr.values);
+            // pad to column count
+            while (r.values.size() < t.columns().size())
+                r.values.push_back("NULL");
+            t.mutableRows().push_back(std::move(r));
+        }
+        return t;
+    }
+
     // RAII guard: sets/restores the thread-local extension manager pointer
     struct ExtMgrGuard {
         ExtensionManager* prev_;
@@ -6876,6 +6904,9 @@ private:
 
     // Phase 98: Change Data Capture
     CdcManager cdcMgr_;
+
+    // Phase 105: Query Federation
+    FederationManager fedMgr_;
 
     // Phase 72: timestamp helper
     static std::string currentTimestamp() {

@@ -36,6 +36,7 @@
 #include "cache/statement_cache.hpp"   // Phase 93: Prepared Statement Cache
 #include "pool/connection_pool.hpp"    // Phase 94: Connection Pool Multiplexing
 #include "monitoring/prometheus.hpp"   // Phase 102: Prometheus Metrics
+#include "federation/federation_manager.hpp"  // Phase 105: Query Federation
 
 namespace milansql {
 
@@ -2299,6 +2300,35 @@ inline bool dispatchCommand(
                 cdcTbl.insert(milansql::Row(row));
             std::cout << "\n";
             dispatch_printTable(cdcTbl, cmd.limit, cmd.limitOffset);
+            break;
+        }
+
+        // ── Phase 105: Federated Table SELECT ────────────────────────────────
+        if (engine.isFederatedTable(cmd.tableName) && cmd.cteList.empty()) {
+            try {
+                milansql::Table fedResult = engine.selectFederated(
+                    cmd.tableName, "", cmd.selectColumns);
+                if (!cmd.whereConds.empty())
+                    fedResult = engine.filterTable(fedResult, cmd.whereConds, cmd.whereLogic);
+                if (!cmd.orderByCols.empty()) fedResult.sortByMulti(cmd.orderByCols);
+                if (cmd.isCount) {
+                    // COUNT(*) from federated
+                    std::vector<milansql::Column> cntCols;
+                    cntCols.push_back(milansql::Column("COUNT(*)", "INT"));
+                    milansql::Table cntTbl("", cntCols);
+                    cntTbl.insert(milansql::Row({std::to_string(fedResult.rows().size())}));
+                    std::cout << "\n";
+                    dispatch_printTable(cntTbl, -1, 0);
+                } else {
+                    if (!cmd.selectColumns.empty())
+                        fedResult = fedResult.project(cmd.selectColumns);
+                    if (cmd.isDistinct) fedResult.makeDistinct();
+                    std::cout << "\n";
+                    dispatch_printTable(fedResult, cmd.limit, cmd.limitOffset);
+                }
+            } catch (const std::exception& ex) {
+                std::cout << "  FEHLER (FEDERATED): " << ex.what() << "\n\n";
+            }
             break;
         }
 
@@ -4939,6 +4969,31 @@ inline bool dispatchCommand(
     // ── Phase 89: Foreign Data Wrapper ───────────────────────────
 
     case milansql::CommandType::CREATE_SERVER: {
+        // Phase 105: CONNECTION 'milansql://host:port' — federation node
+        if (!cmd.federationConnUrl.empty()) {
+            // Parse milansql://host:port
+            std::string url = cmd.federationConnUrl;
+            std::string host = "localhost";
+            int port = 4406;
+            const std::string prefix = "milansql://";
+            if (url.size() > prefix.size() &&
+                url.substr(0, prefix.size()) == prefix) {
+                std::string hostPort = url.substr(prefix.size());
+                auto colonPos = hostPort.rfind(':');
+                if (colonPos != std::string::npos) {
+                    host = hostPort.substr(0, colonPos);
+                    try { port = std::stoi(hostPort.substr(colonPos + 1)); }
+                    catch (...) { port = 4406; }
+                } else {
+                    host = hostPort;
+                }
+            }
+            engine.getFederationManager().addNode(cmd.serverName, host, port);
+            std::cout << "  Federation node '" << cmd.serverName
+                      << "' registriert (" << host << ":" << port << ").\n\n";
+            break;
+        }
+        // Phase 89: FOREIGN DATA WRAPPER
         if (cmd.serverName.empty() || cmd.wrapperType.empty()) {
             std::cout << "  Fehler: CREATE SERVER name FOREIGN DATA WRAPPER type\n\n"; break;
         }
@@ -5414,6 +5469,41 @@ inline bool dispatchCommand(
         oss << "(Compression stats available via SHOW COMPRESSION STATS FOR <table>)\n\n";
 
         std::cout << oss.str();
+        break;
+    }
+
+    // ── Phase 105: Query Federation ──────────────────────────────
+
+    case milansql::CommandType::CREATE_FEDERATED_TABLE: {
+        if (cmd.tableName.empty() || cmd.federatedQuery.empty()) {
+            std::cout << "  Fehler: CREATE FEDERATED TABLE name DISTRIBUTED ACROSS node1, node2 AS SELECT ...\n\n";
+            break;
+        }
+        // Parse comma-separated node names
+        milansql::FederatedTableDef ftd;
+        ftd.name      = cmd.tableName;
+        ftd.baseQuery = cmd.federatedQuery;
+        // Split federatedNodes by comma
+        {
+            std::istringstream nodeStream(cmd.federatedNodes);
+            std::string nodeName;
+            while (std::getline(nodeStream, nodeName, ',')) {
+                // trim
+                while (!nodeName.empty() && nodeName.front() == ' ')
+                    nodeName.erase(nodeName.begin());
+                while (!nodeName.empty() && nodeName.back() == ' ')
+                    nodeName.pop_back();
+                if (!nodeName.empty()) ftd.nodeNames.push_back(nodeName);
+            }
+        }
+        engine.getFederationManager().defineFederatedTable(std::move(ftd));
+        std::cout << "  Federated Table '" << cmd.tableName << "' erstellt.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_FEDERATION_STATUS: {
+        std::string status = engine.getFederationManager().showStatus();
+        std::cout << "\n" << status << "\n";
         break;
     }
 

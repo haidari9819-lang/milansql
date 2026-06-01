@@ -221,6 +221,9 @@ enum class CommandType {
     // Phase 102: Prometheus + Hot Standby + SHOW ENGINE STATUS
     SET_HOT_STANDBY,
     SHOW_ENGINE_STATUS,
+    // Phase 105: Query Federation + Sharding
+    CREATE_FEDERATED_TABLE,
+    SHOW_FEDERATION_STATUS,
     UNKNOWN
 };
 
@@ -489,6 +492,11 @@ struct ParsedCommand {
 
     // Phase 98: CDC
     long long   cdcAfterSeq       = -1; // for SELECT FROM cdc.xxx AFTER SEQUENCE n
+
+    // Phase 105: Query Federation
+    std::string federatedNodes;   // comma-separated node names: "node2, node3"
+    std::string federatedQuery;   // the AS SELECT ... part
+    std::string federationConnUrl; // connection URL for CREATE SERVER milansql://host:port
 };
 
 class Parser {
@@ -2989,20 +2997,39 @@ public:
                 cmd.type = CommandType::UNKNOWN;
             }
 
-        // ── Phase 89: CREATE SERVER name FOREIGN DATA WRAPPER type ──
+        // ── Phase 89/105: CREATE SERVER name ... ──────────────────
         } else if (kw0 == "CREATE" && kw1 == "SERVER") {
-            // CREATE SERVER <name> FOREIGN DATA WRAPPER <type>
+            // Phase 105: CREATE SERVER name CONNECTION 'milansql://host:port'
+            // Phase 89:  CREATE SERVER name FOREIGN DATA WRAPPER type
             cmd.type = CommandType::CREATE_SERVER;
             if (tokens.size() >= 3) {
                 cmd.serverName = tokens[2];
-                // Find WRAPPER keyword and grab the type after it
+                // Check for Phase 105 CONNECTION 'milansql://...' syntax
+                bool isConnectionSyntax = false;
                 for (size_t i = 3; i < tokens.size(); ++i) {
-                    if (toUpper(tokens[i]) == "WRAPPER" && i + 1 < tokens.size()) {
-                        cmd.wrapperType = tokens[i + 1];
+                    if (toUpper(tokens[i]) == "CONNECTION" && i + 1 < tokens.size()) {
+                        // Extract quoted URL
+                        std::string urlTok = tokens[i + 1];
+                        // Strip surrounding quotes
+                        if (!urlTok.empty() && (urlTok.front() == '\'' || urlTok.front() == '"'))
+                            urlTok = urlTok.substr(1);
+                        if (!urlTok.empty() && (urlTok.back() == '\'' || urlTok.back() == '"'))
+                            urlTok.pop_back();
+                        cmd.federationConnUrl = urlTok;
+                        isConnectionSyntax = true;
                         break;
                     }
                 }
-                if (cmd.wrapperType.empty()) cmd.type = CommandType::UNKNOWN;
+                if (!isConnectionSyntax) {
+                    // Phase 89: FOREIGN DATA WRAPPER type
+                    for (size_t i = 3; i < tokens.size(); ++i) {
+                        if (toUpper(tokens[i]) == "WRAPPER" && i + 1 < tokens.size()) {
+                            cmd.wrapperType = tokens[i + 1];
+                            break;
+                        }
+                    }
+                    if (cmd.wrapperType.empty()) cmd.type = CommandType::UNKNOWN;
+                }
             } else {
                 cmd.type = CommandType::UNKNOWN;
             }
@@ -3271,6 +3298,54 @@ public:
                     }
                 }
             }
+
+        // ── Phase 105: CREATE FEDERATED TABLE name DISTRIBUTED ACROSS ... AS SELECT ... ──
+        } else if (kw0 == "CREATE" && kw1 == "FEDERATED" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "TABLE") {
+            cmd.type = CommandType::CREATE_FEDERATED_TABLE;
+            // tokens: CREATE FEDERATED TABLE <name> DISTRIBUTED ACROSS <n1>, <n2>, ... AS SELECT ...
+            if (tokens.size() >= 4) {
+                cmd.tableName = tokens[3];
+            }
+            // Find ACROSS keyword to read node list
+            // Find AS keyword to read base query
+            {
+                // Build uppercase version for searching
+                std::string upInp2;
+                upInp2.reserve(input.size());
+                for (unsigned char c : input)
+                    upInp2 += static_cast<char>(std::toupper(c));
+
+                // Find " AS " (preceded by node list)
+                auto asPos = upInp2.find(" AS ");
+                if (asPos != std::string::npos) {
+                    // Everything after " AS " is the base query
+                    cmd.federatedQuery = input.substr(asPos + 4);
+                    // trim
+                    while (!cmd.federatedQuery.empty() && cmd.federatedQuery.front() == ' ')
+                        cmd.federatedQuery.erase(cmd.federatedQuery.begin());
+                }
+
+                // Find "ACROSS " to extract node names (up to AS)
+                auto acrossPos = upInp2.find("ACROSS ");
+                if (acrossPos != std::string::npos) {
+                    std::string nodesPart = input.substr(acrossPos + 7,
+                        asPos != std::string::npos ? asPos - acrossPos - 7
+                                                   : std::string::npos);
+                    // trim
+                    while (!nodesPart.empty() && nodesPart.front() == ' ')
+                        nodesPart.erase(nodesPart.begin());
+                    while (!nodesPart.empty() && nodesPart.back() == ' ')
+                        nodesPart.pop_back();
+                    cmd.federatedNodes = nodesPart;
+                }
+            }
+            if (cmd.tableName.empty() || cmd.federatedQuery.empty())
+                cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 105: SHOW FEDERATION STATUS ────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "FEDERATION") {
+            cmd.type = CommandType::SHOW_FEDERATION_STATUS;
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

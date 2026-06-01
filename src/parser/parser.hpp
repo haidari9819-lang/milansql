@@ -195,6 +195,10 @@ enum class CommandType {
     CREATE_EXTENSION,
     DROP_EXTENSION,
     SHOW_EXTENSIONS,
+    // Phase 92: COPY FROM/TO
+    COPY_FROM,
+    COPY_TO,
+    SHOW_COPY_STATS,
     UNKNOWN
 };
 
@@ -433,6 +437,15 @@ struct ParsedCommand {
 
     // Phase 90: Extension System
     std::string extensionName;     // for CREATE/DROP EXTENSION
+
+    // Phase 92: COPY FROM/TO
+    std::string copyFile;          // file path
+    std::string copyFormat;        // "CSV" or "BINARY"
+    char        copyDelimiter = ',';  // delimiter char
+    bool        copyHeader    = false; // HEADER true/false
+    bool        copyStdin     = false; // FROM STDIN
+    bool        copyStdout    = false; // TO STDOUT
+    std::string copySubquery;      // for COPY (SELECT ...) TO
 };
 
 class Parser {
@@ -1869,6 +1882,10 @@ public:
             // Phase 90: SHOW EXTENSIONS
             } else if (kw1 == "EXTENSIONS") {
                 cmd.type = CommandType::SHOW_EXTENSIONS;
+            // Phase 92: SHOW COPY STATS
+            } else if (kw1 == "COPY" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATS") {
+                cmd.type = CommandType::SHOW_COPY_STATS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2781,6 +2798,161 @@ public:
             cmd.type = CommandType::DROP_EXTENSION;
             if (tokens.size() >= 3) cmd.extensionName = tokens[2];
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 92: COPY FROM/TO ────────────────────────────────
+        } else if (kw0 == "COPY") {
+            // Detect: COPY (SELECT ...) TO ...  (subquery form)
+            // vs:     COPY tableName FROM/TO ...
+            // vs:     SHOW COPY STATS (handled in SHOW block)
+            {
+                std::string upInp;
+                upInp.reserve(input.size());
+                for (unsigned char c : input)
+                    upInp += static_cast<char>(std::toupper(c));
+
+                // Helper: find quoted string starting at pos, return content
+                auto extractQuoted = [&](size_t startPos) -> std::string {
+                    for (char q : {'\'', '"'}) {
+                        auto q1 = input.find(q, startPos);
+                        if (q1 != std::string::npos) {
+                            auto q2 = input.find(q, q1 + 1);
+                            if (q2 != std::string::npos)
+                                return input.substr(q1 + 1, q2 - q1 - 1);
+                        }
+                    }
+                    return "";
+                };
+
+                // Helper: parse WITH (...) options block
+                auto parseOptions = [&](size_t withPos) {
+                    // Find opening paren
+                    auto op = upInp.find('(', withPos);
+                    if (op == std::string::npos) return;
+                    auto cp = upInp.find(')', op);
+                    if (cp == std::string::npos) return;
+                    std::string opts = upInp.substr(op + 1, cp - op - 1);
+                    std::string optsRaw = input.substr(op + 1, cp - op - 1);
+                    // FORMAT CSV/BINARY
+                    {
+                        auto fmtPos = opts.find("FORMAT");
+                        if (fmtPos != std::string::npos) {
+                            // skip "FORMAT " and get next word
+                            size_t p = fmtPos + 6;
+                            while (p < opts.size() && (opts[p] == ' ' || opts[p] == '\t')) ++p;
+                            std::string fmt;
+                            while (p < opts.size() && opts[p] != ' ' && opts[p] != ',' && opts[p] != '\t') fmt += opts[p++];
+                            if (fmt == "BINARY") cmd.copyFormat = "BINARY";
+                            else cmd.copyFormat = "CSV";
+                        }
+                    }
+                    // HEADER true/false
+                    {
+                        auto hPos = opts.find("HEADER");
+                        if (hPos != std::string::npos) {
+                            size_t p = hPos + 6;
+                            while (p < opts.size() && (opts[p] == ' ' || opts[p] == '\t')) ++p;
+                            std::string val;
+                            while (p < opts.size() && opts[p] != ' ' && opts[p] != ',' && opts[p] != '\t') val += opts[p++];
+                            if (val == "TRUE" || val == "1") cmd.copyHeader = true;
+                        }
+                    }
+                    // DELIMITER ','/'\t'
+                    {
+                        auto dPos = opts.find("DELIMITER");
+                        if (dPos != std::string::npos) {
+                            // find quoted char in raw options
+                            std::string rawDelimPart = optsRaw.substr(dPos);
+                            // extract quoted char
+                            for (char q : {'\'', '"'}) {
+                                auto q1 = rawDelimPart.find(q);
+                                if (q1 != std::string::npos) {
+                                    auto q2 = rawDelimPart.find(q, q1 + 1);
+                                    if (q2 != std::string::npos) {
+                                        std::string dc = rawDelimPart.substr(q1 + 1, q2 - q1 - 1);
+                                        if (dc == "\\t") cmd.copyDelimiter = '\t';
+                                        else if (!dc.empty()) cmd.copyDelimiter = dc[0];
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+
+                // Check COPY (SELECT ...) TO form
+                // tokens[1] may be "(SELECT" (no space) or "(" — check by char
+                bool isSubqueryForm = false;
+                {
+                    size_t checkPos = 4; // skip "COPY"
+                    while (checkPos < input.size() && (input[checkPos] == ' ' || input[checkPos] == '\t')) ++checkPos;
+                    if (checkPos < input.size() && input[checkPos] == '(') isSubqueryForm = true;
+                }
+                if (isSubqueryForm) {
+                    // Find matching closing paren
+                    size_t oparen = input.find('(');
+                    if (oparen != std::string::npos) {
+                        int depth = 1;
+                        size_t p = oparen + 1;
+                        while (p < input.size() && depth > 0) {
+                            if (input[p] == '(') ++depth;
+                            else if (input[p] == ')') --depth;
+                            ++p;
+                        }
+                        // p now points past closing ')'
+                        cmd.copySubquery = input.substr(oparen + 1, p - oparen - 2);
+                        // trim whitespace
+                        while (!cmd.copySubquery.empty() && (cmd.copySubquery.front() == ' ' || cmd.copySubquery.front() == '\t'))
+                            cmd.copySubquery = cmd.copySubquery.substr(1);
+                        // remaining: TO 'file' [WITH ...]
+                        std::string remaining = upInp.substr(p);
+                        while (!remaining.empty() && (remaining.front() == ' ' || remaining.front() == '\t'))
+                            remaining = remaining.substr(1);
+                        if (remaining.size() >= 2 && remaining.substr(0, 2) == "TO") {
+                            cmd.type      = CommandType::COPY_TO;
+                            cmd.copyFormat = "CSV"; // default
+                            cmd.copyFile  = extractQuoted(p);
+                            auto withPos = upInp.find("WITH", p);
+                            if (withPos != std::string::npos) parseOptions(withPos);
+                        } else {
+                            cmd.type = CommandType::UNKNOWN;
+                        }
+                    } else {
+                        cmd.type = CommandType::UNKNOWN;
+                    }
+                } else {
+                    // COPY tableName FROM/TO ...
+                    // tokens: [COPY, tableName, FROM/TO, ...]
+                    if (tokens.size() < 3) { cmd.type = CommandType::UNKNOWN; }
+                    else {
+                        cmd.tableName = tokens[1];
+                        std::string dir = toUpper(tokens[2]);
+                        cmd.copyFormat = "CSV"; // default
+                        if (dir == "FROM") {
+                            cmd.type = CommandType::COPY_FROM;
+                            if (tokens.size() >= 4 && toUpper(tokens[3]) == "STDIN") {
+                                cmd.copyStdin = true;
+                            } else {
+                                cmd.copyFile = extractQuoted(input.find(tokens[2]) + tokens[2].size());
+                                if (cmd.copyFile.empty()) cmd.type = CommandType::UNKNOWN;
+                            }
+                            auto withPos = upInp.find("WITH");
+                            if (withPos != std::string::npos) parseOptions(withPos);
+                        } else if (dir == "TO") {
+                            cmd.type = CommandType::COPY_TO;
+                            if (tokens.size() >= 4 && toUpper(tokens[3]) == "STDOUT") {
+                                cmd.copyStdout = true;
+                            } else {
+                                cmd.copyFile = extractQuoted(input.find(tokens[2]) + tokens[2].size());
+                                if (cmd.copyFile.empty()) cmd.type = CommandType::UNKNOWN;
+                            }
+                            auto withPos = upInp.find("WITH");
+                            if (withPos != std::string::npos) parseOptions(withPos);
+                        } else {
+                            cmd.type = CommandType::UNKNOWN;
+                        }
+                    }
+                }
+            }
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

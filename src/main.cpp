@@ -20,6 +20,7 @@
 #include "parser/parser.hpp"
 #include "storage/storage.hpp"
 #include "dispatch.hpp"
+#include "copy/copy_manager.hpp"  // Phase 92: COPY FROM STDIN
 
 // Phase 59: Replication
 #include "replication/binlog.hpp"
@@ -47,7 +48,7 @@
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v3.6.0 ===           \u2551\n"
+              << "  \u2551        === MilanSQL v3.7.0 ===           \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -789,6 +790,25 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // ── Phase 92: COPY FROM STDIN — read lines until "\." ───────
+        if (cmd.type == milansql::CommandType::COPY_FROM && cmd.copyStdin) {
+            std::cout << "  Enter data followed by \\. on a line by itself:\n";
+            std::vector<std::string> stdinLines;
+            std::string stdinLine;
+            while (std::getline(std::cin, stdinLine)) {
+                if (stdinLine == "\\.") break;
+                stdinLines.push_back(stdinLine);
+            }
+            try {
+                milansql::CopyManager stdinCm;
+                std::string result = stdinCm.copyFromStdin(engine, cmd.tableName,
+                    stdinLines, cmd.copyDelimiter);
+                std::cout << "  " << result << "\n\n";
+                persist();
+            } catch (const std::exception& ex) {
+                std::cout << "  FEHLER (COPY FROM STDIN): " << ex.what() << "\n\n";
+            }
+        } else
         try {
             bool doExit = milansql::dispatchCommand(
                 cmd, engine, parser, eingabe,

@@ -31,6 +31,7 @@
 #include "scheduler/event_scheduler.hpp"
 #include "profiler/query_profiler.hpp"  // Phase 69: Query Profiler
 #include "pubsub/pubsub.hpp"           // Phase 76: LISTEN/NOTIFY
+#include "copy/copy_manager.hpp"       // Phase 92: COPY FROM/TO
 
 namespace milansql {
 
@@ -40,6 +41,9 @@ static QueryProfiler g_profiler;
 // ── Phase 82: Query Rewriter + Adaptive Stats ────────────────
 static QueryRewriter g_queryRewriter;
 static AdaptiveStats g_adaptiveStats;
+
+// ── Phase 92: COPY FROM/TO — persistent stats ─────────────────
+static CopyManager g_copyManager;
 
 // ── Phase 86: Table Statistics Manager ───────────────────────
 static TableStatsManager g_tableStats;
@@ -4871,6 +4875,71 @@ inline bool dispatchCommand(
                 std::cout << "    - " << line << "\n";
             std::cout << "\n";
         }
+        break;
+    }
+
+    // ── Phase 92: COPY FROM ────────────────────────────────────
+    case milansql::CommandType::COPY_FROM: {
+        if (dispatch_slaveReadOnly()) {
+            std::cout << "  FEHLER: Read-only: Slave akzeptiert keine Schreiboperationen\n\n";
+            break;
+        }
+        try {
+            if (cmd.copyStdin) {
+                // STDIN is handled in main.cpp before dispatch; should not reach here
+                std::cout << "  FEHLER: COPY FROM STDIN muss im REPL-Modus ausgefuehrt werden.\n\n";
+            } else if (cmd.copyFormat == "BINARY") {
+                std::string result = g_copyManager.copyFrom(engine, cmd.tableName,
+                    cmd.copyFile, "BINARY", cmd.copyDelimiter, cmd.copyHeader);
+                std::cout << "  " << result << "\n\n";
+                persistFn();
+            } else {
+                std::string result = g_copyManager.copyFrom(engine, cmd.tableName,
+                    cmd.copyFile, "CSV", cmd.copyDelimiter, cmd.copyHeader);
+                std::cout << "  " << result << "\n\n";
+                persistFn();
+            }
+        } catch (const std::exception& ex) {
+            std::cout << "  FEHLER (COPY FROM): " << ex.what() << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 92: COPY TO ──────────────────────────────────────
+    case milansql::CommandType::COPY_TO: {
+        try {
+            if (!cmd.copySubquery.empty()) {
+                // COPY (SELECT ...) TO 'file'
+                milansql::ParsedCommand subCmd = parser.parse(cmd.copySubquery);
+                milansql::Table subResult = dispatch_executeSelectToTable(engine, parser, subCmd);
+                // Build column names
+                std::vector<std::string> colNames;
+                for (const auto& c : subResult.columns()) colNames.push_back(c.name);
+                // Build rows
+                std::vector<std::vector<std::string>> rowData;
+                for (const auto& r : subResult.rows()) rowData.push_back(r.values);
+                std::string result = g_copyManager.copyQueryTo(colNames, rowData,
+                    cmd.copyFile, cmd.copyDelimiter, cmd.copyHeader);
+                std::cout << "  " << result << "\n\n";
+            } else if (cmd.copyFormat == "BINARY") {
+                std::string result = g_copyManager.copyTo(engine, cmd.tableName,
+                    cmd.copyFile, "BINARY", cmd.copyDelimiter, cmd.copyHeader);
+                std::cout << "  " << result << "\n\n";
+            } else {
+                std::string result = g_copyManager.copyTo(engine, cmd.tableName,
+                    cmd.copyFile, "CSV", cmd.copyDelimiter, cmd.copyHeader);
+                std::cout << "  " << result << "\n\n";
+            }
+        } catch (const std::exception& ex) {
+            std::cout << "  FEHLER (COPY TO): " << ex.what() << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 92: SHOW COPY STATS ──────────────────────────────
+    case milansql::CommandType::SHOW_COPY_STATS: {
+        std::string stats = g_copyManager.showStats();
+        std::cout << "\n  " << stats << "\n\n";
         break;
     }
 

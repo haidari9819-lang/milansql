@@ -3702,6 +3702,15 @@ public:
         return currentSchema_ + "." + name;
     }
 
+    // Phase 92: Public mutable table access for COPY bulk import (bypasses constraints)
+    Table& getMutableTable(const std::string& name) {
+        auto key = resolveTableName(name);
+        auto it = tables_.find(key);
+        if (it == tables_.end())
+            throw std::runtime_error("Tabelle '" + key + "' nicht gefunden.");
+        return it->second;
+    }
+
 private:
     std::set<std::string>               schemas_ = {"public"};  // Phase 51: schema registry
     std::string                         currentSchema_ = "public"; // Phase 51: active schema

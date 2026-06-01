@@ -204,6 +204,11 @@ enum class CommandType {
     CLEAR_STATEMENT_CACHE,
     SET_STATEMENT_CACHE,
     SET_STATEMENT_CACHE_SIZE,
+    // Phase 94: Connection Pool Multiplexing
+    SHOW_POOL_STATUS,
+    SET_POOL_MODE,
+    SET_POOL_MAX_CONNECTIONS,
+    SET_POOL_MAX_CLIENT_WAIT,
     UNKNOWN
 };
 
@@ -314,6 +319,9 @@ struct ParsedCommand {
 
     // Phase 93: Statement Cache settings
     std::string stmtCacheValue;   // "ON", "OFF", or a numeric string for SIZE
+
+    // Phase 94: Connection Pool Multiplexing
+    std::string poolValue;        // mode string or numeric string for pool settings
 
     // Phase 37: Alias der Haupttabelle (z.B. "m" in FROM mitarbeiter m)
     std::string tableAlias;
@@ -1911,6 +1919,10 @@ public:
             } else if (kw1 == "STATEMENT" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "CACHE") {
                 cmd.type = CommandType::SHOW_STATEMENT_CACHE;
+            // Phase 94: SHOW POOL STATUS
+            } else if (kw1 == "POOL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_POOL_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2270,6 +2282,45 @@ public:
                     val = tokens[si]; break;
                 }
                 cmd.stmtCacheValue = val;
+            }
+
+        // ── Phase 94: SET POOL_MODE = session/transaction/statement ──
+        } else if (kw0 == "SET" && kw1 == "POOL_MODE") {
+            cmd.type = CommandType::SET_POOL_MODE;
+            {
+                std::string val;
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = tokens[si];
+                    if (t == "=" || toUpper(t) == "POOL_MODE") continue;
+                    val = t; break;
+                }
+                cmd.poolValue = val;
+            }
+
+        // ── Phase 94: SET POOL_MAX_CONNECTIONS = N ─────────────────
+        } else if (kw0 == "SET" && kw1 == "POOL_MAX_CONNECTIONS") {
+            cmd.type = CommandType::SET_POOL_MAX_CONNECTIONS;
+            {
+                std::string val;
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = tokens[si];
+                    if (t == "=") continue;
+                    val = t; break;
+                }
+                cmd.poolValue = val;
+            }
+
+        // ── Phase 94: SET POOL_MAX_CLIENT_WAIT = N ─────────────────
+        } else if (kw0 == "SET" && kw1 == "POOL_MAX_CLIENT_WAIT") {
+            cmd.type = CommandType::SET_POOL_MAX_CLIENT_WAIT;
+            {
+                std::string val;
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = tokens[si];
+                    if (t == "=") continue;
+                    val = t; break;
+                }
+                cmd.poolValue = val;
             }
 
         // ── Phase 54A: SET CACHE ON / SET CACHE OFF ──────────────

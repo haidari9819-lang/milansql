@@ -33,8 +33,12 @@
 #include "pubsub/pubsub.hpp"           // Phase 76: LISTEN/NOTIFY
 #include "copy/copy_manager.hpp"       // Phase 92: COPY FROM/TO
 #include "cache/statement_cache.hpp"   // Phase 93: Prepared Statement Cache
+#include "pool/connection_pool.hpp"    // Phase 94: Connection Pool Multiplexing
 
 namespace milansql {
+
+// ── Phase 94: Global Connection Pool ─────────────────────────
+static ConnectionPool g_connectionPool;
 
 // ── Phase 93: Global Statement Cache ─────────────────────────
 static StatementCache g_stmtCache;
@@ -5005,6 +5009,61 @@ inline bool dispatchCommand(
             }
         } else {
             std::cout << "  Fehler: SET STATEMENT_CACHE_SIZE = N\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 94: Connection Pool Multiplexing ─────────────────
+
+    case milansql::CommandType::SHOW_POOL_STATUS: {
+        std::cout << "\n" << g_connectionPool.showStatus() << "\n";
+        break;
+    }
+
+    case milansql::CommandType::SET_POOL_MODE: {
+        if (!cmd.poolValue.empty()) {
+            g_connectionPool.setMode(cmd.poolValue);
+            std::cout << "  Pool Mode set to '" << cmd.poolValue << "'.\n\n";
+        } else {
+            std::cout << "  Error: SET POOL_MODE = session|transaction|statement\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SET_POOL_MAX_CONNECTIONS: {
+        if (!cmd.poolValue.empty()) {
+            try {
+                int n = std::stoi(cmd.poolValue);
+                if (n > 0) {
+                    g_connectionPool.setMaxConnections(n);
+                    std::cout << "  Pool max connections set to " << n << ".\n\n";
+                } else {
+                    std::cout << "  Error: Value must be > 0.\n\n";
+                }
+            } catch (...) {
+                std::cout << "  Error: Invalid number for POOL_MAX_CONNECTIONS.\n\n";
+            }
+        } else {
+            std::cout << "  Error: SET POOL_MAX_CONNECTIONS = N\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SET_POOL_MAX_CLIENT_WAIT: {
+        if (!cmd.poolValue.empty()) {
+            try {
+                int ms = std::stoi(cmd.poolValue);
+                if (ms >= 0) {
+                    g_connectionPool.setMaxWait(ms);
+                    std::cout << "  Pool max client wait set to " << ms << " ms.\n\n";
+                } else {
+                    std::cout << "  Error: Value must be >= 0.\n\n";
+                }
+            } catch (...) {
+                std::cout << "  Error: Invalid number for POOL_MAX_CLIENT_WAIT.\n\n";
+            }
+        } else {
+            std::cout << "  Error: SET POOL_MAX_CLIENT_WAIT = N\n\n";
         }
         break;
     }

@@ -40,6 +40,11 @@
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 #include "../extensions/extension_manager.hpp" // Phase 90: Extension System
+#include "../compression/compressor.hpp"       // Phase 96: Data Compression
+#include "../compression/rle_compressor.hpp"
+#include "../compression/lz4_compressor.hpp"
+#include "../compression/dict_compressor.hpp"
+#include "../compression/zstd_compressor.hpp"
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -771,6 +776,10 @@ public:
         for (const auto& r : rows_) if (r.xmax != 0) ++n;
         return n;
     }
+
+    // Phase 96: Compression metadata
+    CompressionType compressionType = CompressionType::NONE;
+    DictCompressor  dictCompressor;
 
     // Phase 62: Partition accessors
     void setPartitionInfo(const PartitionInfo& pi) { partitionInfo_ = pi; }
@@ -6152,6 +6161,93 @@ public:
                 queryCache_.invalidate(pk.substr(dot + 1));
             it = tableParent_.find(pk);
         }
+    }
+
+    // ── Phase 96: Compression management ─────────────────────────
+
+    void setTableCompression(const std::string& tblRaw, CompressionType ct) {
+        auto name = resolveTableName(tblRaw);
+        auto it = tables_.find(name);
+        if (it == tables_.end())
+            throw std::runtime_error("Table not found: " + tblRaw);
+        it->second.compressionType = ct;
+    }
+
+    std::string showCompressionStats(const std::string& tblRaw) const {
+        auto name = resolveTableName(tblRaw);
+        const Table& tbl = getTable(name);
+
+        CompressionType ct = tbl.compressionType;
+        std::string typeName = compressionTypeName(ct);
+
+        // Collect all row values
+        std::vector<std::string> allValues;
+        size_t rawSize = 0;
+        for (const auto& row : tbl.rows()) {
+            if (row.xmax != 0) continue;
+            for (const auto& v : row.values) {
+                allValues.push_back(v);
+                rawSize += v.size();
+            }
+        }
+
+        size_t compressedSize = 0;
+
+        if (ct == CompressionType::NONE) {
+            compressedSize = rawSize;
+        } else if (ct == CompressionType::RLE) {
+            RleCompressor rle;
+            // Build a single blob of all values
+            std::string blob;
+            blob.reserve(rawSize);
+            for (const auto& v : allValues) blob += v;
+            auto compressed = rle.compress(blob);
+            compressedSize = compressed.size();
+        } else if (ct == CompressionType::LZ4) {
+            Lz4Compressor lz4;
+            std::string blob;
+            blob.reserve(rawSize);
+            for (const auto& v : allValues) blob += v;
+            auto compressed = lz4.compress(blob);
+            compressedSize = compressed.size();
+        } else if (ct == CompressionType::DICTIONARY) {
+            // Build dictionary from current values, then compress each
+            DictCompressor dict;
+            const_cast<Table&>(tbl).dictCompressor.buildDictionary(allValues);
+            std::vector<uint8_t> allCompressed;
+            for (const auto& v : allValues) {
+                auto tok = const_cast<Table&>(tbl).dictCompressor.compress(v);
+                allCompressed.insert(allCompressed.end(), tok.begin(), tok.end());
+            }
+            compressedSize = allCompressed.size();
+        } else if (ct == CompressionType::ZSTD) {
+            ZstdCompressor zstd;
+            std::string blob;
+            blob.reserve(rawSize);
+            for (const auto& v : allValues) blob += v;
+            auto compressed = zstd.compress(blob);
+            compressedSize = compressed.size();
+        }
+
+        double ratio = (rawSize > 0)
+            ? (static_cast<double>(rawSize) / static_cast<double>(compressedSize))
+            : 1.0;
+        double savings = (rawSize > 0 && compressedSize < rawSize)
+            ? (1.0 - static_cast<double>(compressedSize) / static_cast<double>(rawSize)) * 100.0
+            : 0.0;
+
+        std::ostringstream oss;
+        oss << "  Compression Stats for table '" << tblRaw << "':\n";
+        oss << "  ┌─────────────────────────────────────────┐\n";
+        oss << "  │ Algorithm   : " << typeName << "\n";
+        oss << "  │ Raw size    : " << rawSize << " bytes\n";
+        oss << "  │ Compressed  : " << compressedSize << " bytes\n";
+        oss << std::fixed << std::setprecision(2);
+        oss << "  │ Ratio       : " << ratio << "x\n";
+        oss << "  │ Space saved : " << savings << "%\n";
+        oss << "  │ Row count   : " << allValues.size() / (tbl.columns().size() > 0 ? tbl.columns().size() : 1) << "\n";
+        oss << "  └─────────────────────────────────────────┘\n";
+        return oss.str();
     }
 
     // ── Phase 62: Partition management ───────────────────────────

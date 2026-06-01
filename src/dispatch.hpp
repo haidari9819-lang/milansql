@@ -1975,6 +1975,13 @@ inline bool dispatchCommand(
             try { engine.setTablePartitionInfo(cmd.tableName, pi); } catch (...) {}
             dispatch_savePartitions(engine);
         }
+        // Phase 96: Apply compression type if specified
+        if (!cmd.compressionType.empty()) {
+            try {
+                engine.setTableCompression(cmd.tableName,
+                    milansql::parseCompressionType(cmd.compressionType));
+            } catch (...) {}
+        }
         persistFn();
         dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
@@ -1987,6 +1994,8 @@ inline bool dispatchCommand(
             std::cout << ", " << cmd.foreignKeys.size() << " FK";
         if (!cmd.partitionType.empty())
             std::cout << ", PARTITION BY " << cmd.partitionType;
+        if (!cmd.compressionType.empty())
+            std::cout << ", COMPRESSION=" << cmd.compressionType;
         std::cout << ").\n\n";
         break;
     }
@@ -5095,6 +5104,39 @@ inline bool dispatchCommand(
             }
         } else {
             std::cout << "  Error: SET POOL_MAX_CLIENT_WAIT = N\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 96: ALTER TABLE SET COMPRESSION ────────────────
+    case milansql::CommandType::ALTER_TABLE_SET_COMPRESSION: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: ALTER TABLE name SET COMPRESSION = type\n\n";
+            break;
+        }
+        try {
+            milansql::CompressionType ct = milansql::parseCompressionType(cmd.compressionType);
+            engine.setTableCompression(cmd.tableName, ct);
+            std::cout << "  Compression for table '" << cmd.tableName
+                      << "' set to " << milansql::compressionTypeName(ct) << ".\n\n";
+            persistFn();
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 96: SHOW COMPRESSION STATS ─────────────────────
+    case milansql::CommandType::SHOW_COMPRESSION_STATS: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Fehler: SHOW COMPRESSION STATS FOR tablename\n\n";
+            break;
+        }
+        try {
+            std::cout << engine.showCompressionStats(cmd.tableName);
+            std::cout << "\n";
+        } catch (const std::exception& e) {
+            std::cout << "  FEHLER: " << e.what() << "\n\n";
         }
         break;
     }

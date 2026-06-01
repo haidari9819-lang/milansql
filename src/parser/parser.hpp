@@ -209,6 +209,9 @@ enum class CommandType {
     SET_POOL_MODE,
     SET_POOL_MAX_CONNECTIONS,
     SET_POOL_MAX_CLIENT_WAIT,
+    // Phase 96: Data Compression
+    ALTER_TABLE_SET_COMPRESSION,
+    SHOW_COMPRESSION_STATS,
     UNKNOWN
 };
 
@@ -463,6 +466,9 @@ struct ParsedCommand {
     bool        copyStdin     = false; // FROM STDIN
     bool        copyStdout    = false; // TO STDOUT
     std::string copySubquery;      // for COPY (SELECT ...) TO
+
+    // Phase 96: Data Compression
+    std::string compressionType;   // "lz4", "rle", "dictionary", "zstd", or "none"
 };
 
 class Parser {
@@ -1092,6 +1098,59 @@ public:
                                     tableInheritsTemp = tableInheritsTemp.substr(s, e - s + 1);
                                 // Truncate input to just the column defs part
                                 input = input.substr(0, matchRp + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 96: Pre-process CREATE TABLE ... WITH (COMPRESSION = xxx) ──
+        {
+            std::string ucheck2 = input;
+            for (auto& c : ucheck2) c = static_cast<char>(std::toupper(
+                static_cast<unsigned char>(c)));
+            if (ucheck2.size() > 12 && ucheck2.substr(0, 12) == "CREATE TABLE") {
+                auto firstLp2 = input.find('(');
+                if (firstLp2 != std::string::npos) {
+                    int depth2 = 0; size_t matchRp2 = std::string::npos;
+                    for (size_t k = firstLp2; k < input.size(); ++k) {
+                        if (input[k] == '(') ++depth2;
+                        else if (input[k] == ')') {
+                            --depth2;
+                            if (depth2 == 0) { matchRp2 = k; break; }
+                        }
+                    }
+                    if (matchRp2 != std::string::npos && matchRp2 + 1 < input.size()) {
+                        std::string after2 = input.substr(matchRp2 + 1);
+                        std::string afterU2 = after2;
+                        for (auto& c : afterU2) c = static_cast<char>(std::toupper(
+                            static_cast<unsigned char>(c)));
+                        // Look for WITH ( ... COMPRESSION = value ... )
+                        auto withPos2 = afterU2.find("WITH");
+                        if (withPos2 != std::string::npos) {
+                            auto lp2 = after2.find('(', withPos2);
+                            if (lp2 != std::string::npos) {
+                                auto rp2 = after2.find(')', lp2);
+                                if (rp2 != std::string::npos) {
+                                    std::string opts2 = afterU2.substr(lp2 + 1, rp2 - lp2 - 1);
+                                    auto compPos2 = opts2.find("COMPRESSION");
+                                    if (compPos2 != std::string::npos) {
+                                        auto eqPos2 = opts2.find('=', compPos2);
+                                        if (eqPos2 != std::string::npos) {
+                                            size_t vStart2 = eqPos2 + 1;
+                                            while (vStart2 < opts2.size() && opts2[vStart2] == ' ') ++vStart2;
+                                            size_t vEnd2 = vStart2;
+                                            while (vEnd2 < opts2.size() && opts2[vEnd2] != ' ' && opts2[vEnd2] != ',') ++vEnd2;
+                                            std::string compVal2 = opts2.substr(vStart2, vEnd2 - vStart2);
+                                            // lowercase
+                                            for (auto& c : compVal2) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                            cmd.compressionType = compVal2;
+                                            // Truncate input to just the column defs part
+                                            input = input.substr(0, matchRp2 + 1);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1923,6 +1982,12 @@ public:
             } else if (kw1 == "POOL" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_POOL_STATUS;
+            // Phase 96: SHOW COMPRESSION STATS FOR table
+            } else if (kw1 == "COMPRESSION" && tokens.size() >= 5 &&
+                       toUpper(tokens[2]) == "STATS" &&
+                       toUpper(tokens[3]) == "FOR") {
+                cmd.type = CommandType::SHOW_COMPRESSION_STATS;
+                cmd.tableName = tokens[4];
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3493,6 +3558,14 @@ private:
         } else if (op == "DROP" && kw4 == "PARTITION" && tokens.size() >= 6) {
             cmd.alterOp      = "DROP_PARTITION";
             cmd.partitionName = tokens[5];
+
+        // Phase 96: ALTER TABLE t SET COMPRESSION = xxx
+        } else if (op == "SET" && kw4 == "COMPRESSION" &&
+                   tokens.size() >= 7 && toUpper(tokens[5]) == "=") {
+            cmd.type = CommandType::ALTER_TABLE_SET_COMPRESSION;
+            std::string cv = tokens[6];
+            for (auto& c : cv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            cmd.compressionType = cv;
 
         // Phase 75: ALTER TABLE t ENABLE/DISABLE ROW LEVEL SECURITY
         } else if (op == "ENABLE" && kw4 == "ROW" &&

@@ -55,6 +55,32 @@ if(WIN32)
     target_link_libraries(milansql_stress PRIVATE ws2_32)
 endif()
 
+# ── Fuzzer (Phase 101) ───────────────────────────────────────
+add_executable(milansql_fuzzer src/tests/sql_fuzzer.cpp)
+target_compile_features(milansql_fuzzer PRIVATE cxx_std_17)
+target_include_directories(milansql_fuzzer PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/timeseries src/types)
+if(MSVC)
+    target_compile_options(milansql_fuzzer PRIVATE /W4)
+else()
+    target_compile_options(milansql_fuzzer PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_fuzzer PRIVATE ws2_32)
+endif()
+
+# ── TPC-H Benchmark (Phase 101) ──────────────────────────────
+add_executable(milansql_tpch src/tests/tpch_benchmark.cpp)
+target_compile_features(milansql_tpch PRIVATE cxx_std_17)
+target_include_directories(milansql_tpch PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/timeseries src/types)
+if(MSVC)
+    target_compile_options(milansql_tpch PRIVATE /W4)
+else()
+    target_compile_options(milansql_tpch PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_tpch PRIVATE ws2_32)
+endif()
+
 # ── Benchmark (Phase 39.5) ───────────────────────────────────
 add_executable(milansql_bench src/tests/benchmark.cpp)
 target_compile_features(milansql_bench PRIVATE cxx_std_17)

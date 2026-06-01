@@ -1,0 +1,8 @@
+build/
+*.milan
+*.wal
+*.log
+*.csv
+*.bin
+.git/
+.claude/

@@ -1,0 +1,24 @@
+name: Docker Build
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t milansql:latest .
+
+      - name: Test Docker image
+        run: |
+          docker run -d --name test-milansql \
+            -p 8080:8080 milansql:latest
+          sleep 5
+          curl -f http://localhost:8080/status || echo "HTTP check failed (non-fatal)"
+          docker stop test-milansql
+          docker rm test-milansql

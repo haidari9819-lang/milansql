@@ -38,6 +38,8 @@
 #include "../types/array_type.hpp"          // Phase 88: Array Data Type
 #include "../types/vector_type.hpp"         // Phase 111: pgvector
 #include "../fdw/foreign_data_wrapper.hpp"  // Phase 89: FDW base
+#include "../concurrent/rwlock.hpp"         // Phase 112: per-table RwLocks
+#include "../concurrent/atomic_table.hpp"   // Phase 112: lock-free stats
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 #include "../extensions/extension_manager.hpp" // Phase 90: Extension System
@@ -1074,6 +1076,7 @@ public:
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         Table& t = getTable(tbl);       // wirft wenn Tabelle fehlt
         applyDefaults(t, vals);         // fehlende Werte mit DEFAULT/NULL füllen
         applyAutoInc(t, vals);          // AUTO_INCREMENT-Spalten befüllen
@@ -1197,6 +1200,7 @@ public:
     Table selectAllFiltered(const std::string& tbl, bool fromOnly = false) const {
         auto key = resolveTableName(tbl);
         bufferPool_.access(key);
+        ReadScope rs(getOrCreateRwLock(key), key);  // Phase 112: shared read lock
         const auto& src = getTable(key);
         Table result = src.clone();
         result.mutableRows() = applyRls_(key, src.rows(), "SELECT");
@@ -1215,6 +1219,7 @@ public:
                             bool fromOnly = false) const {
         auto tblName = resolveTableName(tblNameRaw);
         bufferPool_.access(tblName);  // Phase 73: Buffer Pool tracking
+        ReadScope rs(getOrCreateRwLock(tblName), tblName);  // Phase 112: shared read lock
         const Table& src = getTable(tblName);
         Table result(tblName, src.columns());
         bool usedIndex = false;
@@ -1835,6 +1840,7 @@ public:
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -1858,6 +1864,7 @@ public:
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -1880,6 +1887,7 @@ public:
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         // Phase 21: CASCADE / SET NULL / RESTRICT für betroffene Zeilen
         {
             const Table& t = getTable(tbl);
@@ -1957,6 +1965,7 @@ public:
                             const std::string& wCol, const std::string& wVal) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         // Phase 44: Check if any setVal contains an expression (col op num)
         // If so, do per-row evaluation
         bool hasExpr = false;
@@ -2076,6 +2085,7 @@ public:
                           const std::vector<std::string>& setVals) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
         if (inTransaction_) {
             for (size_t k = 0; k < setCols.size() && k < setVals.size(); ++k)
@@ -2097,6 +2107,7 @@ public:
     std::size_t deleteAll(const std::string& tblRaw) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         // Phase 21: CASCADE / SET NULL / RESTRICT für alle Zeilen
         {
             std::vector<Row> rowsCopy(getTable(tbl).rows().begin(),
@@ -6899,6 +6910,21 @@ public:
         bufferPool_.markClean(tableName);
     }
 
+    // Phase 112: RwLock stats for SHOW ENGINE STATUS
+    struct RwLockInfo {
+        std::string tableName;
+        int         activeReaders;
+        bool        hasWriter;
+    };
+    std::vector<RwLockInfo> getRwLockStats() const {
+        std::lock_guard<std::mutex> g(rwLockMapMu_);
+        std::vector<RwLockInfo> out;
+        out.reserve(rwLocks_.size());
+        for (const auto& [name, lk] : rwLocks_)
+            out.push_back({name, lk->activeReaders(), lk->hasActiveWriter()});
+        return out;
+    }
+
 private:
     // Phase 90: Extension Manager
     ExtensionManager extensionMgr_;
@@ -6926,6 +6952,66 @@ private:
 
     // Phase 105: Query Federation
     FederationManager fedMgr_;
+
+    // Phase 112: per-table RwLocks for concurrent read optimization
+    // unique_ptr because RwLock (shared_mutex) is non-movable/non-copyable
+    mutable std::mutex                                      rwLockMapMu_;
+    mutable std::map<std::string, std::unique_ptr<RwLock>> rwLocks_;
+
+    // Get-or-create the RwLock for a table (thread-safe)
+    RwLock& getOrCreateRwLock(const std::string& tblKey) const {
+        std::lock_guard<std::mutex> g(rwLockMapMu_);
+        auto it = rwLocks_.find(tblKey);
+        if (it != rwLocks_.end()) return *it->second;
+        auto res = rwLocks_.emplace(tblKey, std::make_unique<RwLock>());
+        return *res.first->second;
+    }
+
+    // Thread-local set of tables whose lock is already held on this thread.
+    // Prevents recursive deadlock when triggers call DML on the same table.
+    static std::set<std::string>& threadHeldLocks() {
+        static thread_local std::set<std::string> s;
+        return s;
+    }
+
+    // RAII scopes that skip acquisition if already held (recursion guard)
+    struct WriteScope {
+        RwLock* lk_; std::string key_; bool owned_;
+        WriteScope(RwLock& lk, const std::string& key)
+            : lk_(&lk), key_(key), owned_(!threadHeldLocks().count(key)) {
+            if (owned_) {
+                threadHeldLocks().insert(key_);
+                lk_->writeLock();
+                g_atomicStats().incWrite();
+            } else {
+                g_atomicStats().incSkip();
+            }
+        }
+        ~WriteScope() {
+            if (owned_) { lk_->writeUnlock(); threadHeldLocks().erase(key_); }
+        }
+        WriteScope(const WriteScope&) = delete;
+        WriteScope& operator=(const WriteScope&) = delete;
+    };
+
+    struct ReadScope {
+        RwLock* lk_; std::string key_; bool owned_;
+        ReadScope(RwLock& lk, const std::string& key)
+            : lk_(&lk), key_(key), owned_(!threadHeldLocks().count(key)) {
+            if (owned_) {
+                threadHeldLocks().insert(key_);
+                lk_->readLock();
+                g_atomicStats().incRead();
+            } else {
+                g_atomicStats().incSkip();
+            }
+        }
+        ~ReadScope() {
+            if (owned_) { lk_->readUnlock(); threadHeldLocks().erase(key_); }
+        }
+        ReadScope(const ReadScope&) = delete;
+        ReadScope& operator=(const ReadScope&) = delete;
+    };
 
     // Phase 72: timestamp helper
     static std::string currentTimestamp() {

@@ -5634,9 +5634,31 @@ inline bool dispatchCommand(
         oss << "Buffer Pool Size: " << engine.getBufferPoolSizeMB() << " MB\n";
         oss << "Dirty Pages: " << engine.getDirtyBufferPages().size() << "\n\n";
 
-        // --- QUERIES ---
+        // --- QUERIES (Phase 112: lock-free atomic counters) ---
         oss << "--- QUERIES ---\n";
-        oss << "(See /metrics for Prometheus counters)\n\n";
+        const auto& as = milansql::g_atomicStats();
+        oss << "Total Queries:    " << as.queryCount.load()          << "\n";
+        oss << "Read Operations:  " << as.readCount.load()           << "\n";
+        oss << "Write Operations: " << as.writeCount.load()          << "\n";
+        oss << "Cache Hits:       " << as.hitCount.load()            << "\n";
+        oss << "Cache Misses:     " << as.missCount.load()           << "\n";
+        oss << "RwLock Reads:     " << as.rwlockReadAcquires.load()  << "\n";
+        oss << "RwLock Writes:    " << as.rwlockWriteAcquires.load() << "\n";
+        oss << "RwLock Skipped:   " << as.rwlockSkipped.load()       << "\n\n";
+
+        // --- RWLOCKS (Phase 112: per-table reader-writer locks) ---
+        oss << "--- RWLOCKS (per-table) ---\n";
+        auto rwStats = engine.getRwLockStats();
+        if (rwStats.empty()) {
+            oss << "  (no per-table locks created yet)\n";
+        } else {
+            for (const auto& info : rwStats) {
+                oss << "  " << info.tableName
+                    << " — readers: " << info.activeReaders
+                    << ", writer: "   << (info.hasWriter ? "YES" : "no") << "\n";
+            }
+        }
+        oss << "\n";
 
         // --- TABLES ---
         oss << "--- TABLES ---\n";

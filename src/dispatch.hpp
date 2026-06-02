@@ -40,6 +40,8 @@
 #include "config/runtime_config.hpp"          // Phase 109: Hot Config Reload
 #include "migration/migration_manager.hpp"    // Phase 109: Schema Migrations
 #include "ssl/tls_context.hpp"               // Phase 110: SSL/TLS
+#include "index/hnsw_index.hpp"              // Phase 111: pgvector HNSW
+#include "types/vector_type.hpp"             // Phase 111: VectorType
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -196,6 +198,145 @@ static inline std::vector<std::string> splitStatements(const std::string& input)
     if (!cur.empty()) stmts.push_back(cur);
 
     return stmts;
+}
+
+// ── Phase 111: Vector ORDER BY pre-processing ─────────────────
+// Before sortByMulti(), detect __vecop__ entries in orderByCols,
+// compute distance columns, add them to the table, replace the
+// encoded entry with the new column name, then let normal sort handle it.
+// Returns the modified orderByCols (with __vecop__ entries replaced).
+//
+// __vecop__ encoding: "__vecop__colname__OP__[queryVector]"
+static inline std::vector<std::pair<std::string,bool>>
+dispatch_applyVectorOrderBy(
+        milansql::Table& result,
+        const std::vector<std::pair<std::string,bool>>& orderByCols)
+{
+    std::vector<std::pair<std::string,bool>> out;
+    int distColIdx = 0;
+
+    for (const auto& ob : orderByCols) {
+        const std::string& encoded = ob.first;
+        bool desc = ob.second;
+
+        const std::string prefix = "__vecop__";
+        if (encoded.size() > prefix.size() &&
+            encoded.substr(0, prefix.size()) == prefix)
+        {
+            // Decode: __vecop__colname__OP__queryVector
+            std::string rest = encoded.substr(prefix.size());
+            // Find __OP__ separator
+            std::string op;
+            std::string colName;
+            std::string queryStr;
+            static const char* OPS[] = {"__<->__", "__<=>__", "__<#>__"};
+            static const char* OP_SYMS[] = {"<->", "<=>", "<#>"};
+            size_t opFoundIdx = std::string::npos;
+            int opKind = 0;
+            for (int oi = 0; oi < 3; ++oi) {
+                auto pos = rest.find(OPS[oi]);
+                if (pos != std::string::npos &&
+                    (opFoundIdx == std::string::npos || pos < opFoundIdx)) {
+                    opFoundIdx = pos;
+                    opKind     = oi;
+                    op         = OP_SYMS[oi];
+                }
+            }
+            if (opFoundIdx == std::string::npos) {
+                out.push_back(ob); continue;
+            }
+            colName  = rest.substr(0, opFoundIdx);
+            queryStr = rest.substr(opFoundIdx + std::string(OPS[opKind]).size());
+
+            // Parse query vector
+            auto query = milansql::vector_type::parse(queryStr);
+            if (query.empty()) { out.push_back(ob); continue; }
+
+            // Add a computed distance column to every row
+            std::string distColName = "__vec_dist_" + std::to_string(distColIdx++) + "__";
+
+            // Find column index for colName
+            int colIdx = -1;
+            const auto& cols = result.columns();
+            for (size_t ci = 0; ci < cols.size(); ++ci) {
+                std::string bare = cols[ci].name;
+                auto dot = bare.rfind('.');
+                if (dot != std::string::npos) bare = bare.substr(dot + 1);
+                if (bare == colName || cols[ci].name == colName) {
+                    colIdx = static_cast<int>(ci);
+                    break;
+                }
+            }
+
+            // Compute distance for each row and store as new column
+            milansql::Column distCol(distColName, "REAL");
+            result.addColumn(distCol);  // fills "NULL" by default
+
+            const auto& rows = result.rows();
+            int newColIdx = static_cast<int>(result.columns().size()) - 1;
+
+            for (size_t ri = 0; ri < rows.size(); ++ri) {
+                std::string vecStr;
+                if (colIdx >= 0 && static_cast<size_t>(colIdx) < rows[ri].values.size())
+                    vecStr = rows[ri].values[static_cast<size_t>(colIdx)];
+                auto vec = milansql::vector_type::parse(vecStr);
+                float dist = 0.0f;
+                if (vec.size() == query.size()) {
+                    if (op == "<->") dist = milansql::vector_type::l2Distance(vec, query);
+                    else if (op == "<=>") dist = milansql::vector_type::cosineDistance(vec, query);
+                    else if (op == "<#>") dist = -milansql::vector_type::innerProduct(vec, query);
+                } else {
+                    dist = (op == "<=>" ? 1.0f : 1e9f);
+                }
+                result.mutableRows()[ri].values[static_cast<size_t>(newColIdx)] =
+                    milansql::vector_type::fmtFloat(dist);
+            }
+
+            // Replace the encoded entry with the distance column name
+            out.push_back({distColName, desc});
+        } else {
+            out.push_back(ob);
+        }
+    }
+    return out;
+}
+
+// Remove vector distance helper columns added by dispatch_applyVectorOrderBy
+static inline milansql::Table dispatch_removeVectorDistCols(
+        const milansql::Table& tbl)
+{
+    std::vector<std::string> keepCols;
+    for (const auto& col : tbl.columns()) {
+        const std::string prefix = "__vec_dist_";
+        if (col.name.size() < prefix.size() ||
+            col.name.substr(0, prefix.size()) != prefix) {
+            keepCols.push_back(col.name);
+        }
+    }
+    if (keepCols.size() == tbl.columns().size()) return tbl.clone();
+    return tbl.project(keepCols);
+}
+
+// Convenience wrapper: sort table respecting vector distance operators
+static inline void dispatch_sortWithVector(
+        milansql::Table& t,
+        const std::vector<std::pair<std::string,bool>>& orderByCols)
+{
+    if (orderByCols.empty()) return;
+    // Check for __vecop__ entries
+    bool hasVec = false;
+    for (const auto& ob : orderByCols) {
+        if (ob.first.size() > 9 && ob.first.substr(0, 9) == "__vecop__") {
+            hasVec = true; break;
+        }
+    }
+    if (!hasVec) {
+        t.sortByMulti(orderByCols);
+        return;
+    }
+    auto newOrder = dispatch_applyVectorOrderBy(t, orderByCols);
+    t.sortByMulti(newOrder);
+    t = dispatch_removeVectorDistCols(t);
 }
 
 // ── Forward declarations of helper print functions ───────────
@@ -662,7 +803,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
             rightResult = rightResult.project(rc.selectColumns);
 
         milansql::Table result = engine.executeSetOp(leftResult, cmd.setOp, rightResult);
-        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
         return result;
     }
 
@@ -693,7 +834,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
             for (const auto& tbl : fdwToClean)
                 engine.dropTempTable(tbl);
 
-            if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+            if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
             if (!cmd.selectColumns.empty())
                 result = result.project(cmd.selectColumns);
             return result;
@@ -707,7 +848,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
             cmd.groupByCols,
             cmd.selectItems,
             cmd.havingConds, cmd.havingLogic);
-        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
         return result;
     }
 
@@ -717,7 +858,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
         // Apply WHERE filter on the in-memory result
         if (!cmd.whereConds.empty())
             foreignResult = engine.filterTable(foreignResult, cmd.whereConds, cmd.whereLogic);
-        if (!cmd.orderByCols.empty()) foreignResult.sortByMulti(cmd.orderByCols);
+        if (!cmd.orderByCols.empty()) dispatch_sortWithVector(foreignResult, cmd.orderByCols);
         if (!cmd.selectColumns.empty())
             foreignResult = foreignResult.project(cmd.selectColumns);
         if (cmd.isDistinct) foreignResult.makeDistinct();
@@ -755,9 +896,9 @@ static inline milansql::Table dispatch_executeSelectToTable(
         // Phase 88: expand UNNEST after projection
         if (hasUnnest)
             result = dispatch_expandUnnestResult(result, cmd.selectItems);
-        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
     } else {
-        if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+        if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
         if (!cmd.selectColumns.empty())
             result = result.project(cmd.selectColumns);
     }
@@ -1048,7 +1189,7 @@ struct ProcExec {
                 result = engine.selectAll(sc.tableName).clone();
             }
             if (!sc.selectColumns.empty()) result = result.project(sc.selectColumns);
-            if (!sc.orderByCols.empty()) result.sortByMulti(sc.orderByCols);
+            if (!sc.orderByCols.empty()) dispatch_sortWithVector(result, sc.orderByCols);
             dispatch_printTable(result, sc.limit, sc.limitOffset);
         } else if (sc.type == milansql::CommandType::UPDATE) {
             std::size_t n = 0;
@@ -1194,7 +1335,7 @@ struct ProcExec {
                 result = engine.selectAll(sc.tableName).clone();
             }
             if (!sc.selectColumns.empty()) result = result.project(sc.selectColumns);
-            if (!sc.orderByCols.empty()) result.sortByMulti(sc.orderByCols);
+            if (!sc.orderByCols.empty()) dispatch_sortWithVector(result, sc.orderByCols);
             cs.rows.clear(); cs.colNames.clear();
             for (const auto& col : result.columns()) cs.colNames.push_back(col.name);
             for (const auto& row : result.rows()) cs.rows.push_back(row.values);
@@ -2338,7 +2479,7 @@ inline bool dispatchCommand(
                     cmd.tableName, "", cmd.selectColumns);
                 if (!cmd.whereConds.empty())
                     fedResult = engine.filterTable(fedResult, cmd.whereConds, cmd.whereLogic);
-                if (!cmd.orderByCols.empty()) fedResult.sortByMulti(cmd.orderByCols);
+                if (!cmd.orderByCols.empty()) dispatch_sortWithVector(fedResult, cmd.orderByCols);
                 if (cmd.isCount) {
                     // COUNT(*) from federated
                     std::vector<milansql::Column> cntCols;
@@ -2386,7 +2527,7 @@ inline bool dispatchCommand(
                     vt = vt.project(cmd.selectColumns);
                 }
                 if (cmd.isDistinct) vt.makeDistinct();
-                if (!cmd.orderByCols.empty()) vt.sortByMulti(cmd.orderByCols);
+                if (!cmd.orderByCols.empty()) dispatch_sortWithVector(vt, cmd.orderByCols);
                 std::cout << "\n";
                 dispatch_printTable(vt, cmd.limit, cmd.limitOffset);
             } catch (const std::exception& ex) {
@@ -2418,7 +2559,7 @@ inline bool dispatchCommand(
                 engine.cleanupTempTables();
                 std::cout << "\n";
                 if (!cmd.orderByCols.empty())
-                    mainResult.sortByMulti(cmd.orderByCols);
+                    dispatch_sortWithVector(mainResult, cmd.orderByCols);
                 dispatch_printTable(mainResult, cmd.limit, cmd.limitOffset);
             } catch (...) {
                 engine.cleanupTempTables();
@@ -2460,7 +2601,7 @@ inline bool dispatchCommand(
             // Step 2: SORT (if ORDER BY)
             if (!cmd.orderByCols.empty()) {
                 auto t2 = clk::now();
-                result.sortByMulti(cmd.orderByCols);
+                dispatch_sortWithVector(result, cmd.orderByCols);
                 auto t3 = clk::now();
                 double ms2 = fms(t3 - t2).count();
                 totalMs += ms2;
@@ -2735,7 +2876,7 @@ inline bool dispatchCommand(
             milansql::Table result =
                 engine.executeSetOp(leftResult, cmd.setOp, rightResult);
             std::cout << "\n";
-            if (!cmd.orderByCols.empty()) result.sortByMulti(cmd.orderByCols);
+            if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
             dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             break;
         }
@@ -2750,7 +2891,7 @@ inline bool dispatchCommand(
                 result = engine.filterTable(result, cmd.whereConds, cmd.whereLogic);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
+                dispatch_sortWithVector(result, cmd.orderByCols);
             if (!cmd.selectColumns.empty())
                 result = result.project(cmd.selectColumns);
             if (cmd.isDistinct)
@@ -2763,7 +2904,7 @@ inline bool dispatchCommand(
             milansql::Table result = dispatch_materializeView(engine, parser, cmd.tableName, cmd);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
+                dispatch_sortWithVector(result, cmd.orderByCols);
             if (!cmd.selectColumns.empty())
                 result = result.project(cmd.selectColumns);
             if (cmd.isDistinct)
@@ -2788,7 +2929,7 @@ inline bool dispatchCommand(
                 result = engine.filterTable(result, cmd.whereConds, cmd.whereLogic);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
+                dispatch_sortWithVector(result, cmd.orderByCols);
             if (!cmd.selectColumns.empty())
                 result = result.project(cmd.selectColumns);
             if (cmd.isDistinct)
@@ -2846,7 +2987,7 @@ inline bool dispatchCommand(
                     engine.cleanupTempTables();
                     std::cout << "\n";
                     if (!cmd.orderByCols.empty())
-                        result.sortByMulti(cmd.orderByCols);
+                        dispatch_sortWithVector(result, cmd.orderByCols);
                     dispatch_printTable(result, cmd.limit, cmd.limitOffset);
                 } catch (...) {
                     engine.cleanupTempTables();
@@ -2860,7 +3001,7 @@ inline bool dispatchCommand(
                 : ct.filterRows(cmd.whereConds, cmd.whereLogic);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
+                dispatch_sortWithVector(result, cmd.orderByCols);
             if (!cmd.selectColumns.empty())
                 result = result.project(cmd.selectColumns);
             dispatch_printTable(result, cmd.limit, cmd.limitOffset);
@@ -2898,7 +3039,7 @@ inline bool dispatchCommand(
                     engine.dropTempTable(tbl);
                 std::cout << "\n";
                 if (!cmd.orderByCols.empty())
-                    result.sortByMulti(cmd.orderByCols);
+                    dispatch_sortWithVector(result, cmd.orderByCols);
                 if (!cmd.selectColumns.empty())
                     result = result.project(cmd.selectColumns);
                 dispatch_printTable(result, cmd.limit, cmd.limitOffset);
@@ -2918,7 +3059,7 @@ inline bool dispatchCommand(
                 cmd.havingConds, cmd.havingLogic);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
-                result.sortByMulti(cmd.orderByCols);
+                dispatch_sortWithVector(result, cmd.orderByCols);
             dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             break;
         }
@@ -2986,7 +3127,7 @@ inline bool dispatchCommand(
                 milansql::Table foreignResult = engine.executeForeignScan(cmd.tableName);
                 if (!cmd.whereConds.empty())
                     foreignResult = engine.filterTable(foreignResult, cmd.whereConds, cmd.whereLogic);
-                if (!cmd.orderByCols.empty()) foreignResult.sortByMulti(cmd.orderByCols);
+                if (!cmd.orderByCols.empty()) dispatch_sortWithVector(foreignResult, cmd.orderByCols);
                 if (!cmd.selectColumns.empty())
                     foreignResult = foreignResult.project(cmd.selectColumns);
                 if (cmd.isDistinct) foreignResult.makeDistinct();
@@ -3066,12 +3207,12 @@ inline bool dispatchCommand(
                     result = dispatch_expandUnnestResult(result, cmd.selectItems);
                 if (!cmd.orderByCols.empty()) {
                     if (g_profiler.isEnabled()) g_profiler.addStep("Sorting");
-                    result.sortByMulti(cmd.orderByCols);
+                    dispatch_sortWithVector(result, cmd.orderByCols);
                 }
             } else {
                 if (!cmd.orderByCols.empty()) {
                     if (g_profiler.isEnabled()) g_profiler.addStep("Sorting");
-                    result.sortByMulti(cmd.orderByCols);
+                    dispatch_sortWithVector(result, cmd.orderByCols);
                 }
                 if (!cmd.selectColumns.empty()) {
                     if (g_profiler.isEnabled()) g_profiler.addStep("Result projection");
@@ -3771,7 +3912,7 @@ inline bool dispatchCommand(
                 if (!sc.selectColumns.empty())
                     result = result.project(sc.selectColumns);
                 if (!sc.orderByCols.empty())
-                    result.sortByMulti(sc.orderByCols);
+                    dispatch_sortWithVector(result, sc.orderByCols);
                 dispatch_printTable(result, sc.limit, sc.limitOffset);
             } else if (sc.type == milansql::CommandType::UPDATE) {
                 std::size_t n = 0;
@@ -5166,7 +5307,7 @@ inline bool dispatchCommand(
             std::cout << "  Extension '" << cmd.extensionName << "' loaded.\n\n";
         else
             std::cout << "  FEHLER: Unknown extension '" << cmd.extensionName
-                      << "'. Available: milansql_math, milansql_crypto, milansql_uuid, milansql_text\n\n";
+                      << "'. Available: milansql_math, milansql_crypto, milansql_uuid, milansql_text, vector\n\n";
         break;
     }
 
@@ -5642,6 +5783,67 @@ inline bool dispatchCommand(
     case milansql::CommandType::SHOW_MIGRATIONS:
     case milansql::CommandType::SHOW_MIGRATION_STATUS: {
         std::cout << milansql::g_migrationManager().showMigrations();
+        break;
+    }
+
+    // ── Phase 111: pgvector — Create Vector Index ────────────
+    case milansql::CommandType::CREATE_VECTOR_INDEX: {
+        if (cmd.tableName.empty() || cmd.indexColumns.empty()) {
+            std::cout << "  FEHLER: Syntax: CREATE INDEX ON table USING hnsw|ivfflat (col [ops])\n\n";
+            break;
+        }
+        std::string colName111 = cmd.indexColumns[0];
+        std::string method111  = cmd.indexMethod.empty() ? "hnsw" : cmd.indexMethod;
+        std::string opsStr111  = cmd.indexOps;
+
+        // Determine metric from ops string
+        milansql::VectorMetric metric111 = milansql::VectorMetric::L2;
+        {
+            std::string u = opsStr111;
+            for (auto& c : u) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (u.find("COSINE") != std::string::npos)
+                metric111 = milansql::VectorMetric::COSINE;
+            else if (u.find("IP") != std::string::npos || u.find("INNER") != std::string::npos)
+                metric111 = milansql::VectorMetric::INNER_PRODUCT;
+        }
+
+        milansql::g_vectorIndexManager().createIndex(cmd.tableName, colName111, method111, metric111);
+
+        // Populate with existing rows
+        try {
+            milansql::Table tbl111 = engine.selectAll(cmd.tableName);
+            auto* idx111 = milansql::g_vectorIndexManager().getIndex(cmd.tableName, colName111);
+            if (idx111) {
+                int colIdx111 = -1;
+                for (size_t ci = 0; ci < tbl111.columns().size(); ++ci) {
+                    std::string bare = tbl111.columns()[ci].name;
+                    auto dot = bare.rfind('.');
+                    if (dot != std::string::npos) bare = bare.substr(dot + 1);
+                    if (bare == colName111 || tbl111.columns()[ci].name == colName111) {
+                        colIdx111 = static_cast<int>(ci); break;
+                    }
+                }
+                int64_t rowId111 = 0;
+                for (const auto& row : tbl111.rows()) {
+                    int64_t id = rowId111++;
+                    try {
+                        if (!row.values.empty())
+                            id = std::stoll(row.values[0]);
+                    } catch (...) {}
+                    if (colIdx111 >= 0 &&
+                        static_cast<size_t>(colIdx111) < row.values.size()) {
+                        auto vec = milansql::vector_type::parse(
+                            row.values[static_cast<size_t>(colIdx111)]);
+                        if (!vec.empty()) idx111->insert(id, vec);
+                    }
+                }
+                std::cout << "  Vector index created: " << cmd.tableName << "." << colName111
+                          << " [" << method111 << "] — "
+                          << idx111->size() << " vector(s) indexed.\n\n";
+            }
+        } catch (const std::exception& ex) {
+            std::cout << "  WARNING: Could not populate index: " << ex.what() << "\n\n";
+        }
         break;
     }
 

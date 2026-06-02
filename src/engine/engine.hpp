@@ -36,10 +36,12 @@
 #include "../parallel/parallel_executor.hpp" // Phase 77: Parallel Query
 #include "../replication/logical_repl.hpp"  // Phase 81: Logical Replication
 #include "../types/array_type.hpp"          // Phase 88: Array Data Type
+#include "../types/vector_type.hpp"         // Phase 111: pgvector
 #include "../fdw/foreign_data_wrapper.hpp"  // Phase 89: FDW base
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 #include "../extensions/extension_manager.hpp" // Phase 90: Extension System
+#include "../extensions/builtin/vector_ext.hpp" // Phase 111: pgvector functions
 #include "../compression/compressor.hpp"       // Phase 96: Data Compression
 #include "../compression/rle_compressor.hpp"
 #include "../compression/lz4_compressor.hpp"
@@ -4966,6 +4968,20 @@ private:
             return TimeSeriesManager::timeBucket(interval, tsVal);
         }
 
+        // ── Phase 111: pgvector functions (inline fallback) ───────────
+        // These are also handled by extension manager when CREATE EXTENSION vector
+        // is used. Inline fallbacks ensure they work without the extension too.
+        if (fn == "L2_DISTANCE" || fn == "COSINE_SIMILARITY" ||
+            fn == "INNER_PRODUCT" || fn == "VECTOR_DIMS" ||
+            fn == "VECTOR_NORM" || fn == "VECTOR_ADD" ||
+            fn == "VECTOR_SUB" || fn == "VECTOR_MUL") {
+            // Resolve args first
+            std::vector<std::string> rargs;
+            rargs.reserve(args.size());
+            for (const auto& a : args) rargs.push_back(resolveArg(a));
+            return vector_ext::evalVector(fn, rargs);
+        }
+
         return "";
     }
 
@@ -5018,7 +5034,10 @@ private:
              "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
              "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY",
              // Phase 97: Time-Series
-             "TIME_BUCKET"};
+             "TIME_BUCKET",
+             // Phase 111: pgvector
+             "L2_DISTANCE","COSINE_SIMILARITY","INNER_PRODUCT",
+             "VECTOR_DIMS","VECTOR_NORM","VECTOR_ADD","VECTOR_SUB","VECTOR_MUL"};
 
         std::string fn = toUpperStatic(toks[0]);
         bool isFunc = false;

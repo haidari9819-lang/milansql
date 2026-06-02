@@ -237,6 +237,8 @@ enum class CommandType {
     // Phase 110: SSL/TLS
     SHOW_SSL_STATUS,
     SET_SSL,
+    // Phase 111: pgvector
+    CREATE_VECTOR_INDEX,
     UNKNOWN
 };
 
@@ -267,6 +269,8 @@ struct ParsedCommand {
     // Indizes
     std::string              indexName;
     std::vector<std::string> indexColumns;  // Phase 35: ein oder mehrere Spalten
+    std::string              indexMethod;   // Phase 111: "hnsw", "ivfflat", "btree", etc.
+    std::string              indexOps;      // Phase 111: "vector_l2_ops", "vector_cosine_ops", etc.
 
     // SELECT-Optionen (Phase 8 / Phase 38)
     bool                     isCount       = false;
@@ -1745,19 +1749,50 @@ public:
 
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
-            cmd.type = CommandType::CREATE_INDEX;
-            if (tokens.size() >= 5 && toUpper(tokens[3]) == "ON") {
-                cmd.indexName = tokens[2];
-                cmd.tableName = tokens[4];
-                // Phase 35: parenContent kann "col1, col2, ..." sein
-                std::string content = trim(parenContent);
-                std::stringstream ss(content);
-                std::string part;
-                while (std::getline(ss, part, ',')) {
-                    std::string col = trim(part);
-                    if (!col.empty()) cmd.indexColumns.push_back(col);
+            // Phase 111: detect USING hnsw/ivfflat for vector indexes
+            // Syntax A: CREATE INDEX ON table USING method (col ops)
+            // Syntax B: CREATE INDEX name ON table USING method (col ops)
+            bool hasUsing = false;
+            for (size_t ti = 2; ti < tokens.size(); ++ti)
+                if (toUpper(tokens[ti]) == "USING") { hasUsing = true; break; }
+
+            if (hasUsing) {
+                cmd.type = CommandType::CREATE_VECTOR_INDEX;
+                // Determine ON position: tokens[2]=="ON" → Syntax A, else Syntax B
+                size_t onIdx = (tokens.size() > 2 && toUpper(tokens[2]) == "ON") ? 2 : 3;
+                if (onIdx == 3 && tokens.size() > 2) cmd.indexName = tokens[2];
+                if (onIdx + 1 < tokens.size()) cmd.tableName = tokens[onIdx + 1];
+                // Find USING
+                for (size_t ti = onIdx; ti < tokens.size(); ++ti) {
+                    if (toUpper(tokens[ti]) == "USING" && ti + 1 < tokens.size()) {
+                        cmd.indexMethod = tokens[ti + 1];
+                        for (auto& c : cmd.indexMethod) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        break;
+                    }
                 }
-            } else { cmd.type = CommandType::UNKNOWN; }
+                // Parse (col ops) from parenContent: "embedding vector_l2_ops"
+                {
+                    auto parts = tokenize(trim(parenContent));
+                    if (!parts.empty()) {
+                        cmd.indexColumns.push_back(parts[0]);
+                        if (parts.size() >= 2) cmd.indexOps = parts[1];
+                    }
+                }
+            } else {
+                cmd.type = CommandType::CREATE_INDEX;
+                if (tokens.size() >= 5 && toUpper(tokens[3]) == "ON") {
+                    cmd.indexName = tokens[2];
+                    cmd.tableName = tokens[4];
+                    // Phase 35: parenContent kann "col1, col2, ..." sein
+                    std::string content = trim(parenContent);
+                    std::stringstream ss(content);
+                    std::string part;
+                    while (std::getline(ss, part, ',')) {
+                        std::string col = trim(part);
+                        if (!col.empty()) cmd.indexColumns.push_back(col);
+                    }
+                } else { cmd.type = CommandType::UNKNOWN; }
+            }
 
         // ── Phase 84: CREATE PAGED TABLE ─────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "PAGED" &&
@@ -3771,6 +3806,36 @@ private:
             // col itself might be "ASC" or "DESC" (when prior col had trailing comma)
             std::string cu = toUpper(col);
             if (cu == "ASC" || cu == "DESC") continue;  // skip orphaned direction keywords
+
+            // Phase 111: detect vector distance operators <-> <=> <#>
+            // Syntax: colName <-> 'queryVector'
+            if (i < end) {
+                std::string nextTok = stripComma(ft[i]);
+                if (nextTok == "<->" || nextTok == "<=>" || nextTok == "<#>") {
+                    std::string op = nextTok;
+                    ++i;  // consume operator
+                    std::string qvec;
+                    if (i < end) {
+                        qvec = stripComma(ft[i]);
+                        ++i;  // consume query vector token
+                        // Strip surrounding single quotes if present
+                        if (qvec.size() >= 2 && qvec.front() == '\'' && qvec.back() == '\'')
+                            qvec = qvec.substr(1, qvec.size() - 2);
+                    }
+                    // Store as special encoded column name
+                    // Format: __vecop__colname__OP__[query_vector]
+                    std::string encoded = "__vecop__" + col + "__" + op + "__" + qvec;
+                    bool desc = false;
+                    if (i < end) {
+                        std::string d = toUpper(stripComma(ft[i]));
+                        if (d == "DESC") { desc = true; ++i; }
+                        else if (d == "ASC") { ++i; }
+                    }
+                    out.push_back({encoded, desc});
+                    continue;
+                }
+            }
+
             bool desc = false;
             if (i < end) {
                 std::string d = toUpper(stripComma(ft[i]));

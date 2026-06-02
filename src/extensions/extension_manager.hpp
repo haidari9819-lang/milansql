@@ -18,6 +18,7 @@
 #include "builtin/crypto_ext.hpp"
 #include "builtin/uuid_ext.hpp"
 #include "builtin/text_ext.hpp"
+#include "builtin/vector_ext.hpp"   // Phase 111: pgvector
 
 namespace milansql {
 
@@ -55,6 +56,12 @@ public:
             if (!loaded_.count(lower)) { loaded_.insert(lower); registerText(); }
             return true;
         }
+        // Phase 111: pgvector — "vector" or "milansql_vector"
+        if (lower == "vector" || lower == "milansql_vector") {
+            std::string key = "vector";
+            if (!loaded_.count(key)) { loaded_.insert(key); registerVector(); }
+            return true;
+        }
         return false;  // unknown extension
     }
 
@@ -66,6 +73,7 @@ public:
         if (lower == "milansql_crypto") unregisterCrypto();
         if (lower == "milansql_uuid")   unregisterUuid();
         if (lower == "milansql_text")   unregisterText();
+        if (lower == "vector" || lower == "milansql_vector") unregisterVector();
     }
 
     bool isLoaded(const std::string& name) const {
@@ -158,6 +166,28 @@ private:
 
     void unregisterText() {
         for (const auto& n : {"SOUNDEX","LEVENSHTEIN","SIMILARITY","INITCAP","REPEAT","LPAD","RPAD"})
+            funcs_.erase(n);
+    }
+
+    // Phase 111: pgvector extension
+    void registerVector() {
+        static const char* VEC_FUNCS[] = {
+            "L2_DISTANCE", "COSINE_SIMILARITY", "INNER_PRODUCT",
+            "VECTOR_DIMS", "VECTOR_NORM",
+            "VECTOR_ADD", "VECTOR_SUB", "VECTOR_MUL"
+        };
+        for (const auto& n : VEC_FUNCS) {
+            std::string fn(n);
+            funcs_[fn] = [fn](const std::vector<std::string>& a) {
+                return vector_ext::evalVector(fn, a);
+            };
+        }
+    }
+
+    void unregisterVector() {
+        for (const auto& n : {"L2_DISTANCE","COSINE_SIMILARITY","INNER_PRODUCT",
+                               "VECTOR_DIMS","VECTOR_NORM",
+                               "VECTOR_ADD","VECTOR_SUB","VECTOR_MUL"})
             funcs_.erase(n);
     }
 };

@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Projektname und Version
-project(milansql VERSION 5.1.0 LANGUAGES CXX)
+project(milansql VERSION 5.2.0 LANGUAGES CXX)
 
 # C++17 Standard festlegen
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Phase 110: Optional OpenSSL for TLS (Linux)
+find_package(OpenSSL QUIET OPTIONAL_COMPONENTS SSL Crypto)
 
 # Alle Quelldateien sammeln
 set(SOURCES
@@ -15,7 +18,7 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src src/server src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api src/monitoring src/federation src/config src/migration)
+target_include_directories(milansql PRIVATE src src/server src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api src/monitoring src/federation src/config src/migration src/ssl)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)
@@ -25,14 +28,24 @@ else()
 endif()
 
 # Phase 47: Link ws2_32 on Windows (both MSVC and MinGW/MSYS2 use Winsock2)
+# Phase 110: Also link Secur32 and Crypt32 for SChannel TLS
 if(WIN32)
-    target_link_libraries(milansql PRIVATE ws2_32)
+    target_link_libraries(milansql PRIVATE ws2_32 secur32 crypt32)
+endif()
+
+# Phase 110: Link OpenSSL if available (Linux/non-Windows)
+if(OpenSSL_FOUND AND NOT WIN32)
+    target_link_libraries(milansql PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(milansql PRIVATE HAVE_OPENSSL=1)
+    message(STATUS "OpenSSL found — TLS enabled for milansql")
+else()
+    message(STATUS "OpenSSL not found or Windows (SChannel used) — milansql will use platform TLS")
 endif()
 
 # ── Test-Suite (Phase 99) ────────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration)
+target_include_directories(milansql_tests PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()

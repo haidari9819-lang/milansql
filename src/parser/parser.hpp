@@ -234,6 +234,9 @@ enum class CommandType {
     ROLLBACK_MIGRATION,
     SHOW_MIGRATIONS,
     SHOW_MIGRATION_STATUS,
+    // Phase 110: SSL/TLS
+    SHOW_SSL_STATUS,
+    SET_SSL,
     UNKNOWN
 };
 
@@ -2155,6 +2158,10 @@ public:
             // Phase 109: SHOW CONFIG
             } else if (kw1 == "CONFIG") {
                 cmd.type = CommandType::SHOW_CONFIG;
+            // Phase 110: SHOW SSL STATUS
+            } else if (kw1 == "SSL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_SSL_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3431,6 +3438,20 @@ public:
         // SHOW MIGRATION STATUS
         } else if (kw0 == "SHOW" && kw1 == "MIGRATION") {
             cmd.type = CommandType::SHOW_MIGRATION_STATUS;
+
+        // ── Phase 110: SSL/TLS ───────────────────────────────────
+        // SET SSL = ON/OFF
+        } else if (kw0 == "SET" && kw1 == "SSL") {
+            cmd.type = CommandType::SET_SSL;
+            // tokens: SET SSL = ON  or  SET SSL ON
+            for (size_t i = 2; i < tokens.size(); ++i) {
+                std::string t = tokens[i];
+                for (auto& ch : t) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                if (t == "ON" || t == "OFF") { cmd.setValue = t; break; }
+            }
+        // SHOW SSL STATUS (also handled inside SHOW block above, repeated here for outer chain)
+        } else if (kw0 == "SHOW" && kw1 == "SSL") {
+            cmd.type = CommandType::SHOW_SSL_STATUS;
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

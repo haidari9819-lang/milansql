@@ -39,6 +39,7 @@
 #include "federation/federation_manager.hpp"  // Phase 105: Query Federation
 #include "config/runtime_config.hpp"          // Phase 109: Hot Config Reload
 #include "migration/migration_manager.hpp"    // Phase 109: Schema Migrations
+#include "ssl/tls_context.hpp"               // Phase 110: SSL/TLS
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -5641,6 +5642,26 @@ inline bool dispatchCommand(
     case milansql::CommandType::SHOW_MIGRATIONS:
     case milansql::CommandType::SHOW_MIGRATION_STATUS: {
         std::cout << milansql::g_migrationManager().showMigrations();
+        break;
+    }
+
+    // ── Phase 110: SSL/TLS ────────────────────────────────────
+    case milansql::CommandType::SHOW_SSL_STATUS:
+        std::cout << milansql::showSslStatus();
+        break;
+
+    case milansql::CommandType::SET_SSL: {
+        std::string val = cmd.setValue;
+        for (auto& c : val) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (val == "ON") {
+            milansql::g_sslConfig().enabled.store(true);
+            std::cout << "  SSL enabled. Use SHOW SSL STATUS for details.\n\n";
+        } else if (val == "OFF") {
+            milansql::g_sslConfig().enabled.store(false);
+            std::cout << "  SSL disabled.\n\n";
+        } else {
+            std::cout << "  Usage: SET SSL = ON|OFF\n\n";
+        }
         break;
     }
 

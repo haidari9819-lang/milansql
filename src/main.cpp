@@ -42,6 +42,10 @@
 // Phase 79: Connection String Parser
 #include "utils/connection_string.hpp"
 
+// Phase 110: SSL/TLS
+#include "ssl/tls_context.hpp"
+#include "ssl/cert_generator.hpp"
+
 // ============================================================
 // main.cpp — REPL für MilanSQL (Phase 47)
 // Neu: --server / --client / --port N Modi
@@ -162,7 +166,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v5.1.0 ===          \u2551\n"
+              << "  \u2551        === MilanSQL v5.2.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -193,6 +197,11 @@ int main(int argc, char* argv[]) {
     int  masterPort  = 4408;   // Replication port (shifted to avoid conflict with mysql)
     int  replPort    = 4408;
     std::string dsnArg;        // Phase 79: Connection String
+    // Phase 110: SSL/TLS
+    bool sslMode     = false;
+    bool genCert     = false;
+    std::string sslCert = "server.crt";
+    std::string sslKey  = "server.key";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -209,6 +218,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--ws")          wsMode      = true;
         else if (arg == "--master")      masterMode = true;
         else if (arg == "--slave")       slaveMode  = true;
+        else if (arg == "--ssl")         sslMode    = true;
+        else if (arg == "--gen-cert")    genCert    = true;
+        else if (arg == "--ssl-cert"  && i + 1 < argc) sslCert = argv[++i];
+        else if (arg == "--ssl-key"   && i + 1 < argc) sslKey  = argv[++i];
         else if (arg == "--port"          && i + 1 < argc) port        = std::stoi(argv[++i]);
         else if (arg == "--http-port"     && i + 1 < argc) httpPort    = std::stoi(argv[++i]);
         else if (arg == "--mysql-port"    && i + 1 < argc) mysqlPort   = std::stoi(argv[++i]);
@@ -233,6 +246,35 @@ int main(int argc, char* argv[]) {
                 port = cs.port;
             }
         } catch (...) {}
+    }
+
+    // ── Phase 110: --gen-cert ─────────────────────────────────
+    if (genCert) {
+        std::string msg = milansql::CertGenerator::generateSelfSigned(sslCert, sslKey);
+        std::cout << msg;
+        return 0;
+    }
+
+    // ── Phase 110: SSL initialization ─────────────────────────
+    if (sslMode) {
+        milansql::g_sslConfig().enabled.store(true);
+        milansql::g_sslConfig().certPath = sslCert;
+        milansql::g_sslConfig().keyPath  = sslKey;
+        bool ok = milansql::g_tlsContext().loadCertificate(sslCert, sslKey);
+        if (ok) {
+            std::cout << "SSL/TLS initialized ("
+#if defined(_WIN32)
+                      << "SChannel"
+#elif defined(HAVE_OPENSSL) && HAVE_OPENSSL
+                      << "OpenSSL"
+#else
+                      << "stub"
+#endif
+                      << "). Cert: " << sslCert << "\n";
+        } else {
+            std::cerr << "SSL WARNING: " << milansql::g_tlsContext().lastError()
+                      << " — continuing without TLS.\n";
+        }
     }
 
     // ── MySQL Wire Protocol mode (Phase 74) ───────────────────

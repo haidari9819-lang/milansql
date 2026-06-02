@@ -2,7 +2,7 @@
 // ============================================================
 // http_fdw.hpp — HTTP/JSON Foreign Data Wrapper
 // Phase 89: Foreign Data Wrapper
-// Uses Winsock2 for HTTP GET (zero external deps)
+// Platform-agnostic HTTP GET (Windows Winsock2 + POSIX)
 // ============================================================
 
 #include "foreign_data_wrapper.hpp"
@@ -12,39 +12,39 @@
 #include <algorithm>
 
 #ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-// winsock2.h must come before any Windows headers and its macros undone after
-#include <winsock2.h>
-#include <ws2tcpip.h>
-// Undefine Windows macros that clash with C++ / MilanSQL identifiers
-#ifdef DELETE
-#undef DELETE
-#endif
-#ifdef IN
-#undef IN
-#endif
-#ifdef OUT
-#undef OUT
-#endif
-#ifdef BOOL
-#undef BOOL
-#endif
-#ifdef ERROR
-#undef ERROR
-#endif
-#ifdef OPTIONAL
-#undef OPTIONAL
-#endif
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  // Undefine Windows macros that clash with C++ / MilanSQL identifiers
+  #ifdef DELETE
+  #undef DELETE
+  #endif
+  #ifdef IN
+  #undef IN
+  #endif
+  #ifdef OUT
+  #undef OUT
+  #endif
+  #ifdef BOOL
+  #undef BOOL
+  #endif
+  #ifdef ERROR
+  #undef ERROR
+  #endif
+  #ifdef OPTIONAL
+  #undef OPTIONAL
+  #endif
 #else
-#include <sys/socket.h>
-#include <netdb.h>
-#include <unistd.h>
-#define closesocket close
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <arpa/inet.h>
 #endif
 
 namespace milansql {
@@ -96,31 +96,45 @@ private:
         struct addrinfo* res = nullptr;
         hints.ai_family   = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
-        int rc = getaddrinfo(host.c_str(),
-                             std::to_string(port).c_str(),
-                             &hints, &res);
-        if (rc != 0) return "";
-
-        SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
-            closesocket(sock);
-            freeaddrinfo(res);
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0)
             return "";
+
+#ifdef _WIN32
+        SOCKET sock = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sock == INVALID_SOCKET) { freeaddrinfo(res); return ""; }
+        if (::connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
+            closesocket(sock); freeaddrinfo(res); return "";
         }
+#else
+        int sock = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sock < 0) { freeaddrinfo(res); return ""; }
+        if (::connect(sock, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen)) != 0) {
+            ::close(sock); freeaddrinfo(res); return "";
+        }
+#endif
         freeaddrinfo(res);
 
         std::string req = "GET " + path + " HTTP/1.0\r\nHost: " + host
                         + "\r\nConnection: close\r\n\r\n";
-        send(sock, req.c_str(), static_cast<int>(req.size()), 0);
-
+#ifdef _WIN32
+        ::send(sock, req.c_str(), static_cast<int>(req.size()), 0);
         std::string resp;
         char buf[4096];
         int n = 0;
-        while ((n = recv(sock, buf, static_cast<int>(sizeof(buf) - 1), 0)) > 0) {
-            buf[n] = '\0';
-            resp += buf;
+        while ((n = ::recv(sock, buf, static_cast<int>(sizeof(buf) - 1), 0)) > 0) {
+            buf[n] = '\0'; resp += buf;
         }
         closesocket(sock);
+#else
+        ::send(sock, req.c_str(), req.size(), 0);
+        std::string resp;
+        char buf[4096];
+        ssize_t n = 0;
+        while ((n = ::recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+            buf[n] = '\0'; resp += buf;
+        }
+        ::close(sock);
+#endif
 
         // Strip HTTP headers
         size_t hend = resp.find("\r\n\r\n");

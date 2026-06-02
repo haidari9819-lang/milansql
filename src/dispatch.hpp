@@ -37,6 +37,8 @@
 #include "pool/connection_pool.hpp"    // Phase 94: Connection Pool Multiplexing
 #include "monitoring/prometheus.hpp"   // Phase 102: Prometheus Metrics
 #include "federation/federation_manager.hpp"  // Phase 105: Query Federation
+#include "config/runtime_config.hpp"          // Phase 109: Hot Config Reload
+#include "migration/migration_manager.hpp"    // Phase 109: Schema Migrations
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -5547,6 +5549,98 @@ inline bool dispatchCommand(
     case milansql::CommandType::SHOW_FEDERATION_STATUS: {
         std::string status = engine.getFederationManager().showStatus();
         std::cout << "\n" << status << "\n";
+        break;
+    }
+
+    // ── Phase 109: Hot Config Reload ───────────────────────────
+    case milansql::CommandType::SET_CONFIG: {
+        if (cmd.setColumn.empty()) {
+            std::cout << "  Syntax: SET CONFIG key = value\n\n";
+            break;
+        }
+        milansql::g_runtimeConfig().set(cmd.setColumn, cmd.setValue);
+        std::cout << "  Config '" << cmd.setColumn << "' = '" << cmd.setValue << "' set.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::RELOAD_CONFIG: {
+        milansql::g_runtimeConfig().reload();
+        std::cout << "  Configuration reloaded from database.config.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_CONFIG: {
+        std::cout << milansql::g_runtimeConfig().showConfig();
+        break;
+    }
+
+    // ── Phase 109: Schema Migrations ──────────────────────────
+    case milansql::CommandType::CREATE_MIGRATION: {
+        if (cmd.tableName.empty() || cmd.setValue.empty()) {
+            std::cout << "  Syntax: CREATE MIGRATION name AS sql_statement\n\n";
+            break;
+        }
+        std::cout << milansql::g_migrationManager().createMigration(cmd.tableName, cmd.setValue);
+        break;
+    }
+
+    case milansql::CommandType::APPLY_MIGRATION: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Syntax: APPLY MIGRATION name\n\n";
+            break;
+        }
+        if (!milansql::g_migrationManager().exists(cmd.tableName)) {
+            std::cout << "  ERROR: Migration '" << cmd.tableName << "' not found.\n\n";
+            break;
+        }
+        if (milansql::g_migrationManager().isApplied(cmd.tableName)) {
+            std::cout << "  INFO: Migration '" << cmd.tableName << "' already applied.\n\n";
+            break;
+        }
+        {
+            std::string msql = milansql::g_migrationManager().getMigrationSql(cmd.tableName);
+            milansql::Parser mp;
+            milansql::ParsedCommand mc = mp.parse(msql);
+            dispatchCommand(mc, engine, mp, msql, [](){}, [](){}, [](){});
+        }
+        g_stmtCache.clear();                   // schema changed — invalidate caches
+        engine.getQueryCache().clear();
+        std::cout << milansql::g_migrationManager().markApplied(cmd.tableName);
+        break;
+    }
+
+    case milansql::CommandType::ROLLBACK_MIGRATION: {
+        if (cmd.tableName.empty()) {
+            std::cout << "  Syntax: ROLLBACK MIGRATION name\n\n";
+            break;
+        }
+        if (!milansql::g_migrationManager().exists(cmd.tableName)) {
+            std::cout << "  ERROR: Migration '" << cmd.tableName << "' not found.\n\n";
+            break;
+        }
+        if (!milansql::g_migrationManager().isApplied(cmd.tableName)) {
+            std::cout << "  INFO: Migration '" << cmd.tableName << "' is not applied.\n\n";
+            break;
+        }
+        {
+            std::string rsql = milansql::g_migrationManager().getRollbackSql(cmd.tableName);
+            if (rsql.empty()) {
+                std::cout << "  ERROR: No rollback SQL for migration '" << cmd.tableName << "'.\n\n";
+                break;
+            }
+            milansql::Parser rp;
+            milansql::ParsedCommand rc = rp.parse(rsql);
+            dispatchCommand(rc, engine, rp, rsql, [](){}, [](){}, [](){});
+        }
+        g_stmtCache.clear();                   // schema changed — invalidate caches
+        engine.getQueryCache().clear();
+        std::cout << milansql::g_migrationManager().markRolledBack(cmd.tableName);
+        break;
+    }
+
+    case milansql::CommandType::SHOW_MIGRATIONS:
+    case milansql::CommandType::SHOW_MIGRATION_STATUS: {
+        std::cout << milansql::g_migrationManager().showMigrations();
         break;
     }
 

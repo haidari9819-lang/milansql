@@ -224,6 +224,16 @@ enum class CommandType {
     // Phase 105: Query Federation + Sharding
     CREATE_FEDERATED_TABLE,
     SHOW_FEDERATION_STATUS,
+    // Phase 109: Hot Config Reload
+    SET_CONFIG,
+    RELOAD_CONFIG,
+    SHOW_CONFIG,
+    // Phase 109: Online Schema Migrations
+    CREATE_MIGRATION,
+    APPLY_MIGRATION,
+    ROLLBACK_MIGRATION,
+    SHOW_MIGRATIONS,
+    SHOW_MIGRATION_STATUS,
     UNKNOWN
 };
 
@@ -701,6 +711,12 @@ public:
                 if (k == "BEGIN")    { cmd.type = CommandType::BEGIN;    return cmd; }
                 if (k == "COMMIT")   { cmd.type = CommandType::COMMIT;   return cmd; }
                 if (k == "ROLLBACK") {
+                    // ROLLBACK MIGRATION name — must check before plain ROLLBACK
+                    if (st.size() >= 3 && toUpper(st[1]) == "MIGRATION") {
+                        cmd.type = CommandType::ROLLBACK_MIGRATION;
+                        cmd.tableName = st[2];
+                        return cmd;
+                    }
                     // ROLLBACK TO SAVEPOINT name  or  ROLLBACK TO name
                     if (st.size() >= 3 && toUpper(st[1]) == "TO") {
                         size_t ni = 2;
@@ -2131,6 +2147,14 @@ public:
             } else if (kw1 == "ENGINE" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_ENGINE_STATUS;
+            // Phase 109: SHOW MIGRATIONS / SHOW MIGRATION STATUS
+            } else if (kw1 == "MIGRATIONS") {
+                cmd.type = CommandType::SHOW_MIGRATIONS;
+            } else if (kw1 == "MIGRATION") {
+                cmd.type = CommandType::SHOW_MIGRATION_STATUS;
+            // Phase 109: SHOW CONFIG
+            } else if (kw1 == "CONFIG") {
+                cmd.type = CommandType::SHOW_CONFIG;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3346,6 +3370,67 @@ public:
         // ── Phase 105: SHOW FEDERATION STATUS ────────────────────────
         } else if (kw0 == "SHOW" && kw1 == "FEDERATION") {
             cmd.type = CommandType::SHOW_FEDERATION_STATUS;
+
+        // ── Phase 109: Runtime Config ─────────────────────────────────
+        // SET CONFIG key = value
+        } else if (kw0 == "SET" && kw1 == "CONFIG") {
+            cmd.type = CommandType::SET_CONFIG;
+            // tokens: SET CONFIG key = value
+            if (tokens.size() >= 5) {
+                cmd.setColumn = tokens[2]; // key
+                // value is tokens[4] (after =)
+                cmd.setValue = tokens.size() > 4 ? tokens[4] : "";
+            } else if (tokens.size() == 3) {
+                // SET CONFIG key=value
+                auto eq = tokens[2].find('=');
+                if (eq != std::string::npos) {
+                    cmd.setColumn = tokens[2].substr(0, eq);
+                    cmd.setValue  = tokens[2].substr(eq + 1);
+                }
+            }
+        // RELOAD CONFIG
+        } else if (kw0 == "RELOAD" && kw1 == "CONFIG") {
+            cmd.type = CommandType::RELOAD_CONFIG;
+        // SHOW CONFIG
+        } else if (kw0 == "SHOW" && kw1 == "CONFIG") {
+            cmd.type = CommandType::SHOW_CONFIG;
+
+        // ── Phase 109: Schema Migrations ─────────────────────────────
+        // CREATE MIGRATION name AS sql...
+        } else if (kw0 == "CREATE" && kw1 == "MIGRATION") {
+            cmd.type = CommandType::CREATE_MIGRATION;
+            // tokens: CREATE MIGRATION <name> AS <sql...>
+            if (tokens.size() >= 5) {
+                cmd.tableName = tokens[2]; // migration name
+                // find AS keyword
+                size_t asIdx = 3;
+                for (size_t i = 3; i < tokens.size(); ++i) {
+                    std::string t = tokens[i];
+                    for (auto& ch : t) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                    if (t == "AS") { asIdx = i + 1; break; }
+                }
+                // Reconstruct SQL from remainder
+                std::string sql;
+                for (size_t i = asIdx; i < tokens.size(); ++i) {
+                    if (!sql.empty()) sql += " ";
+                    sql += tokens[i];
+                }
+                cmd.setValue = sql;
+            }
+        // APPLY MIGRATION name
+        } else if (kw0 == "APPLY" && kw1 == "MIGRATION") {
+            cmd.type = CommandType::APPLY_MIGRATION;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+        // ROLLBACK MIGRATION name
+        } else if (kw0 == "ROLLBACK" && kw1 == "MIGRATION") {
+            cmd.type = CommandType::ROLLBACK_MIGRATION;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+        // SHOW MIGRATIONS
+        } else if (kw0 == "SHOW" && kw1 == "MIGRATIONS") {
+            cmd.type = CommandType::SHOW_MIGRATIONS;
+        // SHOW MIGRATION STATUS
+        } else if (kw0 == "SHOW" && kw1 == "MIGRATION") {
+            cmd.type = CommandType::SHOW_MIGRATION_STATUS;
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

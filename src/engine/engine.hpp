@@ -992,6 +992,18 @@ struct SubscriptionDef {
     bool enabled = true;
 };
 
+// ── Phase 118: Server-Side Cursor ─────────────────────────────
+enum class FetchDirection { FETCH_NEXT, FETCH_PRIOR, FETCH_FIRST, FETCH_LAST, FETCH_ABSOLUTE, FETCH_RELATIVE };
+
+struct CursorData {
+    std::string name;
+    std::string sql;
+    bool isOpen = false;
+    std::vector<Column> columns;
+    std::vector<Row> rows;
+    int currentPos = -1;
+};
+
 // ------------------------------------------------------------
 // Engine
 // ------------------------------------------------------------
@@ -2567,6 +2579,82 @@ public:
         return tables_.count(resolveTableName(n)) > 0;
     }
 
+    // ── Phase 118: Server-Side Cursor API ─────────────────────────
+
+    void declareCursor(const std::string& name, const std::string& sql) {
+        CursorData cd;
+        cd.name = name;
+        cd.sql = sql;
+        cd.isOpen = false;
+        cd.currentPos = -1;
+        activeCursors_[name] = std::move(cd);
+    }
+
+    std::string openCursor(const std::string& name) {
+        auto it = activeCursors_.find(name);
+        if (it == activeCursors_.end()) return "ERROR: Cursor '" + name + "' not found";
+        it->second.isOpen = true;
+        it->second.currentPos = -1;
+        return "OPEN";
+    }
+
+    Table fetchCursor(const std::string& name, FetchDirection dir, int count, int absPos) {
+        auto it = activeCursors_.find(name);
+        if (it == activeCursors_.end()) {
+            return Table("", {Column("error","TEXT")});
+        }
+        CursorData& cd = it->second;
+        if (!cd.isOpen) {
+            return Table("", {Column("error","TEXT")});
+        }
+
+        int total = static_cast<int>(cd.rows.size());
+        int newPos = cd.currentPos;
+
+        switch (dir) {
+            case FetchDirection::FETCH_NEXT:     newPos = cd.currentPos + 1; count = 1; break;
+            case FetchDirection::FETCH_PRIOR:    newPos = cd.currentPos - 1; count = 1; break;
+            case FetchDirection::FETCH_FIRST:    newPos = 0; count = 1; break;
+            case FetchDirection::FETCH_LAST:     newPos = total - 1; count = 1; break;
+            case FetchDirection::FETCH_ABSOLUTE: newPos = absPos; count = 1; break;
+            case FetchDirection::FETCH_RELATIVE: newPos = cd.currentPos + absPos; count = 1; break;
+        }
+
+        Table result("", cd.columns);
+
+        if (newPos < 0 || newPos >= total) {
+            cd.currentPos = (newPos < 0) ? -1 : total;
+            return result; // empty = no more rows
+        }
+
+        int end = std::min(newPos + count, total);
+        for (int i = newPos; i < end; i++) {
+            result.insert(cd.rows[static_cast<size_t>(i)]);
+        }
+        cd.currentPos = end - 1;
+        return result;
+    }
+
+    std::string closeCursor(const std::string& name) {
+        auto it = activeCursors_.find(name);
+        if (it == activeCursors_.end()) return "ERROR: Cursor '" + name + "' not found";
+        it->second.isOpen = false;
+        return "CLOSE";
+    }
+
+    std::string deallocateCursor(const std::string& name) {
+        auto it = activeCursors_.find(name);
+        if (it == activeCursors_.end()) return "ERROR: Cursor '" + name + "' not found";
+        activeCursors_.erase(it);
+        return "DEALLOCATE";
+    }
+
+    CursorData* getCursor(const std::string& name) {
+        auto it = activeCursors_.find(name);
+        if (it == activeCursors_.end()) return nullptr;
+        return &it->second;
+    }
+
     // ── Phase 31/32: CASE/Func — Projektion mit Ausdrücken ──────
     Table projectWithItems(const Table& src,
                            const std::vector<SelectItem>& items) const {
@@ -3915,6 +4003,7 @@ private:
     std::map<std::string, TriggerDef>   triggers_;   // trigger name → def
     std::map<std::string, ProcedureDef> procedures_; // procedure name → def
     std::map<std::string, PreparedStmt> preparedStmts_; // Phase 45: prepared stmts
+    std::map<std::string, CursorData> activeCursors_;   // Phase 118: server-side cursors
 
     // ── Phase 43: Trigger Execution Engine ───────────────────────
 

@@ -2238,6 +2238,86 @@ static void testGroup35() {
     }
 }
 
+// ── Group 36: Phase 118 — Server-Side Cursor API ───────────────
+static void testGroup36() {
+    std::cout << "\n--- Group 36: Server-Side Cursor API ---\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+
+    // Setup: create a table and insert rows
+    execSQL(engine, parser, "CREATE TABLE cursor_test (id INT, name TEXT, dept TEXT)");
+    execSQL(engine, parser, "INSERT INTO cursor_test VALUES (1, Alice, Eng)");
+    execSQL(engine, parser, "INSERT INTO cursor_test VALUES (2, Bob, Eng)");
+    execSQL(engine, parser, "INSERT INTO cursor_test VALUES (3, Carol, HR)");
+    execSQL(engine, parser, "INSERT INTO cursor_test VALUES (4, Dave, HR)");
+
+    // DECLARE cursor
+    engine.declareCursor("emp_cursor", "SELECT id, name, dept FROM cursor_test");
+    check(engine.getCursor("emp_cursor") != nullptr, "DECLARE cursor creates entry");
+    check(!engine.getCursor("emp_cursor")->isOpen, "DECLARE cursor isOpen=false");
+
+    // Manually populate the cursor (simulate OPEN)
+    {
+        milansql::CursorData* cd = engine.getCursor("emp_cursor");
+        auto tbl = executeSelect(engine, parser, "SELECT id, name, dept FROM cursor_test");
+        cd->columns = tbl.columns();
+        cd->rows.clear();
+        for (const auto& row : tbl.rows()) {
+            if (row.xmax == 0) cd->rows.push_back(row);
+        }
+        cd->isOpen = true;
+        cd->currentPos = -1;
+    }
+
+    milansql::CursorData* cd = engine.getCursor("emp_cursor");
+    check(cd != nullptr && cd->isOpen, "OPEN cursor sets isOpen");
+    check(cd != nullptr && cd->rows.size() == 4, "OPEN cursor loads 4 rows");
+
+    // FETCH NEXT
+    {
+        auto r = engine.fetchCursor("emp_cursor", milansql::FetchDirection::FETCH_NEXT, 1, 0);
+        check(r.rowCount() == 1, "FETCH NEXT returns 1 row");
+        check(!r.rows().empty() && !r.rows()[0].values.empty() && r.rows()[0].values[0] == "1", "FETCH NEXT row 1 id=1");
+    }
+
+    // FETCH NEXT again
+    {
+        auto r = engine.fetchCursor("emp_cursor", milansql::FetchDirection::FETCH_NEXT, 1, 0);
+        check(r.rowCount() == 1, "FETCH NEXT row 2");
+        check(!r.rows().empty() && !r.rows()[0].values.empty() && r.rows()[0].values[0] == "2", "FETCH NEXT row 2 id=2");
+    }
+
+    // FETCH FIRST
+    {
+        auto r = engine.fetchCursor("emp_cursor", milansql::FetchDirection::FETCH_FIRST, 1, 0);
+        check(r.rowCount() == 1, "FETCH FIRST returns 1 row");
+        check(!r.rows().empty() && !r.rows()[0].values.empty() && r.rows()[0].values[0] == "1", "FETCH FIRST id=1");
+    }
+
+    // FETCH LAST
+    {
+        auto r = engine.fetchCursor("emp_cursor", milansql::FetchDirection::FETCH_LAST, 1, 0);
+        check(r.rowCount() == 1, "FETCH LAST returns 1 row");
+        check(!r.rows().empty() && !r.rows()[0].values.empty() && r.rows()[0].values[0] == "4", "FETCH LAST id=4");
+    }
+
+    // FETCH ABSOLUTE 2 (0-based index 2 = row id=3)
+    {
+        auto r = engine.fetchCursor("emp_cursor", milansql::FetchDirection::FETCH_ABSOLUTE, 1, 2);
+        check(r.rowCount() == 1, "FETCH ABSOLUTE 2 returns 1 row");
+        check(!r.rows().empty() && !r.rows()[0].values.empty() && r.rows()[0].values[0] == "3", "FETCH ABSOLUTE 2 returns row index 2 (id=3)");
+    }
+
+    // CLOSE cursor
+    engine.closeCursor("emp_cursor");
+    cd = engine.getCursor("emp_cursor");
+    check(cd != nullptr && !cd->isOpen, "CLOSE cursor sets isOpen=false");
+
+    // DEALLOCATE cursor
+    engine.deallocateCursor("emp_cursor");
+    check(engine.getCursor("emp_cursor") == nullptr, "DEALLOCATE removes cursor");
+}
+
 // ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
@@ -2351,6 +2431,9 @@ int main() {
     }
     try { testGroup35(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 35 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup36(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 36 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

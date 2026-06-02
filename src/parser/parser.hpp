@@ -259,6 +259,12 @@ enum class CommandType {
     NEIGHBORS_GRAPH,
     SHOW_GRAPH_NODES,
     SHOW_GRAPH_EDGES,
+    // Phase 118: Server-Side Cursor
+    DECLARE_CURSOR,
+    OPEN_CURSOR,
+    FETCH_CURSOR,
+    CLOSE_CURSOR,
+    DEALLOCATE_CURSOR,
     UNKNOWN
 };
 
@@ -555,6 +561,13 @@ struct ParsedCommand {
     std::string graphPathFrom, graphPathTo;              // SHORTEST PATH
     std::string graphNeighborNode;                       // NEIGHBORS OF
     int         graphNeighborDepth = 1;                  // DEPTH n
+
+    // Phase 118: Server-Side Cursor fields
+    std::string cursorName;
+    std::string cursorSql;
+    FetchDirection fetchDirection = FetchDirection::FETCH_NEXT;
+    int fetchCount = 1;
+    int fetchPosition = 0;
 };
 
 class Parser {
@@ -3800,6 +3813,81 @@ public:
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }
+
+        // ── Phase 118: Server-Side Cursor Commands ─────────────────
+        // DECLARE cursorname CURSOR FOR select_sql
+        else if (kw0 == "DECLARE" && tokens.size() >= 4) {
+            size_t forIdx = 0;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "FOR") { forIdx = i; break; }
+            }
+            if (forIdx > 0) {
+                cmd.type = CommandType::DECLARE_CURSOR;
+                cmd.cursorName = tokens[1];
+                std::string sql;
+                for (size_t i = forIdx + 1; i < tokens.size(); ++i) {
+                    if (!sql.empty()) sql += " ";
+                    sql += tokens[i];
+                }
+                cmd.cursorSql = sql;
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+        }
+        // OPEN name
+        else if (kw0 == "OPEN" && tokens.size() == 2) {
+            cmd.type = CommandType::OPEN_CURSOR;
+            cmd.cursorName = tokens[1];
+        }
+        // FETCH [direction [n]] FROM name
+        else if (kw0 == "FETCH") {
+            cmd.type = CommandType::FETCH_CURSOR;
+            cmd.fetchDirection = FetchDirection::FETCH_NEXT;
+            cmd.fetchCount = 1;
+            cmd.fetchPosition = 0;
+            size_t fromIdx = 0;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "FROM") { fromIdx = i; break; }
+            }
+            if (fromIdx > 0 && fromIdx + 1 < tokens.size()) {
+                cmd.cursorName = tokens[fromIdx + 1];
+                if (fromIdx == 1) {
+                    // FETCH FROM name — default NEXT
+                } else if (fromIdx >= 2) {
+                    std::string dir = toUpper(tokens[1]);
+                    if (dir == "NEXT")          cmd.fetchDirection = FetchDirection::FETCH_NEXT;
+                    else if (dir == "PRIOR")    cmd.fetchDirection = FetchDirection::FETCH_PRIOR;
+                    else if (dir == "FIRST")    cmd.fetchDirection = FetchDirection::FETCH_FIRST;
+                    else if (dir == "LAST")     cmd.fetchDirection = FetchDirection::FETCH_LAST;
+                    else if (dir == "ABSOLUTE" && fromIdx >= 3) {
+                        cmd.fetchDirection = FetchDirection::FETCH_ABSOLUTE;
+                        try { cmd.fetchPosition = std::stoi(tokens[2]); } catch (...) {}
+                    }
+                    else if (dir == "RELATIVE" && fromIdx >= 3) {
+                        cmd.fetchDirection = FetchDirection::FETCH_RELATIVE;
+                        try { cmd.fetchPosition = std::stoi(tokens[2]); } catch (...) {}
+                    }
+                    else {
+                        try { cmd.fetchCount = std::stoi(tokens[1]); } catch (...) {}
+                    }
+                }
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+        }
+        // CLOSE name
+        else if (kw0 == "CLOSE" && tokens.size() == 2) {
+            cmd.type = CommandType::CLOSE_CURSOR;
+            cmd.cursorName = tokens[1];
+        }
+        // DEALLOCATE name  or  DEALLOCATE CURSOR name
+        else if (kw0 == "DEALLOCATE" && kw1 != "PREPARE") {
+            cmd.type = CommandType::DEALLOCATE_CURSOR;
+            if (tokens.size() == 2) cmd.cursorName = tokens[1];
+            else if (tokens.size() >= 3 && toUpper(tokens[1]) == "CURSOR") cmd.cursorName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+        }
+
         else                     { cmd.type = CommandType::UNKNOWN; }
 
         return cmd;

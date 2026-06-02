@@ -6167,6 +6167,57 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 118: Server-Side Cursor Commands ───────────────────
+    case milansql::CommandType::DECLARE_CURSOR: {
+        engine.declareCursor(cmd.cursorName, cmd.cursorSql);
+        std::cout << "  DECLARE cursor '" << cmd.cursorName << "'\n\n";
+        break;
+    }
+
+    case milansql::CommandType::OPEN_CURSOR: {
+        milansql::CursorData* cd = engine.getCursor(cmd.cursorName);
+        if (!cd) {
+            std::cout << "  ERROR: Cursor '" << cmd.cursorName << "' not found\n\n";
+            break;
+        }
+        // Execute the stored SQL to populate cursor rows
+        milansql::ParsedCommand innerCmd = parser.parse(cd->sql);
+        milansql::Table result = dispatch_executeSelectToTable(engine, parser, innerCmd);
+        cd->columns = result.columns();
+        // Copy rows from table into cursor
+        cd->rows.clear();
+        for (const auto& row : result.rows()) {
+            if (row.xmax == 0) cd->rows.push_back(row);
+        }
+        cd->isOpen = true;
+        cd->currentPos = -1;
+        std::cout << "  OPEN cursor '" << cmd.cursorName << "' (" << cd->rows.size() << " rows)\n\n";
+        break;
+    }
+
+    case milansql::CommandType::FETCH_CURSOR: {
+        milansql::Table result = engine.fetchCursor(
+            cmd.cursorName, cmd.fetchDirection, cmd.fetchCount, cmd.fetchPosition);
+        if (result.columns().empty()) {
+            std::cout << "  FETCH: no more rows\n\n";
+        } else {
+            dispatch_printTable(result);
+        }
+        break;
+    }
+
+    case milansql::CommandType::CLOSE_CURSOR: {
+        engine.closeCursor(cmd.cursorName);
+        std::cout << "  CLOSE cursor '" << cmd.cursorName << "'\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DEALLOCATE_CURSOR: {
+        engine.deallocateCursor(cmd.cursorName);
+        std::cout << "  DEALLOCATE cursor '" << cmd.cursorName << "'\n\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Architecture — MilanSQL</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --primary:   #2563eb;
+      --accent:    #7c3aed;
+      --cyan:      #06b6d4;
+      --bg:        #020817;
+      --bg-card:   rgba(255,255,255,0.04);
+      --border:    rgba(255,255,255,0.08);
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --max-w:     1400px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0f1e; }
+    ::-webkit-scrollbar-thumb { background: #2563eb44; border-radius: 3px; }
+
+    .gradient-text {
+      background: linear-gradient(135deg, #60a5fa, #a78bfa, #22d3ee);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* Navigation */
+    nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      background: rgba(2, 8, 23, 0.75);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-inner {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 0 40px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-logo {
+      font-size: 1.35rem;
+      font-weight: 800;
+      text-decoration: none;
+      letter-spacing: -0.5px;
+    }
+    .nav-logo .blue  { color: #60a5fa; }
+    .nav-logo .white { color: #f1f5f9; }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: #f1f5f9; }
+    .nav-links a.active { color: #f1f5f9; }
+
+    .nav-btn {
+      padding: 8px 20px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-decoration: none;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      transition: opacity 0.2s, transform 0.2s;
+    }
+    .nav-btn:hover { opacity: 0.88; transform: translateY(-1px); }
+
+    /* Page Layout */
+    .page-wrapper {
+      display: flex;
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 100px 40px 80px;
+      gap: 48px;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      position: sticky;
+      top: 84px;
+      height: fit-content;
+      max-height: calc(100vh - 100px);
+      overflow-y: auto;
+    }
+
+    .sidebar::-webkit-scrollbar { width: 4px; }
+    .sidebar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
+
+    .toc-title {
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #475569;
+      margin-bottom: 16px;
+    }
+
+    .toc-list { list-style: none; }
+
+    .toc-list li a {
+      display: block;
+      padding: 4px 0 4px 10px;
+      font-size: 0.83rem;
+      color: #64748b;
+      text-decoration: none;
+      border-left: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .toc-list li a:hover {
+      color: #94a3b8;
+      border-color: #2563eb;
+    }
+
+    /* Main Content */
+    .main-content { flex: 1; min-width: 0; }
+
+    .page-header {
+      margin-bottom: 56px;
+      padding-bottom: 40px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .page-tag {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      margin-bottom: 14px;
+    }
+
+    .page-title {
+      font-size: 2.8rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: #f1f5f9;
+      line-height: 1.1;
+      margin-bottom: 16px;
+    }
+
+    .page-sub {
+      font-size: 1.05rem;
+      color: #64748b;
+      max-width: 620px;
+      line-height: 1.7;
+    }
+
+    /* Sections */
+    .arch-section {
+      margin-bottom: 72px;
+    }
+
+    .section-heading {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 24px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .section-icon {
+      width: 36px; height: 36px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+      background: rgba(37,99,235,0.15);
+      border: 1px solid rgba(37,99,235,0.3);
+      flex-shrink: 0;
+    }
+
+    /* Pipeline diagram */
+    .pipeline-box {
+      background: rgba(8,14,28,0.9);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 36px 40px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.88rem;
+      line-height: 2;
+      overflow-x: auto;
+    }
+
+    .pipe-row {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      margin-bottom: 4px;
+    }
+
+    .pipe-box {
+      padding: 8px 18px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      white-space: nowrap;
+      text-align: center;
+      min-width: 140px;
+    }
+
+    .pipe-arrow {
+      font-size: 1.1rem;
+      color: #334155;
+      padding: 0 8px;
+    }
+
+    .pipe-detail {
+      margin-left: 16px;
+      font-size: 0.75rem;
+      color: #475569;
+      font-style: italic;
+      font-family: system-ui, sans-serif;
+    }
+
+    .pb-sql    { background: rgba(6,182,212,0.12);  border: 1px solid rgba(6,182,212,0.3);  color: #67e8f9; }
+    .pb-parser { background: rgba(37,99,235,0.12);  border: 1px solid rgba(37,99,235,0.3);  color: #93c5fd; }
+    .pb-engine { background: rgba(124,58,237,0.12); border: 1px solid rgba(124,58,237,0.3); color: #c4b5fd; }
+    .pb-opt    { background: rgba(249,115,22,0.12); border: 1px solid rgba(249,115,22,0.3); color: #fdba74; }
+    .pb-store  { background: rgba(34,197,94,0.10);  border: 1px solid rgba(34,197,94,0.25); color: #86efac; }
+
+    /* File structure table */
+    .file-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    .file-table th {
+      text-align: left;
+      padding: 10px 16px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #475569;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .file-table td {
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      vertical-align: top;
+    }
+
+    .file-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .file-table .file-name {
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.8rem;
+      color: #67e8f9;
+      white-space: nowrap;
+    }
+
+    .phase-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      background: rgba(124,58,237,0.15);
+      border: 1px solid rgba(124,58,237,0.3);
+      color: #c4b5fd;
+      white-space: nowrap;
+    }
+
+    .file-table .file-desc {
+      color: #64748b;
+      font-size: 0.83rem;
+    }
+
+    /* Layer descriptions */
+    .layers-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 20px;
+    }
+
+    .layer-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      transition: border-color 0.2s;
+    }
+    .layer-card:hover { border-color: rgba(96,165,250,0.25); }
+
+    .layer-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .layer-num {
+      width: 28px; height: 28px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.78rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      flex-shrink: 0;
+    }
+
+    .layer-name {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+
+    .layer-card p {
+      font-size: 0.875rem;
+      color: #64748b;
+      line-height: 1.7;
+    }
+
+    .layer-files {
+      margin-top: 12px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.75rem;
+      color: #475569;
+    }
+
+    /* Design decisions */
+    .decision-list {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .decision-item {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      display: flex;
+      gap: 20px;
+    }
+
+    .decision-icon {
+      font-size: 1.5rem;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .decision-content h3 {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 6px;
+    }
+
+    .decision-content p {
+      font-size: 0.875rem;
+      color: #64748b;
+      line-height: 1.7;
+    }
+
+    /* Concurrency section */
+    .concurrency-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+    }
+
+    .concurrency-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 22px;
+    }
+
+    .concurrency-card h3 {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #f1f5f9;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .concurrency-card p {
+      font-size: 0.83rem;
+      color: #64748b;
+      line-height: 1.7;
+    }
+
+    .kw   { color: #60a5fa; }
+    .str  { color: #86efac; }
+    .cmt  { color: #475569; font-style: italic; }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 64px 40px 40px;
+    }
+
+    .footer-inner { max-width: var(--max-w); margin: 0 auto; }
+
+    .footer-top {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr;
+      gap: 48px;
+      padding-bottom: 48px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+    }
+
+    .footer-brand .nav-logo { display: inline-block; margin-bottom: 14px; }
+    .footer-brand p { font-size: 0.9rem; color: #475569; line-height: 1.7; max-width: 340px; }
+
+    .footer-col h4 {
+      font-size: 0.82rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.08em; color: #64748b; margin-bottom: 16px;
+    }
+    .footer-col ul { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+    .footer-col a { font-size: 0.88rem; color: #475569; text-decoration: none; transition: color 0.2s; }
+    .footer-col a:hover { color: #94a3b8; }
+
+    .footer-bottom {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 0.83rem; color: #334155;
+    }
+    .footer-heart { color: #ec4899; }
+
+    @media (max-width: 1024px) {
+      .sidebar { display: none; }
+      .layers-grid { grid-template-columns: 1fr; }
+      .concurrency-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 768px) {
+      .nav-inner { padding: 0 20px; }
+      .nav-links { display: none; }
+      .page-wrapper { padding: 90px 24px 60px; }
+      .page-title { font-size: 2rem; }
+      .footer-top { grid-template-columns: 1fr; gap: 32px; }
+      .footer-bottom { flex-direction: column; gap: 8px; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAVIGATION -->
+<nav>
+  <div class="nav-inner">
+    <a href="index.html" class="nav-logo">
+      <span class="blue">Milan</span><span class="white">SQL</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="index.html">Home</a></li>
+      <li><a href="demo.html">Live Demo</a></li>
+      <li><a href="sql-reference.html">SQL Reference</a></li>
+      <li><a href="tutorial.html">Tutorial</a></li>
+      <li><a href="architecture.html" class="active">Architecture</a></li>
+      <li><a href="https://github.com/haidari9819-lang/milansql">GitHub</a></li>
+    </ul>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0" class="nav-btn">Get Started</a>
+  </div>
+</nav>
+
+<div class="page-wrapper">
+
+  <!-- SIDEBAR TOC -->
+  <aside class="sidebar">
+    <div class="toc-title">Architecture</div>
+    <ul class="toc-list">
+      <li><a href="#pipeline">Query Pipeline</a></li>
+      <li><a href="#files">File Structure</a></li>
+      <li><a href="#layers">System Layers</a></li>
+      <li><a href="#decisions">Design Decisions</a></li>
+      <li><a href="#concurrency">Concurrency Model</a></li>
+    </ul>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content">
+
+    <div class="page-header">
+      <span class="page-tag">Internals</span>
+      <h1 class="page-title">Architecture <span class="gradient-text">Deep Dive</span></h1>
+      <p class="page-sub">A complete tour of MilanSQL's internals — query pipeline, storage layers, optimizer design, and the engineering decisions behind a zero-dependency C++17 database engine.</p>
+    </div>
+
+    <!-- QUERY PIPELINE -->
+    <section class="arch-section" id="pipeline">
+      <h2 class="section-heading">
+        <span class="section-icon">⚙</span>
+        Query Pipeline
+      </h2>
+      <p style="color:#64748b;font-size:0.95rem;margin-bottom:28px;line-height:1.7;">
+        Every SQL statement travels through a fixed pipeline from raw text to storage and back. Each stage is a distinct module in its own <code style="font-size:0.85em;color:#67e8f9;">.hpp</code> file with no circular dependencies.
+      </p>
+
+      <div class="pipeline-box">
+        <div class="pipe-row">
+          <span class="pipe-box pb-sql">SQL String</span>
+          <span class="pipe-arrow">──▶</span>
+          <span class="pipe-box pb-parser">Tokenizer</span>
+          <span class="pipe-detail">parser/parser.hpp · splits text into Token{type,value}</span>
+        </div>
+        <div class="pipe-row" style="padding-left:160px;color:#334155;font-size:0.8rem;margin-bottom:2px;">↓</div>
+        <div class="pipe-row">
+          <span class="pipe-box pb-sql" style="visibility:hidden;">SQL String</span>
+          <span class="pipe-arrow">──▶</span>
+          <span class="pipe-box pb-parser">Parser</span>
+          <span class="pipe-detail">parser/parser.hpp · builds ParsedCommand{type, args, clauses}</span>
+        </div>
+        <div class="pipe-row" style="padding-left:160px;color:#334155;font-size:0.8rem;margin-bottom:2px;">↓</div>
+        <div class="pipe-row">
+          <span class="pipe-box pb-sql" style="visibility:hidden;">SQL String</span>
+          <span class="pipe-arrow">──▶</span>
+          <span class="pipe-box pb-parser">Dispatcher</span>
+          <span class="pipe-detail">dispatch.hpp · routes command type → correct handler</span>
+        </div>
+        <div class="pipe-row" style="padding-left:160px;color:#334155;font-size:0.8rem;margin-bottom:2px;">↓</div>
+        <div class="pipe-row">
+          <span class="pipe-box pb-sql" style="visibility:hidden;">SQL String</span>
+          <span class="pipe-arrow">──▶</span>
+          <span class="pipe-box pb-opt">Optimizer</span>
+          <span class="pipe-detail">optimizer/ · rewrite rules, stats, join reorder, index selection</span>
+        </div>
+        <div class="pipe-row" style="padding-left:160px;color:#334155;font-size:0.8rem;margin-bottom:2px;">↓</div>
+        <div class="pipe-row">
+          <span class="pipe-box pb-sql" style="visibility:hidden;">SQL String</span>
+          <span class="pipe-arrow">──▶</span>
+          <span class="pipe-box pb-engine">Engine</span>
+          <span class="pipe-detail">engine/engine.hpp · executes DML/DDL, manages transactions</span>
+        </div>
+        <div class="pipe-row" style="padding-left:160px;color:#334155;font-size:0.8rem;margin-bottom:2px;">↓</div>
+        <div class="pipe-row">
+          <span class="pipe-box pb-sql" style="visibility:hidden;">SQL String</span>
+          <span class="pipe-arrow">──▶</span>
+          <span class="pipe-box pb-store">Storage</span>
+          <span class="pipe-detail">storage/storage.hpp · binary format v9, WAL, buffer pool, I/O</span>
+        </div>
+        <div class="pipe-row" style="padding-left:160px;color:#334155;font-size:0.8rem;margin-bottom:2px;">↓</div>
+        <div style="padding-left:168px;font-size:0.8rem;color:#475569;font-style:italic;margin-top:4px;">
+          ResultSet → Dispatcher → Protocol layer → Client
+        </div>
+      </div>
+    </section>
+
+    <!-- FILE STRUCTURE -->
+    <section class="arch-section" id="files">
+      <h2 class="section-heading">
+        <span class="section-icon">📂</span>
+        File Structure
+      </h2>
+      <p style="color:#64748b;font-size:0.95rem;margin-bottom:24px;line-height:1.7;">
+        Every component is a header-only <code style="font-size:0.85em;color:#67e8f9;">.hpp</code> file. No .cpp translation units, no separate compile steps — just include and build.
+      </p>
+
+      <div style="overflow-x:auto;">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Phase</th>
+              <th>Purpose</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td class="file-name">engine/engine.hpp</td><td><span class="phase-badge">Phase 1–108</span></td><td class="file-desc">Core engine: Table, Row, Column definitions; all DML/DDL execution; transaction manager; MVCC version chains</td></tr>
+            <tr><td class="file-name">parser/parser.hpp</td><td><span class="phase-badge">Phase 5</span></td><td class="file-desc">SQL tokenizer and recursive-descent parser, produces ParsedCommand with all clauses</td></tr>
+            <tr><td class="file-name">dispatch.hpp</td><td><span class="phase-badge">Phase 6</span></td><td class="file-desc">Central dispatcher: maps ParsedCommand.type to the correct engine or server handler</td></tr>
+            <tr><td class="file-name">storage/storage.hpp</td><td><span class="phase-badge">Phase 3</span></td><td class="file-desc">Binary format v9 serializer/deserializer, WAL journal, buffer pool page manager, checkpoint</td></tr>
+            <tr><td class="file-name">storage/column_store.hpp</td><td><span class="phase-badge">Phase 80</span></td><td class="file-desc">Column-store engine for OLAP: columnar layout, vectorized SUM/AVG/COUNT scans</td></tr>
+            <tr><td class="file-name">server/http_server.hpp</td><td><span class="phase-badge">Phase 20</span></td><td class="file-desc">REST API server (port 8080): /query, /tables, /health endpoints + web dashboard</td></tr>
+            <tr><td class="file-name">server/pg_server.hpp</td><td><span class="phase-badge">Phase 30</span></td><td class="file-desc">PostgreSQL wire protocol v3 server (port 5433): compatible with psql and libpq</td></tr>
+            <tr><td class="file-name">server/mysql_server.hpp</td><td><span class="phase-badge">Phase 31</span></td><td class="file-desc">MySQL wire protocol server (port 4407): compatible with mysql CLI and mysql-connector</td></tr>
+            <tr><td class="file-name">api/graphql_server.hpp</td><td><span class="phase-badge">Phase 50</span></td><td class="file-desc">GraphQL API server (port 8081): auto-generated schema, field filtering, in-browser playground</td></tr>
+            <tr><td class="file-name">optimizer/query_rewriter.hpp</td><td><span class="phase-badge">Phase 82</span></td><td class="file-desc">Adaptive query rewriter: removes WHERE 1=1, redundant conditions, rewrites IN subqueries</td></tr>
+            <tr><td class="file-name">optimizer/adaptive_stats.hpp</td><td><span class="phase-badge">Phase 83</span></td><td class="file-desc">Runtime access statistics per column, feeds SHOW INDEX SUGGESTIONS</td></tr>
+            <tr><td class="file-name">parallel/parallel_executor.hpp</td><td><span class="phase-badge">Phase 85</span></td><td class="file-desc">Parallel query executor: splits row ranges across N worker threads, merges results</td></tr>
+            <tr><td class="file-name">pubsub/pubsub.hpp</td><td><span class="phase-badge">Phase 76</span></td><td class="file-desc">LISTEN/NOTIFY pub/sub: channel registry, async notification dispatch to listening sessions</td></tr>
+            <tr><td class="file-name">replication/logical_repl.hpp</td><td><span class="phase-badge">Phase 70</span></td><td class="file-desc">Logical replication: CREATE PUBLICATION/SUBSCRIPTION, append-only change log, streaming</td></tr>
+            <tr><td class="file-name">cdc/cdc_manager.hpp</td><td><span class="phase-badge">Phase 72</span></td><td class="file-desc">Change Data Capture: ALTER TABLE ENABLE CDC, per-row change events, AFTER SEQUENCE query</td></tr>
+            <tr><td class="file-name">locking/lock_manager.hpp</td><td><span class="phase-badge">Phase 60</span></td><td class="file-desc">Row-level lock manager for SELECT FOR UPDATE, deadlock detection</td></tr>
+            <tr><td class="file-name">cache/statement_cache.hpp</td><td><span class="phase-badge">Phase 84</span></td><td class="file-desc">LRU prepared statement cache: caches parsed plans for repeated queries</td></tr>
+            <tr><td class="file-name">compression/</td><td><span class="phase-badge">Phase 86</span></td><td class="file-desc">LZ4, RLE, Dictionary, ZSTD page-level compression engines</td></tr>
+            <tr><td class="file-name">timeseries/ts_manager.hpp</td><td><span class="phase-badge">Phase 90</span></td><td class="file-desc">Time-series: time_bucket(), retention policies, partitioned ts tables, range scans</td></tr>
+            <tr><td class="file-name">extensions/ext_system.hpp</td><td><span class="phase-badge">Phase 95</span></td><td class="file-desc">Extension system: CREATE EXTENSION, built-in milansql_math/crypto/uuid/text extensions</td></tr>
+            <tr><td class="file-name">fdw/</td><td><span class="phase-badge">Phase 97</span></td><td class="file-desc">Foreign Data Wrapper: CSV + HTTP external table sources</td></tr>
+            <tr><td class="file-name">pool/connection_pool.hpp</td><td><span class="phase-badge">Phase 98</span></td><td class="file-desc">Connection pool multiplexer: manages N server connections to the engine</td></tr>
+            <tr><td class="file-name">main.cpp</td><td><span class="phase-badge">Phase 1</span></td><td class="file-desc">Entry point: REPL loop, CLI flag parsing (--http, --server, --pg, --mysql, --graphql)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- LAYERS -->
+    <section class="arch-section" id="layers">
+      <h2 class="section-heading">
+        <span class="section-icon">🏗</span>
+        System Layers
+      </h2>
+      <div class="layers-grid">
+
+        <div class="layer-card">
+          <div class="layer-header">
+            <div class="layer-num">1</div>
+            <div class="layer-name">Client Layer</div>
+          </div>
+          <p>End-user interfaces: the interactive REPL, Python DB-API 2.0 driver, Node.js client, Java JDBC adapter, and any HTTP/REST client. All clients speak to the Protocol layer — none interact with the engine directly.</p>
+          <div class="layer-files">clients/python/ · clients/nodejs/ · REPL in main.cpp</div>
+        </div>
+
+        <div class="layer-card">
+          <div class="layer-header">
+            <div class="layer-num">2</div>
+            <div class="layer-name">Protocol Layer</div>
+          </div>
+          <p>Handles network I/O and wire protocol framing. TCP server on 4406 uses a simple length-prefixed text protocol. HTTP server on 8080 provides JSON REST. PG wire (5433) and MySQL wire (4407) provide standards-compatible binary protocols. GraphQL (8081) offers a query playground.</p>
+          <div class="layer-files">server/http_server.hpp · server/pg_server.hpp · server/mysql_server.hpp · api/graphql_server.hpp</div>
+        </div>
+
+        <div class="layer-card">
+          <div class="layer-header">
+            <div class="layer-num">3</div>
+            <div class="layer-name">Parser Layer</div>
+          </div>
+          <p>A hand-written recursive-descent tokenizer and parser that converts SQL text into a structured ParsedCommand object. No grammars, no ANTLR, no Bison — pure C++17. Handles the full SQL dialect including CTEs, window functions, subqueries, and MilanSQL extensions.</p>
+          <div class="layer-files">parser/parser.hpp · dispatch.hpp</div>
+        </div>
+
+        <div class="layer-card">
+          <div class="layer-header">
+            <div class="layer-num">4</div>
+            <div class="layer-name">Engine Layer</div>
+          </div>
+          <p>The execution core. Receives a ParsedCommand and executes it — DDL creates/alters schema, DML reads/modifies rows. Manages the MVCC transaction log, WAL commit protocol, savepoints, triggers, stored procedures, and row-level security policy evaluation.</p>
+          <div class="layer-files">engine/engine.hpp · locking/ · cdc/ · pubsub/ · replication/</div>
+        </div>
+
+        <div class="layer-card">
+          <div class="layer-header">
+            <div class="layer-num">5</div>
+            <div class="layer-name">Optimizer Layer</div>
+          </div>
+          <p>Sits between the Parser and Engine. The query rewriter simplifies the parsed AST before execution. The adaptive statistics module tracks column access patterns at runtime and feeds the index suggester. The parallel executor splits large scans across worker threads. The join reorderer uses cardinality estimates to choose optimal join order.</p>
+          <div class="layer-files">optimizer/ · parallel/ · cache/statement_cache.hpp</div>
+        </div>
+
+        <div class="layer-card">
+          <div class="layer-header">
+            <div class="layer-num">6</div>
+            <div class="layer-name">Storage Layer</div>
+          </div>
+          <p>Manages durable, page-based storage. Row tables use binary format v9 — a fixed-size page layout with slot arrays. Column tables use a separate columnar format. The WAL journal ensures durability: every mutation is logged before being applied. The buffer pool caches hot pages in memory. Optional compression (LZ4/RLE/Dictionary/ZSTD) operates transparently at the page level.</p>
+          <div class="layer-files">storage/storage.hpp · storage/column_store.hpp · compression/</div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- DESIGN DECISIONS -->
+    <section class="arch-section" id="decisions">
+      <h2 class="section-heading">
+        <span class="section-icon">🔬</span>
+        Design Decisions
+      </h2>
+      <div class="decision-list">
+
+        <div class="decision-item">
+          <div class="decision-icon">📦</div>
+          <div class="decision-content">
+            <h3>Why header-only?</h3>
+            <p>Header-only C++ eliminates the need for a separate compilation and linking step for library code. Every component can be included directly into the single <code style="color:#67e8f9;font-size:0.9em;">main.cpp</code> translation unit. This makes the build system trivial (CMake with one target), makes the code portable across Windows, Linux, and macOS with no platform-specific build scripts, and makes it easy for contributors to read the entire codebase in file order. The trade-off is longer compile times for a full rebuild, but incremental builds are fast because only the main translation unit needs recompiling.</p>
+          </div>
+        </div>
+
+        <div class="decision-item">
+          <div class="decision-icon">🚫</div>
+          <div class="decision-content">
+            <h3>Why no external dependencies?</h3>
+            <p>Every external library is a potential build failure, a versioning conflict, a security vulnerability, or a licensing concern. By relying only on the C++17 standard library, MilanSQL can be cloned and compiled on any machine with a modern compiler — no <code style="color:#67e8f9;font-size:0.9em;">apt install</code>, no <code style="color:#67e8f9;font-size:0.9em;">vcpkg</code>, no Conan, no submodules. This was a deliberate pedagogical choice: if you need a feature (compression, B-trees, hash maps), you implement it yourself and understand exactly how it works.</p>
+          </div>
+        </div>
+
+        <div class="decision-item">
+          <div class="decision-icon">💾</div>
+          <div class="decision-content">
+            <h3>Binary format v9 — design rationale</h3>
+            <p>The storage format has gone through 9 iterations (v1 was plain text, v2 added type tags, v4 introduced page-based layout, v7 added compression headers, v9 added column-store support). Version 9 uses a page-based layout with a 16-byte page header (magic number, version, row count, free-space offset), slot array for variable-length row offsets, and a data region. Each row is length-prefixed with a null bitmap for nullable columns. This layout supports efficient sequential scans, slot-level deletion without compaction, and transparent page-level compression.</p>
+          </div>
+        </div>
+
+        <div class="decision-item">
+          <div class="decision-icon">🔀</div>
+          <div class="decision-content">
+            <h3>Hand-written parser vs. parser generators</h3>
+            <p>Tools like ANTLR or Bison would generate a parser from a grammar file, but they introduce an external dependency and a code generation step. A hand-written recursive-descent parser is pure C++, directly readable, debuggable with a standard debugger, and trivially extensible — adding a new SQL clause is a few lines of C++. The parser is also tightly coupled to the ParsedCommand output type, making it easy to add new fields without regenerating code.</p>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- CONCURRENCY MODEL -->
+    <section class="arch-section" id="concurrency">
+      <h2 class="section-heading">
+        <span class="section-icon">⚡</span>
+        Concurrency Model
+      </h2>
+      <p style="color:#64748b;font-size:0.95rem;margin-bottom:24px;line-height:1.7;">
+        MilanSQL uses multiple layers of concurrency control to support concurrent clients, parallel query execution, and background workers.
+      </p>
+      <div class="concurrency-grid">
+
+        <div class="concurrency-card">
+          <h3>🔒 Mutexes &amp; MVCC</h3>
+          <p>A per-table <code style="color:#67e8f9;font-size:0.88em;">std::shared_mutex</code> protects schema and row data. MVCC (Multi-Version Concurrency Control) gives each transaction a snapshot of the database — readers never block writers and writers never block readers. Each row stores a version chain with transaction IDs.</p>
+        </div>
+
+        <div class="concurrency-card">
+          <h3>💡 Query Cache</h3>
+          <p>A global LRU query cache (configurable size) stores the result sets of identical read-only queries. Cache entries are invalidated on any write to the relevant tables. The statement cache separately stores parsed query plans to skip re-parsing identical SQL strings.</p>
+        </div>
+
+        <div class="concurrency-card">
+          <h3>🔱 Parallel Executor</h3>
+          <p>For tables exceeding the <code style="color:#67e8f9;font-size:0.88em;">PARALLEL_THRESHOLD</code> row count, sequential scans are split into N equal ranges and executed across a thread pool. Per-range partial results are merged via a combine function. Aggregations (SUM, COUNT, AVG) use partial aggregation with a final merge step.</p>
+        </div>
+
+        <div class="concurrency-card">
+          <h3>📡 Pub/Sub Sessions</h3>
+          <p>Each client session can LISTEN on named channels. A <code style="color:#67e8f9;font-size:0.88em;">std::unordered_map</code> keyed by channel name holds lists of waiting session callbacks. NOTIFY pushes a message to all registered listeners asynchronously, using a condition variable to wake blocked sessions.</p>
+        </div>
+
+        <div class="concurrency-card">
+          <h3>📝 WAL Journal</h3>
+          <p>Before any write is applied to a page, its intent is appended to the Write-Ahead Log. On crash, the WAL is replayed from the last checkpoint to restore consistency. Checkpoints flush dirty pages to disk and truncate the WAL, controlled by the background checkpoint worker.</p>
+        </div>
+
+        <div class="concurrency-card">
+          <h3>🔗 Lock Manager</h3>
+          <p>SELECT FOR UPDATE acquires a row-level exclusive lock via the lock manager. The lock manager maintains a lock table keyed by (table_id, row_id) and detects deadlocks by building a wait-for graph on each new lock request. Deadlocked transactions are aborted with a clear error message.</p>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <a href="index.html" class="nav-logo">
+          <span class="blue">Milan</span><span class="white">SQL</span>
+        </a>
+        <p>A production-grade relational database engine built phase-by-phase from scratch in C++17 — zero external dependencies, header-only, binary storage format v9.</p>
+      </div>
+      <div class="footer-col">
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="sql-reference.html">SQL Reference</a></li>
+          <li><a href="tutorial.html">Tutorial</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="demo.html">Live Demo</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/haidari9819-lang/milansql">GitHub Repository</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0">Download v5.0.0</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>Built with <span class="footer-heart">❤️</span> by <a href="https://github.com/haidari9819-lang" style="color:#475569;text-decoration:none;">Mirwais Haidari</a></span>
+      <span>© 2026 MilanSQL · MIT License</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tutorial — MilanSQL</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    :root { --primary: #2563eb; --accent: #7c3aed; --bg: #020817; --bg-card: rgba(255,255,255,0.04); --border: rgba(255,255,255,0.08); --text: #e2e8f0; }
+    html { scroll-behavior: smooth; }
+    body { background: var(--bg); color: var(--text); font-family: system-ui,-apple-system,'Segoe UI',sans-serif; line-height: 1.6; }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #0a0f1e; } ::-webkit-scrollbar-thumb { background: #2563eb44; border-radius: 3px; }
+    .gradient-text { background: linear-gradient(135deg,#60a5fa,#a78bfa,#22d3ee); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; background: rgba(2,8,23,0.85); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border); }
+    .nav-inner { max-width: 1400px; margin: 0 auto; padding: 0 40px; height: 64px; display: flex; align-items: center; justify-content: space-between; }
+    .nav-logo { font-size: 1.25rem; font-weight: 800; text-decoration: none; }
+    .nav-logo .blue { color: #60a5fa; } .nav-logo .white { color: #f1f5f9; }
+    .nav-links { display: flex; align-items: center; gap: 28px; list-style: none; }
+    .nav-links a { color: #94a3b8; text-decoration: none; font-size: 0.88rem; font-weight: 500; transition: color .2s; }
+    .nav-links a:hover, .nav-links a.active { color: #f1f5f9; }
+    .nav-btn { padding: 7px 18px; border-radius: 8px; font-size: 0.85rem; font-weight: 600; text-decoration: none; background: linear-gradient(135deg,var(--primary),var(--accent)); color: #fff; }
+    .page-layout { display: grid; grid-template-columns: 240px 1fr; max-width: 1400px; margin: 0 auto; padding: 88px 40px 60px; gap: 48px; min-height: 100vh; }
+    .sidebar { position: sticky; top: 80px; height: fit-content; }
+    .sidebar-title { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #475569; margin-bottom: 12px; }
+    .step-nav { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+    .step-nav a { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 8px; text-decoration: none; font-size: 0.85rem; color: #64748b; transition: all .15s; border-left: 2px solid transparent; }
+    .step-nav a:hover { color: #94a3b8; background: rgba(255,255,255,0.04); border-left-color: #2563eb44; }
+    .step-num-small { width: 22px; height: 22px; border-radius: 6px; background: rgba(37,99,235,0.2); display: flex; align-items: center; justify-content: center; font-size: 0.72rem; font-weight: 700; color: #60a5fa; flex-shrink: 0; }
+    .content h1 { font-size: 2.4rem; font-weight: 800; letter-spacing: -0.03em; color: #f1f5f9; margin-bottom: 12px; }
+    .content .lead { font-size: 1.05rem; color: #64748b; margin-bottom: 56px; line-height: 1.7; }
+    .tutorial-step { display: grid; grid-template-columns: 48px 1fr; gap: 24px; margin-bottom: 56px; scroll-margin-top: 80px; }
+    .step-indicator { display: flex; flex-direction: column; align-items: center; }
+    .step-circle { width: 48px; height: 48px; border-radius: 14px; background: linear-gradient(135deg,var(--primary),var(--accent)); display: flex; align-items: center; justify-content: center; font-size: 1.1rem; font-weight: 800; color: #fff; flex-shrink: 0; }
+    .step-line { width: 2px; flex: 1; min-height: 40px; background: linear-gradient(180deg,rgba(37,99,235,0.3),transparent); margin-top: 8px; }
+    .step-body h2 { font-size: 1.4rem; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; letter-spacing: -0.02em; }
+    .step-body p { font-size: 0.93rem; color: #94a3b8; margin-bottom: 18px; line-height: 1.7; }
+    .code-block { background: #0d1117; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; overflow: hidden; margin-bottom: 14px; }
+    .code-block-bar { display: flex; align-items: center; justify-content: space-between; padding: 10px 18px; border-bottom: 1px solid rgba(255,255,255,0.06); background: rgba(255,255,255,0.02); }
+    .code-block-label { font-size: 0.75rem; color: #475569; font-family: monospace; }
+    .copy-btn { font-size: 0.72rem; color: #475569; background: none; border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; padding: 2px 8px; cursor: pointer; transition: all .2s; }
+    .copy-btn:hover { color: #94a3b8; }
+    .code-block pre { padding: 18px 22px; font-family: 'Cascadia Code','Fira Code','Courier New',monospace; font-size: 0.83rem; line-height: 1.85; color: #e2e8f0; overflow-x: auto; }
+    .kw { color: #60a5fa; } .str { color: #86efac; } .cmt { color: #475569; font-style: italic; } .num { color: #fb923c; } .typ { color: #67e8f9; } .fn { color: #c084fc; }
+    .tip-box { background: rgba(37,99,235,0.08); border: 1px solid rgba(37,99,235,0.2); border-radius: 10px; padding: 14px 18px; margin-bottom: 14px; font-size: 0.88rem; color: #93c5fd; line-height: 1.6; }
+    .tip-box strong { color: #60a5fa; }
+    footer { border-top: 1px solid var(--border); padding: 40px; text-align: center; font-size: 0.85rem; color: #334155; }
+    footer a { color: #475569; text-decoration: none; } footer a:hover { color: #94a3b8; }
+    @media (max-width: 900px) { .page-layout { grid-template-columns: 1fr; } .sidebar { display: none; } }
+    @media (max-width: 600px) { .nav-links { display: none; } .page-layout { padding: 80px 20px 40px; } }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="index.html" class="nav-logo"><span class="blue">Milan</span><span class="white">SQL</span></a>
+    <ul class="nav-links">
+      <li><a href="index.html">Home</a></li>
+      <li><a href="demo.html">Live Demo</a></li>
+      <li><a href="sql-reference.html">SQL Reference</a></li>
+      <li><a href="tutorial.html" class="active">Tutorial</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="https://github.com/haidari9819-lang/milansql">GitHub</a></li>
+    </ul>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0" class="nav-btn">v5.0.0</a>
+  </div>
+</nav>
+
+<div class="page-layout">
+  <aside class="sidebar">
+    <div class="sidebar-title">Steps</div>
+    <ul class="step-nav">
+      <li><a href="#step1"><span class="step-num-small">1</span>Installation</a></li>
+      <li><a href="#step2"><span class="step-num-small">2</span>First Queries</a></li>
+      <li><a href="#step3"><span class="step-num-small">3</span>JOINs &amp; Subqueries</a></li>
+      <li><a href="#step4"><span class="step-num-small">4</span>Transactions</a></li>
+      <li><a href="#step5"><span class="step-num-small">5</span>Advanced Features</a></li>
+      <li><a href="#step6"><span class="step-num-small">6</span>Performance</a></li>
+      <li><a href="#step7"><span class="step-num-small">7</span>Client Drivers</a></li>
+      <li><a href="#step8"><span class="step-num-small">8</span>Replication &amp; Pub/Sub</a></li>
+    </ul>
+  </aside>
+
+  <main class="content">
+    <h1>Getting Started <span class="gradient-text">Tutorial</span></h1>
+    <p class="lead">From zero to advanced SQL in 8 steps. No external dependencies required — just a C++17 compiler and CMake.</p>
+
+    <!-- Step 1 -->
+    <div class="tutorial-step" id="step1">
+      <div class="step-indicator"><div class="step-circle">1</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>Installation &amp; Build</h2>
+        <p>Clone the repository and build with CMake + Ninja. MilanSQL has zero external dependencies.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">bash (Linux / macOS)</span><button class="copy-btn">Copy</button></div>
+          <pre>git clone https://github.com/haidari9819-lang/milansql
+cd milansql
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/milansql</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">bash (Windows — MSYS2 UCRT64)</span><button class="copy-btn">Copy</button></div>
+          <pre>export PATH="/c/msys64/ucrt64/bin:$PATH"
+cmake -B build -G Ninja
+cmake --build build
+./build/milansql.exe</pre>
+        </div>
+        <div class="tip-box"><strong>Tip:</strong> Run <code>./build/milansql_tests.exe</code> to verify all 223 tests pass.</div>
+      </div>
+    </div>
+
+    <!-- Step 2 -->
+    <div class="tutorial-step" id="step2">
+      <div class="step-indicator"><div class="step-circle">2</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>First Queries</h2>
+        <p>Start the interactive REPL and create your first table. MilanSQL persists all data to <code>database.milan</code> automatically.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">CREATE TABLE</span> employees (
+  id     <span class="typ">INT</span>  <span class="kw">PRIMARY KEY AUTO_INCREMENT</span>,
+  name   <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,
+  dept   <span class="typ">TEXT</span>,
+  salary <span class="typ">REAL</span> <span class="kw">DEFAULT</span> <span class="num">0</span>
+);
+
+<span class="kw">INSERT INTO</span> employees (name, dept, salary) <span class="kw">VALUES</span>
+  (<span class="str">'Alice'</span>, <span class="str">'Engineering'</span>, <span class="num">95000</span>),
+  (<span class="str">'Bob'</span>,   <span class="str">'Engineering'</span>, <span class="num">88000</span>),
+  (<span class="str">'Carol'</span>, <span class="str">'Marketing'</span>,   <span class="num">72000</span>);
+
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> employees;
+<span class="kw">SELECT</span> dept, <span class="fn">AVG</span>(salary) <span class="kw">FROM</span> employees <span class="kw">GROUP BY</span> dept;</pre>
+        </div>
+        <div class="tip-box"><strong>Tip:</strong> Use <code>\dt</code> to list tables, <code>\d tablename</code> to describe, <code>\q</code> to quit.</div>
+      </div>
+    </div>
+
+    <!-- Step 3 -->
+    <div class="tutorial-step" id="step3">
+      <div class="step-indicator"><div class="step-circle">3</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>JOINs &amp; Subqueries</h2>
+        <p>MilanSQL supports INNER, LEFT, RIGHT, and FULL OUTER JOINs as well as correlated subqueries.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">CREATE TABLE</span> departments (id <span class="typ">INT</span> <span class="kw">PRIMARY KEY</span>, name <span class="typ">TEXT</span>, budget <span class="typ">REAL</span>);
+<span class="kw">INSERT INTO</span> departments <span class="kw">VALUES</span> (<span class="num">1</span>, <span class="str">'Engineering'</span>, <span class="num">500000</span>), (<span class="num">2</span>, <span class="str">'Marketing'</span>, <span class="num">200000</span>);
+
+<span class="cmt">-- INNER JOIN</span>
+<span class="kw">SELECT</span> e.name, e.salary, d.budget
+<span class="kw">FROM</span> employees e <span class="kw">INNER JOIN</span> departments d <span class="kw">ON</span> e.dept = d.name;
+
+<span class="cmt">-- IN subquery</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> employees
+<span class="kw">WHERE</span> dept <span class="kw">IN</span> (<span class="kw">SELECT</span> name <span class="kw">FROM</span> departments <span class="kw">WHERE</span> budget &gt; <span class="num">300000</span>);
+
+<span class="cmt">-- Correlated subquery</span>
+<span class="kw">SELECT</span> name, salary,
+  (<span class="kw">SELECT AVG</span>(salary) <span class="kw">FROM</span> employees e2 <span class="kw">WHERE</span> e2.dept = e.dept) <span class="kw">AS</span> dept_avg
+<span class="kw">FROM</span> employees e;</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 4 -->
+    <div class="tutorial-step" id="step4">
+      <div class="step-indicator"><div class="step-circle">4</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>Transactions &amp; ACID</h2>
+        <p>MVCC + Write-Ahead Log for full ACID guarantees. Supports nested savepoints and SELECT FOR UPDATE row locking.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">BEGIN</span>;
+<span class="kw">UPDATE</span> employees <span class="kw">SET</span> salary = salary * <span class="num">1.1</span> <span class="kw">WHERE</span> dept = <span class="str">'Engineering'</span>;
+<span class="kw">COMMIT</span>;
+
+<span class="cmt">-- Savepoints</span>
+<span class="kw">BEGIN</span>;
+<span class="kw">INSERT INTO</span> employees (name, dept, salary) <span class="kw">VALUES</span> (<span class="str">'Frank'</span>, <span class="str">'HR'</span>, <span class="num">55000</span>);
+<span class="kw">SAVEPOINT</span> after_frank;
+<span class="kw">INSERT INTO</span> employees (name, dept, salary) <span class="kw">VALUES</span> (<span class="str">'Grace'</span>, <span class="str">'HR'</span>, <span class="num">52000</span>);
+<span class="kw">ROLLBACK TO SAVEPOINT</span> after_frank;  <span class="cmt">-- undo Grace, keep Frank</span>
+<span class="kw">COMMIT</span>;</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 5 -->
+    <div class="tutorial-step" id="step5">
+      <div class="step-indicator"><div class="step-circle">5</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>Advanced Features</h2>
+        <p>Window functions, Recursive CTEs, Table Inheritance, and Array operations.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL — Window Functions</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">SELECT</span> name, dept, salary,
+  <span class="fn">RANK</span>()      <span class="kw">OVER</span> (<span class="kw">PARTITION BY</span> dept <span class="kw">ORDER BY</span> salary <span class="kw">DESC</span>) <span class="kw">AS</span> rank,
+  <span class="fn">SUM</span>(salary) <span class="kw">OVER</span> (<span class="kw">PARTITION BY</span> dept) <span class="kw">AS</span> dept_total
+<span class="kw">FROM</span> employees;</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL — Recursive CTE</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">WITH RECURSIVE</span> counter(n) <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> <span class="num">1</span>
+  <span class="kw">UNION ALL</span>
+  <span class="kw">SELECT</span> n + <span class="num">1</span> <span class="kw">FROM</span> counter <span class="kw">WHERE</span> n &lt; <span class="num">10</span>
+)
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> counter;</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL — Table Inheritance</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">CREATE TABLE</span> person  (id <span class="typ">INT</span> <span class="kw">PRIMARY KEY</span>, name <span class="typ">TEXT</span>);
+<span class="kw">CREATE TABLE</span> employee (salary <span class="typ">REAL</span>) <span class="kw">INHERITS</span> (person);
+
+<span class="kw">INSERT INTO</span> person   (id, name) <span class="kw">VALUES</span> (<span class="num">1</span>, <span class="str">'Alice'</span>);
+<span class="kw">INSERT INTO</span> employee (id, name, salary) <span class="kw">VALUES</span> (<span class="num">2</span>, <span class="str">'Bob'</span>, <span class="num">75000</span>);
+
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> person;       <span class="cmt">-- Alice + Bob (2 rows)</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM ONLY</span> person;  <span class="cmt">-- Alice only (1 row)</span></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 6 -->
+    <div class="tutorial-step" id="step6">
+      <div class="step-indicator"><div class="step-circle">6</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>Performance &amp; Query Planning</h2>
+        <p>EXPLAIN, ANALYZE, adaptive optimizer, column store for OLAP, and parallel query execution.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">CREATE INDEX</span> idx_emp_salary <span class="kw">ON</span> employees(salary);
+<span class="kw">EXPLAIN SELECT</span> * <span class="kw">FROM</span> employees <span class="kw">WHERE</span> salary &gt; <span class="num">80000</span>;
+<span class="kw">ANALYZE TABLE</span> employees;
+<span class="kw">SHOW STATISTICS FOR</span> employees;
+
+<span class="kw">SET QUERY_REWRITE</span> = <span class="str">ON</span>;
+<span class="kw">EXPLAIN REWRITTEN SELECT</span> * <span class="kw">FROM</span> employees <span class="kw">WHERE</span> <span class="num">1</span>=<span class="num">1</span>;
+<span class="kw">SHOW INDEX SUGGESTIONS</span>;
+
+<span class="kw">SET MAX_PARALLEL_WORKERS</span> = <span class="num">4</span>;
+<span class="kw">SELECT</span> <span class="cmt">/*+ PARALLEL(4) */</span> <span class="fn">COUNT</span>(*) <span class="kw">FROM</span> employees;</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 7 -->
+    <div class="tutorial-step" id="step7">
+      <div class="step-indicator"><div class="step-circle">7</div><div class="step-line"></div></div>
+      <div class="step-body">
+        <h2>Client Drivers</h2>
+        <p>Connect from Python, Node.js, Java (JDBC), Rust, .NET, psql, or any HTTP client.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">bash — Start servers</span><button class="copy-btn">Copy</button></div>
+          <pre>./build/milansql.exe --http --http-port 8080 --pg --pg-port 5433 --graphql --graphql-port 8081</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">Python — DB-API 2.0</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">import</span> milansql
+conn = milansql.<span class="fn">connect</span>(<span class="str">"milansql://root@localhost:4406/mydb"</span>)
+cur = conn.<span class="fn">cursor</span>()
+cur.<span class="fn">execute</span>(<span class="str">"SELECT name, salary FROM employees WHERE salary > %s"</span>, (<span class="num">80000</span>,))
+<span class="kw">print</span>(cur.<span class="fn">fetchall</span>())</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">curl — REST API</span><button class="copy-btn">Copy</button></div>
+          <pre>curl -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT * FROM employees LIMIT 5"}'</pre>
+        </div>
+        <div class="tip-box"><strong>GraphQL Playground:</strong> Open <code>http://localhost:8081/graphql/playground</code> in your browser.</div>
+      </div>
+    </div>
+
+    <!-- Step 8 -->
+    <div class="tutorial-step" id="step8">
+      <div class="step-indicator"><div class="step-circle">8</div></div>
+      <div class="step-body">
+        <h2>Replication &amp; Pub/Sub</h2>
+        <p>Logical replication between instances, LISTEN/NOTIFY pub/sub, and Change Data Capture.</p>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL — LISTEN / NOTIFY</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">LISTEN</span> employee_changes;
+<span class="kw">NOTIFY</span> employee_changes, <span class="str">'new_hire:Alice'</span>;
+<span class="kw">UNLISTEN</span> *;</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL — Logical Replication</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">CREATE PUBLICATION</span> mypub <span class="kw">FOR TABLE</span> employees, departments;
+<span class="kw">CREATE SUBSCRIPTION</span> mysub
+  <span class="kw">CONNECTION</span> <span class="str">'milansql://root@primary:4406/db'</span>
+  <span class="kw">PUBLICATION</span> mypub;
+<span class="kw">SHOW LOGICAL LOG</span>;</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-block-bar"><span class="code-block-label">SQL — Change Data Capture</span><button class="copy-btn">Copy</button></div>
+          <pre><span class="kw">ALTER TABLE</span> employees <span class="kw">ENABLE CDC</span>;
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> cdc.employees;
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> cdc.employees <span class="kw">AFTER SEQUENCE</span> <span class="num">3</span>;</pre>
+        </div>
+        <div class="tip-box"><strong>Next steps:</strong> See the <a href="sql-reference.html" style="color:#60a5fa;">SQL Reference</a> for the full command list, or the <a href="architecture.html" style="color:#60a5fa;">Architecture Guide</a> for internals.</div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<footer>
+  <a href="index.html">MilanSQL</a> &middot; <a href="https://github.com/haidari9819-lang/milansql">GitHub</a> &middot; MIT License &middot; v5.0.0 &middot; 108 Phases
+</footer>
+
+<script>
+document.querySelectorAll('.copy-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const pre = btn.closest('.code-block').querySelector('pre');
+    navigator.clipboard.writeText(pre.innerText || pre.textContent).then(() => {
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1800);
+    });
+  });
+});
+</script>
+</body>
+</html>

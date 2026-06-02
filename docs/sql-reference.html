@@ -1,0 +1,1329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQL Reference — MilanSQL</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --primary:   #2563eb;
+      --accent:    #7c3aed;
+      --cyan:      #06b6d4;
+      --bg:        #020817;
+      --bg-card:   rgba(255,255,255,0.04);
+      --border:    rgba(255,255,255,0.08);
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --max-w:     1400px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a0f1e; }
+    ::-webkit-scrollbar-thumb { background: #2563eb44; border-radius: 3px; }
+
+    .gradient-text {
+      background: linear-gradient(135deg, #60a5fa, #a78bfa, #22d3ee);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* Navigation */
+    nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      background: rgba(2, 8, 23, 0.75);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-inner {
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 0 40px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-logo {
+      font-size: 1.35rem;
+      font-weight: 800;
+      text-decoration: none;
+      letter-spacing: -0.5px;
+    }
+    .nav-logo .blue  { color: #60a5fa; }
+    .nav-logo .white { color: #f1f5f9; }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: #f1f5f9; }
+    .nav-links a.active { color: #f1f5f9; }
+
+    .nav-btn {
+      padding: 8px 20px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-decoration: none;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: #fff;
+      transition: opacity 0.2s, transform 0.2s;
+    }
+    .nav-btn:hover { opacity: 0.88; transform: translateY(-1px); }
+
+    /* Page Layout */
+    .page-wrapper {
+      display: flex;
+      max-width: var(--max-w);
+      margin: 0 auto;
+      padding: 100px 40px 80px;
+      gap: 48px;
+    }
+
+    /* Sidebar TOC */
+    .sidebar {
+      width: 240px;
+      flex-shrink: 0;
+      position: sticky;
+      top: 84px;
+      height: fit-content;
+      max-height: calc(100vh - 100px);
+      overflow-y: auto;
+    }
+
+    .sidebar::-webkit-scrollbar { width: 4px; }
+    .sidebar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
+
+    .toc-title {
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #475569;
+      margin-bottom: 16px;
+    }
+
+    .toc-group { margin-bottom: 20px; }
+
+    .toc-group-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #60a5fa;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .toc-group ul { list-style: none; }
+
+    .toc-group ul li a {
+      display: block;
+      padding: 3px 0 3px 10px;
+      font-size: 0.82rem;
+      color: #64748b;
+      text-decoration: none;
+      border-left: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .toc-group ul li a:hover {
+      color: #94a3b8;
+      border-color: #2563eb;
+    }
+
+    /* Main Content */
+    .main-content { flex: 1; min-width: 0; }
+
+    .page-header {
+      margin-bottom: 56px;
+      padding-bottom: 40px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .page-tag {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      margin-bottom: 14px;
+    }
+
+    .page-title {
+      font-size: 2.8rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: #f1f5f9;
+      line-height: 1.1;
+      margin-bottom: 16px;
+    }
+
+    .page-sub {
+      font-size: 1.05rem;
+      color: #64748b;
+      max-width: 600px;
+      line-height: 1.7;
+    }
+
+    /* Command Categories */
+    .cmd-category {
+      margin-bottom: 72px;
+    }
+
+    .category-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 32px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .category-badge {
+      padding: 4px 12px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .cb-ddl    { background: rgba(37,99,235,0.15);  border: 1px solid rgba(37,99,235,0.3);  color: #93c5fd; }
+    .cb-dml    { background: rgba(124,58,237,0.15); border: 1px solid rgba(124,58,237,0.3); color: #c4b5fd; }
+    .cb-txn    { background: rgba(6,182,212,0.15);  border: 1px solid rgba(6,182,212,0.3);  color: #67e8f9; }
+    .cb-admin  { background: rgba(34,197,94,0.12);  border: 1px solid rgba(34,197,94,0.25); color: #86efac; }
+    .cb-special{ background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.3); color: #fdba74; }
+    .cb-set    { background: rgba(236,72,153,0.15); border: 1px solid rgba(236,72,153,0.3); color: #f9a8d4; }
+
+    .category-title {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+
+    /* Command entries */
+    .cmd-entry {
+      margin-bottom: 40px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      transition: border-color 0.2s;
+    }
+    .cmd-entry:hover { border-color: rgba(96,165,250,0.25); }
+
+    .cmd-entry-header {
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      background: rgba(255,255,255,0.02);
+    }
+
+    .cmd-name {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #f1f5f9;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      margin-bottom: 6px;
+    }
+
+    .cmd-desc {
+      font-size: 0.88rem;
+      color: #64748b;
+      line-height: 1.6;
+    }
+
+    .cmd-body { padding: 0; }
+
+    .cmd-section-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: #475569;
+      padding: 14px 24px 6px;
+    }
+
+    .syntax-block {
+      margin: 0 24px 0;
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 10px;
+      padding: 16px 20px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.82rem;
+      line-height: 1.8;
+      color: #cbd5e1;
+      overflow-x: auto;
+      margin-bottom: 4px;
+    }
+
+    .example-block {
+      margin: 0 24px 20px;
+      background: rgba(8,14,28,0.8);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .example-bar {
+      padding: 7px 14px;
+      background: rgba(255,255,255,0.02);
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      font-size: 0.7rem;
+      color: #334155;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .example-block pre {
+      padding: 16px 20px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Courier New', monospace;
+      font-size: 0.81rem;
+      line-height: 1.8;
+      color: #e2e8f0;
+      overflow-x: auto;
+    }
+
+    .kw   { color: #60a5fa; }
+    .str  { color: #86efac; }
+    .cmt  { color: #475569; font-style: italic; }
+    .fn   { color: #c084fc; }
+    .num  { color: #fb923c; }
+    .typ  { color: #67e8f9; }
+    .op   { color: #f472b6; }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 64px 40px 40px;
+    }
+
+    .footer-inner { max-width: var(--max-w); margin: 0 auto; }
+
+    .footer-top {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr;
+      gap: 48px;
+      padding-bottom: 48px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 32px;
+    }
+
+    .footer-brand .nav-logo { display: inline-block; margin-bottom: 14px; }
+    .footer-brand p { font-size: 0.9rem; color: #475569; line-height: 1.7; max-width: 340px; }
+
+    .footer-col h4 {
+      font-size: 0.82rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.08em; color: #64748b; margin-bottom: 16px;
+    }
+    .footer-col ul { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+    .footer-col a { font-size: 0.88rem; color: #475569; text-decoration: none; transition: color 0.2s; }
+    .footer-col a:hover { color: #94a3b8; }
+
+    .footer-bottom {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 0.83rem; color: #334155;
+    }
+    .footer-heart { color: #ec4899; }
+
+    @media (max-width: 1024px) {
+      .sidebar { display: none; }
+      .page-wrapper { padding: 90px 24px 60px; }
+    }
+    @media (max-width: 768px) {
+      .nav-inner { padding: 0 20px; }
+      .nav-links { display: none; }
+      .page-title { font-size: 2rem; }
+      .footer-top { grid-template-columns: 1fr; gap: 32px; }
+      .footer-bottom { flex-direction: column; gap: 8px; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAVIGATION -->
+<nav>
+  <div class="nav-inner">
+    <a href="index.html" class="nav-logo">
+      <span class="blue">Milan</span><span class="white">SQL</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="index.html">Home</a></li>
+      <li><a href="demo.html">Live Demo</a></li>
+      <li><a href="sql-reference.html" class="active">SQL Reference</a></li>
+      <li><a href="tutorial.html">Tutorial</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="https://github.com/haidari9819-lang/milansql">GitHub</a></li>
+    </ul>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0" class="nav-btn">Get Started</a>
+  </div>
+</nav>
+
+<div class="page-wrapper">
+
+  <!-- SIDEBAR TOC -->
+  <aside class="sidebar">
+    <div class="toc-title">SQL Reference</div>
+
+    <div class="toc-group">
+      <div class="toc-group-label">DDL</div>
+      <ul>
+        <li><a href="#create-table">CREATE TABLE</a></li>
+        <li><a href="#create-column-table">CREATE COLUMN TABLE</a></li>
+        <li><a href="#create-index">CREATE INDEX</a></li>
+        <li><a href="#create-view">CREATE VIEW</a></li>
+        <li><a href="#create-procedure">CREATE PROCEDURE</a></li>
+        <li><a href="#drop">DROP</a></li>
+        <li><a href="#alter-table">ALTER TABLE</a></li>
+        <li><a href="#truncate">TRUNCATE</a></li>
+      </ul>
+    </div>
+
+    <div class="toc-group">
+      <div class="toc-group-label">DML</div>
+      <ul>
+        <li><a href="#select">SELECT</a></li>
+        <li><a href="#insert">INSERT INTO</a></li>
+        <li><a href="#update">UPDATE</a></li>
+        <li><a href="#delete">DELETE</a></li>
+        <li><a href="#copy">COPY FROM/TO</a></li>
+      </ul>
+    </div>
+
+    <div class="toc-group">
+      <div class="toc-group-label">Transactions</div>
+      <ul>
+        <li><a href="#begin">BEGIN / COMMIT / ROLLBACK</a></li>
+        <li><a href="#savepoint">SAVEPOINT</a></li>
+        <li><a href="#release-savepoint">RELEASE SAVEPOINT</a></li>
+        <li><a href="#rollback-to">ROLLBACK TO SAVEPOINT</a></li>
+      </ul>
+    </div>
+
+    <div class="toc-group">
+      <div class="toc-group-label">Admin</div>
+      <ul>
+        <li><a href="#create-user">CREATE USER</a></li>
+        <li><a href="#grant">GRANT</a></li>
+        <li><a href="#revoke">REVOKE</a></li>
+        <li><a href="#show">SHOW TABLES/COLUMNS</a></li>
+        <li><a href="#describe">DESCRIBE</a></li>
+        <li><a href="#explain">EXPLAIN</a></li>
+        <li><a href="#analyze">ANALYZE TABLE</a></li>
+      </ul>
+    </div>
+
+    <div class="toc-group">
+      <div class="toc-group-label">Special</div>
+      <ul>
+        <li><a href="#listen-notify">LISTEN / NOTIFY</a></li>
+        <li><a href="#publication">CREATE PUBLICATION</a></li>
+        <li><a href="#create-event">CREATE EVENT</a></li>
+        <li><a href="#rls">ROW LEVEL SECURITY</a></li>
+        <li><a href="#create-policy">CREATE POLICY</a></li>
+      </ul>
+    </div>
+
+    <div class="toc-group">
+      <div class="toc-group-label">SET / SHOW</div>
+      <ul>
+        <li><a href="#set-query-rewrite">SET QUERY_REWRITE</a></li>
+        <li><a href="#set-parallel">SET PARALLEL_THRESHOLD</a></li>
+        <li><a href="#show-query-stats">SHOW QUERY STATS</a></li>
+        <li><a href="#show-index-suggestions">SHOW INDEX SUGGESTIONS</a></li>
+        <li><a href="#show-engine-status">SHOW ENGINE STATUS</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content">
+
+    <div class="page-header">
+      <span class="page-tag">Reference</span>
+      <h1 class="page-title">SQL <span class="gradient-text">Reference</span></h1>
+      <p class="page-sub">Complete reference for all SQL commands supported by MilanSQL v5.0.0 — DDL, DML, transactions, window functions, CTEs, and MilanSQL-specific extensions.</p>
+    </div>
+
+    <!-- ═══ DDL ═══ -->
+    <section class="cmd-category" id="ddl">
+      <div class="category-header">
+        <span class="category-badge cb-ddl">DDL</span>
+        <h2 class="category-title">Data Definition Language</h2>
+      </div>
+
+      <div class="cmd-entry" id="create-table">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE TABLE</div>
+          <div class="cmd-desc">Creates a new table with specified columns, types, constraints, and optional table inheritance.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE [TEMPORARY] TABLE [IF NOT EXISTS] <em>table_name</em> (<br>
+&nbsp;&nbsp;<em>col_name</em> <em>data_type</em> [NOT NULL] [DEFAULT <em>expr</em>] [PRIMARY KEY] [UNIQUE] [AUTO_INCREMENT],<br>
+&nbsp;&nbsp;...,<br>
+&nbsp;&nbsp;[CONSTRAINT <em>name</em>] [PRIMARY KEY (<em>cols</em>)] | [FOREIGN KEY (<em>col</em>) REFERENCES <em>tbl</em>(<em>col</em>)] | [CHECK (<em>expr</em>)]<br>
+) [INHERITS (<em>parent_table</em>)];</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE TABLE</span> employees (
+  id      <span class="typ">INT</span>  <span class="kw">PRIMARY KEY AUTO_INCREMENT</span>,
+  name    <span class="typ">TEXT</span> <span class="kw">NOT NULL</span>,
+  dept    <span class="typ">TEXT</span> <span class="kw">DEFAULT</span> <span class="str">'General'</span>,
+  salary  <span class="typ">REAL</span> <span class="kw">CHECK</span> (salary &gt; <span class="num">0</span>),
+  manager <span class="typ">INT</span>  <span class="kw">REFERENCES</span> employees(id)
+);</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="create-column-table">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE COLUMN TABLE</div>
+          <div class="cmd-desc">Creates a column-store table optimized for OLAP aggregation queries. Columnar layout enables faster SUM/AVG/COUNT/MIN/MAX scans.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE COLUMN TABLE <em>table_name</em> (<br>
+&nbsp;&nbsp;<em>col_name</em> <em>data_type</em> [NOT NULL] [DEFAULT <em>expr</em>],<br>
+&nbsp;&nbsp;...<br>
+);</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE COLUMN TABLE</span> sales_facts (
+  id      <span class="typ">INT</span>  <span class="kw">PRIMARY KEY</span>,
+  amount  <span class="typ">REAL</span>,
+  region  <span class="typ">TEXT</span>,
+  sale_dt <span class="typ">DATE</span>
+);
+<span class="cmt">-- Fast columnar aggregation:</span>
+<span class="kw">SELECT</span> region, <span class="fn">SUM</span>(amount) <span class="kw">FROM</span> sales_facts <span class="kw">GROUP BY</span> region;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="create-index">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE INDEX</div>
+          <div class="cmd-desc">Creates a B-Tree, composite, full-text, or spatial index to accelerate lookups and joins.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE [UNIQUE] [FULLTEXT | SPATIAL] INDEX <em>index_name</em><br>
+ON <em>table_name</em> (<em>col1</em> [ASC|DESC], <em>col2</em>, ...);</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE INDEX</span> idx_emp_dept <span class="kw">ON</span> employees(dept);
+<span class="kw">CREATE UNIQUE INDEX</span> idx_emp_email <span class="kw">ON</span> employees(email);
+<span class="kw">CREATE FULLTEXT INDEX</span> idx_ft_desc <span class="kw">ON</span> products(description);
+<span class="kw">CREATE INDEX</span> idx_composite <span class="kw">ON</span> orders(customer_id, order_date <span class="kw">DESC</span>);</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="create-view">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE VIEW / CREATE MATERIALIZED VIEW</div>
+          <div class="cmd-desc">Creates a named virtual table from a SELECT query. Materialized views persist the result for faster access.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE [OR REPLACE] VIEW <em>view_name</em> [(<em>col_list</em>)] AS <em>select_stmt</em>;<br>
+CREATE MATERIALIZED VIEW <em>view_name</em> AS <em>select_stmt</em>;<br>
+REFRESH MATERIALIZED VIEW <em>view_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE VIEW</span> high_earners <span class="kw">AS</span>
+  <span class="kw">SELECT</span> name, salary <span class="kw">FROM</span> employees <span class="kw">WHERE</span> salary &gt; <span class="num">80000</span>;
+
+<span class="kw">CREATE MATERIALIZED VIEW</span> monthly_totals <span class="kw">AS</span>
+  <span class="kw">SELECT</span> <span class="fn">DATE_TRUNC</span>(<span class="str">'month'</span>, sale_dt) <span class="kw">AS</span> month,
+         <span class="fn">SUM</span>(amount) <span class="kw">AS</span> total
+  <span class="kw">FROM</span> sales_facts <span class="kw">GROUP BY</span> month;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="create-procedure">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE PROCEDURE / CREATE FUNCTION</div>
+          <div class="cmd-desc">Creates a stored procedure or user-defined function with procedural logic, cursors, loops, and conditionals.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE [OR REPLACE] PROCEDURE <em>proc_name</em>([<em>param</em> <em>type</em>, ...])<br>
+BEGIN<br>
+&nbsp;&nbsp;<em>statements</em>;<br>
+END;<br><br>
+CREATE [OR REPLACE] FUNCTION <em>func_name</em>([<em>param</em> <em>type</em>]) RETURNS <em>type</em><br>
+BEGIN<br>
+&nbsp;&nbsp;RETURN <em>expr</em>;<br>
+END;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE PROCEDURE</span> give_raise(dept_name <span class="typ">TEXT</span>, pct <span class="typ">REAL</span>)
+<span class="kw">BEGIN</span>
+  <span class="kw">UPDATE</span> employees
+  <span class="kw">SET</span> salary = salary * (<span class="num">1</span> + pct / <span class="num">100</span>)
+  <span class="kw">WHERE</span> dept = dept_name;
+<span class="kw">END</span>;
+
+<span class="kw">CALL</span> give_raise(<span class="str">'Engineering'</span>, <span class="num">10</span>);</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="drop">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">DROP TABLE / DROP INDEX / DROP VIEW</div>
+          <div class="cmd-desc">Removes a table, index, or view and all associated data. Use IF EXISTS to avoid errors when the object does not exist.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">DROP TABLE [IF EXISTS] <em>table_name</em> [CASCADE];<br>
+DROP INDEX [IF EXISTS] <em>index_name</em> ON <em>table_name</em>;<br>
+DROP VIEW [IF EXISTS] <em>view_name</em>;<br>
+DROP PROCEDURE [IF EXISTS] <em>proc_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">DROP TABLE IF EXISTS</span> temp_staging;
+<span class="kw">DROP INDEX</span> idx_emp_dept <span class="kw">ON</span> employees;
+<span class="kw">DROP VIEW IF EXISTS</span> high_earners;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="alter-table">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">ALTER TABLE</div>
+          <div class="cmd-desc">Modifies an existing table — add/drop/rename columns, add constraints, enable CDC or partitioning.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">ALTER TABLE <em>table_name</em><br>
+&nbsp;&nbsp;ADD COLUMN <em>col</em> <em>type</em> [constraints] |<br>
+&nbsp;&nbsp;DROP COLUMN <em>col</em> |<br>
+&nbsp;&nbsp;RENAME COLUMN <em>old</em> TO <em>new</em> |<br>
+&nbsp;&nbsp;MODIFY COLUMN <em>col</em> <em>new_type</em> |<br>
+&nbsp;&nbsp;ADD CONSTRAINT <em>name</em> <em>constraint_def</em> |<br>
+&nbsp;&nbsp;ENABLE CDC |<br>
+&nbsp;&nbsp;ENABLE ROW LEVEL SECURITY;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">ALTER TABLE</span> employees <span class="kw">ADD COLUMN</span> hire_date <span class="typ">DATE</span>;
+<span class="kw">ALTER TABLE</span> employees <span class="kw">DROP COLUMN</span> old_field;
+<span class="kw">ALTER TABLE</span> orders <span class="kw">ENABLE CDC</span>;
+<span class="kw">ALTER TABLE</span> employees <span class="kw">ENABLE ROW LEVEL SECURITY</span>;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="truncate">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">TRUNCATE</div>
+          <div class="cmd-desc">Removes all rows from a table quickly without logging individual row deletions. Faster than DELETE with no WHERE clause.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">TRUNCATE [TABLE] <em>table_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">TRUNCATE TABLE</span> staging_data;
+<span class="kw">TRUNCATE</span> temp_logs;</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ DML ═══ -->
+    <section class="cmd-category" id="dml">
+      <div class="category-header">
+        <span class="category-badge cb-dml">DML</span>
+        <h2 class="category-title">Data Manipulation Language</h2>
+      </div>
+
+      <div class="cmd-entry" id="select">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SELECT</div>
+          <div class="cmd-desc">Retrieves rows from one or more tables. Supports WHERE, ORDER BY, LIMIT, GROUP BY, HAVING, all JOIN types, window functions, CTEs, UNION/INTERSECT/EXCEPT, and subqueries.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Full Syntax</div>
+          <div class="syntax-block">[WITH [RECURSIVE] <em>cte_name</em> AS (<em>select</em>), ...]<br>
+SELECT [DISTINCT] <em>expr</em> [AS <em>alias</em>], ...<br>
+FROM <em>table</em> [AS <em>alias</em>]<br>
+&nbsp;&nbsp;[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <em>table2</em> ON <em>condition</em><br>
+[WHERE <em>condition</em>]<br>
+[GROUP BY <em>col</em>, ...]<br>
+[HAVING <em>condition</em>]<br>
+[WINDOW <em>w</em> AS (PARTITION BY <em>col</em> ORDER BY <em>col</em>)]<br>
+[ORDER BY <em>col</em> [ASC|DESC], ...]<br>
+[LIMIT <em>n</em>] [OFFSET <em>n</em>]<br>
+[FOR UPDATE]<br>
+[UNION | INTERSECT | EXCEPT [ALL] <em>select</em>]</div>
+          <div class="cmd-section-label">Window Functions</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SELECT</span> name, dept, salary,
+  <span class="fn">RANK</span>() <span class="kw">OVER</span> (<span class="kw">PARTITION BY</span> dept <span class="kw">ORDER BY</span> salary <span class="kw">DESC</span>) <span class="kw">AS</span> rank,
+  <span class="fn">SUM</span>(salary) <span class="kw">OVER</span> (<span class="kw">PARTITION BY</span> dept) <span class="kw">AS</span> dept_total,
+  <span class="fn">ROW_NUMBER</span>() <span class="kw">OVER</span> () <span class="kw">AS</span> row_num,
+  <span class="fn">LAG</span>(salary, <span class="num">1</span>) <span class="kw">OVER</span> (<span class="kw">ORDER BY</span> hire_date) <span class="kw">AS</span> prev_salary
+<span class="kw">FROM</span> employees;</pre>
+          </div>
+          <div class="cmd-section-label">CTEs (Common Table Expressions)</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">WITH</span> dept_avg <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> dept, <span class="fn">AVG</span>(salary) <span class="kw">AS</span> avg_sal
+  <span class="kw">FROM</span> employees <span class="kw">GROUP BY</span> dept
+),
+<span class="kw">RECURSIVE</span> org_tree(id, name, depth) <span class="kw">AS</span> (
+  <span class="kw">SELECT</span> id, name, <span class="num">0</span> <span class="kw">FROM</span> employees <span class="kw">WHERE</span> manager <span class="kw">IS NULL</span>
+  <span class="kw">UNION ALL</span>
+  <span class="kw">SELECT</span> e.id, e.name, t.depth + <span class="num">1</span>
+  <span class="kw">FROM</span> employees e <span class="kw">JOIN</span> org_tree t <span class="kw">ON</span> e.manager = t.id
+)
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> org_tree <span class="kw">ORDER BY</span> depth;</pre>
+          </div>
+          <div class="cmd-section-label">UNION / INTERSECT / EXCEPT</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SELECT</span> id <span class="kw">FROM</span> customers
+<span class="kw">UNION ALL</span>
+<span class="kw">SELECT</span> id <span class="kw">FROM</span> suppliers;
+
+<span class="kw">SELECT</span> name <span class="kw">FROM</span> employees
+<span class="kw">INTERSECT</span>
+<span class="kw">SELECT</span> name <span class="kw">FROM</span> contractors;
+
+<span class="kw">SELECT</span> name <span class="kw">FROM</span> employees
+<span class="kw">EXCEPT</span>
+<span class="kw">SELECT</span> name <span class="kw">FROM</span> terminated;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="insert">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">INSERT INTO</div>
+          <div class="cmd-desc">Inserts one or more rows into a table. Supports VALUES, SELECT subquery, and ON DUPLICATE KEY UPDATE for upsert behavior.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">INSERT INTO <em>table</em> [(<em>col1</em>, <em>col2</em>, ...)]<br>
+VALUES (<em>val1</em>, <em>val2</em>, ...) [, (...), ...]<br>
+| SELECT <em>...</em><br>
+[ON DUPLICATE KEY UPDATE <em>col</em> = <em>val</em>, ...];</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">INSERT INTO</span> employees (name, dept, salary)
+<span class="kw">VALUES</span> (<span class="str">'Alice'</span>, <span class="str">'Engineering'</span>, <span class="num">95000</span>),
+       (<span class="str">'Bob'</span>,   <span class="str">'Marketing'</span>,   <span class="num">72000</span>);
+
+<span class="cmt">-- Insert from SELECT</span>
+<span class="kw">INSERT INTO</span> archive <span class="kw">SELECT</span> * <span class="kw">FROM</span> employees <span class="kw">WHERE</span> hire_date &lt; <span class="str">'2020-01-01'</span>;
+
+<span class="cmt">-- Upsert</span>
+<span class="kw">INSERT INTO</span> counters (key, val) <span class="kw">VALUES</span> (<span class="str">'hits'</span>, <span class="num">1</span>)
+<span class="kw">ON DUPLICATE KEY UPDATE</span> val = val + <span class="num">1</span>;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="update">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">UPDATE</div>
+          <div class="cmd-desc">Modifies existing rows in a table, optionally joining other tables for correlated updates.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">UPDATE <em>table</em> [AS <em>alias</em>]<br>
+SET <em>col1</em> = <em>expr1</em>, <em>col2</em> = <em>expr2</em>, ...<br>
+[FROM <em>other_table</em>]<br>
+[WHERE <em>condition</em>];</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">UPDATE</span> employees
+<span class="kw">SET</span> salary = salary * <span class="num">1.1</span>,
+    dept   = <span class="str">'Senior Engineering'</span>
+<span class="kw">WHERE</span> dept = <span class="str">'Engineering'</span> <span class="kw">AND</span> salary &gt; <span class="num">90000</span>;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="delete">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">DELETE</div>
+          <div class="cmd-desc">Removes rows from a table matching a WHERE condition. Without WHERE, all rows are deleted.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">DELETE FROM <em>table</em> [WHERE <em>condition</em>];</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">DELETE FROM</span> employees <span class="kw">WHERE</span> id = <span class="num">42</span>;
+<span class="kw">DELETE FROM</span> sessions <span class="kw">WHERE</span> created_at &lt; <span class="str">'2024-01-01'</span>;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="copy">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">COPY FROM / COPY TO</div>
+          <div class="cmd-desc">Bulk-loads data from a CSV/TSV file into a table, or exports table rows to a file. The fastest way to import/export large datasets.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">COPY <em>table</em> [(<em>col1</em>, ...)] FROM <span class="str">'<em>filepath</em>'</span> [WITH (FORMAT CSV, HEADER, DELIMITER <span class="str">','</span>)];<br>
+COPY <em>table</em> TO <span class="str">'<em>filepath</em>'</span> [WITH (FORMAT CSV, HEADER)];</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">COPY</span> employees <span class="kw">FROM</span> <span class="str">'/data/employees.csv'</span>
+  <span class="kw">WITH</span> (FORMAT CSV, HEADER, DELIMITER <span class="str">','</span>);
+
+<span class="kw">COPY</span> employees <span class="kw">TO</span> <span class="str">'/backup/employees_export.csv'</span>
+  <span class="kw">WITH</span> (FORMAT CSV, HEADER);</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ TRANSACTIONS ═══ -->
+    <section class="cmd-category" id="transactions">
+      <div class="category-header">
+        <span class="category-badge cb-txn">Transactions</span>
+        <h2 class="category-title">Transaction Control</h2>
+      </div>
+
+      <div class="cmd-entry" id="begin">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">BEGIN / COMMIT / ROLLBACK</div>
+          <div class="cmd-desc">Controls transaction boundaries. MilanSQL uses MVCC (Multi-Version Concurrency Control) with WAL for ACID guarantees.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">BEGIN [TRANSACTION] [ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SERIALIZABLE}];<br>
+COMMIT;<br>
+ROLLBACK;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">BEGIN</span>;
+  <span class="kw">INSERT INTO</span> orders (item, price) <span class="kw">VALUES</span> (<span class="str">'Widget'</span>, <span class="num">9.99</span>);
+  <span class="kw">UPDATE</span> inventory <span class="kw">SET</span> qty = qty - <span class="num">1</span> <span class="kw">WHERE</span> item = <span class="str">'Widget'</span>;
+<span class="kw">COMMIT</span>;
+
+<span class="kw">BEGIN</span>;
+  <span class="kw">DELETE FROM</span> orders <span class="kw">WHERE</span> id = <span class="num">99</span>;
+<span class="kw">ROLLBACK</span>; <span class="cmt">-- undoes the delete</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="savepoint">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SAVEPOINT</div>
+          <div class="cmd-desc">Creates a named checkpoint within a transaction, enabling partial rollback without aborting the entire transaction.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SAVEPOINT <em>savepoint_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">BEGIN</span>;
+  <span class="kw">INSERT INTO</span> orders <span class="kw">VALUES</span> (<span class="num">1</span>, <span class="str">'Item A'</span>, <span class="num">10.00</span>);
+  <span class="kw">SAVEPOINT</span> after_first_insert;
+  <span class="kw">INSERT INTO</span> orders <span class="kw">VALUES</span> (<span class="num">2</span>, <span class="str">'Item B'</span>, <span class="num">20.00</span>);
+  <span class="kw">ROLLBACK TO SAVEPOINT</span> after_first_insert; <span class="cmt">-- only Item B rolled back</span>
+<span class="kw">COMMIT</span>; <span class="cmt">-- Item A is committed</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="release-savepoint">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">RELEASE SAVEPOINT</div>
+          <div class="cmd-desc">Removes a named savepoint, freeing associated resources. The transaction continues normally.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">RELEASE SAVEPOINT <em>savepoint_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SAVEPOINT</span> sp1;
+<span class="cmt">-- ... do work ...</span>
+<span class="kw">RELEASE SAVEPOINT</span> sp1; <span class="cmt">-- sp1 no longer available for rollback</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="rollback-to">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">ROLLBACK TO SAVEPOINT</div>
+          <div class="cmd-desc">Rolls back all changes made after the named savepoint, without aborting the enclosing transaction.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">ROLLBACK [TRANSACTION] TO SAVEPOINT <em>savepoint_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">BEGIN</span>;
+  <span class="kw">SAVEPOINT</span> before_risky;
+  <span class="kw">UPDATE</span> accounts <span class="kw">SET</span> balance = balance - <span class="num">1000</span> <span class="kw">WHERE</span> id = <span class="num">5</span>;
+  <span class="cmt">-- something went wrong</span>
+  <span class="kw">ROLLBACK TO SAVEPOINT</span> before_risky;
+<span class="kw">COMMIT</span>;</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ ADMIN ═══ -->
+    <section class="cmd-category" id="admin">
+      <div class="category-header">
+        <span class="category-badge cb-admin">Admin</span>
+        <h2 class="category-title">Administration &amp; Introspection</h2>
+      </div>
+
+      <div class="cmd-entry" id="create-user">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE USER</div>
+          <div class="cmd-desc">Creates a new database user with an optional password for authentication.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE USER <em>username</em> [IDENTIFIED BY <span class="str">'<em>password</em>'</span>];</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE USER</span> alice <span class="kw">IDENTIFIED BY</span> <span class="str">'secret123'</span>;
+<span class="kw">CREATE USER</span> readonly_bot;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="grant">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">GRANT</div>
+          <div class="cmd-desc">Grants privileges on a table or database to a user or role.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">GRANT <em>privilege</em> [, ...] ON [TABLE] <em>object</em> TO <em>user</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">GRANT</span> SELECT, INSERT <span class="kw">ON</span> employees <span class="kw">TO</span> alice;
+<span class="kw">GRANT</span> ALL <span class="kw">ON</span> orders <span class="kw">TO</span> admin_user;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="revoke">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">REVOKE</div>
+          <div class="cmd-desc">Revokes previously granted privileges from a user.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">REVOKE <em>privilege</em> [, ...] ON [TABLE] <em>object</em> FROM <em>user</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">REVOKE</span> INSERT <span class="kw">ON</span> employees <span class="kw">FROM</span> alice;
+<span class="kw">REVOKE</span> ALL <span class="kw">ON</span> orders <span class="kw">FROM</span> readonly_bot;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="show">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SHOW TABLES / SHOW COLUMNS / SHOW INDEXES</div>
+          <div class="cmd-desc">Lists tables in the current database, columns of a table, or indexes defined on a table.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SHOW TABLES;<br>
+SHOW COLUMNS FROM <em>table_name</em>;<br>
+SHOW INDEXES FROM <em>table_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SHOW TABLES</span>;
+<span class="kw">SHOW COLUMNS FROM</span> employees;
+<span class="kw">SHOW INDEXES FROM</span> orders;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="describe">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">DESCRIBE</div>
+          <div class="cmd-desc">Shows the column structure of a table — name, type, nullability, and default values.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">DESCRIBE <em>table_name</em>;<br>
+DESC <em>table_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">DESCRIBE</span> employees;
+<span class="kw">DESC</span> orders;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="explain">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">EXPLAIN</div>
+          <div class="cmd-desc">Shows the query execution plan chosen by the optimizer — scan type, join algorithm, index usage, and estimated cost. Use EXPLAIN REWRITTEN to see optimizer rewrites.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">EXPLAIN <em>select_stmt</em>;<br>
+EXPLAIN REWRITTEN <em>select_stmt</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">EXPLAIN SELECT</span> * <span class="kw">FROM</span> employees <span class="kw">WHERE</span> dept = <span class="str">'Engineering'</span>;
+<span class="cmt">-- Output: Index Scan on idx_emp_dept (cost=0.12)</span>
+
+<span class="kw">EXPLAIN REWRITTEN SELECT</span> * <span class="kw">FROM</span> employees <span class="kw">WHERE</span> <span class="num">1</span>=<span class="num">1</span>;
+<span class="cmt">-- Rewrite: removed always-true condition WHERE 1=1</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="analyze">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">ANALYZE TABLE</div>
+          <div class="cmd-desc">Updates the optimizer's statistics for a table — row count, column cardinality, and histogram data for better query plans.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">ANALYZE TABLE <em>table_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">ANALYZE TABLE</span> employees;
+<span class="kw">ANALYZE TABLE</span> sales_facts;</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ SPECIAL ═══ -->
+    <section class="cmd-category" id="special">
+      <div class="category-header">
+        <span class="category-badge cb-special">Special</span>
+        <h2 class="category-title">Pub/Sub, Replication &amp; Security</h2>
+      </div>
+
+      <div class="cmd-entry" id="listen-notify">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">LISTEN / NOTIFY / UNLISTEN</div>
+          <div class="cmd-desc">PostgreSQL-compatible asynchronous pub/sub messaging. Sessions LISTEN on a named channel; any session can NOTIFY to broadcast messages to all listeners.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">LISTEN <em>channel_name</em>;<br>
+NOTIFY <em>channel_name</em> [, <span class="str">'<em>payload</em>'</span>];<br>
+UNLISTEN <em>channel_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="cmt">-- Session A: subscribe</span>
+<span class="kw">LISTEN</span> order_events;
+
+<span class="cmt">-- Session B: publish</span>
+<span class="kw">NOTIFY</span> order_events, <span class="str">'{"order_id": 42, "status": "shipped"}'</span>;
+
+<span class="cmt">-- Session A: unsubscribe</span>
+<span class="kw">UNLISTEN</span> order_events;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="publication">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE PUBLICATION / CREATE SUBSCRIPTION</div>
+          <div class="cmd-desc">Sets up logical replication — a publisher exports a stream of row changes, and subscribers consume that stream to replicate data.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE PUBLICATION <em>pub_name</em> FOR TABLE <em>table1</em> [, <em>table2</em>, ...];<br>
+CREATE SUBSCRIPTION <em>sub_name</em><br>
+&nbsp;&nbsp;CONNECTION <span class="str">'<em>connection_string</em>'</span><br>
+&nbsp;&nbsp;PUBLICATION <em>pub_name</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="cmt">-- On primary:</span>
+<span class="kw">CREATE PUBLICATION</span> orders_pub <span class="kw">FOR TABLE</span> orders, order_items;
+
+<span class="cmt">-- On replica:</span>
+<span class="kw">CREATE SUBSCRIPTION</span> orders_sub
+  <span class="kw">CONNECTION</span> <span class="str">'host=primary port=4406'</span>
+  <span class="kw">PUBLICATION</span> orders_pub;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="create-event">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE EVENT</div>
+          <div class="cmd-desc">Schedules a SQL statement to run at a fixed time or on a recurring interval. MySQL-compatible event scheduler.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE EVENT <em>event_name</em><br>
+ON SCHEDULE EVERY <em>n</em> {SECOND | MINUTE | HOUR | DAY}<br>
+             | AT <span class="str">'<em>timestamp</em>'</span><br>
+DO <em>sql_statement</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE EVENT</span> cleanup_sessions
+  <span class="kw">ON SCHEDULE EVERY</span> <span class="num">1</span> HOUR
+  <span class="kw">DO</span> <span class="kw">DELETE FROM</span> sessions <span class="kw">WHERE</span> expires &lt; <span class="fn">NOW</span>();
+
+<span class="kw">CREATE EVENT</span> one_time_report
+  <span class="kw">ON SCHEDULE AT</span> <span class="str">'2026-12-31 23:59:00'</span>
+  <span class="kw">DO INSERT INTO</span> reports <span class="kw">SELECT</span> * <span class="kw">FROM</span> year_summary;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="rls">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">ENABLE / DISABLE ROW LEVEL SECURITY</div>
+          <div class="cmd-desc">Enables or disables row-level security (RLS) on a table. When RLS is enabled, all access is filtered through policies unless the user is a superuser.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">ENABLE ROW LEVEL SECURITY ON <em>table_name</em>;<br>
+DISABLE ROW LEVEL SECURITY ON <em>table_name</em>;<br>
+<span class="cmt">-- or via ALTER TABLE:</span><br>
+ALTER TABLE <em>table_name</em> ENABLE ROW LEVEL SECURITY;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">ENABLE ROW LEVEL SECURITY ON</span> orders;
+<span class="kw">DISABLE ROW LEVEL SECURITY ON</span> public_catalog;</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="create-policy">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">CREATE POLICY</div>
+          <div class="cmd-desc">Defines a row-level security policy for a table. The USING expression is evaluated per row; only rows where it returns true are visible to the target user.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">CREATE POLICY <em>policy_name</em> ON <em>table_name</em><br>
+&nbsp;&nbsp;FOR {SELECT | INSERT | UPDATE | DELETE | ALL}<br>
+&nbsp;&nbsp;TO <em>username</em><br>
+&nbsp;&nbsp;USING (<em>expr</em>);</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">CREATE POLICY</span> own_orders <span class="kw">ON</span> orders
+  <span class="kw">FOR</span> SELECT <span class="kw">TO</span> alice
+  <span class="kw">USING</span> (customer_id = <span class="fn">CURRENT_USER_ID</span>());
+
+<span class="kw">CREATE POLICY</span> dept_data <span class="kw">ON</span> employees
+  <span class="kw">FOR ALL TO</span> manager
+  <span class="kw">USING</span> (dept = <span class="fn">CURRENT_USER_DEPT</span>());</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ SET/SHOW ═══ -->
+    <section class="cmd-category" id="set-show">
+      <div class="category-header">
+        <span class="category-badge cb-set">SET / SHOW</span>
+        <h2 class="category-title">Configuration &amp; Diagnostics</h2>
+      </div>
+
+      <div class="cmd-entry" id="set-query-rewrite">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SET QUERY_REWRITE</div>
+          <div class="cmd-desc">Enables or disables the adaptive query rewriter, which automatically simplifies redundant conditions and rewrites suboptimal patterns.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SET QUERY_REWRITE = {ON | OFF};</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SET</span> QUERY_REWRITE = <span class="str">ON</span>;
+<span class="cmt">-- Now WHERE 1=1 is automatically removed,</span>
+<span class="cmt">-- redundant OR conditions are simplified, etc.</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="set-parallel">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SET PARALLEL_THRESHOLD</div>
+          <div class="cmd-desc">Sets the minimum row count at which the parallel query executor kicks in, splitting work across multiple worker threads.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SET PARALLEL_THRESHOLD = <em>n</em>;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SET</span> PARALLEL_THRESHOLD = <span class="num">10000</span>;
+<span class="cmt">-- Queries touching >10,000 rows use parallel execution</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="show-query-stats">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SHOW QUERY STATS</div>
+          <div class="cmd-desc">Displays cumulative query execution statistics — total queries, cache hits, average latency, and slow query count.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SHOW QUERY STATS;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SHOW QUERY STATS</span>;
+<span class="cmt">-- total_queries: 1042</span>
+<span class="cmt">-- cache_hits: 387</span>
+<span class="cmt">-- avg_latency_ms: 0.74</span>
+<span class="cmt">-- slow_queries (>100ms): 3</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="show-index-suggestions">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SHOW INDEX SUGGESTIONS</div>
+          <div class="cmd-desc">Analyzes the adaptive optimizer's access statistics and recommends indexes based on actual query patterns observed at runtime.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SHOW INDEX SUGGESTIONS;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SHOW INDEX SUGGESTIONS</span>;
+<span class="cmt">-- CREATE INDEX idx_orders_customer ON orders(customer_id)  -- 91% filter rate</span>
+<span class="cmt">-- CREATE INDEX idx_emp_dept ON employees(dept)             -- 78% filter rate</span></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cmd-entry" id="show-engine-status">
+        <div class="cmd-entry-header">
+          <div class="cmd-name">SHOW ENGINE STATUS</div>
+          <div class="cmd-desc">Displays the current engine state — active transactions, buffer pool usage, WAL position, replication lag, and background worker status.</div>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-section-label">Syntax</div>
+          <div class="syntax-block">SHOW ENGINE STATUS;</div>
+          <div class="cmd-section-label">Example</div>
+          <div class="example-block">
+            <div class="example-bar">SQL</div>
+            <pre><span class="kw">SHOW ENGINE STATUS</span>;
+<span class="cmt">-- active_transactions: 2</span>
+<span class="cmt">-- buffer_pool_pages: 1024 / 4096</span>
+<span class="cmt">-- wal_lsn: 0x00041FA0</span>
+<span class="cmt">-- replication_lag_ms: 12</span>
+<span class="cmt">-- event_scheduler: running (3 events)</span></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-inner">
+    <div class="footer-top">
+      <div class="footer-brand">
+        <a href="index.html" class="nav-logo">
+          <span class="blue">Milan</span><span class="white">SQL</span>
+        </a>
+        <p>A production-grade relational database engine built phase-by-phase from scratch in C++17 — zero external dependencies, header-only, binary storage format v9.</p>
+      </div>
+      <div class="footer-col">
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="sql-reference.html">SQL Reference</a></li>
+          <li><a href="tutorial.html">Tutorial</a></li>
+          <li><a href="architecture.html">Architecture</a></li>
+          <li><a href="demo.html">Live Demo</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h4>Project</h4>
+        <ul>
+          <li><a href="https://github.com/haidari9819-lang/milansql">GitHub Repository</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0">Download v5.0.0</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/blob/main/LICENSE">MIT License</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>Built with <span class="footer-heart">❤️</span> by <a href="https://github.com/haidari9819-lang" style="color:#475569;text-decoration:none;">Mirwais Haidari</a></span>
+      <span>© 2026 MilanSQL · MIT License</span>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

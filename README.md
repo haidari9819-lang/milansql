@@ -6,7 +6,7 @@
 
 Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
-![Version](https://img.shields.io/badge/version-v4.0.0-gold)
+![Version](https://img.shields.io/badge/version-v5.0.0-gold)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
@@ -14,10 +14,30 @@ Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
 <!-- Topics: database sql cpp c-plus-plus query-engine btree replication mvcc window-functions postgresql-compatible -->
 
-**From Zero to PostgreSQL Challenger — 100 phases, pure C++17**
+**From Zero to v5.0.0 — 108 phases, pure C++17**
 
 > A complete relational database engine built from scratch in C++17.  
-> 100 development phases. Zero external dependencies. 5 network protocols.
+> 108 development phases. Zero external dependencies. 5 network protocols.
+
+## Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 108 phases |
+| [Tutorial](docs/tutorial.html) | Step-by-step getting started guide |
+| [Architecture](docs/architecture.html) | Internal architecture deep-dive |
+| [Live Demo](docs/demo.html) | Try MilanSQL in your browser |
+| [WASM Build](WASM_BUILD.md) | Build for WebAssembly / Emscripten |
+
+## Client Drivers
+
+| Language | Install | Protocol |
+|----------|---------|----------|
+| Python | `pip install milansql` | DB-API 2.0, TCP :4406 |
+| Node.js | `npm install milansql` | TCP :4406 |
+| Java | `com.milansql:milansql-jdbc:5.0.0` | JDBC over TCP |
+| Rust | `cargo add milansql` | TCP :4406 |
+| .NET | `dotnet add package MilanSQL.Data` | ADO.NET over TCP |
 
 ## Quick Start
 
@@ -175,13 +195,18 @@ const conn = await connect({ host: 'localhost', port: 4406 });
 const rows = await conn.query('SELECT * FROM users');
 ```
 
-## Performance
+## Benchmarks (TPC-H SF 0.01)
 
-- **INSERT throughput:** ~98,000 ops/sec
-- **SELECT (no index):** ~1M rows/sec scan
-- **Index lookup:** O(log n) B-Tree
-- **Parallel queries:** up to N worker threads
-- **Column store:** 5-10x faster aggregation for OLAP
+| Metric | MilanSQL v5.0.0 |
+|--------|-----------------|
+| INSERT throughput | ~98,000 rows/sec |
+| SELECT scan | ~1M rows/sec |
+| Index lookup | O(log n) B-Tree |
+| Q1 (GROUP BY) | &lt;10 ms |
+| Q3 (3-table JOIN) | &lt;20 ms |
+| Q5 (5-table JOIN) | &lt;30 ms |
+| Column store vs row | 5–10× faster aggregation |
+| Test suite | 223 tests, 0 failures |
 
 ## License
 

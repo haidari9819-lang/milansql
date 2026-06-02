@@ -778,12 +778,13 @@
     </a>
     <ul class="nav-links">
       <li><a href="#features">Features</a></li>
-      <li><a href="#code">Docs</a></li>
-      <li><a href="#start">Download</a></li>
       <li><a href="demo.html">Live Demo</a></li>
+      <li><a href="sql-reference.html">SQL Reference</a></li>
+      <li><a href="tutorial.html">Tutorial</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
       <li><a href="https://github.com/haidari9819-lang/milansql">GitHub</a></li>
     </ul>
-    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v4.0.0" class="nav-btn">Get Started</a>
+    <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0" class="nav-btn">Get Started</a>
   </div>
 </nav>
 
@@ -793,7 +794,7 @@
 
     <div class="hero-left">
       <div class="hero-pill">
-        <span>✦</span> Now at v4.0.0 · 100 Phases Complete
+        <span>✦</span> Now at v5.0.0 · 108 Phases Complete
       </div>
       <div class="hero-eyebrow">The Database Engine</div>
       <h1 class="hero-title">
@@ -801,13 +802,13 @@
         <span class="gradient-text">Scratch.</span>
       </h1>
       <p class="hero-tagline">
-        100 phases. 5 network protocols. Zero dependencies.<br>
+        108 phases. 5 network protocols. Zero dependencies.<br>
         A complete relational database engine with ACID transactions,
-        PostgreSQL Wire Protocol, GraphQL API, CDC, and adaptive query optimizer.
+        PostgreSQL Wire Protocol, GraphQL API, CDC, WebSocket, WASM, and adaptive query optimizer.
       </p>
       <div class="hero-buttons">
-        <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v4.0.0" class="btn-hero-primary">
-          ⬇ Download v4.0.0
+        <a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0" class="btn-hero-primary">
+          ⬇ Download v5.0.0
         </a>
         <a href="demo.html" class="btn-hero-primary" style="background:linear-gradient(135deg,#238636,#1a7f37);">
           &#9889; Try it Online
@@ -820,7 +821,7 @@
         <span class="badge"><span class="dot"></span> CI passing</span>
         <span class="badge">C++17</span>
         <span class="badge">0 dependencies</span>
-        <span class="badge">100 phases</span>
+        <span class="badge">108 phases</span>
       </div>
     </div>
 
@@ -863,7 +864,7 @@
 <div class="stats-bar">
   <div class="stats-grid">
     <div class="stat-item">
-      <div class="stat-number">100</div>
+      <div class="stat-number">108</div>
       <div class="stat-label">Development Phases</div>
     </div>
     <div class="stat-item">
@@ -1210,6 +1211,35 @@ $ curl http://localhost:<span class="num">8080</span>/health
   </div>
 </section>
 
+<!-- ═══════════════════════════════════════ DOCS ══ -->
+<section class="section" id="docs">
+  <div class="section-inner">
+    <span class="section-tag">Documentation</span>
+    <h2 class="section-title">Everything you need<br><span class="gradient-text">to get started.</span></h2>
+    <p class="section-sub">Comprehensive guides, SQL reference, and architecture docs — all in one place.</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon-box ic-blue">📖</div>
+        <h3>SQL Reference</h3>
+        <p>Complete reference for all SQL commands — DDL, DML, transactions, window functions, CTEs, and MilanSQL-specific extensions.</p>
+        <a href="sql-reference.html" class="feature-link">Open reference →</a>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon-box ic-purple">🎓</div>
+        <h3>Tutorial</h3>
+        <p>Step-by-step tutorial from first query to advanced features — joins, transactions, replication, and client drivers.</p>
+        <a href="tutorial.html" class="feature-link">Start tutorial →</a>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon-box ic-cyan">🏗️</div>
+        <h3>Architecture</h3>
+        <p>Deep-dive into the query pipeline, storage format, optimizer layers, and concurrency model of MilanSQL.</p>
+        <a href="architecture.html" class="feature-link">Explore architecture →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ════════════════════════════ GETTING STARTED ══ -->
 <section class="section" id="start">
   <div class="section-inner">
@@ -1296,7 +1326,7 @@ conn = milansql.connect(
         <h4>Project</h4>
         <ul>
           <li><a href="https://github.com/haidari9819-lang/milansql">GitHub Repository</a></li>
-          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v4.0.0">Download v4.0.0</a></li>
+          <li><a href="https://github.com/haidari9819-lang/milansql/releases/tag/v5.0.0">Download v5.0.0</a></li>
           <li><a href="https://github.com/haidari9819-lang/milansql/releases">All Releases</a></li>
           <li><a href="https://github.com/haidari9819-lang/milansql/issues">Issues</a></li>
         </ul>

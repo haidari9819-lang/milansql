@@ -1,0 +1,22 @@
+Package: milansql
+Version: 5.7.0
+Architecture: amd64
+Maintainer: Mirwais Haidari <haidari9819@gmail.com>
+Section: database
+Priority: optional
+Homepage: https://haidari9819-lang.github.io/milansql/
+Description: Production-grade SQL database engine
+ MilanSQL is a relational database engine built from scratch in C++17
+ with zero external dependencies. It supports SQL-92 syntax, MVCC
+ transactions, WAL crash recovery, full-text search, JSON, time-series,
+ and a built-in HTTP/GraphQL API.
+ .
+ Features:
+  - ACID transactions with MVCC
+  - WAL crash recovery + Double-Write Buffer
+  - MySQL and PostgreSQL wire protocol compatibility
+  - Built-in HTTP REST and GraphQL APIs
+  - Native C++17, zero external dependencies
+Depends: libc6 (>= 2.17), libstdc++6 (>= 9.0)
+Recommends: systemd
+Installed-Size: 4096

@@ -1,0 +1,158 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Linux build ─────────────────────────────────────────────
+  build-linux:
+    name: Build Linux (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build g++ strip
+
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17
+          cmake --build build --parallel $(nproc)
+          strip build/milansql
+
+      - name: Run tests
+        run: |
+          cmake --build build --target milansql_tests
+          ./build/milansql_tests
+
+      - name: Package tar.gz
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          tar -czf "milansql-${TAG}-linux-x64.tar.gz" \
+            -C build milansql \
+            README.md LICENSE INSTALL.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: milansql-linux-x64
+          path: milansql-*-linux-x64.tar.gz
+          retention-days: 7
+
+  # ── Windows build ────────────────────────────────────────────
+  build-windows:
+    name: Build Windows (MSYS2/UCRT64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17
+          cmake --build build --parallel
+
+      - name: Run tests
+        shell: msys2 {0}
+        run: |
+          cmake --build build --target milansql_tests
+          ./build/milansql_tests.exe
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          Compress-Archive `
+            -Path build/milansql.exe, README.md, LICENSE, INSTALL.md `
+            -DestinationPath "milansql-$tag-windows-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: milansql-windows-x64
+          path: milansql-*-windows-x64.zip
+          retention-days: 7
+
+  # ── macOS build ──────────────────────────────────────────────
+  build-macos:
+    name: Build macOS (ARM64/x64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_STANDARD=17
+          cmake --build build --parallel $(sysctl -n hw.ncpu)
+          strip build/milansql
+
+      - name: Run tests
+        run: |
+          cmake --build build --target milansql_tests
+          ./build/milansql_tests
+
+      - name: Package tar.gz
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          tar -czf "milansql-${TAG}-macos-arm64.tar.gz" \
+            -C build milansql \
+            README.md LICENSE INSTALL.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: milansql-macos-arm64
+          path: milansql-*-macos-arm64.tar.gz
+          retention-days: 7
+
+  # ── Create GitHub Release ────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts
+        run: find artifacts/ -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/milansql-linux-x64/*.tar.gz
+            artifacts/milansql-windows-x64/*.zip
+            artifacts/milansql-macos-arm64/*.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

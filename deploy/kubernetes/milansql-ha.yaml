@@ -1,0 +1,188 @@
+---
+# ConfigMap: replication configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: milansql-ha-config
+  labels:
+    app: milansql-ha
+data:
+  replication.conf: |
+    # MilanSQL HA Replication Configuration
+    # Pod index 0 = master, index 1+ = read replicas
+    replication_enabled=true
+    binlog_enabled=true
+    sync_commit=ON
+    max_replicas=2
+  startup.sh: |
+    #!/bin/bash
+    # Determine role from pod ordinal index
+    ORDINAL=${POD_NAME##*-}
+    if [ "$ORDINAL" = "0" ]; then
+      echo "Starting as MASTER (index 0)"
+      exec /usr/bin/milansql --server --port 4406 \
+        --http --http-port 8080 \
+        --replication-master \
+        --data-dir /milansql/data
+    else
+      echo "Starting as REPLICA (index $ORDINAL), waiting for master..."
+      # Wait for master to be ready
+      until nc -z milansql-ha-0.milansql-ha-headless 4406; do
+        echo "Waiting for master milansql-ha-0..."
+        sleep 3
+      done
+      exec /usr/bin/milansql --server --port 4406 \
+        --http --http-port 8080 \
+        --replication-slave \
+        --master-host milansql-ha-0.milansql-ha-headless \
+        --master-port 4406 \
+        --data-dir /milansql/data
+    fi
+
+---
+# Headless service for HA StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: milansql-ha-headless
+  labels:
+    app: milansql-ha
+spec:
+  clusterIP: None
+  selector:
+    app: milansql-ha
+  ports:
+  - name: tcp
+    port: 4406
+    targetPort: 4406
+
+---
+# Read service (all pods)
+apiVersion: v1
+kind: Service
+metadata:
+  name: milansql-ha-read
+  labels:
+    app: milansql-ha
+spec:
+  selector:
+    app: milansql-ha
+  ports:
+  - name: tcp
+    port: 4406
+    targetPort: 4406
+  - name: http
+    port: 8080
+    targetPort: 8080
+
+---
+# Write service (master only, via label selector)
+apiVersion: v1
+kind: Service
+metadata:
+  name: milansql-ha-write
+  labels:
+    app: milansql-ha
+spec:
+  selector:
+    app: milansql-ha
+    role: master
+  ports:
+  - name: tcp
+    port: 4406
+    targetPort: 4406
+
+---
+# HA StatefulSet: 3 replicas (1 master + 2 slaves)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: milansql-ha
+  labels:
+    app: milansql-ha
+spec:
+  serviceName: milansql-ha-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: milansql-ha
+  template:
+    metadata:
+      labels:
+        app: milansql-ha
+    spec:
+      terminationGracePeriodSeconds: 60
+      initContainers:
+      - name: init-replica
+        image: busybox:1.35
+        command:
+        - sh
+        - -c
+        - |
+          ORDINAL=${POD_NAME##*-}
+          if [ "$ORDINAL" != "0" ]; then
+            echo "Replica $ORDINAL: waiting for master milansql-ha-0..."
+            until nc -z milansql-ha-0.milansql-ha-headless 4406 2>/dev/null; do
+              echo "Master not ready, retrying in 3s..."
+              sleep 3
+            done
+            echo "Master is ready."
+          fi
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      containers:
+      - name: milansql
+        image: milansql/milansql:5.7.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "/milansql/config/startup.sh"]
+        ports:
+        - containerPort: 4406
+          name: tcp
+        - containerPort: 8080
+          name: http
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /status
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        volumeMounts:
+        - name: data
+          mountPath: /milansql/data
+        - name: config
+          mountPath: /milansql/config
+      volumes:
+      - name: config
+        configMap:
+          name: milansql-ha-config
+          defaultMode: 0755
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi

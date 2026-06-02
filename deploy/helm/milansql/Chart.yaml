@@ -1,0 +1,19 @@
+apiVersion: v2
+name: milansql
+description: MilanSQL — Production-grade SQL database engine written in C++17
+type: application
+version: 5.7.0
+appVersion: "5.7.0"
+keywords:
+  - database
+  - sql
+  - milansql
+  - relational
+home: https://haidari9819-lang.github.io/milansql/
+sources:
+  - https://github.com/haidari9819-lang/milansql
+maintainers:
+  - name: Mirwais Haidari
+    email: haidari9819@gmail.com
+annotations:
+  category: Database

@@ -1,0 +1,29 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+  configure)
+    # Create dedicated system user
+    if ! id -u milansql >/dev/null 2>&1; then
+      useradd -r -s /bin/false -d /var/lib/milansql milansql
+    fi
+
+    # Create data directory
+    mkdir -p /var/lib/milansql
+    chown milansql:milansql /var/lib/milansql
+    chmod 750 /var/lib/milansql
+
+    # Create log directory
+    mkdir -p /var/log/milansql
+    chown milansql:milansql /var/log/milansql
+
+    # Enable and start service
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload || true
+      systemctl enable milansql || true
+      systemctl start milansql || true
+    fi
+    ;;
+esac
+
+exit 0

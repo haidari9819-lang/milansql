@@ -1,0 +1,77 @@
+# MilanSQL Helm Chart — Default Values
+# Override with: helm install milansql ./milansql -f my-values.yaml
+
+replicaCount: 1
+
+image:
+  repository: milansql/milansql
+  tag: "5.7.0"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  tcpPort: 4406
+  mysqlPort: 4407
+  pgPort: 5433
+  httpPort: 8080
+  graphqlPort: 8081
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+  limits:
+    memory: "2Gi"
+    cpu: "2000m"
+
+persistence:
+  enabled: true
+  storageClass: ""   # "" = cluster default
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  annotations: {}
+
+replication:
+  enabled: false
+  replicas: 1
+
+ssl:
+  enabled: false
+  # secretName: milansql-tls  # Kubernetes TLS secret
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+
+securityContext: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+livenessProbe:
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+config:
+  serverPort: 4406
+  httpPort: 8080
+  # Additional milansql config options
+  # autoCheckpointInterval: 1000
+  # maxConnections: 100

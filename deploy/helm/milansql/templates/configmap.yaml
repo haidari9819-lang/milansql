@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "milansql.fullname" . }}-config
+  labels:
+    {{- include "milansql.labels" . | nindent 4 }}
+data:
+  milansql.conf: |
+    server_port={{ .Values.config.serverPort }}
+    http_port={{ .Values.config.httpPort }}
+    data_dir=/milansql/data
+    {{- if .Values.ssl.enabled }}
+    ssl=ON
+    {{- end }}
+    {{- if .Values.replication.enabled }}
+    replication_enabled=true
+    {{- end }}

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+  remove|purge)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop milansql || true
+      systemctl disable milansql || true
+    fi
+    ;;
+esac
+
+exit 0

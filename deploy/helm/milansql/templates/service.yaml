@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "milansql.fullname" . }}
+  labels:
+    {{- include "milansql.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "milansql.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: tcp
+    port: {{ .Values.service.tcpPort }}
+    targetPort: tcp
+    protocol: TCP
+  - name: mysql
+    port: {{ .Values.service.mysqlPort }}
+    targetPort: mysql
+    protocol: TCP
+  - name: postgres
+    port: {{ .Values.service.pgPort }}
+    targetPort: postgres
+    protocol: TCP
+  - name: http
+    port: {{ .Values.service.httpPort }}
+    targetPort: http
+    protocol: TCP
+  - name: graphql
+    port: {{ .Values.service.graphqlPort }}
+    targetPort: graphql
+    protocol: TCP
+---
+# Headless service for StatefulSet pod DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "milansql.fullname" . }}-headless
+  labels:
+    {{- include "milansql.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "milansql.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: tcp
+    port: {{ .Values.service.tcpPort }}
+    targetPort: tcp

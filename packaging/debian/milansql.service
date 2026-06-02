@@ -1,0 +1,35 @@
+[Unit]
+Description=MilanSQL Database Engine
+Documentation=https://haidari9819-lang.github.io/milansql/
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=milansql
+Group=milansql
+WorkingDirectory=/var/lib/milansql
+ExecStart=/usr/bin/milansql \
+  --server --port 4406 \
+  --http --http-port 8080
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/milansql /var/log/milansql
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=32768
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=milansql
+
+[Install]
+WantedBy=multi-user.target

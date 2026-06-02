@@ -4436,6 +4436,20 @@ private:
                     ++i;
                 }
                 if (i < end) ++i; // skip )
+                // Phase 119: IN BOOLEAN MODE / IN NATURAL LANGUAGE MODE
+                if (i + 2 < end && toUpper(ft[i]) == "IN") {
+                    std::string mode2 = toUpper(ft[i + 1]);
+                    std::string mode3 = (i + 3 < end) ? toUpper(ft[i + 2]) : "";
+                    if (mode2 == "BOOLEAN" && mode3 == "MODE") {
+                        cond.matchMode = "BOOLEAN";
+                        i += 3;
+                    } else if (mode2 == "NATURAL" && i + 3 < end &&
+                               toUpper(ft[i + 2]) == "LANGUAGE" &&
+                               i + 4 < end && toUpper(ft[i + 3]) == "MODE") {
+                        cond.matchMode = "";
+                        i += 4;
+                    }
+                }
                 cmd.whereConds.push_back(cond);
                 continue;
             }

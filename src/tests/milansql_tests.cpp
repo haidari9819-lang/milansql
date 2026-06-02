@@ -2318,6 +2318,97 @@ static void testGroup36() {
     check(engine.getCursor("emp_cursor") == nullptr, "DEALLOCATE removes cursor");
 }
 
+// ── Group 37: Phase 119 — Full-Text Search V2 (BM25 + Boolean + SNIPPET) ────
+static void testGroup37() {
+    std::cout << "\n--- Group 37: Full-Text Search V2 (BM25 + Boolean Mode + SNIPPET) ---\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+
+    // Setup
+    execSQL(engine, parser, "CREATE TABLE articles (id INT, title TEXT, body TEXT)");
+    execSQL(engine, parser, "INSERT INTO articles VALUES (1, 'SQL Basics', 'Learn SQL SELECT and INSERT')");
+    execSQL(engine, parser, "INSERT INTO articles VALUES (2, 'Advanced SQL', 'Window functions and CTEs in SQL')");
+    execSQL(engine, parser, "INSERT INTO articles VALUES (3, 'NoSQL Guide', 'Document stores and graph databases')");
+    execSQL(engine, parser, "CREATE FULLTEXT INDEX ft_body ON articles (body)");
+
+    // BM25 search — basic via searchFulltext
+    {
+        auto results = engine.searchFulltext("articles", {"body"}, "SQL");
+        check(results.size() >= 2, "BM25 searchFulltext finds multiple SQL docs");
+    }
+
+    // BM25 search via WHERE MATCH AGAINST (natural language)
+    {
+        milansql::WhereCondition wc;
+        wc.isMatchAgainst = true;
+        wc.matchCols = {"body"};
+        wc.againstQuery = "SQL";
+        wc.matchMode = "";
+        auto tbl = engine.selectWhere("articles", {wc}, "AND").table;
+        check(tbl.rowCount() >= 2, "MATCH AGAINST 'SQL' natural language finds >= 2 rows");
+    }
+
+    // Boolean mode — required term (+SQL)
+    {
+        milansql::WhereCondition wc;
+        wc.isMatchAgainst = true;
+        wc.matchCols = {"body"};
+        wc.againstQuery = "+SQL";
+        wc.matchMode = "BOOLEAN";
+        auto tbl = engine.selectWhere("articles", {wc}, "AND").table;
+        check(tbl.rowCount() >= 1, "Boolean +SQL finds SQL docs");
+        // NoSQL row contains SQL (it's part of NoSQL) - depends on tokenizer
+        // At minimum 2 rows with "SQL" as substring
+    }
+
+    // Boolean mode — excluded term (+SQL -INSERT)
+    {
+        milansql::WhereCondition wc;
+        wc.isMatchAgainst = true;
+        wc.matchCols = {"body"};
+        wc.againstQuery = "+sql -insert";
+        wc.matchMode = "BOOLEAN";
+        auto tbl = engine.selectWhere("articles", {wc}, "AND").table;
+        check(tbl.rowCount() >= 1, "Boolean +sql -insert excludes INSERT docs");
+        // Verify that no row contains "insert"
+        bool anyInsert = false;
+        for (const auto& row : tbl.rows()) {
+            for (const auto& v : row.values) {
+                std::string lv = v;
+                for (char& c : lv) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lv.find("insert") != std::string::npos) { anyInsert = true; break; }
+            }
+        }
+        check(!anyInsert, "Boolean +sql -insert: no row contains insert");
+    }
+
+    // Boolean mode via searchBooleanMode
+    {
+        auto results = engine.searchBooleanMode("articles", {"body"}, "+sql -insert");
+        check(results.size() >= 1, "searchBooleanMode +sql -insert returns >= 1 result");
+    }
+
+    // SNIPPET function — using evaluateFunc
+    {
+        milansql::Table tmpTbl("", {milansql::Column("body", "TEXT")});
+        milansql::Row row({"Learn SQL SELECT and INSERT operations"});
+        std::string snippet = engine.evalFuncPublic("SNIPPET", {"'Learn SQL SELECT and INSERT operations'", "'SQL'"});
+        check(!snippet.empty(), "SNIPPET function returns non-empty text");
+        // snippet should contain SQL context
+        std::string lsnip = snippet;
+        for (char& c : lsnip) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        check(lsnip.find("sql") != std::string::npos || lsnip.find("learn") != std::string::npos,
+              "SNIPPET contains relevant text");
+    }
+
+    // avgDocLength was computed during index build
+    {
+        auto results = engine.searchFulltext("articles", {"body"}, "databases");
+        // "NoSQL Guide" body contains "databases"
+        check(results.size() >= 1, "BM25 finds 'databases' doc");
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
@@ -2434,6 +2525,9 @@ int main() {
     }
     try { testGroup36(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 36 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup37(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 37 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

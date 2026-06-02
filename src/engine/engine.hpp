@@ -58,6 +58,8 @@
 #include "../timeseries/timeseries_manager.hpp" // Phase 97: Time-Series
 #include "../cdc/cdc_manager.hpp"               // Phase 98: CDC
 #include "../federation/federation_manager.hpp" // Phase 105: Query Federation
+#include "../search/bm25.hpp"                  // Phase 119: BM25 Scorer
+#include "../search/boolean_mode.hpp"          // Phase 119: Boolean Mode Parser
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -204,6 +206,8 @@ struct WhereCondition {
     bool                     isMatchAgainst = false;
     std::vector<std::string> matchCols;
     std::string              againstQuery;
+    // Phase 119: match mode: "" = natural language, "BOOLEAN" = boolean mode
+    std::string              matchMode;
 
     // Default constructor (all fields zero-/empty-initialized)
     WhereCondition() = default;
@@ -285,6 +289,8 @@ struct FullTextIndex {
     std::map<size_t, std::map<std::string,int>> forwardIndex;
     // total word counts per row
     std::map<size_t, int> rowWordCount;
+    // Phase 119: BM25 average document length
+    double avgDocLength = 0.0;
 };
 
 // ── Phase 43: Trigger-Definition ─────────────────────────────
@@ -2457,6 +2463,13 @@ public:
             std::sort(idxList.begin(), idxList.end());
             idxList.erase(std::unique(idxList.begin(), idxList.end()), idxList.end());
         }
+
+        // Phase 119: compute avgDocLength for BM25
+        double totalLen = 0;
+        for (const auto& [docId, wc] : idx.rowWordCount) {
+            totalLen += wc;
+        }
+        idx.avgDocLength = idx.rowWordCount.empty() ? 0.0 : totalLen / idx.rowWordCount.size();
     }
 
     void createFulltextIndex(const std::string& idxName, const std::string& tableNameRaw,
@@ -2506,20 +2519,26 @@ public:
         std::map<size_t, double> scores;
 
         if (idx) {
+            // Phase 119: BM25 scoring
+            int totalDocs = (int)idx->rowWordCount.size();
+            double avgLen = idx->avgDocLength > 0.0 ? idx->avgDocLength : 1.0;
+
             for (const auto& qw : queryWords) {
                 auto it = idx->invertedIndex.find(qw);
                 if (it == idx->invertedIndex.end()) continue;
+                int docsWithTerm = (int)it->second.size();
                 for (size_t rowI : it->second) {
-                    int termCount = 0;
+                    int termFreq = 0;
                     auto fi2 = idx->forwardIndex.find(rowI);
                     if (fi2 != idx->forwardIndex.end()) {
                         auto wi = fi2->second.find(qw);
-                        if (wi != fi2->second.end()) termCount = wi->second;
+                        if (wi != fi2->second.end()) termFreq = wi->second;
                     }
-                    int totalWords = 1;
+                    int docLen = 1;
                     auto wc = idx->rowWordCount.find(rowI);
-                    if (wc != idx->rowWordCount.end()) totalWords = std::max(1, wc->second);
-                    scores[rowI] += (double)termCount / totalWords;
+                    if (wc != idx->rowWordCount.end()) docLen = std::max(1, wc->second);
+                    scores[rowI] += Bm25Scorer::score(termFreq, docLen, avgLen,
+                                                       docsWithTerm, totalDocs);
                 }
             }
         } else {
@@ -2529,6 +2548,11 @@ public:
             const auto& cols = table.columns();
             const auto& rows = table.rows();
 
+            // Phase 119: BM25 for non-indexed fallback
+            // First pass: compute corpus stats
+            std::vector<std::map<std::string,int>> docWordMaps(rows.size());
+            std::vector<int> docLengths(rows.size(), 0);
+            double totalDocLen = 0;
             for (size_t rowI = 0; rowI < rows.size(); ++rowI) {
                 std::string fullText;
                 for (const auto& colName : searchCols) {
@@ -2540,12 +2564,25 @@ public:
                     }
                 }
                 auto words = tokenizeText(fullText);
-                int totalWords = std::max(1, (int)words.size());
-                std::map<std::string,int> wc;
-                for (const auto& w : words) wc[w]++;
-                for (const auto& qw : queryWords) {
-                    auto it = wc.find(qw);
-                    if (it != wc.end()) scores[rowI] += (double)it->second / totalWords;
+                docLengths[rowI] = (int)words.size();
+                totalDocLen += docLengths[rowI];
+                for (const auto& w : words) docWordMaps[rowI][w]++;
+            }
+            double avgLen = rows.empty() ? 1.0 : totalDocLen / rows.size();
+            int totalDocs = (int)rows.size();
+
+            for (const auto& qw : queryWords) {
+                int docsWithTerm = 0;
+                for (size_t rowI = 0; rowI < rows.size(); ++rowI) {
+                    if (docWordMaps[rowI].count(qw)) docsWithTerm++;
+                }
+                for (size_t rowI = 0; rowI < rows.size(); ++rowI) {
+                    auto it = docWordMaps[rowI].find(qw);
+                    if (it != docWordMaps[rowI].end()) {
+                        scores[rowI] += Bm25Scorer::score(it->second,
+                            std::max(1, docLengths[rowI]), avgLen,
+                            docsWithTerm, totalDocs);
+                    }
                 }
             }
         }
@@ -2556,6 +2593,69 @@ public:
         std::sort(result.begin(), result.end(),
                   [](const auto& a, const auto& b){ return a.second > b.second; });
         return result;
+    }
+
+    // Phase 119: Boolean Mode search — returns row indices matching the boolean query
+    std::vector<size_t> searchBooleanMode(
+            const std::string& tableNameRaw,
+            const std::vector<std::string>& searchCols,
+            const std::string& query) const {
+        auto tableName = resolveTableName(tableNameRaw);
+        auto tblIt = tables_.find(tableName);
+        if (tblIt == tables_.end()) return {};
+
+        const auto& table = tblIt->second;
+        const auto& cols = table.columns();
+        const auto& rows = table.rows();
+
+        auto boolTerms = BooleanModeParser::parse(query);
+        if (boolTerms.empty()) return {};
+
+        std::vector<size_t> result;
+        for (size_t rowI = 0; rowI < rows.size(); ++rowI) {
+            if (rows[rowI].xmax != 0) continue;  // skip dead rows
+            std::string fullText;
+            for (const auto& colName : searchCols) {
+                for (size_t c = 0; c < cols.size(); ++c) {
+                    if (cols[c].name == colName && c < rows[rowI].values.size()) {
+                        fullText += " " + rows[rowI].values[c];
+                        break;
+                    }
+                }
+            }
+            if (BooleanModeParser::match(fullText, boolTerms)) {
+                result.push_back(rowI);
+            }
+        }
+        return result;
+    }
+
+    // Phase 119: Compute snippet for a given row and query
+    std::string computeSnippet(const std::string& tableNameRaw,
+                                size_t rowIdx,
+                                const std::vector<std::string>& searchCols,
+                                const std::string& query,
+                                int maxLen = 150) const {
+        auto tableName = resolveTableName(tableNameRaw);
+        auto tblIt = tables_.find(tableName);
+        if (tblIt == tables_.end()) return "";
+
+        const auto& table = tblIt->second;
+        const auto& cols = table.columns();
+        const auto& rows = table.rows();
+        if (rowIdx >= rows.size()) return "";
+
+        std::string fullText;
+        for (const auto& colName : searchCols) {
+            for (size_t c = 0; c < cols.size(); ++c) {
+                if (cols[c].name == colName && c < rows[rowIdx].values.size()) {
+                    fullText += rows[rowIdx].values[c] + " ";
+                    break;
+                }
+            }
+        }
+        if (!fullText.empty() && fullText.back() == ' ') fullText.pop_back();
+        return extractSnippet(fullText, query, maxLen);
     }
 
     // Returns fulltext indexes for a given table (for SHOW INDEXES)
@@ -5162,6 +5262,18 @@ private:
             return vector_ext::evalVector(fn, rargs);
         }
 
+        // ── Phase 119: SNIPPET(col, query [, maxLen]) ─────────────
+        if (fn == "SNIPPET") {
+            if (args.size() < 2) return "";
+            std::string text  = resolveArg(args[0]);
+            std::string query = resolveArg(args[1]);
+            int maxLen = 150;
+            if (args.size() >= 3) {
+                try { maxLen = std::stoi(resolveArg(args[2])); } catch (...) {}
+            }
+            return extractSnippet(text, query, maxLen);
+        }
+
         return "";
     }
 
@@ -5578,6 +5690,12 @@ private:
                     if (ci2 >= 0 && static_cast<size_t>(ci2) < row.values.size())
                         text += " " + row.values[static_cast<size_t>(ci2)];
                 }
+                // Phase 119: Boolean mode support
+                if (c.matchMode == "BOOLEAN") {
+                    auto boolTerms = BooleanModeParser::parse(c.againstQuery);
+                    return BooleanModeParser::match(text, boolTerms);
+                }
+                // Natural language mode (default)
                 auto docWords = tokenizeText(text);
                 std::set<std::string> docSet(docWords.begin(), docWords.end());
                 auto qWords = tokenizeText(c.againstQuery);

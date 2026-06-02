@@ -60,6 +60,7 @@
 #include "../federation/federation_manager.hpp" // Phase 105: Query Federation
 #include "../search/bm25.hpp"                  // Phase 119: BM25 Scorer
 #include "../search/boolean_mode.hpp"          // Phase 119: Boolean Mode Parser
+#include "../profiler/slow_query_log.hpp"      // Phase 120: Slow Query Log
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1020,6 +1021,9 @@ public:
         loadSubscriptions_();
         loadPagedTableSchemas_();
     }
+
+    // ── Phase 120: Slow Query Log (public so dispatch can access) ──
+    SlowQueryLog slowQueryLog;
 
     // ── Phase 75: Row-Level Security ──────────────────────────
     struct RlsPolicy {

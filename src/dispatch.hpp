@@ -31,6 +31,7 @@
 #include "utils/csv_utils.hpp"
 #include "scheduler/event_scheduler.hpp"
 #include "profiler/query_profiler.hpp"  // Phase 69: Query Profiler
+#include "profiler/slow_query_log.hpp"  // Phase 120: Slow Query Log
 #include "pubsub/pubsub.hpp"           // Phase 76: LISTEN/NOTIFY
 #include "copy/copy_manager.hpp"       // Phase 92: COPY FROM/TO
 #include "cache/statement_cache.hpp"   // Phase 93: Prepared Statement Cache
@@ -1968,6 +1969,8 @@ inline bool dispatchCommand(
                 "{type=\"" + qtype + "\"}");
     }
     auto prom_t0_ = std::chrono::steady_clock::now();
+    // Phase 120: Slow Query Log timing
+    auto slowq_t0_ = std::chrono::high_resolution_clock::now();
 
     // Phase 102: register help strings once (lazy)
     static bool prom_help_registered_ = false;
@@ -6218,11 +6221,94 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 120: Slow Query Log Commands ───────────────────────
+    case milansql::CommandType::SET_SLOW_QUERY_LOG:
+        engine.slowQueryLog.enabled = cmd.boolVal;
+        std::cout << "  Slow Query Log " << (cmd.boolVal ? "enabled" : "disabled") << ".\n\n";
+        break;
+
+    case milansql::CommandType::SET_SLOW_QUERY_THRESHOLD:
+        engine.slowQueryLog.thresholdMs = cmd.slowThreshold;
+        std::cout << "  Slow Query Threshold set to " << cmd.slowThreshold << "ms.\n\n";
+        break;
+
+    case milansql::CommandType::SHOW_SLOW_QUERIES: {
+        auto entries = engine.slowQueryLog.showSlowQueries(cmd.slowQueryLimit);
+        if (entries.empty()) {
+            std::cout << "  (no slow queries logged)\n\n";
+        } else {
+            std::cout << "\n";
+            std::cout << "  Query | Duration(ms) | Calls | Avg(ms) | Total(ms)\n";
+            std::cout << "  -------------------------------------------------------\n";
+            for (auto& e : entries) {
+                std::cout << "  " << e.fingerprint
+                          << " | " << (int)e.durationMs << "ms"
+                          << " | " << e.calls
+                          << " | " << (int)e.avgMs << "ms"
+                          << " | " << (int)e.totalMs << "ms\n";
+            }
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TOP_QUERIES: {
+        std::vector<milansql::SlowQueryEntry> entries;
+        if (cmd.topQuerySortBy == "calls")      entries = engine.slowQueryLog.showTopByCalls();
+        else if (cmd.topQuerySortBy == "total") entries = engine.slowQueryLog.showTopByTotal();
+        else                                     entries = engine.slowQueryLog.showTopByTime();
+        if (entries.empty()) {
+            std::cout << "  (no top queries)\n\n";
+        } else {
+            std::cout << "\n";
+            std::cout << "  Fingerprint | Calls | Avg(ms) | Total(ms) | Max(ms)\n";
+            std::cout << "  -------------------------------------------------------\n";
+            for (auto& e : entries) {
+                std::cout << "  " << e.fingerprint
+                          << " | " << e.calls
+                          << " | " << (int)e.avgMs << "ms"
+                          << " | " << (int)e.totalMs << "ms"
+                          << " | " << (int)e.maxMs << "ms\n";
+            }
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::FLUSH_SLOW_QUERY_LOG:
+        engine.slowQueryLog.flush();
+        std::cout << "  Slow Query Log flushed.\n\n";
+        break;
+
+    case milansql::CommandType::SHOW_INDEX_RECOMMENDATIONS_SQ: {
+        auto recs = engine.slowQueryLog.indexRecommendations();
+        if (recs.empty()) {
+            std::cout << "  (no index recommendations)\n\n";
+        } else {
+            for (auto& r : recs) std::cout << "  " << r << "\n";
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    // ── Phase 121: SHOW VECTOR STATS ─────────────────────────────
+    case milansql::CommandType::SHOW_VECTOR_STATS: {
+        std::cout << milansql::g_vectorIndexManager().showIndexes();
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe
                   << "'\n  Tippe 'help' fuer eine Uebersicht.\n\n";
         break;
+    }
+
+    // Phase 120: Slow Query Log — record elapsed time
+    {
+        auto slowq_t1_ = std::chrono::high_resolution_clock::now();
+        double slowq_ms_ = std::chrono::duration<double, std::milli>(slowq_t1_ - slowq_t0_).count();
+        engine.slowQueryLog.add(eingabe, slowq_ms_);
     }
 
     // Phase 102: Prometheus — record query duration

@@ -265,6 +265,15 @@ enum class CommandType {
     FETCH_CURSOR,
     CLOSE_CURSOR,
     DEALLOCATE_CURSOR,
+    // Phase 120: Slow Query Log
+    SET_SLOW_QUERY_LOG,
+    SET_SLOW_QUERY_THRESHOLD,
+    SHOW_SLOW_QUERIES,
+    SHOW_TOP_QUERIES,
+    FLUSH_SLOW_QUERY_LOG,
+    SHOW_INDEX_RECOMMENDATIONS_SQ,
+    // Phase 121: pgvector V2
+    SHOW_VECTOR_STATS,
     UNKNOWN
 };
 
@@ -568,6 +577,12 @@ struct ParsedCommand {
     FetchDirection fetchDirection = FetchDirection::FETCH_NEXT;
     int fetchCount = 1;
     int fetchPosition = 0;
+
+    // Phase 120: Slow Query Log fields
+    std::string topQuerySortBy; // "time", "calls", "total"
+    int slowQueryLimit = 100;
+    bool boolVal = false;       // for SET_SLOW_QUERY_LOG ON/OFF
+    double slowThreshold = 0.0; // for SET_SLOW_QUERY_THRESHOLD
 };
 
 class Parser {
@@ -2288,6 +2303,36 @@ public:
             } else if (kw1 == "SSL" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_SSL_STATUS;
+            // Phase 120: SHOW SLOW QUERIES [LIMIT N]
+            } else if (kw1 == "SLOW" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "QUERIES") {
+                cmd.type = CommandType::SHOW_SLOW_QUERIES;
+                cmd.slowQueryLimit = 100;
+                for (size_t si = 3; si + 1 < tokens.size(); ++si) {
+                    if (toUpper(tokens[si]) == "LIMIT") {
+                        try { cmd.slowQueryLimit = std::stoi(tokens[si + 1]); } catch (...) {}
+                        break;
+                    }
+                }
+            // Phase 120: SHOW TOP QUERIES BY time|calls|total
+            } else if (kw1 == "TOP" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "QUERIES") {
+                cmd.type = CommandType::SHOW_TOP_QUERIES;
+                cmd.topQuerySortBy = "time";
+                for (size_t si = 3; si < tokens.size(); ++si) {
+                    std::string t = toUpper(tokens[si]);
+                    if (t == "CALLS") { cmd.topQuerySortBy = "calls"; break; }
+                    if (t == "TOTAL") { cmd.topQuerySortBy = "total"; break; }
+                    if (t == "TIME")  { cmd.topQuerySortBy = "time";  break; }
+                }
+            // Phase 120: SHOW INDEX RECOMMENDATIONS
+            } else if (kw1 == "INDEX" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "RECOMMENDATIONS") {
+                cmd.type = CommandType::SHOW_INDEX_RECOMMENDATIONS_SQ;
+            // Phase 121: SHOW VECTOR STATS
+            } else if (kw1 == "VECTOR" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATS") {
+                cmd.type = CommandType::SHOW_VECTOR_STATS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2687,6 +2732,36 @@ public:
                 }
                 cmd.poolValue = val;
             }
+
+        // ── Phase 120: SET SLOW_QUERY_LOG = ON/OFF ────────────────
+        } else if (kw0 == "SET" && kw1 == "SLOW_QUERY_LOG") {
+            cmd.type = CommandType::SET_SLOW_QUERY_LOG;
+            {
+                std::string val;
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = toUpper(tokens[si]);
+                    if (t == "=") continue;
+                    val = t; break;
+                }
+                cmd.boolVal = (val == "ON" || val == "1" || val == "TRUE");
+            }
+
+        // ── Phase 120: SET SLOW_QUERY_THRESHOLD = N ───────────────
+        } else if (kw0 == "SET" && kw1 == "SLOW_QUERY_THRESHOLD") {
+            cmd.type = CommandType::SET_SLOW_QUERY_THRESHOLD;
+            {
+                for (size_t si = 2; si < tokens.size(); ++si) {
+                    std::string t = tokens[si];
+                    if (t == "=") continue;
+                    try { cmd.slowThreshold = std::stod(t); } catch (...) {}
+                    break;
+                }
+            }
+
+        // ── Phase 120: FLUSH SLOW QUERY LOG ───────────────────────
+        } else if (kw0 == "FLUSH" && kw1 == "SLOW" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "QUERY" && toUpper(tokens[3]) == "LOG") {
+            cmd.type = CommandType::FLUSH_SLOW_QUERY_LOG;
 
         // ── Phase 54A: SET CACHE ON / SET CACHE OFF ──────────────
         // Phase 102: SET HOT_STANDBY = ON/OFF

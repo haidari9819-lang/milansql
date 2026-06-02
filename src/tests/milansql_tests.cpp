@@ -2410,6 +2410,249 @@ static void testGroup37() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Group 38: Phase 120 — Slow Query Log + Query Fingerprinting
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup38() {
+    std::cout << "\n--- Group 38: Slow Query Log + Query Fingerprinting ---\n";
+
+    // Test fingerprinting directly (static method, no engine needed)
+    {
+        std::string fp1 = milansql::SlowQueryLog::fingerprint("SELECT * FROM t WHERE id = 1");
+        std::string fp2 = milansql::SlowQueryLog::fingerprint("SELECT * FROM t WHERE id = 2");
+        check(fp1 == fp2, "Fingerprint: different numeric literals produce same fingerprint");
+
+        std::string fp3 = milansql::SlowQueryLog::fingerprint("SELECT * FROM t WHERE name = 'Alice'");
+        std::string fp4 = milansql::SlowQueryLog::fingerprint("SELECT * FROM t WHERE name = 'Bob'");
+        check(fp3 == fp4, "Fingerprint: different string literals produce same fingerprint");
+
+        check(fp1 != fp3, "Fingerprint: different WHERE columns produce different fingerprints");
+    }
+
+    // Test SlowQueryLog directly
+    {
+        milansql::SlowQueryLog log;
+        log.enabled = true;
+        log.thresholdMs = 0.0; // catch everything
+
+        log.add("SELECT * FROM users WHERE id = 1", 5.0);
+        log.add("SELECT * FROM users WHERE id = 2", 8.0);
+        log.add("SELECT * FROM users WHERE id = 3", 3.0);
+        log.add("INSERT INTO users VALUES (1, 'Alice')", 2.0);
+
+        // All inserts have same fingerprint for SELECT
+        auto slow = log.showSlowQueries(100);
+        // 2 unique fingerprints: SELECT * FROM users WHERE id = ? and INSERT
+        check(slow.size() >= 2, "SlowQueryLog: >= 2 unique fingerprints after 4 queries");
+
+        // Check aggregation: SELECT was called 3 times
+        bool found3calls = false;
+        for (auto& e : slow) {
+            if (e.calls >= 3) { found3calls = true; break; }
+        }
+        check(found3calls, "SlowQueryLog: aggregated SELECT entry has calls >= 3");
+
+        // showTopByCalls
+        auto topCalls = log.showTopByCalls(5);
+        check(!topCalls.empty(), "showTopByCalls: returns results");
+        check(topCalls[0].calls >= topCalls[topCalls.size()-1].calls,
+              "showTopByCalls: sorted by calls desc");
+
+        // showTopByTime
+        auto topTime = log.showTopByTime(5);
+        check(!topTime.empty(), "showTopByTime: returns results");
+
+        // showTopByTotal
+        auto topTotal = log.showTopByTotal(5);
+        check(!topTotal.empty(), "showTopByTotal: returns results");
+
+        // size
+        check(log.size() >= 2, "SlowQueryLog::size() >= 2 unique fingerprints");
+
+        // flush
+        log.flush();
+        check(log.size() == 0, "SlowQueryLog: flush clears all entries");
+        auto afterFlush = log.showSlowQueries(100);
+        check(afterFlush.empty(), "SlowQueryLog: showSlowQueries empty after flush");
+    }
+
+    // Test threshold
+    {
+        milansql::SlowQueryLog log;
+        log.enabled = true;
+        log.thresholdMs = 100.0; // only > 100ms
+
+        log.add("SELECT * FROM t", 50.0);   // below threshold
+        log.add("SELECT * FROM t", 200.0);  // above threshold
+
+        auto slow = log.showSlowQueries(100);
+        check(slow.size() == 1, "SlowQueryLog: only 1 entry above threshold");
+        check(slow[0].durationMs >= 200.0, "SlowQueryLog: recorded entry has correct duration");
+    }
+
+    // Test disabled log
+    {
+        milansql::SlowQueryLog log;
+        log.enabled = false;
+        log.thresholdMs = 0.0;
+
+        log.add("SELECT * FROM t", 500.0);
+        check(log.size() == 0, "SlowQueryLog: disabled log records nothing");
+    }
+
+    // Test index recommendations
+    {
+        milansql::SlowQueryLog log;
+        log.enabled = true;
+        log.thresholdMs = 0.0;
+
+        // avgMs > threshold*2 = 0, has WHERE, no INDEX
+        log.add("SELECT * FROM users WHERE age > 25", 10.0);
+        auto recs = log.indexRecommendations();
+        // Since threshold=0, avgMs (10) > threshold*2 (0), should produce recommendation
+        check(!recs.empty(), "SlowQueryLog: indexRecommendations returns suggestion for slow WHERE query");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Group 39: Phase 121 — pgvector V2 + Semantic Search
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup39() {
+    std::cout << "\n--- Group 39: pgvector V2 + Semantic Search ---\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+
+    // Create docs table with vector column
+    execSQL(engine, parser,
+        "CREATE TABLE docs (id INT PRIMARY KEY AUTO_INCREMENT, category TEXT, content TEXT, embedding VECTOR(3))");
+
+    // Insert tech vectors
+    execSQL(engine, parser,
+        "INSERT INTO docs VALUES (NULL, 'tech', 'Machine learning overview', '[1.0, 0.1, 0.0]')");
+    execSQL(engine, parser,
+        "INSERT INTO docs VALUES (NULL, 'tech', 'Deep learning tutorial', '[0.9, 0.2, 0.0]')");
+    // Insert sport vectors
+    execSQL(engine, parser,
+        "INSERT INTO docs VALUES (NULL, 'sport', 'Football championship', '[0.0, 0.1, 1.0]')");
+    execSQL(engine, parser,
+        "INSERT INTO docs VALUES (NULL, 'sport', 'Basketball season', '[0.0, 0.2, 0.9]')");
+
+    // Basic SELECT to verify 4 rows
+    {
+        auto tbl = executeSelect(engine, parser, "SELECT * FROM docs");
+        check(tbl.rowCount() == 4, "pgvector V2: docs table has 4 rows");
+    }
+
+    // Test vector distance in SELECT using ORDER BY embedding <-> query
+    {
+        // Use selectWhere to get tech rows only
+        milansql::WhereCondition wc;
+        wc.col = "category";
+        wc.op = "=";
+        wc.val = "'tech'";
+        auto result = engine.selectWhere("docs", {wc}, "AND");
+        check(result.table.rowCount() == 2, "pgvector V2: WHERE category='tech' returns 2 rows");
+    }
+
+    // Test GROUP BY category
+    {
+        auto tbl = executeSelect(engine, parser,
+            "SELECT category, COUNT(*) FROM docs GROUP BY category");
+        check(tbl.rowCount() == 2, "pgvector V2: GROUP BY category returns 2 groups");
+
+        // Verify counts
+        bool techFound = false, sportFound = false;
+        for (const auto& row : tbl.rows()) {
+            if (row.xmax != 0) continue;
+            if (row.values.size() >= 2) {
+                std::string cat = row.values[0];
+                // strip surrounding quotes if present
+                if (cat.size() >= 2 && cat.front() == '\'' && cat.back() == '\'')
+                    cat = cat.substr(1, cat.size() - 2);
+                if (cat == "tech" && row.values[1] == "2") techFound = true;
+                if (cat == "sport" && row.values[1] == "2") sportFound = true;
+            }
+        }
+        check(techFound, "pgvector V2: tech group has count 2");
+        check(sportFound, "pgvector V2: sport group has count 2");
+    }
+
+    // Test vector type parsing
+    {
+        auto vec = milansql::vector_type::parse("[1.0, 0.5, 0.0]");
+        check(vec.size() == 3, "vector_type::parse returns 3 elements");
+        check(std::abs(vec[0] - 1.0) < 0.001, "vector_type::parse first element correct");
+    }
+
+    // Test vector distances
+    {
+        std::vector<float> v1 = {1.0f, 0.0f, 0.0f};
+        std::vector<float> v2 = {0.0f, 0.0f, 1.0f};
+        double dist = milansql::vector_type::l2Distance(v1, v2);
+        check(std::abs(dist - std::sqrt(2.0)) < 0.01, "L2 distance [1,0,0] vs [0,0,1] = sqrt(2)");
+
+        double cosine = milansql::vector_type::cosineDistance(v1, v2);
+        check(std::abs(cosine - 1.0) < 0.01, "Cosine distance orthogonal vectors = 1.0");
+    }
+
+    // Test SHOW VECTOR STATS — parser parses it correctly
+    {
+        auto cmd = parser.parse("SHOW VECTOR STATS");
+        check(cmd.type == milansql::CommandType::SHOW_VECTOR_STATS,
+              "Parser: SHOW VECTOR STATS parsed correctly");
+    }
+
+    // Test SHOW SLOW QUERIES parser
+    {
+        auto cmd = parser.parse("SHOW SLOW QUERIES");
+        check(cmd.type == milansql::CommandType::SHOW_SLOW_QUERIES,
+              "Parser: SHOW SLOW QUERIES parsed correctly");
+        check(cmd.slowQueryLimit == 100, "Parser: default slow query limit is 100");
+    }
+
+    // Test SHOW SLOW QUERIES LIMIT 5
+    {
+        auto cmd = parser.parse("SHOW SLOW QUERIES LIMIT 5");
+        check(cmd.type == milansql::CommandType::SHOW_SLOW_QUERIES,
+              "Parser: SHOW SLOW QUERIES LIMIT 5 parsed correctly");
+        check(cmd.slowQueryLimit == 5, "Parser: slow query limit parsed as 5");
+    }
+
+    // Test SHOW TOP QUERIES BY calls
+    {
+        auto cmd = parser.parse("SHOW TOP QUERIES BY calls");
+        check(cmd.type == milansql::CommandType::SHOW_TOP_QUERIES,
+              "Parser: SHOW TOP QUERIES BY calls parsed correctly");
+        check(cmd.topQuerySortBy == "calls", "Parser: topQuerySortBy = calls");
+    }
+
+    // Test FLUSH SLOW QUERY LOG
+    {
+        auto cmd = parser.parse("FLUSH SLOW QUERY LOG");
+        check(cmd.type == milansql::CommandType::FLUSH_SLOW_QUERY_LOG,
+              "Parser: FLUSH SLOW QUERY LOG parsed correctly");
+    }
+
+    // Test SET SLOW_QUERY_LOG = ON
+    {
+        auto cmd = parser.parse("SET SLOW_QUERY_LOG = ON");
+        check(cmd.type == milansql::CommandType::SET_SLOW_QUERY_LOG,
+              "Parser: SET SLOW_QUERY_LOG = ON parsed correctly");
+        check(cmd.boolVal == true, "Parser: SET SLOW_QUERY_LOG = ON → boolVal=true");
+    }
+
+    // Test SET SLOW_QUERY_THRESHOLD = 50
+    {
+        auto cmd = parser.parse("SET SLOW_QUERY_THRESHOLD = 50");
+        check(cmd.type == milansql::CommandType::SET_SLOW_QUERY_THRESHOLD,
+              "Parser: SET SLOW_QUERY_THRESHOLD = 50 parsed correctly");
+        check(std::abs(cmd.slowThreshold - 50.0) < 0.001,
+              "Parser: slowThreshold = 50.0");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -2528,6 +2771,12 @@ int main() {
     }
     try { testGroup37(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 37 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup38(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 38 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup39(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 39 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

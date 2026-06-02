@@ -5859,7 +5859,7 @@ inline bool dispatchCommand(
 
         // Populate with existing rows
         try {
-            milansql::Table tbl111 = engine.selectAll(cmd.tableName);
+            milansql::Table tbl111 = engine.selectAll(cmd.tableName).clone();
             auto* idx111 = milansql::g_vectorIndexManager().getIndex(cmd.tableName, colName111);
             if (idx111) {
                 int colIdx111 = -1;

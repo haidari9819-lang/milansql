@@ -44,6 +44,8 @@
 #include "../optimizer/histogram.hpp"       // Phase 113: Histogram Selectivity
 #include "../wal/double_write_buffer.hpp"   // Phase 114: Double-Write Buffer
 #include "../wal/lsn_manager.hpp"           // Phase 114: LSN Manager
+#include "../document/document_store.hpp"   // Phase 116: Document Store
+#include "../graph/graph_store.hpp"         // Phase 116: Graph Store
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 #include "../extensions/extension_manager.hpp" // Phase 90: Extension System

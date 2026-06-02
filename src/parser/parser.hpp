@@ -244,6 +244,21 @@ enum class CommandType {
     CHECK_DATABASE,
     REPAIR_TABLE,
     SHOW_RECOVERY_LOG,
+    // Phase 116: Document Store
+    CREATE_COLLECTION,
+    INSERT_DOCUMENT,
+    FIND_DOCUMENT,
+    UPDATE_DOCUMENT,
+    DELETE_DOCUMENT,
+    SHOW_COLLECTIONS,
+    // Phase 116: Graph Store
+    CREATE_GRAPH_NODE,
+    CREATE_GRAPH_EDGE,
+    MATCH_GRAPH,
+    SHORTEST_PATH_GRAPH,
+    NEIGHBORS_GRAPH,
+    SHOW_GRAPH_NODES,
+    SHOW_GRAPH_EDGES,
     UNKNOWN
 };
 
@@ -519,6 +534,27 @@ struct ParsedCommand {
     std::string federatedNodes;   // comma-separated node names: "node2, node3"
     std::string federatedQuery;   // the AS SELECT ... part
     std::string federationConnUrl; // connection URL for CREATE SERVER milansql://host:port
+
+    // Phase 116: Document Store
+    std::string documentJson;      // JSON string for INSERT/UPDATE DOCUMENT
+    std::string docFilterField;    // field name in WHERE
+    std::string docFilterOp;       // =, >, <, >=, <=, !=, CONTAINS
+    std::string docFilterValue;    // comparison value
+
+    // Phase 116: Graph Store
+    std::string graphNodeVar;      // variable name  e.g., "alice"
+    std::string graphNodeLabel;    // label e.g., "Person"
+    std::map<std::string, std::string> graphNodeProps;  // properties
+    std::string graphEdgeType;     // edge type e.g., "KNOWS"
+    std::string graphFromNode;     // from-node name for CREATE EDGE
+    std::string graphToNode;       // to-node name for CREATE EDGE
+    std::string graphMatchFromVar, graphMatchFromLabel;  // MATCH from side
+    std::string graphMatchEdgeType;                      // MATCH edge
+    std::string graphMatchToVar,   graphMatchToLabel;    // MATCH to side
+    std::vector<std::string> graphReturnCols;            // RETURN columns
+    std::string graphPathFrom, graphPathTo;              // SHORTEST PATH
+    std::string graphNeighborNode;                       // NEIGHBORS OF
+    int         graphNeighborDepth = 1;                  // DEPTH n
 };
 
 class Parser {
@@ -1432,6 +1468,32 @@ public:
                 parseLimit(tokens, rest, cmd);
             }
 
+        // ── Phase 116: INSERT INTO collection DOCUMENT {json} ──────
+        } else if (kw0 == "INSERT" && kw1 == "INTO" && tokens.size() >= 4 &&
+                   [&]() -> bool {
+                       for (size_t i_ = 3; i_ < tokens.size(); ++i_)
+                           if (toUpper(tokens[i_]) == "DOCUMENT") return true;
+                       return false;
+                   }()) {
+            cmd.type      = CommandType::INSERT_DOCUMENT;
+            cmd.tableName = tokens[2];
+            {
+                std::string upRaw116;
+                for (unsigned char c : input) upRaw116 += static_cast<char>(std::toupper(c));
+                size_t dpos116 = upRaw116.find(" DOCUMENT ");
+                if (dpos116 != std::string::npos)
+                    cmd.documentJson = input.substr(dpos116 + 10);
+                else {
+                    size_t dpos2 = upRaw116.rfind("DOCUMENT");
+                    if (dpos2 != std::string::npos)
+                        cmd.documentJson = input.substr(dpos2 + 8);
+                }
+                while (!cmd.documentJson.empty() && cmd.documentJson.front() == ' ')
+                    cmd.documentJson = cmd.documentJson.substr(1);
+                while (!cmd.documentJson.empty() && cmd.documentJson.back() == ' ')
+                    cmd.documentJson.pop_back();
+            }
+
         // ── Phase 39: INSERT OR REPLACE / INSERT OR IGNORE ──────
         // Syntax: INSERT OR REPLACE INTO tbl VALUES (...)
         //         INSERT OR IGNORE  INTO tbl VALUES (...)
@@ -2080,6 +2142,14 @@ public:
             // Phase 114: SHOW RECOVERY LOG
             } else if (kw1 == "RECOVERY" && tokens.size() >= 3 && toUpper(tokens[2]) == "LOG") {
                 cmd.type = CommandType::SHOW_RECOVERY_LOG;
+            // Phase 116: SHOW COLLECTIONS
+            } else if (kw1 == "COLLECTIONS") {
+                cmd.type = CommandType::SHOW_COLLECTIONS;
+            // Phase 116: SHOW NODES / SHOW EDGES
+            } else if (kw1 == "NODES") {
+                cmd.type = CommandType::SHOW_GRAPH_NODES;
+            } else if (kw1 == "EDGES") {
+                cmd.type = CommandType::SHOW_GRAPH_EDGES;
             // Phase 72: SHOW MATERIALIZED VIEWS
             } else if (kw1 == "MATERIALIZED" && tokens.size() >= 3 && toUpper(tokens[2]) == "VIEWS") {
                 cmd.type = CommandType::SHOW_MATERIALIZED_VIEWS;
@@ -3495,6 +3565,220 @@ public:
         // SHOW SSL STATUS (also handled inside SHOW block above, repeated here for outer chain)
         } else if (kw0 == "SHOW" && kw1 == "SSL") {
             cmd.type = CommandType::SHOW_SSL_STATUS;
+
+        // ── Phase 116: Document Store ─────────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "COLLECTION" && tokens.size() >= 3) {
+            cmd.type      = CommandType::CREATE_COLLECTION;
+            cmd.tableName = tokens[2];
+
+        } else if (kw0 == "SHOW" && kw1 == "COLLECTIONS") {
+            cmd.type = CommandType::SHOW_COLLECTIONS;
+
+        // ── Phase 116 (Document) ─────────────────────────────────
+        } else if (kw0 == "FIND" && tokens.size() >= 2) {
+            cmd.type      = CommandType::FIND_DOCUMENT;
+            cmd.tableName = tokens[1];
+            // Parse optional WHERE field op value
+            for (size_t i = 2; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "WHERE" && i + 3 < tokens.size()) {
+                    cmd.docFilterField = tokens[i + 1];
+                    cmd.docFilterOp    = toUpper(tokens[i + 2]);
+                    cmd.docFilterValue = tokens[i + 3];
+                    break;
+                }
+            }
+
+        } else if (kw0 == "UPDATE" && kw1 == "DOCUMENT" && tokens.size() >= 3) {
+            cmd.type      = CommandType::UPDATE_DOCUMENT;
+            cmd.tableName = tokens[2];
+            // Parse WHERE and SET json
+            size_t whereIdx = 0;
+            for (size_t i = 3; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "WHERE") { whereIdx = i; break; }
+            }
+            if (whereIdx > 0 && whereIdx + 3 < tokens.size()) {
+                cmd.docFilterField = tokens[whereIdx + 1];
+                cmd.docFilterOp    = toUpper(tokens[whereIdx + 2]);
+                cmd.docFilterValue = tokens[whereIdx + 3];
+            }
+            // Extract SET json from raw input
+            {
+                std::string upRaw;
+                for (unsigned char c : input) upRaw += static_cast<char>(std::toupper(c));
+                size_t spos = upRaw.rfind(" SET ");
+                if (spos != std::string::npos)
+                    cmd.documentJson = input.substr(spos + 5);
+                while (!cmd.documentJson.empty() && cmd.documentJson.back() == ' ')
+                    cmd.documentJson.pop_back();
+            }
+
+        } else if (kw0 == "DELETE" && kw1 == "DOCUMENT" && tokens.size() >= 3) {
+            cmd.type      = CommandType::DELETE_DOCUMENT;
+            cmd.tableName = tokens[2];
+            for (size_t i = 3; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "WHERE" && i + 3 < tokens.size()) {
+                    cmd.docFilterField = tokens[i + 1];
+                    cmd.docFilterOp    = toUpper(tokens[i + 2]);
+                    cmd.docFilterValue = tokens[i + 3];
+                    break;
+                }
+            }
+
+        // ── Phase 116: Graph Store ─────────────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "NODE") {
+            cmd.type = CommandType::CREATE_GRAPH_NODE;
+            {
+                // Parse (var:Label {props})
+                size_t open  = input.find('(');
+                size_t close = input.rfind(')');
+                if (open != std::string::npos) {
+                    std::string inner = input.substr(open + 1,
+                        close != std::string::npos ? close - open - 1 : std::string::npos);
+                    // var:Label
+                    size_t colon = inner.find(':');
+                    size_t brace = inner.find('{');
+                    if (colon != std::string::npos) {
+                        cmd.graphNodeVar   = inner.substr(0, colon);
+                        size_t lend = brace != std::string::npos ? brace : inner.size();
+                        cmd.graphNodeLabel = inner.substr(colon + 1, lend - colon - 1);
+                    } else {
+                        cmd.graphNodeVar = inner.substr(0, brace != std::string::npos ? brace : inner.size());
+                    }
+                    // Trim
+                    while (!cmd.graphNodeVar.empty()   && cmd.graphNodeVar.back()   == ' ') cmd.graphNodeVar.pop_back();
+                    while (!cmd.graphNodeLabel.empty() && cmd.graphNodeLabel.back() == ' ') cmd.graphNodeLabel.pop_back();
+                    while (!cmd.graphNodeVar.empty()   && cmd.graphNodeVar.front()  == ' ') cmd.graphNodeVar = cmd.graphNodeVar.substr(1);
+                    // Parse props {key: val}
+                    if (brace != std::string::npos) {
+                        size_t bcl = inner.rfind('}');
+                        std::string ps = inner.substr(brace + 1, bcl != std::string::npos ? bcl - brace - 1 : inner.size());
+                        std::istringstream pss(ps);
+                        std::string tok;
+                        while (std::getline(pss, tok, ',')) {
+                            while (!tok.empty() && tok.front() == ' ') tok = tok.substr(1);
+                            while (!tok.empty() && tok.back()  == ' ') tok.pop_back();
+                            size_t ceq = tok.find(':');
+                            if (ceq == std::string::npos) continue;
+                            std::string k = tok.substr(0, ceq);
+                            std::string v = tok.substr(ceq + 1);
+                            while (!k.empty() && k.back()  == ' ') k.pop_back();
+                            while (!v.empty() && v.front() == ' ') v = v.substr(1);
+                            while (!v.empty() && v.back()  == ' ') v.pop_back();
+                            cmd.graphNodeProps[k] = v;
+                        }
+                    }
+                }
+            }
+
+        } else if (kw0 == "CREATE" && kw1 == "EDGE") {
+            cmd.type = CommandType::CREATE_GRAPH_EDGE;
+            {
+                // Parse (from)-[:TYPE]->(to)
+                // Extract first node name
+                size_t p1 = input.find('(');
+                size_t p2 = input.find(')', p1 != std::string::npos ? p1 : 0);
+                if (p1 != std::string::npos && p2 != std::string::npos)
+                    cmd.graphFromNode = input.substr(p1 + 1, p2 - p1 - 1);
+                // Extract edge type [: ... ]
+                size_t b1 = input.find("[:");
+                size_t b2 = input.find(']', b1 != std::string::npos ? b1 : 0);
+                if (b1 != std::string::npos && b2 != std::string::npos)
+                    cmd.graphEdgeType = input.substr(b1 + 2, b2 - b1 - 2);
+                // Extract second node name
+                size_t p3 = input.find('(', p2 != std::string::npos ? p2 : 0);
+                size_t p4 = input.find(')', p3 != std::string::npos ? p3 : 0);
+                if (p3 != std::string::npos && p4 != std::string::npos)
+                    cmd.graphToNode = input.substr(p3 + 1, p4 - p3 - 1);
+                // Trim
+                for (std::string* s : {&cmd.graphFromNode, &cmd.graphEdgeType, &cmd.graphToNode}) {
+                    while (!s->empty() && s->front() == ' ') *s = s->substr(1);
+                    while (!s->empty() && s->back()  == ' ') s->pop_back();
+                }
+            }
+
+        } else if (kw0 == "MATCH") {
+            cmd.type = CommandType::MATCH_GRAPH;
+            {
+                // MATCH (fromVar:FromLabel)-[:EdgeType]->(toVar:ToLabel) RETURN cols...
+                size_t p1 = input.find('(');
+                size_t p2 = input.find(')', p1 != std::string::npos ? p1 : 0);
+                if (p1 != std::string::npos && p2 != std::string::npos) {
+                    std::string fn = input.substr(p1 + 1, p2 - p1 - 1);
+                    size_t col = fn.find(':');
+                    if (col != std::string::npos) {
+                        cmd.graphMatchFromVar   = fn.substr(0, col);
+                        cmd.graphMatchFromLabel = fn.substr(col + 1);
+                    } else { cmd.graphMatchFromVar = fn; }
+                }
+                size_t b1 = input.find("[:");
+                size_t b2 = input.find(']', b1 != std::string::npos ? b1 : 0);
+                if (b1 != std::string::npos && b2 != std::string::npos) {
+                    cmd.graphMatchEdgeType = input.substr(b1 + 2, b2 - b1 - 2);
+                    // strip * (for *2 depth patterns)
+                    auto st = cmd.graphMatchEdgeType.find('*');
+                    if (st != std::string::npos) cmd.graphMatchEdgeType = cmd.graphMatchEdgeType.substr(0, st);
+                }
+                size_t p3 = input.find('(', p2 != std::string::npos ? p2 : 0);
+                size_t p4 = input.find(')', p3 != std::string::npos ? p3 : 0);
+                if (p3 != std::string::npos && p4 != std::string::npos) {
+                    std::string tn = input.substr(p3 + 1, p4 - p3 - 1);
+                    size_t col = tn.find(':');
+                    if (col != std::string::npos) {
+                        cmd.graphMatchToVar   = tn.substr(0, col);
+                        cmd.graphMatchToLabel = tn.substr(col + 1);
+                    } else { cmd.graphMatchToVar = tn; }
+                }
+                // RETURN columns
+                std::string upInput;
+                for (unsigned char c : input) upInput += static_cast<char>(std::toupper(c));
+                size_t retPos = upInput.find(" RETURN ");
+                if (retPos != std::string::npos) {
+                    std::string retStr = input.substr(retPos + 8);
+                    std::istringstream rss(retStr);
+                    std::string tok;
+                    while (std::getline(rss, tok, ',')) {
+                        while (!tok.empty() && tok.front() == ' ') tok = tok.substr(1);
+                        while (!tok.empty() && tok.back()  == ' ') tok.pop_back();
+                        if (!tok.empty()) cmd.graphReturnCols.push_back(tok);
+                    }
+                }
+                // Trim all
+                for (std::string* s : {&cmd.graphMatchFromVar, &cmd.graphMatchFromLabel,
+                                       &cmd.graphMatchEdgeType, &cmd.graphMatchToVar,
+                                       &cmd.graphMatchToLabel}) {
+                    while (!s->empty() && s->front() == ' ') *s = s->substr(1);
+                    while (!s->empty() && s->back()  == ' ') s->pop_back();
+                }
+            }
+
+        } else if (kw0 == "SHORTEST" && tokens.size() >= 6 &&
+                   toUpper(tokens[1]) == "PATH") {
+            cmd.type = CommandType::SHORTEST_PATH_GRAPH;
+            // SHORTEST PATH FROM fromNode TO toNode
+            for (size_t i = 2; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "FROM" && i + 1 < tokens.size())
+                    cmd.graphPathFrom = tokens[i + 1];
+                if (toUpper(tokens[i]) == "TO"   && i + 1 < tokens.size())
+                    cmd.graphPathTo   = tokens[i + 1];
+            }
+
+        } else if (kw0 == "NEIGHBORS" && tokens.size() >= 3 &&
+                   toUpper(tokens[1]) == "OF") {
+            cmd.type              = CommandType::NEIGHBORS_GRAPH;
+            cmd.graphNeighborNode = tokens[2];
+            // DEPTH n
+            for (size_t i = 3; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "DEPTH" && i + 1 < tokens.size()) {
+                    try { cmd.graphNeighborDepth = std::stoi(tokens[i + 1]); }
+                    catch (...) {}
+                }
+            }
+
+        } else if (kw0 == "SHOW" && kw1 == "NODES") {
+            cmd.type = CommandType::SHOW_GRAPH_NODES;
+
+        } else if (kw0 == "SHOW" && kw1 == "EDGES") {
+            cmd.type = CommandType::SHOW_GRAPH_EDGES;
 
         // ── Phase 114: CHECK TABLE / CHECK DATABASE ───────────────
         } else if (kw0 == "CHECK" && kw1 == "TABLE" && tokens.size() >= 3) {

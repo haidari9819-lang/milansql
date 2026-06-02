@@ -5964,6 +5964,209 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 116: Document Store ──────────────────────────────────
+    case milansql::CommandType::CREATE_COLLECTION:
+        milansql::g_documentStore().createCollection(cmd.tableName);
+        std::cout << "  Collection '" << cmd.tableName << "' erstellt.\n\n";
+        break;
+
+    case milansql::CommandType::INSERT_DOCUMENT: {
+        int docId = milansql::g_documentStore().insert(cmd.tableName, cmd.documentJson);
+        std::cout << "  Dokument eingefügt. _id=" << docId << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::FIND_DOCUMENT: {
+        std::vector<milansql::JsonDoc> docs;
+        if (cmd.docFilterField.empty()) {
+            docs = milansql::g_documentStore().findAll(cmd.tableName);
+        } else {
+            docs = milansql::g_documentStore().find(
+                cmd.tableName, cmd.docFilterField, cmd.docFilterOp, cmd.docFilterValue);
+        }
+        std::cout << "\n  Collection: " << cmd.tableName
+                  << "  (" << docs.size() << " Dokument(e))\n";
+        std::cout << "  ─────────────────────────────────────────────\n";
+        for (const auto& d : docs)
+            std::cout << "  [" << d.id << "] " << d.json << "\n";
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::UPDATE_DOCUMENT: {
+        int n = milansql::g_documentStore().update(
+            cmd.tableName, cmd.docFilterField, cmd.docFilterOp,
+            cmd.docFilterValue, cmd.documentJson);
+        std::cout << "  " << n << " Dokument(e) aktualisiert.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DELETE_DOCUMENT: {
+        int n = milansql::g_documentStore().remove(
+            cmd.tableName, cmd.docFilterField, cmd.docFilterOp, cmd.docFilterValue);
+        std::cout << "  " << n << " Dokument(e) gelöscht.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_COLLECTIONS: {
+        auto colls = milansql::g_documentStore().listCollections();
+        std::cout << "\n  Collections (" << colls.size() << "):\n";
+        if (colls.empty()) {
+            std::cout << "  (keine Collections vorhanden)\n";
+        } else {
+            for (const auto& c : colls)
+                std::cout << "  · " << c
+                          << "  (" << milansql::g_documentStore().count(c) << " docs)\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 116: Graph Store ─────────────────────────────────────
+    case milansql::CommandType::CREATE_GRAPH_NODE: {
+        // Use "name" property if available, otherwise graphNodeVar
+        std::string nodeName = cmd.graphNodeVar;
+        auto nameIt = cmd.graphNodeProps.find("name");
+        if (nameIt != cmd.graphNodeProps.end()) nodeName = nameIt->second;
+        // Still register under the variable name too
+        int nid = milansql::g_graphStore().createNode(
+            cmd.graphNodeLabel, cmd.graphNodeVar, cmd.graphNodeProps);
+        // If name property differs from var, also register under name
+        if (!nodeName.empty() && nodeName != cmd.graphNodeVar) {
+            // Node already created under var; we just display the name prop
+            (void)nid;
+        }
+        std::cout << "  Node (" << cmd.graphNodeVar;
+        if (!cmd.graphNodeLabel.empty()) std::cout << ":" << cmd.graphNodeLabel;
+        std::cout << ") erstellt.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::CREATE_GRAPH_EDGE: {
+        bool ok = milansql::g_graphStore().createEdge(
+            cmd.graphFromNode, cmd.graphEdgeType, cmd.graphToNode);
+        if (ok)
+            std::cout << "  Edge (" << cmd.graphFromNode << ")-[:"
+                      << cmd.graphEdgeType << "]->(" << cmd.graphToNode
+                      << ") erstellt.\n\n";
+        else
+            std::cout << "  Fehler: Node(s) nicht gefunden.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::MATCH_GRAPH: {
+        auto rows = milansql::g_graphStore().matchPattern(
+            cmd.graphMatchFromLabel, cmd.graphMatchEdgeType, cmd.graphMatchToLabel);
+        std::cout << "\n  MATCH (" << cmd.graphMatchFromLabel << ")-[:"
+                  << cmd.graphMatchEdgeType << "]->(" << cmd.graphMatchToLabel
+                  << ")  " << rows.size() << " Ergebnis(se)\n";
+        std::cout << "  ─────────────────────────────────────────────\n";
+
+        for (const auto& r : rows) {
+            // Print return columns
+            if (cmd.graphReturnCols.empty()) {
+                std::cout << "  " << r.fromName << " → " << r.toName << "\n";
+            } else {
+                bool first = true;
+                for (const auto& col : cmd.graphReturnCols) {
+                    if (!first) std::cout << ", ";
+                    first = false;
+                    // col is like "p.name" or "friend.name"
+                    auto dot = col.find('.');
+                    std::string var   = dot != std::string::npos ? col.substr(0, dot) : col;
+                    std::string prop  = dot != std::string::npos ? col.substr(dot + 1) : "name";
+                    // Determine which side this var refers to
+                    std::string val;
+                    if (var == cmd.graphMatchFromVar) {
+                        if (prop == "name") val = r.fromName;
+                        else val = r.fromName;
+                    } else {
+                        if (prop == "name") val = r.toName;
+                        else val = r.toName;
+                    }
+                    std::cout << val;
+                }
+                std::cout << "\n";
+            }
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::SHORTEST_PATH_GRAPH: {
+        auto path = milansql::g_graphStore().shortestPath(
+            cmd.graphPathFrom, cmd.graphPathTo);
+        std::cout << "\n  SHORTEST PATH: " << cmd.graphPathFrom
+                  << " → " << cmd.graphPathTo << "\n";
+        if (path.empty()) {
+            std::cout << "  Kein Pfad gefunden.\n\n";
+        } else {
+            std::cout << "  Pfad (" << path.size() - 1 << " Hop(s)): ";
+            for (size_t i = 0; i < path.size(); ++i) {
+                if (i) std::cout << " → ";
+                std::cout << path[i];
+            }
+            std::cout << "\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::NEIGHBORS_GRAPH: {
+        auto nbrs = milansql::g_graphStore().neighbors(
+            cmd.graphNeighborNode, cmd.graphNeighborDepth);
+        std::cout << "\n  NEIGHBORS OF " << cmd.graphNeighborNode
+                  << " DEPTH " << cmd.graphNeighborDepth
+                  << "  (" << nbrs.size() << " Knoten):\n";
+        for (const auto& n : nbrs)
+            std::cout << "  · " << n << "\n";
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_GRAPH_NODES: {
+        auto nodes = milansql::g_graphStore().allNodes();
+        std::cout << "\n  NODES (" << nodes.size() << "):\n";
+        std::cout << "  ─────────────────────────────────────────────\n";
+        for (const auto& n : nodes) {
+            std::cout << "  [" << n.id << "] (" << n.name;
+            if (!n.label.empty()) std::cout << ":" << n.label;
+            if (!n.props.empty()) {
+                std::cout << " {";
+                bool f = true;
+                for (const auto& [k, v] : n.props) {
+                    if (!f) std::cout << ", ";
+                    std::cout << k << ": " << v;
+                    f = false;
+                }
+                std::cout << "}";
+            }
+            std::cout << ")\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_GRAPH_EDGES: {
+        const auto& edges = milansql::g_graphStore().allEdges();
+        std::cout << "\n  EDGES (" << edges.size() << "):\n";
+        std::cout << "  ─────────────────────────────────────────────\n";
+        for (const auto& e : edges) {
+            const milansql::GraphNode* fn = nullptr, *tn = nullptr;
+            // Find node names
+            for (const auto& n : milansql::g_graphStore().allNodes()) {
+                if (n.id == e.fromId) fn = &n;
+                if (n.id == e.toId)   tn = &n;
+            }
+            std::cout << "  [" << e.id << "] ("
+                      << (fn ? fn->name : std::to_string(e.fromId))
+                      << ")-[:" << e.type << "]->("
+                      << (tn ? tn->name : std::to_string(e.toId))
+                      << ")\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

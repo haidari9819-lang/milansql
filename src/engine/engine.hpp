@@ -40,6 +40,8 @@
 #include "../fdw/foreign_data_wrapper.hpp"  // Phase 89: FDW base
 #include "../concurrent/rwlock.hpp"         // Phase 112: per-table RwLocks
 #include "../concurrent/atomic_table.hpp"   // Phase 112: lock-free stats
+#include "../optimizer/dp_planner.hpp"      // Phase 113: DP Join Order Optimizer
+#include "../optimizer/histogram.hpp"       // Phase 113: Histogram Selectivity
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 #include "../extensions/extension_manager.hpp" // Phase 90: Extension System
@@ -1596,6 +1598,80 @@ public:
         for (const auto& r : base.rows()) {
             if (r.xmax != 0) continue;  // Phase 71: skip dead rows
             current.insert(r);
+        }
+
+        // ── Phase 113: DP Join Order Optimizer ───────────────────
+        // For 3+ tables, use bitmask DP to find optimal join order.
+        if (joins.size() >= 2) {
+            // Build per-table info
+            std::vector<milansql::JoinTableInfo> dpTables;
+            dpTables.push_back({baseName, base.rowCount(), {}});
+            for (const auto& jc2 : joins) {
+                milansql::JoinTableInfo jti;
+                jti.name     = jc2.table;
+                jti.rowCount = tables_.count(jc2.table)
+                                ? tables_.at(jc2.table).rowCount() : 0;
+                dpTables.push_back(jti);
+            }
+
+            // Helper: extract table prefix from "tbl.col"
+            auto tblOf113 = [](const std::string& s) -> std::string {
+                auto p = s.rfind('.'); return p != std::string::npos ? s.substr(0, p) : s;
+            };
+
+            // Helper: find which dpTables[] index matches a name/alias
+            auto findIdx113 = [&](const std::string& pfx) -> int {
+                if (pfx.empty()) return -1;
+                for (int ti = 0; ti < static_cast<int>(dpTables.size()); ++ti) {
+                    if (tblNamesMatch(pfx, dpTables[static_cast<size_t>(ti)].name)) return ti;
+                }
+                // Alias lookup for join tables
+                for (int ti = 1; ti < static_cast<int>(dpTables.size()); ++ti) {
+                    const JoinClause& jci = joins[static_cast<size_t>(ti - 1)];
+                    if (!jci.tableAlias.empty() && pfx == jci.tableAlias) return ti;
+                }
+                return -1;  // unknown (likely base table alias)
+            };
+
+            // Compute requiredTables (connectivity) for each join table
+            for (size_t ji = 1; ji < dpTables.size(); ++ji) {
+                const JoinClause& jc2 = joins[ji - 1];
+                std::string leftPfx   = tblOf113(jc2.onLeft);
+                std::string rightPfx  = tblOf113(jc2.onRight);
+
+                std::set<int> req;
+                for (const std::string& pfx : {leftPfx, rightPfx}) {
+                    int idx = findIdx113(pfx);
+                    if (idx < 0) {
+                        req.insert(0);  // unknown alias → assume base table
+                    } else if (idx != static_cast<int>(ji)) {
+                        req.insert(idx);
+                    }
+                }
+                if (req.empty()) req.insert(0);
+                dpTables[ji].requiredTables.assign(req.begin(), req.end());
+            }
+
+            // Build cache key from sorted table names
+            std::string cacheKey;
+            std::vector<std::string> tNames;
+            for (const auto& t : dpTables) tNames.push_back(t.name);
+            std::sort(tNames.begin(), tNames.end());
+            for (const auto& n : tNames) cacheKey += n + ",";
+
+            // Run DP planner
+            auto dpResult = milansql::g_dpPlanner().plan(dpTables, cacheKey);
+            lastJoinPlan_ = dpResult;
+
+            // Reorder joins if DP found a valid plan
+            if (dpResult.dpUsed &&
+                dpResult.joinOrder.size() == joins.size()) {
+                std::vector<JoinClause> reordered;
+                reordered.reserve(joins.size());
+                for (int jcIdx : dpResult.joinOrder)
+                    reordered.push_back(joins[static_cast<size_t>(jcIdx)]);
+                joins = std::move(reordered);
+            }
         }
 
         // Jeden JOIN-Schritt nacheinander anwenden
@@ -6062,6 +6138,39 @@ public:
         }
 
         if (req.isJoin) {
+            // Phase 113: DP Planner info for 3+ table JOINs
+            if (req.joinClauses.size() >= 2) {
+                // Build dpTables for planner
+                std::vector<milansql::JoinTableInfo> dpTbl;
+                std::string rBase = resolveTableName(req.tableName);
+                size_t bRows = tables_.count(rBase) ? tables_.at(rBase).rowCount() : 0;
+                dpTbl.push_back({rBase, bRows, {}});
+                for (const auto& jc2 : req.joinClauses) {
+                    std::string rJ = resolveTableName(jc2.table);
+                    size_t jr = tables_.count(rJ) ? tables_.at(rJ).rowCount() : 0;
+                    dpTbl.push_back({rJ, jr, {}});
+                }
+                // Conservative: each join requires previous (sequential default)
+                for (size_t ji = 1; ji < dpTbl.size(); ++ji)
+                    dpTbl[ji].requiredTables = {static_cast<int>(ji) - 1};
+
+                std::string ck;
+                std::vector<std::string> tn;
+                for (const auto& t : dpTbl) tn.push_back(t.name);
+                std::sort(tn.begin(), tn.end());
+                for (const auto& n : tn) ck += n + ",";
+
+                auto dp = milansql::g_dpPlanner().plan(dpTbl, ck);
+                addStep("DP_PLAN", "-",
+                    "DP Planner: " + dp.description, "-");
+                // Show optimal order
+                if (dp.dpUsed) {
+                    std::string orderStr = dpTbl[0].name;
+                    for (int idx : dp.joinOrder)
+                        orderStr += " \u2192 " + dpTbl[static_cast<size_t>(idx + 1)].name;
+                    addStep("DP_ORDER", "-", "Optimal order: " + orderStr, "-");
+                }
+            }
             // JOIN: Haupt-Tabelle scannen, dann jede JOIN-Tabelle
             addStep("SCAN", req.tableName, "FULL SCAN", "-");
             for (const auto& jc : req.joinClauses) {
@@ -6952,6 +7061,9 @@ private:
 
     // Phase 105: Query Federation
     FederationManager fedMgr_;
+
+    // Phase 113: DP planner result for last JOIN query (for EXPLAIN)
+    mutable JoinPlan lastJoinPlan_;
 
     // Phase 112: per-table RwLocks for concurrent read optimization
     // unique_ptr because RwLock (shared_mutex) is non-movable/non-copyable

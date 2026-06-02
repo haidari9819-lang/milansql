@@ -166,7 +166,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v5.4.0 ===          \u2551\n"
+              << "  \u2551        === MilanSQL v5.5.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"

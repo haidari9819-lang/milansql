@@ -42,6 +42,8 @@
 #include "ssl/tls_context.hpp"               // Phase 110: SSL/TLS
 #include "index/hnsw_index.hpp"              // Phase 111: pgvector HNSW
 #include "types/vector_type.hpp"             // Phase 111: VectorType
+#include "optimizer/dp_planner.hpp"          // Phase 113: DP Join Order Optimizer
+#include "optimizer/histogram.hpp"           // Phase 113: Histogram Selectivity
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -528,10 +530,22 @@ static inline void dispatch_printExplain(const milansql::ExplainPlan& plan) {
     if (plan.steps.empty()) {
         std::cout << "  (Kein Plan verfuegbar)\n\n"; return;
     }
+    // Phase 113: Print DP planner info prominently before the plan table
+    for (const auto& s : plan.steps) {
+        if (s.op == "DP_PLAN")  std::cout << "  " << s.details << "\n";
+        if (s.op == "DP_ORDER") std::cout << "  " << s.details << "\n";
+    }
+    // Only show non-DP steps in the table
+    milansql::ExplainPlan filtered;
+    for (const auto& s : plan.steps)
+        if (s.op != "DP_PLAN" && s.op != "DP_ORDER")
+            filtered.steps.push_back(s);
+    if (filtered.steps.empty()) { std::cout << "\n"; return; }
+    const milansql::ExplainPlan& planToShow = filtered.steps.empty() ? plan : filtered;
     std::vector<std::string> hdr = {"Schritt", "Operation", "Tabelle", "Details", "Index"};
     std::vector<size_t> w(5);
     for (size_t i = 0; i < 5; ++i) w[i] = hdr[i].size();
-    for (const auto& s : plan.steps) {
+    for (const auto& s : planToShow.steps) {
         w[0] = std::max(w[0], std::to_string(s.nr).size());
         w[1] = std::max(w[1], s.op.size());
         w[2] = std::max(w[2], s.table.size());
@@ -559,10 +573,10 @@ static inline void dispatch_printExplain(const milansql::ExplainPlan& plan) {
     hline("\u250c", "\u252c", "\u2510", "\u2500");
     printRow(hdr);
     hline("\u251c", "\u253c", "\u2524", "\u2500");
-    for (const auto& s : plan.steps)
+    for (const auto& s : planToShow.steps)
         printRow({std::to_string(s.nr), s.op, s.table, s.details, s.index});
     hline("\u2514", "\u2534", "\u2518", "\u2500");
-    std::cout << "  EXPLAIN: " << plan.steps.size() << " Schritt(e)\n\n";
+    std::cout << "  EXPLAIN: " << planToShow.steps.size() << " Schritt(e)\n\n";
 }
 
 // ── whereDesc ─────────────────────────────────────────────────
@@ -5087,9 +5101,19 @@ inline bool dispatchCommand(
 
     // ── Phase 82: Adaptive Query Optimizer ───────────────────────
 
-    case milansql::CommandType::SHOW_QUERY_STATS:
+    case milansql::CommandType::SHOW_QUERY_STATS: {
         g_adaptiveStats.showStats();
+        // Phase 113: DP Planner stats
+        const auto& dps = milansql::g_dpStats();
+        std::cout << "\n--- DP Query Planner (Phase 113) ---\n";
+        std::cout << "  Queries planned (DP):   " << dps.queriesPlanned.load()   << "\n";
+        std::cout << "  Plan cache hits:        " << dps.planCacheHits.load()    << "\n";
+        std::cout << "  Plan cache misses:      " << dps.planCacheMisses.load()  << "\n";
+        std::cout << "  Total subsets evaluated:" << dps.totalSubsetsEval.load() << "\n";
+        std::cout << "  Plan cache size:        " << milansql::g_dpPlanner().cacheSize() << "\n";
+        std::cout << "\n";
         break;
+    }
 
     case milansql::CommandType::SHOW_INDEX_SUGGESTIONS:
         g_adaptiveStats.showIndexSuggestions();
@@ -5110,10 +5134,12 @@ inline bool dispatchCommand(
             }
             g_tableStats.saveStats();
             g_adaptiveStats.saveStats();
+            milansql::g_dpPlanner().invalidate();  // Phase 113: stats changed
             std::cout << "  ANALYZE: " << count << " Tabelle(n) analysiert.\n\n";
         } else {
             // ANALYZE TABLE name
             g_adaptiveStats.analyzeTable(cmd.tableName);
+            milansql::g_dpPlanner().invalidate(cmd.tableName);  // Phase 113
             if (engine.tableExists(cmd.tableName)) {
                 const Table& tbl = engine.getTables().at(cmd.tableName);
                 g_tableStats.analyzeTable(cmd.tableName, tbl);

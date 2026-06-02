@@ -6,7 +6,7 @@
 
 Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
-![Version](https://img.shields.io/badge/version-v5.0.0-gold)
+![Version](https://img.shields.io/badge/version-v5.8.0-gold)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
@@ -14,16 +14,16 @@ Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
 <!-- Topics: database sql cpp c-plus-plus query-engine btree replication mvcc window-functions postgresql-compatible -->
 
-**From Zero to v5.0.0 — 108 phases, pure C++17**
+**From Zero to v5.8.0 — 117 phases, pure C++17**
 
 > A complete relational database engine built from scratch in C++17.  
-> 108 development phases. Zero external dependencies. 5 network protocols.
+> 117 development phases. Zero external dependencies. 5 network protocols.
 
 ## Documentation
 
 | Guide | Description |
 |-------|-------------|
-| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 108 phases |
+| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 117 phases |
 | [Tutorial](docs/tutorial.html) | Step-by-step getting started guide |
 | [Architecture](docs/architecture.html) | Internal architecture deep-dive |
 | [Live Demo](docs/demo.html) | Try MilanSQL in your browser |
@@ -197,7 +197,7 @@ const rows = await conn.query('SELECT * FROM users');
 
 ## Benchmarks (TPC-H SF 0.01)
 
-| Metric | MilanSQL v5.0.0 |
+| Metric | MilanSQL v5.8.0 |
 |--------|-----------------|
 | INSERT throughput | ~98,000 rows/sec |
 | SELECT scan | ~1M rows/sec |

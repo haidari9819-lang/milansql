@@ -2,6 +2,21 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v5.8.0] — 2026-05-30
+
+### Added
+
+- **Phase 110:** SSL/TLS Encryption (SChannel on Windows, OpenSSL on Linux)
+- **Phase 111:** pgvector AI/ML — HNSW index, Cosine/L2/Inner-Product distance, vector_similarity()
+- **Phase 112:** Lock-free B-Tree + per-table Reader-Writer Locks (shared reads, exclusive writes)
+- **Phase 113:** DP Query Planner V2 — dynamic-programming join order optimizer + column histograms
+- **Phase 114:** Crash Recovery V2 — Double-Write Buffer (CRC-32) + LSN Manager + CHECK/REPAIR TABLE
+- **Phase 115:** Production Packaging — Kubernetes CRD + Helm chart + APT/RPM packages + Windows MSI + GitHub Actions release pipeline
+- **Phase 116:** Multi-Model Database — Document Store (MongoDB-like JSON collections) + Graph Store (Neo4j-like property graph with BFS)
+- **Phase 117:** Embedded Mode — SQLite-compatible C API (`milansql_open/exec/prepare/step`), static library, single-header amalgamation
+
+---
+
 ## [v4.0.0] — 2026-05-31 — "The PostgreSQL Challenger"
 
 ### 100 Phases Complete

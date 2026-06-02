@@ -166,7 +166,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v5.5.0 ===          \u2551\n"
+              << "  \u2551        === MilanSQL v5.6.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -410,6 +410,19 @@ int main(int argc, char* argv[]) {
     milansql::Parser             parser;
     milansql::MilanBinaryStorage storage;
     std::string                  eingabe;
+
+    // ── Phase 114: Double-Write Buffer Recovery ──────────────────
+    {
+        auto dwbRes = milansql::g_doubleWriteBuffer().recover();
+        if (dwbRes.hadPendingWrite) {
+            if (dwbRes.pagesRecovered > 0)
+                std::cout << "  DWB Recovery: " << dwbRes.pagesRecovered
+                          << " page(s) recovered from double-write buffer.\n";
+            if (dwbRes.pagesCorrupt > 0)
+                std::cout << "  DWB Recovery: " << dwbRes.pagesCorrupt
+                          << " corrupt DWB entry(s) discarded.\n";
+        }
+    }
 
     // ── Phase 72: WAL Crash Recovery ─────────────────────────────
     // Step 1: Load binary database (last persisted state)

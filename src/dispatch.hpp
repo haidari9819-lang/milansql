@@ -4820,6 +4820,55 @@ inline bool dispatchCommand(
         engine.showRecoveryStatus();
         break;
 
+    // ── Phase 114: Crash Recovery V2 ──────────────────────────────
+    case milansql::CommandType::SHOW_RECOVERY_LOG:
+        engine.showRecoveryLog();
+        break;
+
+    case milansql::CommandType::CHECK_TABLE: {
+        auto res = engine.checkTable(cmd.tableName);
+        std::cout << "\n";
+        if (res.ok) {
+            std::cout << "  CHECK TABLE " << cmd.tableName << "\n";
+            std::cout << "  ┌─────────────────────────────────────────┐\n";
+            std::cout << "  │ Status  : OK                             │\n";
+            std::cout << "  │ Rows    : " << res.rowsChecked;
+            for (int sp = static_cast<int>(std::to_string(res.rowsChecked).size()); sp < 29; ++sp) std::cout << ' ';
+            std::cout << "│\n";
+            std::cout << "  │ Issues  : 0 (table is consistent)        │\n";
+            std::cout << "  └─────────────────────────────────────────┘\n\n";
+        } else {
+            std::cout << "  CHECK TABLE " << cmd.tableName << "\n";
+            std::cout << "  Status : ERROR — " << res.issues.size() << " issue(s) found\n";
+            for (const auto& iss : res.issues)
+                std::cout << "  * " << iss << "\n";
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::CHECK_DATABASE:
+        engine.checkDatabase();
+        break;
+
+    case milansql::CommandType::REPAIR_TABLE: {
+        auto res = engine.repairTable(cmd.tableName);
+        std::cout << "\n";
+        std::cout << "  REPAIR TABLE " << cmd.tableName << "\n";
+        std::cout << "  ─────────────────────────────────────────────\n";
+        if (!res.tableExists) {
+            std::cout << "  ERROR: " << res.actions.front() << "\n\n";
+        } else {
+            std::cout << "  Rows examined : " << res.rowsExamined << "\n";
+            std::cout << "  Rows fixed    : " << res.rowsFixed << "\n";
+            for (const auto& act : res.actions)
+                std::cout << "  → " << act << "\n";
+            std::cout << "\n";
+            if (res.rowsFixed > 0) persistFn();
+        }
+        break;
+    }
+
     // ── Phase 72: Materialized Views ──────────────────────────────
 
     case milansql::CommandType::SHOW_MATERIALIZED_VIEWS:

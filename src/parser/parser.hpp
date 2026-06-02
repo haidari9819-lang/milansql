@@ -239,6 +239,11 @@ enum class CommandType {
     SET_SSL,
     // Phase 111: pgvector
     CREATE_VECTOR_INDEX,
+    // Phase 114: Crash Recovery V2
+    CHECK_TABLE,
+    CHECK_DATABASE,
+    REPAIR_TABLE,
+    SHOW_RECOVERY_LOG,
     UNKNOWN
 };
 
@@ -2072,6 +2077,9 @@ public:
             // Phase 72: SHOW RECOVERY STATUS
             } else if (kw1 == "RECOVERY" && tokens.size() >= 3 && toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_RECOVERY_STATUS;
+            // Phase 114: SHOW RECOVERY LOG
+            } else if (kw1 == "RECOVERY" && tokens.size() >= 3 && toUpper(tokens[2]) == "LOG") {
+                cmd.type = CommandType::SHOW_RECOVERY_LOG;
             // Phase 72: SHOW MATERIALIZED VIEWS
             } else if (kw1 == "MATERIALIZED" && tokens.size() >= 3 && toUpper(tokens[2]) == "VIEWS") {
                 cmd.type = CommandType::SHOW_MATERIALIZED_VIEWS;
@@ -3487,6 +3495,24 @@ public:
         // SHOW SSL STATUS (also handled inside SHOW block above, repeated here for outer chain)
         } else if (kw0 == "SHOW" && kw1 == "SSL") {
             cmd.type = CommandType::SHOW_SSL_STATUS;
+
+        // ── Phase 114: CHECK TABLE / CHECK DATABASE ───────────────
+        } else if (kw0 == "CHECK" && kw1 == "TABLE" && tokens.size() >= 3) {
+            cmd.type      = CommandType::CHECK_TABLE;
+            cmd.tableName = tokens[2];
+
+        } else if (kw0 == "CHECK" && kw1 == "DATABASE") {
+            cmd.type = CommandType::CHECK_DATABASE;
+
+        // ── Phase 114: REPAIR TABLE ───────────────────────────────
+        } else if (kw0 == "REPAIR" && kw1 == "TABLE" && tokens.size() >= 3) {
+            cmd.type      = CommandType::REPAIR_TABLE;
+            cmd.tableName = tokens[2];
+
+        // ── Phase 114: SHOW RECOVERY LOG ─────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "RECOVERY" &&
+                   tokens.size() >= 3 && toUpper(tokens[2]) == "LOG") {
+            cmd.type = CommandType::SHOW_RECOVERY_LOG;
 
         } else if (kw0 == "HELP") { cmd.type = CommandType::HELP; }
         else if  (kw0 == "EXIT") { cmd.type = CommandType::EXIT; }

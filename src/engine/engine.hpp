@@ -42,6 +42,8 @@
 #include "../concurrent/atomic_table.hpp"   // Phase 112: lock-free stats
 #include "../optimizer/dp_planner.hpp"      // Phase 113: DP Join Order Optimizer
 #include "../optimizer/histogram.hpp"       // Phase 113: Histogram Selectivity
+#include "../wal/double_write_buffer.hpp"   // Phase 114: Double-Write Buffer
+#include "../wal/lsn_manager.hpp"           // Phase 114: LSN Manager
 #include "../fdw/csv_fdw.hpp"               // Phase 89: CSV FDW
 #include "../fdw/http_fdw.hpp"              // Phase 89: HTTP/JSON FDW
 #include "../extensions/extension_manager.hpp" // Phase 90: Extension System
@@ -6756,6 +6758,257 @@ public:
              sp < 10; ++sp) std::cout << " ";
         std::cout << "│\n";
         std::cout << "  └──────────────────────────────────────┘\n\n";
+    }
+
+    // ── Phase 114: SHOW RECOVERY LOG (enhanced) ───────────────────
+    void showRecoveryLog() const {
+        std::cout << "\n";
+        std::cout << "  ╔══════════════════════════════════════════╗\n";
+        std::cout << "  ║       RECOVERY LOG — Phase 114           ║\n";
+        std::cout << "  ╚══════════════════════════════════════════╝\n\n";
+
+        if (!recoveryStatus_.hadWal) {
+            std::cout << "  Kein WAL beim Start gefunden.\n";
+            std::cout << "  → Kein Recovery notwendig (clean shutdown).\n\n";
+        } else {
+            std::cout << "  WAL-Datei gefunden und verarbeitet:\n\n";
+            std::cout << "    Committete Transaktionen  : "
+                      << recoveryStatus_.recoveredTxCount << " (replay OK)\n";
+            std::cout << "    Uncommittete Transaktionen: "
+                      << recoveryStatus_.discardedTxCount << " (verworfen)\n";
+            std::cout << "    Wiederhergestellte Ops    : "
+                      << recoveryStatus_.replayedOpCount << "\n\n";
+
+            if (recoveryStatus_.discardedTxCount > 0) {
+                std::cout << "  INFO: "
+                          << recoveryStatus_.discardedTxCount
+                          << " uncommitted transaction"
+                          << (recoveryStatus_.discardedTxCount == 1 ? "" : "s")
+                          << " discarded (no COMMIT found in WAL).\n";
+            }
+            if (recoveryStatus_.recoveredTxCount > 0) {
+                std::cout << "  INFO: "
+                          << recoveryStatus_.recoveredTxCount
+                          << " committed transaction"
+                          << (recoveryStatus_.recoveredTxCount == 1 ? "" : "s")
+                          << " successfully replayed.\n";
+            }
+            std::cout << "\n";
+        }
+
+        // LSN state
+        std::cout << "  LSN State:\n";
+        g_lsnManager().showStatus();
+        std::cout << "\n";
+
+        // Double-Write Buffer state
+        std::cout << "  Double-Write Buffer:\n";
+        bool clean = g_doubleWriteBuffer().isClean();
+        std::cout << "  └─ Status: "
+                  << (clean ? "CLEAN (no pending writes)" : "PENDING (incomplete write detected)")
+                  << "\n\n";
+    }
+
+    // ── Phase 114: CHECK TABLE ────────────────────────────────────
+    struct TableCheckResult {
+        std::string tableName;
+        bool        ok         = true;
+        int         rowsChecked = 0;
+        std::vector<std::string> issues;
+    };
+
+    TableCheckResult checkTable(const std::string& tableName) const {
+        TableCheckResult res;
+        res.tableName = tableName;
+
+        auto it = tables_.find(tableName);
+        if (it == tables_.end()) {
+            res.ok = false;
+            res.issues.push_back("Table '" + tableName + "' does not exist.");
+            return res;
+        }
+
+        const Table& tbl     = it->second;
+        const auto&  cols    = tbl.columns();
+        const auto&  rows    = tbl.rows();
+        res.rowsChecked      = static_cast<int>(rows.size());
+
+        // ── 1. Primary key uniqueness ─────────────────────────────
+        int pkIdx = -1;
+        for (size_t i = 0; i < cols.size(); ++i)
+            if (cols[i].isPrimaryKey) { pkIdx = static_cast<int>(i); break; }
+
+        if (pkIdx >= 0) {
+            std::map<std::string, int> pkSeen;
+            for (int ri = 0; ri < static_cast<int>(rows.size()); ++ri) {
+                if (rows[ri].xmax != 0) continue; // skip deleted rows
+                if (static_cast<int>(rows[ri].values.size()) <= pkIdx) continue;
+                const std::string& pkVal = rows[ri].values[static_cast<size_t>(pkIdx)];
+                if (pkSeen.count(pkVal)) {
+                    res.ok = false;
+                    res.issues.push_back(
+                        "Duplicate primary key '" + pkVal +
+                        "' at rows " + std::to_string(pkSeen[pkVal]) +
+                        " and " + std::to_string(ri));
+                }
+                pkSeen[pkVal] = ri;
+            }
+        }
+
+        // ── 2. NOT NULL constraint compliance ─────────────────────
+        for (const auto& row : rows) {
+            if (row.xmax != 0) continue;
+            for (size_t ci = 0; ci < cols.size() && ci < row.values.size(); ++ci) {
+                if ((cols[ci].notNull || cols[ci].isPrimaryKey) &&
+                    row.values[ci] == "NULL") {
+                    res.ok = false;
+                    res.issues.push_back(
+                        "NOT NULL violation in column '" + cols[ci].name + "'");
+                }
+            }
+        }
+
+        // ── 3. CHECK constraint compliance ────────────────────────
+        for (const auto& row : rows) {
+            if (row.xmax != 0) continue;
+            for (size_t ci = 0; ci < cols.size() && ci < row.values.size(); ++ci) {
+                for (const auto& chk : cols[ci].checks) {
+                    const std::string& val = row.values[ci];
+                    bool pass = true;
+                    try {
+                        double lv = std::stod(val);
+                        double rv = std::stod(chk.val);
+                        if      (chk.op == ">")  pass = lv >  rv;
+                        else if (chk.op == ">=") pass = lv >= rv;
+                        else if (chk.op == "<")  pass = lv <  rv;
+                        else if (chk.op == "<=") pass = lv <= rv;
+                        else if (chk.op == "=")  pass = lv == rv;
+                        else if (chk.op == "!=") pass = lv != rv;
+                    } catch (...) {
+                        // String comparison
+                        if      (chk.op == "=")  pass = val == chk.val;
+                        else if (chk.op == "!=") pass = val != chk.val;
+                    }
+                    if (!pass) {
+                        res.ok = false;
+                        res.issues.push_back(
+                            "CHECK constraint violated in column '" +
+                            cols[ci].name + "': " + val + " " + chk.op +
+                            " " + chk.val + " is false");
+                    }
+                }
+            }
+        }
+
+        return res;
+    }
+
+    // ── Phase 114: CHECK DATABASE ─────────────────────────────────
+    void checkDatabase() const {
+        auto names = getAllTableNamesInternal();
+        int  total = static_cast<int>(names.size());
+        int  ok    = 0;
+        int  bad   = 0;
+
+        std::cout << "\n";
+        std::cout << "  CHECK DATABASE — " << total << " table(s)\n";
+        std::cout << "  ─────────────────────────────────────────────\n";
+
+        for (const auto& name : names) {
+            auto res = checkTable(name);
+            if (res.ok) {
+                ++ok;
+                std::cout << "  [OK]  " << name
+                          << " (" << res.rowsChecked << " rows)\n";
+            } else {
+                ++bad;
+                std::cout << "  [ERR] " << name
+                          << " — " << res.issues.size() << " issue(s):\n";
+                for (const auto& iss : res.issues)
+                    std::cout << "         * " << iss << "\n";
+            }
+        }
+
+        std::cout << "  ─────────────────────────────────────────────\n";
+        std::cout << "  Result: " << ok << " OK, " << bad << " with errors.\n\n";
+    }
+
+    // ── Phase 114: REPAIR TABLE ───────────────────────────────────
+    struct RepairResult {
+        std::string tableName;
+        int  rowsExamined  = 0;
+        int  rowsFixed     = 0;
+        bool tableExists   = true;
+        std::vector<std::string> actions;
+    };
+
+    RepairResult repairTable(const std::string& tableName) {
+        RepairResult res;
+        res.tableName = tableName;
+
+        auto it = tables_.find(tableName);
+        if (it == tables_.end()) {
+            res.tableExists = false;
+            res.actions.push_back("Table '" + tableName + "' not found.");
+            return res;
+        }
+
+        Table& tbl   = it->second;
+        auto&  cols  = const_cast<std::vector<Column>&>(tbl.columns());
+        auto&  rows  = tbl.mutableRows();
+        res.rowsExamined = static_cast<int>(rows.size());
+
+        // ── 1. Remove duplicate primary keys (keep first occurrence) ─
+        int pkIdx = -1;
+        for (size_t i = 0; i < cols.size(); ++i)
+            if (cols[i].isPrimaryKey) { pkIdx = static_cast<int>(i); break; }
+
+        if (pkIdx >= 0) {
+            std::set<std::string> pkSeen;
+            int removed = 0;
+            for (auto& row : rows) {
+                if (row.xmax != 0) continue;
+                if (static_cast<int>(row.values.size()) <= pkIdx) continue;
+                const std::string& pk = row.values[static_cast<size_t>(pkIdx)];
+                if (pkSeen.count(pk)) {
+                    row.xmax = 1;  // mark deleted
+                    ++removed;
+                    ++res.rowsFixed;
+                } else {
+                    pkSeen.insert(pk);
+                }
+            }
+            if (removed > 0)
+                res.actions.push_back("Removed " + std::to_string(removed) +
+                                      " duplicate primary key row(s).");
+        }
+
+        // ── 2. Fix NOT NULL violations → replace NULL with default ───
+        int nullFixed = 0;
+        for (auto& row : rows) {
+            if (row.xmax != 0) continue;
+            for (size_t ci = 0; ci < cols.size() && ci < row.values.size(); ++ci) {
+                if ((cols[ci].notNull || cols[ci].isPrimaryKey) &&
+                    row.values[ci] == "NULL") {
+                    if (cols[ci].hasDefault)
+                        row.values[ci] = cols[ci].defaultValue;
+                    else if (cols[ci].type == "INT" || cols[ci].type == "INTEGER")
+                        row.values[ci] = "0";
+                    else
+                        row.values[ci] = "";
+                    ++nullFixed;
+                    ++res.rowsFixed;
+                }
+            }
+        }
+        if (nullFixed > 0)
+            res.actions.push_back("Fixed " + std::to_string(nullFixed) +
+                                  " NOT NULL violation(s).");
+
+        if (res.actions.empty())
+            res.actions.push_back("No issues found — table is consistent.");
+
+        return res;
     }
 
     // ── Phase 72: Materialized Views ─────────────────────────────

@@ -104,9 +104,47 @@ else()
     target_compile_options(milansql_bench PRIVATE -Wall -Wextra)
 endif()
 
+# ── Phase 117: Embedded Mode ─────────────────────────────────
+# Enable C language for the embedded C API test
+enable_language(C)
+# Static library: milansql_embedded
+add_library(milansql_embedded STATIC src/embedded/embedded_api.cpp)
+target_compile_features(milansql_embedded PRIVATE cxx_std_17)
+target_include_directories(milansql_embedded PUBLIC include)
+target_include_directories(milansql_embedded PRIVATE
+    src src/server src/locking src/optimizer src/cache src/utils
+    src/backup src/replication src/scheduler src/pubsub src/parallel
+    src/compression src/copy src/pool src/fdw src/cdc src/api
+    src/extensions src/extensions/builtin src/timeseries src/types
+    src/mvcc src/wal src/buffer src/spatial src/profiler src/storage
+    src/federation src/config src/migration src/ssl src/index
+    src/concurrent src/document src/graph)
+if(MSVC)
+    target_compile_options(milansql_embedded PRIVATE /W4)
+else()
+    target_compile_options(milansql_embedded PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_embedded PRIVATE ws2_32 secur32 crypt32)
+endif()
+
+# C test executable: milansql_embedded_test (compiled as C, links C++ lib)
+add_executable(milansql_embedded_test src/tests/embedded_test.c)
+target_include_directories(milansql_embedded_test PRIVATE include)
+target_link_libraries(milansql_embedded_test PRIVATE milansql_embedded)
+# C test needs the C++ runtime via the C++ linker driver
+set_target_properties(milansql_embedded_test PROPERTIES LINKER_LANGUAGE CXX)
+if(WIN32)
+    target_link_libraries(milansql_embedded_test PRIVATE ws2_32 secur32 crypt32)
+    # Force console subsystem so WinMain is not required
+    target_compile_options(milansql_embedded_test PRIVATE -mconsole)
+    target_link_options(milansql_embedded_test PRIVATE -mconsole)
+endif()
+
 # ── CTest Integration ────────────────────────────────────────
 enable_testing()
-add_test(NAME milansql_tests COMMAND milansql_tests)
+add_test(NAME milansql_tests          COMMAND milansql_tests)
+add_test(NAME milansql_embedded_tests COMMAND milansql_embedded_test)
 
 # Ausgabe-Info
 message(STATUS "MilanSQL v${PROJECT_VERSION} — Build konfiguriert")

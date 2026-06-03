@@ -28,12 +28,13 @@ git add -A
 git push origin main
 echo "✓ main updated"
 
-# 3. release Branch aktualisieren
+# 3. release Branch aktualisieren (orphan — nutze checkout statt merge)
 echo ""
 echo "Updating release branch..."
 git checkout release
 
-git merge main --squash -X theirs
+# Alle Dateien von main übernehmen (funktioniert auch bei unrelated histories)
+git checkout main -- .
 
 git commit \
   --author="Mirwais Haidari <haidari9819@gmail.com>" \

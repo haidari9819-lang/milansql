@@ -1,6 +1,8 @@
 // ============================================================
 // milansql_tests.cpp — Automatisierte Testsuite für MilanSQL
 // Phase 99: Extended Test Suite (200+ Tests) + Stress Testing
+// Phase 127: Multi-Tenant Support (Group 42)
+// Phase 128: Automatic Failover + High Availability Sentinel (Group 43)
 // ============================================================
 
 #include <iostream>

@@ -13,6 +13,7 @@ namespace milansql {
 struct QueryResult {
     std::vector<milansql::Column> columns;
     std::vector<milansql::Row>    rows;
+    std::string                   error;  // non-empty on failure
 };
 
 inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engine) {
@@ -90,6 +91,113 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         qr.rows.push_back(milansql::Row({"Interval", std::to_string(s.intervalSeconds) + "s"}));
         qr.rows.push_back(milansql::Row({"Threshold", std::to_string(s.changeThresholdPct) + "%"}));
         qr.rows.push_back(milansql::Row({"Tables Analyzed", std::to_string(s.tablesAnalyzed)}));
+        break;
+    }
+
+    // ── Phase 127: Multi-Tenant Support ──────────────────────────
+    case milansql::CommandType::CREATE_TENANT: {
+        int maxConn = 100;
+        double maxGB = 10.0;
+        int maxTbl = 200;
+        if (cmd.tenantOptions.count("max_connections"))
+            maxConn = std::stoi(cmd.tenantOptions.at("max_connections"));
+        if (cmd.tenantOptions.count("max_storage_gb"))
+            maxGB = std::stod(cmd.tenantOptions.at("max_storage_gb"));
+        if (cmd.tenantOptions.count("max_tables"))
+            maxTbl = std::stoi(cmd.tenantOptions.at("max_tables"));
+        if (!engine.tenantManager.createTenant(cmd.tenantName, maxConn, maxGB, maxTbl)) {
+            qr.error = "Tenant '" + cmd.tenantName + "' already exists";
+        }
+        break;
+    }
+
+    case milansql::CommandType::DROP_TENANT: {
+        if (!engine.tenantManager.dropTenant(cmd.tenantName)) {
+            qr.error = "Cannot drop tenant '" + cmd.tenantName + "'";
+        }
+        break;
+    }
+
+    case milansql::CommandType::USE_TENANT: {
+        if (!engine.tenantManager.switchTenant(cmd.tenantName)) {
+            qr.error = "Tenant '" + cmd.tenantName + "' not found";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TENANTS: {
+        qr.columns = {milansql::Column{"Tenant","TEXT"}, milansql::Column{"MaxConn","INT"},
+                      milansql::Column{"MaxStorageGB","TEXT"}, milansql::Column{"MaxTables","INT"},
+                      milansql::Column{"DataDir","TEXT"}};
+        for (auto& t : engine.tenantManager.allTenants()) {
+            milansql::Row r({t.name, std::to_string(t.maxConnections),
+                             std::to_string((int)t.maxStorageGB),
+                             std::to_string(t.maxTables), t.dataDir});
+            qr.rows.push_back(r);
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TENANT_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        auto* t = engine.tenantManager.getTenant(cmd.tenantName);
+        if (!t) { qr.error = "Tenant not found"; break; }
+        qr.rows.push_back(milansql::Row({"Name", t->name}));
+        qr.rows.push_back(milansql::Row({"MaxConnections", std::to_string(t->maxConnections)}));
+        qr.rows.push_back(milansql::Row({"MaxStorageGB", std::to_string((int)t->maxStorageGB)}));
+        qr.rows.push_back(milansql::Row({"MaxTables", std::to_string(t->maxTables)}));
+        qr.rows.push_back(milansql::Row({"DataDir", t->dataDir}));
+        qr.rows.push_back(milansql::Row({"Status", t->active ? "ACTIVE" : "INACTIVE"}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TENANT_USAGE: {
+        qr.columns = {milansql::Column{"Tenant","TEXT"}, milansql::Column{"Connections","TEXT"},
+                      milansql::Column{"Tables","TEXT"}, milansql::Column{"Storage","TEXT"},
+                      milansql::Column{"Status","TEXT"}};
+        for (auto& t : engine.tenantManager.allTenants()) {
+            milansql::Row r({t.name,
+                std::to_string(t.currentConnections) + "/" + std::to_string(t.maxConnections),
+                std::to_string(t.currentTables) + "/" + std::to_string(t.maxTables),
+                std::to_string((int)t.currentStorageMB) + "MB/" + std::to_string((int)t.maxStorageGB) + "GB",
+                t.active ? "ACTIVE" : "INACTIVE"});
+            qr.rows.push_back(r);
+        }
+        break;
+    }
+
+    // ── Phase 128: HA Sentinel ────────────────────────────────────
+    case milansql::CommandType::PROMOTE_TO_MASTER: {
+        engine.promoteToMaster();
+        break;
+    }
+
+    case milansql::CommandType::DEMOTE_TO_SLAVE: {
+        engine.demoteToSlave();
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SENTINEL_STATUS: {
+        qr.columns = {milansql::Column{"Node","TEXT"}, milansql::Column{"Port","INT"},
+                      milansql::Column{"Role","TEXT"}, milansql::Column{"Status","TEXT"},
+                      milansql::Column{"FailedChecks","INT"}};
+        for (auto& n : engine.sentinel.nodes()) {
+            milansql::Row r({n.host, std::to_string(n.port),
+                             n.isMaster ? "MASTER" : "SLAVE",
+                             n.isAlive ? "ALIVE" : "DOWN",
+                             std::to_string(n.failedChecks)});
+            qr.rows.push_back(r);
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_HA_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        qr.rows.push_back(milansql::Row({"Role", engine.isMaster_ ? "MASTER" : "SLAVE"}));
+        qr.rows.push_back(milansql::Row({"Sentinel", engine.sentinel.sentinelActive ? "ACTIVE" : "INACTIVE"}));
+        qr.rows.push_back(milansql::Row({"Monitored Nodes", std::to_string(engine.sentinel.nodeCount())}));
+        qr.rows.push_back(milansql::Row({"Current Master",
+            engine.sentinel.currentMasterHost + ":" + std::to_string(engine.sentinel.currentMasterPort)}));
         break;
     }
 

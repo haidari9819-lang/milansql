@@ -6390,6 +6390,137 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 127: CREATE TENANT ──────────────────────────────────
+    case milansql::CommandType::CREATE_TENANT: {
+        int maxConn = 100;
+        double maxGB = 10.0;
+        int maxTbl = 200;
+        if (cmd.tenantOptions.count("max_connections"))
+            maxConn = std::stoi(cmd.tenantOptions.at("max_connections"));
+        if (cmd.tenantOptions.count("max_storage_gb"))
+            maxGB = std::stod(cmd.tenantOptions.at("max_storage_gb"));
+        if (cmd.tenantOptions.count("max_tables"))
+            maxTbl = std::stoi(cmd.tenantOptions.at("max_tables"));
+        if (!engine.tenantManager.createTenant(cmd.tenantName, maxConn, maxGB, maxTbl)) {
+            std::cout << "  ERROR: Tenant '" << cmd.tenantName << "' already exists.\n\n";
+        } else {
+            std::cout << "  Tenant '" << cmd.tenantName << "' created.\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 127: DROP TENANT ────────────────────────────────────
+    case milansql::CommandType::DROP_TENANT: {
+        if (!engine.tenantManager.dropTenant(cmd.tenantName)) {
+            std::cout << "  ERROR: Cannot drop tenant '" << cmd.tenantName << "'.\n\n";
+        } else {
+            std::cout << "  Tenant '" << cmd.tenantName << "' dropped.\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 127: USE TENANT ─────────────────────────────────────
+    case milansql::CommandType::USE_TENANT: {
+        if (!engine.tenantManager.switchTenant(cmd.tenantName)) {
+            std::cout << "  ERROR: Tenant '" << cmd.tenantName << "' not found.\n\n";
+        } else {
+            std::cout << "  Switched to tenant '" << cmd.tenantName << "'.\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 127: SHOW TENANTS ───────────────────────────────────
+    case milansql::CommandType::SHOW_TENANTS: {
+        std::cout << "\n  Tenants:\n";
+        std::cout << "  Name | MaxConn | MaxStorageGB | MaxTables | DataDir\n";
+        std::cout << "  -------------------------------------------------------\n";
+        for (auto& t : engine.tenantManager.allTenants()) {
+            std::cout << "  " << t.name
+                      << " | " << t.maxConnections
+                      << " | " << (int)t.maxStorageGB
+                      << " | " << t.maxTables
+                      << " | " << t.dataDir << "\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 127: SHOW TENANT STATUS ────────────────────────────
+    case milansql::CommandType::SHOW_TENANT_STATUS: {
+        auto* t = engine.tenantManager.getTenant(cmd.tenantName);
+        if (!t) {
+            std::cout << "  ERROR: Tenant not found.\n\n";
+        } else {
+            std::cout << "\n  Tenant Status: " << t->name << "\n";
+            std::cout << "  MaxConnections: " << t->maxConnections << "\n";
+            std::cout << "  MaxStorageGB: " << (int)t->maxStorageGB << "\n";
+            std::cout << "  MaxTables: " << t->maxTables << "\n";
+            std::cout << "  DataDir: " << t->dataDir << "\n";
+            std::cout << "  Status: " << (t->active ? "ACTIVE" : "INACTIVE") << "\n\n";
+        }
+        break;
+    }
+
+    // ── Phase 127: SHOW TENANT USAGE ─────────────────────────────
+    case milansql::CommandType::SHOW_TENANT_USAGE: {
+        std::cout << "\n  Tenant Usage:\n";
+        std::cout << "  Tenant | Connections | Tables | Storage | Status\n";
+        std::cout << "  ---------------------------------------------------\n";
+        for (auto& t : engine.tenantManager.allTenants()) {
+            std::cout << "  " << t.name
+                      << " | " << t.currentConnections << "/" << t.maxConnections
+                      << " | " << t.currentTables << "/" << t.maxTables
+                      << " | " << (int)t.currentStorageMB << "MB/" << (int)t.maxStorageGB << "GB"
+                      << " | " << (t.active ? "ACTIVE" : "INACTIVE") << "\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 128: PROMOTE TO MASTER ─────────────────────────────
+    case milansql::CommandType::PROMOTE_TO_MASTER: {
+        engine.promoteToMaster();
+        std::cout << "  Promoted to MASTER.\n\n";
+        break;
+    }
+
+    // ── Phase 128: DEMOTE TO SLAVE ───────────────────────────────
+    case milansql::CommandType::DEMOTE_TO_SLAVE: {
+        engine.demoteToSlave();
+        std::cout << "  Demoted to SLAVE.\n\n";
+        break;
+    }
+
+    // ── Phase 128: SHOW SENTINEL STATUS ──────────────────────────
+    case milansql::CommandType::SHOW_SENTINEL_STATUS: {
+        if (engine.sentinel.nodes().empty()) {
+            std::cout << "  (no nodes monitored)\n\n";
+        } else {
+            std::cout << "\n  Node | Port | Role | Status | FailedChecks\n";
+            std::cout << "  -------------------------------------------\n";
+            for (auto& n : engine.sentinel.nodes()) {
+                std::cout << "  " << n.host
+                          << " | " << n.port
+                          << " | " << (n.isMaster ? "MASTER" : "SLAVE")
+                          << " | " << (n.isAlive ? "ALIVE" : "DOWN")
+                          << " | " << n.failedChecks << "\n";
+            }
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    // ── Phase 128: SHOW HA STATUS ─────────────────────────────────
+    case milansql::CommandType::SHOW_HA_STATUS: {
+        std::cout << "\n  HA Status:\n";
+        std::cout << "  Role: " << (engine.isMaster_ ? "MASTER" : "SLAVE") << "\n";
+        std::cout << "  Sentinel: " << (engine.sentinel.sentinelActive ? "ACTIVE" : "INACTIVE") << "\n";
+        std::cout << "  Monitored Nodes: " << engine.sentinel.nodeCount() << "\n";
+        std::cout << "  Current Master: " << engine.sentinel.currentMasterHost
+                  << ":" << engine.sentinel.currentMasterPort << "\n\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

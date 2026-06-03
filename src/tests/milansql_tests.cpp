@@ -2791,6 +2791,148 @@ static void testGroup41() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Group 42: Phase 127 — Multi-Tenant Support
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup42() {
+    std::cout << "\n--- Group 42: Multi-Tenant Support ---\n";
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+    auto checkT = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // CREATE TENANT
+    auto r1 = execSQL("CREATE TENANT tenant_a");
+    checkT(r1.error.empty(), "CREATE TENANT tenant_a succeeds");
+
+    auto r2 = execSQL("CREATE TENANT tenant_b");
+    checkT(r2.error.empty(), "CREATE TENANT tenant_b succeeds");
+
+    // SHOW TENANTS
+    auto r3 = execSQL("SHOW TENANTS");
+    checkT(r3.rows.size() >= 3, "SHOW TENANTS shows default + 2 new");
+
+    // CREATE TENANT with options
+    auto r4 = execSQL("CREATE TENANT acme_corp WITH (max_connections=50, max_storage_gb=10, max_tables=100)");
+    checkT(r4.error.empty(), "CREATE TENANT with options succeeds");
+
+    auto* t = engine.tenantManager.getTenant("acme_corp");
+    checkT(t != nullptr, "acme_corp tenant exists");
+    checkT(t && t->maxConnections == 50, "acme_corp max_connections=50");
+    checkT(t && t->maxTables == 100, "acme_corp max_tables=100");
+
+    // USE TENANT
+    auto r5 = execSQL("USE TENANT tenant_a");
+    checkT(r5.error.empty(), "USE TENANT tenant_a succeeds");
+    checkT(engine.tenantManager.activeTenant == "tenant_a", "activeTenant is tenant_a");
+
+    auto r6 = execSQL("USE TENANT tenant_b");
+    checkT(r6.error.empty(), "USE TENANT tenant_b returns no error");
+    checkT(engine.tenantManager.activeTenant == "tenant_b", "activeTenant is tenant_b");
+
+    // USE TENANT nonexistent -> error
+    auto r7 = execSQL("USE TENANT nonexistent_xyz");
+    checkT(!r7.error.empty(), "USE TENANT nonexistent -> error");
+
+    // SHOW TENANT STATUS
+    auto r8 = execSQL("SHOW TENANT STATUS tenant_a");
+    checkT(!r8.rows.empty(), "SHOW TENANT STATUS returns rows");
+
+    // SHOW TENANT USAGE
+    auto r9 = execSQL("SHOW TENANT USAGE");
+    checkT(r9.rows.size() >= 3, "SHOW TENANT USAGE shows all tenants");
+
+    // DROP TENANT
+    auto r10 = execSQL("DROP TENANT tenant_b");
+    checkT(r10.error.empty(), "DROP TENANT tenant_b succeeds");
+    checkT(engine.tenantManager.getTenant("tenant_b") == nullptr, "tenant_b is gone");
+
+    // DROP default -> error
+    auto r11 = execSQL("DROP TENANT default");
+    checkT(!r11.error.empty(), "Cannot drop default tenant");
+
+    // Duplicate CREATE -> error
+    auto r12 = execSQL("CREATE TENANT tenant_a");
+    checkT(!r12.error.empty(), "Duplicate CREATE TENANT -> error");
+}
+
+// ══════════════════════════════════════════════════════════════
+// Group 43: Phase 128 — Automatic Failover + HA Sentinel
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup43() {
+    std::cout << "\n--- Group 43: Automatic Failover + HA Sentinel ---\n";
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+    auto checkT = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // Initial state: isMaster = true
+    checkT(engine.isMaster_, "Engine starts as MASTER");
+    checkT(!engine.isSlave_, "Engine starts not as SLAVE");
+
+    // DEMOTE TO SLAVE
+    auto r1 = execSQL("DEMOTE TO SLAVE");
+    checkT(r1.error.empty(), "DEMOTE TO SLAVE succeeds");
+    checkT(!engine.isMaster_, "After DEMOTE: isMaster=false");
+    checkT(engine.isSlave_, "After DEMOTE: isSlave=true");
+
+    // PROMOTE TO MASTER
+    auto r2 = execSQL("PROMOTE TO MASTER");
+    checkT(r2.error.empty(), "PROMOTE TO MASTER succeeds");
+    checkT(engine.isMaster_, "After PROMOTE: isMaster=true");
+    checkT(!engine.isSlave_, "After PROMOTE: isSlave=false");
+
+    // Sentinel
+    engine.sentinel.addMonitor("localhost", 4406, true);  // master
+    engine.sentinel.addMonitor("localhost", 4407, false); // slave
+    engine.sentinel.addMonitor("localhost", 4408, false); // slave
+
+    auto r3 = execSQL("SHOW SENTINEL STATUS");
+    checkT(r3.rows.size() == 3, "SHOW SENTINEL STATUS shows 3 nodes");
+
+    // Check alive/role
+    bool foundMaster = false;
+    for (auto& row : r3.rows)
+        if (row.values.size() >= 3 && row.values[2] == "MASTER") foundMaster = true;
+    checkT(foundMaster, "SENTINEL STATUS has a MASTER node");
+
+    // HA STATUS
+    auto r4 = execSQL("SHOW HA STATUS");
+    checkT(!r4.rows.empty(), "SHOW HA STATUS returns rows");
+
+    // Failover simulation
+    engine.sentinel.markDown("localhost", 4406); // master goes down
+    std::string newMaster = engine.sentinel.electNewMaster();
+    checkT(!newMaster.empty(), "electNewMaster returns a node");
+    // Verify master changed
+    bool hasNewMaster = false;
+    for (auto& n : engine.sentinel.nodes())
+        if (n.isMaster && n.isAlive) hasNewMaster = true;
+    checkT(hasNewMaster, "After failover, alive node is master");
+
+    // sentinel health checks
+    checkT(engine.sentinel.nodeCount() == 3, "Sentinel monitors 3 nodes");
+    checkT(engine.sentinel.sentinelActive, "Sentinel is active");
+
+    // Status summary
+    std::string summary = engine.sentinel.statusSummary();
+    checkT(!summary.empty(), "Sentinel statusSummary not empty");
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -2921,6 +3063,12 @@ int main() {
     }
     try { testGroup41(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 41 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup42(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 42 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup43(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 43 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

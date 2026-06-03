@@ -88,6 +88,8 @@
 #include "../profiler/slow_query_log.hpp"      // Phase 120: Slow Query Log
 #include "../lb/load_balancer.hpp"             // Phase 125: Load Balancer
 #include "../cache/plan_cache.hpp"             // Phase 126: Plan Cache V2
+#include "../tenant/tenant_manager.hpp"        // Phase 127: Multi-Tenant Support
+#include "../ha/sentinel.hpp"                  // Phase 128: HA Sentinel
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1057,6 +1059,17 @@ public:
 
     // ── Phase 126: Plan Cache V2 ──────────────────────────────────
     PlanCache planCache;
+
+    // ── Phase 127: Multi-Tenant Support ───────────────────────────
+    TenantManager tenantManager;
+
+    // ── Phase 128: HA Sentinel + Role ─────────────────────────────
+    Sentinel sentinel;
+    bool isMaster_ = true;   // default: this instance is master
+    bool isSlave_ = false;
+
+    void promoteToMaster() { isMaster_ = true; isSlave_ = false; }
+    void demoteToSlave()   { isMaster_ = false; isSlave_ = true; }
     bool optimizerTraceEnabled = false;
     std::vector<std::string> optimizerTraceLog;
 

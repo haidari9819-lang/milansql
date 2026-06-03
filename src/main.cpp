@@ -166,7 +166,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v6.1.0 ===          \u2551\n"
+              << "  \u2551        === MilanSQL v6.2.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -205,6 +205,8 @@ int main(int argc, char* argv[]) {
     // Phase 125: Load Balancer
     bool lbMode  = false;
     int  lbPort  = 4405;
+    // Phase 128: Sentinel mode
+    bool sentinelMode = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -224,6 +226,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--ssl")         sslMode    = true;
         else if (arg == "--gen-cert")    genCert    = true;
         else if (arg == "--lb")          lbMode     = true;
+        else if (arg == "--sentinel")    sentinelMode = true;
         else if (arg == "--ssl-cert"  && i + 1 < argc) sslCert = argv[++i];
         else if (arg == "--ssl-key"   && i + 1 < argc) sslKey  = argv[++i];
         else if (arg == "--backend"   && i + 1 < argc) {
@@ -249,6 +252,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-port"   && i + 1 < argc) masterPort  = std::stoi(argv[++i]);
         else if (arg == "--repl-port"     && i + 1 < argc) replPort    = std::stoi(argv[++i]);
         else if (arg == "--lb-port"       && i + 1 < argc) lbPort      = std::stoi(argv[++i]);
+        else if (arg == "--monitor"       && i + 1 < argc) {
+            // handled below after engine is constructed
+            (void)0;
+        }
     }
 
     // Phase 79: apply DSN to client/server port if given
@@ -444,6 +451,24 @@ int main(int argc, char* argv[]) {
     if (lbMode) {
         std::cout << "Load Balancer mode on port " << lbPort << "\n";
         std::cout << "Backends: " << engine.loadBalancer.size() << "\n";
+    }
+
+    // ── Phase 128: Apply --monitor arguments to sentinel ─────────
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--monitor" && i + 1 < argc) {
+            std::string monitor = argv[++i];
+            auto colon = monitor.rfind(':');
+            if (colon != std::string::npos) {
+                std::string host = monitor.substr(0, colon);
+                int mport = 0;
+                try { mport = std::stoi(monitor.substr(colon + 1)); } catch (...) {}
+                if (mport > 0) engine.sentinel.addMonitor(host, mport);
+            }
+        }
+    }
+    if (sentinelMode) {
+        std::cout << "Sentinel mode active. Monitoring " << engine.sentinel.nodeCount() << " nodes.\n";
     }
 
     // ── Phase 114: Double-Write Buffer Recovery ──────────────────

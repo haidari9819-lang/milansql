@@ -282,6 +282,18 @@ enum class CommandType {
     FLUSH_PLAN_CACHE,
     SHOW_OPTIMIZER_TRACE,
     SHOW_AUTO_ANALYZE_STATUS,
+    // Phase 127: Multi-Tenant Support
+    CREATE_TENANT,
+    DROP_TENANT,
+    USE_TENANT,
+    SHOW_TENANTS,
+    SHOW_TENANT_STATUS,
+    SHOW_TENANT_USAGE,
+    // Phase 128: Automatic Failover + High Availability Sentinel
+    PROMOTE_TO_MASTER,
+    DEMOTE_TO_SLAVE,
+    SHOW_SENTINEL_STATUS,
+    SHOW_HA_STATUS,
     UNKNOWN
 };
 
@@ -598,6 +610,10 @@ struct ParsedCommand {
 
     // Phase 126: Query Hints (from /*+ HINT1 HINT2 */ in SELECT)
     std::vector<std::string> hints;
+
+    // Phase 127: Multi-Tenant Support
+    std::string tenantName;
+    std::map<std::string, std::string> tenantOptions; // max_connections, max_storage_gb, max_tables
 };
 
 class Parser {
@@ -882,6 +898,12 @@ public:
                 // SHOW SCHEMAS
                 if (k0 == "SHOW" && k1 == "SCHEMAS") {
                     cmd.type = CommandType::SHOW_SCHEMAS;
+                    return cmd;
+                }
+                // USE TENANT name (Phase 127 — must be checked before generic USE)
+                if (k0 == "USE" && k1 == "TENANT") {
+                    cmd.type = CommandType::USE_TENANT;
+                    if (st.size() >= 3) cmd.tenantName = st[2];
                     return cmd;
                 }
                 // USE schemaname
@@ -2393,6 +2415,25 @@ public:
             } else if (kw1 == "AUTO" && tokens.size() >= 4 &&
                        toUpper(tokens[2]) == "ANALYZE" && toUpper(tokens[3]) == "STATUS") {
                 cmd.type = CommandType::SHOW_AUTO_ANALYZE_STATUS;
+            // Phase 127: SHOW TENANTS
+            } else if (kw1 == "TENANTS") {
+                cmd.type = CommandType::SHOW_TENANTS;
+            // Phase 127: SHOW TENANT STATUS name / SHOW TENANT USAGE
+            } else if (kw1 == "TENANT" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_TENANT_STATUS;
+                if (tokens.size() >= 4) cmd.tenantName = tokens[3];
+            } else if (kw1 == "TENANT" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "USAGE") {
+                cmd.type = CommandType::SHOW_TENANT_USAGE;
+            // Phase 128: SHOW SENTINEL STATUS
+            } else if (kw1 == "SENTINEL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_SENTINEL_STATUS;
+            // Phase 128: SHOW HA STATUS
+            } else if (kw1 == "HA" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_HA_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2898,6 +2939,87 @@ public:
         } else if (kw0 == "SHOW" && kw1 == "AUTO" && tokens.size() >= 4 &&
                    toUpper(tokens[2]) == "ANALYZE" && toUpper(tokens[3]) == "STATUS") {
             cmd.type = CommandType::SHOW_AUTO_ANALYZE_STATUS;
+
+        // ── Phase 127: CREATE TENANT name [WITH (...)] ────────────
+        } else if (kw0 == "CREATE" && kw1 == "TENANT") {
+            cmd.type = CommandType::CREATE_TENANT;
+            if (tokens.size() >= 3) cmd.tenantName = tokens[2];
+            // Parse WITH (key=val, ...) options
+            {
+                std::string upInput = input;
+                for (char& c : upInput) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                auto withPos = upInput.find(" WITH ");
+                if (withPos != std::string::npos) {
+                    size_t lparen = input.find('(', withPos);
+                    size_t rparen = (lparen != std::string::npos) ? input.find(')', lparen) : std::string::npos;
+                    if (lparen != std::string::npos && rparen != std::string::npos) {
+                        std::string opts = input.substr(lparen + 1, rparen - lparen - 1);
+                        std::istringstream iss(opts);
+                        std::string opt;
+                        while (std::getline(iss, opt, ',')) {
+                            auto eq = opt.find('=');
+                            if (eq != std::string::npos) {
+                                std::string key = opt.substr(0, eq);
+                                std::string val = opt.substr(eq + 1);
+                                // trim whitespace
+                                key.erase(0, key.find_first_not_of(" \t"));
+                                if (!key.empty()) key.erase(key.find_last_not_of(" \t") + 1);
+                                val.erase(0, val.find_first_not_of(" \t"));
+                                if (!val.empty()) val.erase(val.find_last_not_of(" \t") + 1);
+                                // convert key to lowercase for lookup
+                                std::string lkey = key;
+                                for (char& c : lkey) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                cmd.tenantOptions[lkey] = val;
+                            }
+                        }
+                    }
+                }
+            }
+
+        // ── Phase 127: DROP TENANT name ───────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "TENANT") {
+            cmd.type = CommandType::DROP_TENANT;
+            if (tokens.size() >= 3) cmd.tenantName = tokens[2];
+
+        // ── Phase 127: USE TENANT name ────────────────────────────
+        } else if (kw0 == "USE" && kw1 == "TENANT") {
+            cmd.type = CommandType::USE_TENANT;
+            if (tokens.size() >= 3) cmd.tenantName = tokens[2];
+
+        // ── Phase 127: SHOW TENANTS ───────────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "TENANTS") {
+            cmd.type = CommandType::SHOW_TENANTS;
+
+        // ── Phase 127: SHOW TENANT STATUS name ───────────────────
+        } else if (kw0 == "SHOW" && kw1 == "TENANT" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "STATUS") {
+            cmd.type = CommandType::SHOW_TENANT_STATUS;
+            cmd.tenantName = tokens[3];
+
+        // ── Phase 127: SHOW TENANT USAGE ──────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "TENANT" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "USAGE") {
+            cmd.type = CommandType::SHOW_TENANT_USAGE;
+
+        // ── Phase 128: PROMOTE TO MASTER ──────────────────────────
+        } else if (kw0 == "PROMOTE" && kw1 == "TO" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "MASTER") {
+            cmd.type = CommandType::PROMOTE_TO_MASTER;
+
+        // ── Phase 128: DEMOTE TO SLAVE ────────────────────────────
+        } else if (kw0 == "DEMOTE" && kw1 == "TO" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "SLAVE") {
+            cmd.type = CommandType::DEMOTE_TO_SLAVE;
+
+        // ── Phase 128: SHOW SENTINEL STATUS ──────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "SENTINEL" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "STATUS") {
+            cmd.type = CommandType::SHOW_SENTINEL_STATUS;
+
+        // ── Phase 128: SHOW HA STATUS ─────────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "HA" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "STATUS") {
+            cmd.type = CommandType::SHOW_HA_STATUS;
 
         // ── Phase 57: BACKUP DATABASE TO 'file' ──────────────────
         } else if (kw0 == "BACKUP" && kw1 == "DATABASE") {

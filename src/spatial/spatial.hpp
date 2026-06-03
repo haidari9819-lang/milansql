@@ -108,6 +108,74 @@ struct SpatialUtils {
             u += static_cast<char>(std::toupper((unsigned char)s[i]));
         return u == "POINT";
     }
+
+    // ── Phase 132: V2 Spatial functions ──────────────────────────
+
+    // ST_WITHIN(lat, lng, minLat, maxLat, minLng, maxLng) — check if point inside bounding box
+    static bool stWithin(double lat, double lng, double minLat, double maxLat, double minLng, double maxLng) {
+        return lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng;
+    }
+
+    // ST_BBOX: create bounding box from center + radius in km
+    // Returns as string "BBOX(minLat,maxLat,minLng,maxLng)"
+    static std::string stBbox(double centerLat, double centerLng, double radiusKm) {
+        double latDeg = radiusKm / 111.0;
+        double lngDeg = radiusKm / (111.0 * std::cos(centerLat * PI / 180.0));
+        return "BBOX(" + std::to_string(centerLat - latDeg) + "," +
+                         std::to_string(centerLat + latDeg) + "," +
+                         std::to_string(centerLng - lngDeg) + "," +
+                         std::to_string(centerLng + lngDeg) + ")";
+    }
+
+    // ST_GEOHASH: encode lat/lng as geohash string
+    static std::string stGeohash(double lat, double lng, int precision = 6) {
+        static const char* BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+        std::string hash;
+        double minLat2 = -90, maxLat2 = 90, minLng2 = -180, maxLng2 = 180;
+        int bits = 0, bit = 0;
+        bool isLng = true;
+        while ((int)hash.size() < precision) {
+            if (isLng) {
+                double mid = (minLng2 + maxLng2) / 2.0;
+                if (lng >= mid) { bit = (bit << 1) | 1; minLng2 = mid; }
+                else { bit = bit << 1; maxLng2 = mid; }
+            } else {
+                double mid = (minLat2 + maxLat2) / 2.0;
+                if (lat >= mid) { bit = (bit << 1) | 1; minLat2 = mid; }
+                else { bit = bit << 1; maxLat2 = mid; }
+            }
+            isLng = !isLng;
+            if (++bits == 5) { hash += BASE32[bit]; bits = 0; bit = 0; }
+        }
+        return hash;
+    }
+
+    // ST_BEARING: compass bearing from point A to point B (degrees)
+    static double stBearing(double lat1, double lng1, double lat2, double lng2) {
+        double dLng = (lng2 - lng1) * PI / 180.0;
+        double rlat1 = lat1 * PI / 180.0;
+        double rlat2 = lat2 * PI / 180.0;
+        double y = std::sin(dLng) * std::cos(rlat2);
+        double x = std::cos(rlat1) * std::sin(rlat2) -
+                    std::sin(rlat1) * std::cos(rlat2) * std::cos(dLng);
+        double bearing = std::atan2(y, x) * 180.0 / PI;
+        return std::fmod(bearing + 360.0, 360.0);
+    }
+
+    // ST_DESTINATION: destination point given start, distance (km), bearing (degrees)
+    // Returns "POINT(lat,lng)"
+    static std::string stDestination(double lat, double lng, double distKm, double bearingDeg) {
+        double d = distKm / R_KM;
+        double bearing = bearingDeg * PI / 180.0;
+        double rlat = lat * PI / 180.0;
+        double rlng = lng * PI / 180.0;
+        double lat2 = std::asin(std::sin(rlat)*std::cos(d) +
+                                 std::cos(rlat)*std::sin(d)*std::cos(bearing));
+        double lng2 = rlng + std::atan2(std::sin(bearing)*std::sin(d)*std::cos(rlat),
+                                         std::cos(d) - std::sin(rlat)*std::sin(lat2));
+        return "POINT(" + std::to_string(lat2 * 180.0 / PI) + "," +
+                          std::to_string(lng2 * 180.0 / PI) + ")";
+    }
 };
 
 } // namespace milansql

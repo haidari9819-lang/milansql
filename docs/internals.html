@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MilanSQL — Technical Internals</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg2: #161b22;
+      --bg3: #1c2128;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #f0a500;
+      --accent2: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --purple: #bc8cff;
+      --code-bg: #1c2128;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.7; }
+
+    /* NAV */
+    nav { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 0 2rem; display: flex; align-items: center; gap: 0; position: sticky; top: 0; z-index: 100; }
+    .nav-brand { font-weight: 700; color: var(--accent); font-size: 1.1rem; padding: 1rem 1.5rem 1rem 0; border-right: 1px solid var(--border); margin-right: 0.5rem; }
+    nav a { color: var(--muted); text-decoration: none; padding: 1rem 0.9rem; font-size: 0.88rem; transition: color .2s; }
+    nav a:hover { color: var(--text); }
+    nav a.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+
+    /* LAYOUT */
+    .page { display: flex; max-width: 1300px; margin: 0 auto; padding: 2rem 1rem; gap: 2rem; }
+
+    /* SIDEBAR */
+    .sidebar { width: 240px; flex-shrink: 0; }
+    .sidebar-inner { position: sticky; top: 80px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; }
+    .sidebar h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 0.8rem; }
+    .sidebar a { display: block; color: var(--muted); text-decoration: none; font-size: 0.85rem; padding: 0.3rem 0; transition: color .15s; }
+    .sidebar a:hover { color: var(--accent2); }
+    .sidebar a.sub { padding-left: 0.8rem; font-size: 0.82rem; }
+
+    /* MAIN CONTENT */
+    .content { flex: 1; min-width: 0; }
+    .content h1 { font-size: 2rem; color: var(--accent); margin-bottom: 0.3rem; }
+    .content .subtitle { color: var(--muted); margin-bottom: 2.5rem; }
+
+    section { margin-bottom: 3.5rem; }
+    section h2 { font-size: 1.35rem; color: var(--accent2); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; margin-bottom: 1.2rem; }
+    section h3 { font-size: 1rem; color: var(--text); margin: 1.4rem 0 0.6rem; }
+    section p { color: var(--muted); margin-bottom: 0.8rem; }
+
+    /* CODE BLOCKS */
+    pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.6; margin: 1rem 0; }
+    code { font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace; }
+    .kw { color: #ff7b72; }
+    .cm { color: var(--muted); font-style: italic; }
+    .st { color: #a5d6ff; }
+    .nm { color: #79c0ff; }
+    .fn { color: var(--accent); }
+
+    /* TABLES */
+    table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.88rem; }
+    th { background: var(--bg3); color: var(--accent); text-align: left; padding: 0.6rem 1rem; border: 1px solid var(--border); font-weight: 600; }
+    td { padding: 0.55rem 1rem; border: 1px solid var(--border); color: var(--muted); }
+    tr:nth-child(even) td { background: var(--bg2); }
+
+    /* CALLOUT */
+    .callout { background: var(--bg3); border-left: 3px solid var(--accent); border-radius: 0 6px 6px 0; padding: 0.8rem 1.2rem; margin: 1rem 0; }
+    .callout p { margin: 0; }
+
+    /* FORMULA */
+    .formula { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 0.8rem 1.2rem; font-family: monospace; font-size: 0.9rem; color: var(--green); margin: 0.8rem 0; }
+
+    /* BADGE */
+    .badge { display: inline-block; background: var(--bg3); border: 1px solid var(--border); border-radius: 20px; padding: 0.2rem 0.7rem; font-size: 0.75rem; color: var(--accent); margin: 0.2rem; }
+
+    @media (max-width: 900px) {
+      .sidebar { display: none; }
+      nav a { padding: 1rem 0.5rem; font-size: 0.8rem; }
+    }
+  </style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-brand">MilanSQL</div>
+  <a href="index.html">Home</a>
+  <a href="demo.html">Demo</a>
+  <a href="sql-reference.html">SQL Reference</a>
+  <a href="tutorial.html">Tutorial</a>
+  <a href="architecture.html">Architecture</a>
+  <a href="internals.html" class="active">Internals</a>
+  <a href="https://github.com/haidari9819-lang/milansql/releases">Download</a>
+  <a href="https://github.com/haidari9819-lang/milansql">GitHub</a>
+</nav>
+
+<div class="page">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-inner">
+      <h3>Contents</h3>
+      <a href="#btree">B-Tree Index</a>
+      <a href="#btree-algo" class="sub">Algorithm</a>
+      <a href="#btree-code" class="sub">Code Reference</a>
+      <a href="#mvcc">MVCC</a>
+      <a href="#mvcc-xmin" class="sub">xmin / xmax</a>
+      <a href="#mvcc-vacuum" class="sub">Vacuum</a>
+      <a href="#wal">WAL + Double-Write</a>
+      <a href="#wal-format" class="sub">Log Format</a>
+      <a href="#wal-recovery" class="sub">Recovery</a>
+      <a href="#joins">Hash Join vs Nested Loop</a>
+      <a href="#joins-hash" class="sub">Hash Join O(n+m)</a>
+      <a href="#joins-nl" class="sub">Nested Loop O(n×m)</a>
+      <a href="#joins-dp" class="sub">DP Join Planner</a>
+      <a href="#bm25">BM25 Full-Text Search</a>
+      <a href="#bm25-formula" class="sub">Formula</a>
+      <a href="#bm25-boolean" class="sub">Boolean Mode</a>
+      <a href="#hnsw">HNSW Vector Index</a>
+      <a href="#hnsw-build" class="sub">Build Phase</a>
+      <a href="#hnsw-search" class="sub">Search Phase</a>
+      <a href="#dp">DP Join Optimizer</a>
+      <a href="#dp-bitmask" class="sub">Bitmask DP</a>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="content">
+    <h1>Technical Internals</h1>
+    <p class="subtitle">Deep dive into MilanSQL's core algorithms and data structures.</p>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="btree">
+      <h2>B-Tree Index</h2>
+      <p>MilanSQL uses a B⁺-Tree for all single-column and composite indexes. Leaf nodes store the full row key and a pointer (row offset); internal nodes store separator keys only.</p>
+
+      <h3 id="btree-algo">Algorithm</h3>
+      <p>A B-Tree of order <em>t</em> maintains these invariants:</p>
+      <ul style="color:var(--muted); padding-left:1.5rem; margin-bottom:1rem;">
+        <li>Every non-root node has at least <em>t−1</em> keys.</li>
+        <li>Every node has at most <em>2t−1</em> keys.</li>
+        <li>All leaf nodes are at the same depth.</li>
+        <li>Leaf nodes are linked for efficient range scans.</li>
+      </ul>
+      <pre><code><span class="cm">// Lookup: O(log n)</span>
+<span class="kw">Node*</span> <span class="fn">search</span>(Node* node, Key key) {
+    <span class="kw">int</span> i = 0;
+    <span class="kw">while</span> (i &lt; node-&gt;nKeys &amp;&amp; key &gt; node-&gt;keys[i]) i++;
+    <span class="kw">if</span> (i &lt; node-&gt;nKeys &amp;&amp; key == node-&gt;keys[i])
+        <span class="kw">return</span> node-&gt;ptrs[i];   <span class="cm">// found</span>
+    <span class="kw">if</span> (node-&gt;isLeaf) <span class="kw">return nullptr</span>;
+    <span class="kw">return</span> <span class="fn">search</span>(node-&gt;children[i], key);
+}</code></pre>
+
+      <table>
+        <tr><th>Operation</th><th>Complexity</th><th>Notes</th></tr>
+        <tr><td>Lookup</td><td>O(log n)</td><td>Tree height = log_t(n)</td></tr>
+        <tr><td>Insert</td><td>O(log n)</td><td>May trigger node splits</td></tr>
+        <tr><td>Delete</td><td>O(log n)</td><td>May trigger node merges</td></tr>
+        <tr><td>Range scan</td><td>O(log n + k)</td><td>k = result count</td></tr>
+      </table>
+
+      <h3 id="btree-code">Code Reference</h3>
+      <div class="callout"><p>Implementation: <code>src/engine/engine.hpp</code> — struct <code>BTreeIndex</code>, methods <code>btreeInsert()</code>, <code>btreeLookup()</code>, <code>btreeRangeScan()</code></p></div>
+    </section>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="mvcc">
+      <h2>MVCC — Multi-Version Concurrency Control</h2>
+      <p>MVCC allows readers and writers to proceed without blocking each other. Every row carries two transaction-ID fields that define its visible lifetime.</p>
+
+      <h3 id="mvcc-xmin">xmin / xmax Concept</h3>
+      <pre><code><span class="kw">struct</span> <span class="nm">Row</span> {
+    <span class="kw">uint64_t</span> xmin;  <span class="cm">// TxID that created this row version</span>
+    <span class="kw">uint64_t</span> xmax;  <span class="cm">// TxID that deleted/updated this row (0 = live)</span>
+    vector&lt;string&gt; values;
+};</code></pre>
+
+      <p>A transaction with ID <code>txid</code> can see a row when:</p>
+      <div class="formula">visible = (xmin &lt;= txid) AND (xmax == 0 OR xmax &gt; txid)</div>
+
+      <p>On UPDATE, the old row's <code>xmax</code> is set to the current TxID and a new row version is inserted with <code>xmin = txid</code>. DELETE only sets <code>xmax</code>.</p>
+
+      <h3 id="mvcc-vacuum">Vacuum</h3>
+      <p>Dead row versions (where <code>xmax &lt; oldest_active_txid</code>) are reclaimed by VACUUM. This keeps the table compact without blocking ongoing queries.</p>
+      <pre><code><span class="cm">// VACUUM removes rows invisible to all active transactions</span>
+<span class="fn">VACUUM</span> employees;
+<span class="fn">VACUUM ANALYZE</span> employees;  <span class="cm">-- also refreshes optimizer statistics</span></code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="wal">
+      <h2>WAL + Double-Write Buffer</h2>
+      <p>The Write-Ahead Log guarantees durability: every write is persisted to the WAL before the data page is modified. On crash, the WAL is replayed from the last checkpoint.</p>
+
+      <h3 id="wal-format">Log Format</h3>
+      <pre><code><span class="cm">// WAL entry (binary, 8-byte aligned)</span>
+<span class="kw">struct</span> <span class="nm">WalEntry</span> {
+    <span class="kw">uint64_t</span> lsn;       <span class="cm">// Log Sequence Number (monotonic)</span>
+    <span class="kw">uint64_t</span> txid;      <span class="cm">// Transaction ID</span>
+    <span class="kw">uint8_t</span>  type;      <span class="cm">// INSERT | UPDATE | DELETE | COMMIT | ROLLBACK</span>
+    <span class="kw">uint32_t</span> checksum;  <span class="cm">// CRC-32 of entry payload</span>
+    <span class="kw">uint32_t</span> dataLen;
+    <span class="kw">uint8_t</span>  data[];    <span class="cm">// Serialized row delta</span>
+};</code></pre>
+
+      <h3 id="wal-recovery">Crash Recovery</h3>
+      <pre><code><span class="cm">-- Manual recovery commands (Phase 114)</span>
+<span class="fn">CHECK TABLE</span> orders;    <span class="cm">-- verify page checksums</span>
+<span class="fn">REPAIR TABLE</span> orders;   <span class="cm">-- replay WAL, rebuild indexes</span></code></pre>
+
+      <p>The <strong>Double-Write Buffer</strong> writes each page to a dedicated buffer area first, then to its final location. If the process crashes mid-write, recovery uses the buffer copy — preventing torn-page corruption.</p>
+
+      <table>
+        <tr><th>Component</th><th>File</th><th>Purpose</th></tr>
+        <tr><td>WAL</td><td>*.milan.wal</td><td>Redo log</td></tr>
+        <tr><td>Checkpoint</td><td>*.checkpoint</td><td>Last flushed LSN</td></tr>
+        <tr><td>Double-Write</td><td>in-memory buffer</td><td>Torn-page prevention</td></tr>
+      </table>
+    </section>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="joins">
+      <h2>Hash Join O(n+m) vs Nested Loop O(n×m)</h2>
+      <p>MilanSQL's join executor selects a strategy per join pair at planning time.</p>
+
+      <h3 id="joins-hash">Hash Join — O(n + m)</h3>
+      <p>Optimal when neither side has an index on the join key.</p>
+      <pre><code><span class="cm">// Build phase: hash smaller table</span>
+unordered_map&lt;Key, vector&lt;Row&gt;&gt; hashTable;
+<span class="kw">for</span> (<span class="kw">auto</span>&amp; row : smallerTable)
+    hashTable[row[joinCol]].push_back(row);
+
+<span class="cm">// Probe phase: stream larger table</span>
+<span class="kw">for</span> (<span class="kw">auto</span>&amp; row : largerTable) {
+    <span class="kw">auto</span> it = hashTable.<span class="fn">find</span>(row[joinCol]);
+    <span class="kw">if</span> (it != hashTable.<span class="fn">end</span>())
+        <span class="kw">for</span> (<span class="kw">auto</span>&amp; match : it-&gt;second)
+            results.<span class="fn">push_back</span>(<span class="fn">merge</span>(row, match));
+}</code></pre>
+
+      <h3 id="joins-nl">Nested Loop — O(n × m)</h3>
+      <p>Used when both tables are small (&lt;10 rows) or a correlated subquery forces row-by-row evaluation.</p>
+      <pre><code><span class="kw">for</span> (<span class="kw">auto</span>&amp; outer : leftTable)
+    <span class="kw">for</span> (<span class="kw">auto</span>&amp; inner : rightTable)
+        <span class="kw">if</span> (outer[joinKey] == inner[joinKey])
+            results.<span class="fn">push_back</span>(<span class="fn">merge</span>(outer, inner));</code></pre>
+
+      <table>
+        <tr><th>Strategy</th><th>Time</th><th>Memory</th><th>Condition</th></tr>
+        <tr><td>Nested Loop</td><td>O(n × m)</td><td>O(1)</td><td>Both sides ≤ 10 rows</td></tr>
+        <tr><td>Hash Join</td><td>O(n + m)</td><td>O(min(n,m))</td><td>No index on join key</td></tr>
+        <tr><td>Merge Join</td><td>O(n log n)</td><td>O(1)</td><td>Both sides have B-Tree index</td></tr>
+      </table>
+
+      <h3 id="joins-dp">DP Join-Order Planner (3+ tables)</h3>
+      <p>For queries joining three or more tables, an exhaustive bitmask DP finds the optimal join order.</p>
+      <pre><code><span class="cm">// cost[S] = minimum cost to join the table subset S</span>
+<span class="kw">for</span> (uint32_t S = 1; S &lt; (1u &lt;&lt; n); S++) {
+    <span class="kw">for</span> (<span class="kw">auto</span> split : <span class="fn">subsets</span>(S)) {
+        <span class="kw">double</span> c = cost[split] + cost[S ^ split]
+                 + <span class="fn">estimateJoin</span>(split, S ^ split);
+        <span class="kw">if</span> (c &lt; cost[S]) { cost[S] = c; best[S] = split; }
+    }
+}</code></pre>
+    </section>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="bm25">
+      <h2>BM25 Full-Text Search</h2>
+      <p>MilanSQL implements Okapi BM25 (Phase 119) — the same ranking algorithm used by Elasticsearch and Lucene.</p>
+
+      <h3 id="bm25-formula">Formula</h3>
+      <div class="formula">
+IDF(t) = log( (N − df(t) + 0.5) / (df(t) + 0.5) + 1 )
+
+TF(t,d) = freq(t,d) × (k1 + 1)
+          ──────────────────────────────────────────
+          freq(t,d) + k1 × (1 − b + b × |d| / avgdl)
+
+Score(q,d) = Σ IDF(t) × TF(t,d)    for each term t in query q
+      </div>
+
+      <table>
+        <tr><th>Parameter</th><th>Value</th><th>Effect</th></tr>
+        <tr><td>k1</td><td>1.5</td><td>Term frequency saturation</td></tr>
+        <tr><td>b</td><td>0.75</td><td>Document length normalisation</td></tr>
+        <tr><td>N</td><td>total docs</td><td>Corpus size</td></tr>
+        <tr><td>df(t)</td><td>docs with term</td><td>Inverse document frequency</td></tr>
+        <tr><td>avgdl</td><td>avg doc length</td><td>Length normalisation baseline</td></tr>
+      </table>
+
+      <h3 id="bm25-boolean">Boolean Mode</h3>
+      <pre><code><span class="cm">-- Required term, excluded term, phrase</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> articles
+<span class="kw">WHERE</span> <span class="fn">MATCH</span>(body) <span class="fn">AGAINST</span>(<span class="st">'+database -nosql "query optimizer"'</span>
+      <span class="kw">IN BOOLEAN MODE</span>);</code></pre>
+
+      <div class="callout">
+        <p>Implementation: <code>src/search/bm25.hpp</code> — <code>Bm25Scorer::score()</code> and <code>src/search/boolean_mode.hpp</code> — <code>BooleanModeParser::match()</code></p>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="hnsw">
+      <h2>HNSW Vector Index</h2>
+      <p>Hierarchical Navigable Small World (HNSW) provides approximate nearest-neighbour search in O(log n) time — used for pgvector semantic search (Phase 111).</p>
+
+      <h3 id="hnsw-build">Build Phase</h3>
+      <p>Each inserted vector is placed into a random layer. Higher layers have exponentially fewer nodes, forming a coarse-to-fine navigation structure.</p>
+      <pre><code><span class="cm">// Layer assignment: geometric distribution</span>
+<span class="kw">int</span> layer = <span class="kw">floor</span>(-<span class="fn">log</span>(<span class="fn">random</span>()) * mL);
+
+<span class="cm">// Connect to ef_construction nearest neighbours per layer</span>
+<span class="kw">for</span> (<span class="kw">int</span> l = min(layer, maxLayer); l &gt;= 0; l--) {
+    <span class="kw">auto</span> candidates = <span class="fn">searchLayer</span>(entryPoint, vec, efConstruction, l);
+    <span class="fn">connect</span>(newNode, <span class="fn">selectNeighbours</span>(candidates, M));
+}</code></pre>
+
+      <h3 id="hnsw-search">Search Phase</h3>
+      <pre><code><span class="cm">// Greedy descent through layers, then beam search at layer 0</span>
+Node* ep = entryPoint;
+<span class="kw">for</span> (<span class="kw">int</span> l = maxLayer; l &gt; 0; l--)
+    ep = <span class="fn">greedySearch</span>(ep, query, l);        <span class="cm">// 1 result per layer</span>
+<span class="kw">return</span> <span class="fn">beamSearch</span>(ep, query, ef, 0);       <span class="cm">// ef results at layer 0</span></code></pre>
+
+      <table>
+        <tr><th>Distance</th><th>Operator</th><th>Formula</th></tr>
+        <tr><td>L2 (Euclidean)</td><td><code>&lt;-&gt;</code></td><td>√Σ(aᵢ−bᵢ)²</td></tr>
+        <tr><td>Inner Product</td><td><code>&lt;#&gt;</code></td><td>−Σ(aᵢ×bᵢ)</td></tr>
+        <tr><td>Cosine</td><td><code>&lt;=&gt;</code></td><td>1 − (a·b)/(|a||b|)</td></tr>
+      </table>
+
+      <div class="callout">
+        <p>Implementation: <code>src/types/vector_type.hpp</code> — <code>HNSWIndex</code> struct, <code>hnswInsert()</code>, <code>hnswSearch()</code></p>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════ -->
+    <section id="dp">
+      <h2>DP Join-Order Optimizer</h2>
+      <p>Introduced in Phase 113, the dynamic-programming planner finds the optimal join order for queries with 3 or more tables — a problem that is otherwise exponential in naive approaches.</p>
+
+      <h3 id="dp-bitmask">Bitmask DP</h3>
+      <p>Each subset of tables is represented as a bitmask. The planner computes the minimum-cost plan for every possible subset bottom-up.</p>
+
+      <pre><code><span class="cm">// n = number of tables, 2ⁿ subsets</span>
+vector&lt;<span class="kw">double</span>&gt; cost(1u &lt;&lt; n, INF);
+vector&lt;uint32_t&gt; best(1u &lt;&lt; n, 0);
+
+<span class="cm">// Base: single-table scan costs</span>
+<span class="kw">for</span> (<span class="kw">int</span> i = 0; i &lt; n; i++)
+    cost[1u &lt;&lt; i] = <span class="fn">scanCost</span>(tables[i]);
+
+<span class="cm">// Fill: all subsets of size 2..n</span>
+<span class="kw">for</span> (uint32_t S = 1; S &lt; (1u &lt;&lt; n); S++) {
+    <span class="kw">for</span> (uint32_t sub = (S-1)&amp;S; sub; sub = (sub-1)&amp;S) {
+        uint32_t rest = S ^ sub;
+        <span class="kw">if</span> (!rest || sub &gt; rest) <span class="kw">continue</span>;
+        <span class="kw">double</span> c = cost[sub] + cost[rest]
+                 + <span class="fn">joinCost</span>(sub, rest, histograms);
+        <span class="kw">if</span> (c &lt; cost[S]) { cost[S] = c; best[S] = sub; }
+    }
+}
+<span class="cm">// Reconstruct optimal left-deep join tree</span>
+<span class="kw">return</span> <span class="fn">buildPlan</span>(best, (1u &lt;&lt; n) - 1);</code></pre>
+
+      <table>
+        <tr><th>Tables</th><th>Subsets checked</th><th>Time</th></tr>
+        <tr><td>2</td><td>3</td><td>&lt;1 µs</td></tr>
+        <tr><td>4</td><td>15</td><td>&lt;1 µs</td></tr>
+        <tr><td>8</td><td>255</td><td>&lt;10 µs</td></tr>
+        <tr><td>12</td><td>4 095</td><td>&lt;1 ms</td></tr>
+        <tr><td>16</td><td>65 535</td><td>&lt;10 ms</td></tr>
+      </table>
+
+      <div class="callout">
+        <p>Column histograms (Phase 113) provide cardinality estimates for <code>joinCost()</code>, making the planner adaptive to actual data distributions.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+</body>
+</html>

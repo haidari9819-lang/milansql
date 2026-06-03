@@ -1127,16 +1127,22 @@ public:
     /**
      * Insert a new row into the table.
      *
-     * Validation order:
-     * 1. Apply DEFAULT values
-     * 2. Apply AUTO_INCREMENT
-     * 3. Check NOT NULL / UNIQUE / CHECK constraints
-     * 4. Check FK constraints
-     * 5. Acquire write lock
-     * 6. Insert row + update all indexes
-     * 7. Fire AFTER INSERT triggers
-     * 8. Append to WAL + update CDC log
-     * 9. Release write lock
+     * Validation and write pipeline:
+     *   1. Apply DEFAULT values for omitted columns
+     *   2. Resolve AUTO_INCREMENT counter (atomic increment)
+     *   3. Evaluate CHECK constraints
+     *   4. Enforce NOT NULL constraints
+     *   5. Enforce UNIQUE constraints (B-Tree lookup)
+     *   6. Enforce FOREIGN KEY constraints
+     *   7. Fire BEFORE INSERT triggers
+     *   8. Acquire write lock (std::unique_lock)
+     *   9. Append row to table storage + update all indexes
+     *  10. Append WAL entry (LSN assigned)
+     *  11. Update CDC log (if enabled)
+     *  12. Fire AFTER INSERT triggers
+     *  13. Release write lock
+     *
+     * Thread safety: exclusive write lock; readers are blocked during insert.
      */
     void insertRow(const std::string& tblRaw, std::vector<std::string> vals) {
         auto tbl = resolveTableName(tblRaw);
@@ -1282,15 +1288,19 @@ public:
     /**
      * Execute a SELECT query with filtering, projection, and ordering.
      *
-     * Execution order:
-     * 1. Acquire shared read lock on table
-     * 2. Apply RLS policies (if enabled)
-     * 3. Filter rows via rowMatches()
-     * 4. Apply window functions / aggregations
-     * 5. Apply ORDER BY, LIMIT, OFFSET
-     * 6. Release read lock
+     * Execution flow:
+     *   1. Acquire shared read lock (std::shared_mutex)
+     *   2. Apply Row-Level Security policies (if enabled)
+     *   3. Filter rows via rowMatches() — evaluates WHERE conditions
+     *   4. Project columns, evaluate expressions and window functions
+     *   5. Apply GROUP BY + aggregate functions (SUM/AVG/COUNT/MIN/MAX)
+     *   6. Apply HAVING filter
+     *   7. Apply ORDER BY (quicksort on result set)
+     *   8. Apply LIMIT / OFFSET
+     *   9. Release read lock
      *
-     * Complexity: O(n) table scan without index, O(log n) with B-Tree index.
+     * Thread safety: multiple concurrent SELECTs are allowed (shared lock).
+     * Complexity:    O(n) table scan without index; O(log n) with B-Tree.
      */
     // SELECT mit WHERE (AND / OR, alle Operatoren inkl. LIKE)
     WhereResult selectWhere(const std::string& tblNameRaw,
@@ -1650,6 +1660,21 @@ public:
 
     // ── Phase 12: Multi-JOIN (INNER + LEFT) ──────────────────
 
+    /**
+     * Execute one or more JOIN operations.
+     *
+     * Strategy selection (evaluated per join pair):
+     *   NESTED LOOP — both sides have ≤ 10 rows; O(n × m)
+     *   HASH JOIN   — no usable index on either side; O(n + m)
+     *                 Build phase: hash smaller table by join key
+     *                 Probe phase: look up each row from larger table
+     *   MERGE JOIN  — both sides have a B-Tree index on join key; O(n log n)
+     *                 Merge sorted streams in one pass
+     *
+     * For 3+ tables, the DP join-order planner (Phase 113) finds the
+     * optimal join order using bitmask DP over all 2ⁿ table subsets,
+     * minimising estimated intermediate result sizes.
+     */
     // Führt eine Kette von JOINs aus (INNER oder LEFT).
     // Ergebnis-Spalten: "tabelle.spalte" (qualifiziert).
     // WHERE wird auf das Gesamtergebnis angewendet.

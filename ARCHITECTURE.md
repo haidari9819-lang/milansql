@@ -3,107 +3,158 @@
 ## Query Lifecycle
 
 ```
-User SQL → Parser → ParsedCommand → Optimizer →
-Executor → Storage → QueryResult
+                    ┌─────────────────────────────────────┐
+                    │           User / Client              │
+                    │  SQL string or network protocol      │
+                    └──────────────────┬──────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────┐
+                    │         Parser (parser.hpp)          │
+                    │  Tokenizer → ParsedCommand struct    │
+                    └──────────────────┬──────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────┐
+                    │       Dispatcher (dispatch.hpp)      │
+                    │  Routes command to engine method     │
+                    └──────────┬───────────────┬──────────┘
+                               │               │
+              ┌────────────────▼──┐    ┌───────▼────────────────┐
+              │   Optimizer       │    │   Executor              │
+              │  Cost-based plan  │    │  Hash/Merge/NL JOINs    │
+              │  Join order (DP)  │    │  Aggregations, Windows  │
+              └────────────┬──────┘    └────────┬───────────────┘
+                           │                    │
+                    ┌──────▼────────────────────▼──────────┐
+                    │         Engine (engine.hpp)           │
+                    │  Table • MVCC • WAL • Buffer Pool     │
+                    └──────────────────┬──────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────┐
+                    │        Storage (storage.hpp)         │
+                    │  Binary page format v9 (8 KB pages) │
+                    └─────────────────────────────────────┘
 ```
 
-Every SQL statement flows through this pipeline:
-
-1. **Parser** (`src/parser/parser.hpp`) — tokenizes input, builds `ParsedCommand`
-2. **Dispatcher** (`src/dispatch.hpp`) — routes to the correct engine method
-3. **Optimizer** (`src/optimizer/`) — rewrites queries, chooses join strategies
-4. **Executor** — runs JOINs, aggregations, window functions
-5. **Storage** (`src/storage/storage.hpp`) — binary serialization to `.milan` files
-
-## Storage Layout
-
-| File | Purpose |
-|------|---------|
-| `database.milan` | Main data file (binary, v9 page format) |
-| `database.milan.wal` | Write-ahead log for crash recovery |
-| `database.checkpoint` | Last checkpoint LSN |
-| `database.config` | Runtime configuration |
-| `database.stats` | Table statistics for the optimizer |
-| `*.mdb` | Per-table page files (8KB pages) |
-
-## Key Design Decisions
-
-### Why header-only?
-Single compilation unit means easier integration, no linker issues,
-and a simpler build system. All engine logic lives in `.hpp` files —
-`main.cpp` is the only `.cpp` that matters.
-
-### Why C++17?
-`std::shared_mutex` (reader-writer lock), `std::optional`,
-`std::string_view`, and structured bindings cover all needs.
-No C++20 required — maximum compiler compatibility.
-
-### Why zero external dependencies?
-- **Portability** — compiles anywhere with a C++17 compiler
-- **Security** — no supply chain risk
-- **Simplicity** — `cmake -B build && ninja -C build` is the entire build
-
-## Component Map
+## Source Tree
 
 ```
 src/
-├── engine/engine.hpp        Core engine: Table, Row, Column, MVCC
-├── parser/parser.hpp        SQL tokenizer + parser → ParsedCommand
-├── dispatch.hpp             Command router → engine methods
-├── storage/storage.hpp      Binary page format (v9) serializer
-├── storage/column_store.hpp Column-oriented store for OLAP
-├── optimizer/               Cost-based query optimizer + rewriter
+├── engine/
+│   └── engine.hpp           Core engine: Table, Row, Column, MVCC, WAL,
+│                            Buffer Pool, Indexes, Aggregations, Triggers
+├── parser/
+│   └── parser.hpp           SQL tokenizer + recursive-descent parser
+│                            Produces ParsedCommand struct
+├── dispatch.hpp             Routes ParsedCommand → engine method
+│                            Handles timing, slow query log
+├── storage/
+│   ├── storage.hpp          Binary serializer: page format v9
+│   └── column_store.hpp     Column-oriented store for OLAP
+├── optimizer/               Cost-based query optimizer
+│                            Adaptive statistics + join order DP
 ├── server/
 │   ├── http_server.hpp      REST API + Web Dashboard (port 8080)
 │   ├── pg_server.hpp        PostgreSQL wire protocol v3 (port 5433)
-│   ├── mysql_server.hpp     MySQL wire protocol (port 4407)
+│   ├── mysql_server.hpp     MySQL wire protocol v10 (port 4407)
 │   └── websocket_server.hpp WebSocket server
-├── api/graphql_server.hpp   GraphQL API (port 8081)
+├── api/
+│   └── graphql_server.hpp   GraphQL API (port 8081)
 ├── search/
-│   ├── bm25.hpp             BM25 relevance scorer
+│   ├── bm25.hpp             BM25 relevance scorer (k1=1.5, b=0.75)
 │   └── boolean_mode.hpp     Boolean full-text search parser
 ├── types/
-│   ├── array_type.hpp       Array data type utilities
+│   ├── array_type.hpp       TEXT[] / INT[] array type
 │   └── vector_type.hpp      VECTOR(n) type + HNSW index
-├── compression/             LZ4 + RLE + Dictionary + ZSTD
+├── compression/             LZ4 + RLE + Dictionary + ZSTD compressors
 ├── replication/             Physical master/slave + logical pub/sub
-├── cdc/cdc_manager.hpp      Change Data Capture
-├── cache/statement_cache.hpp LRU prepared statement cache
-├── pool/connection_pool.hpp  Connection pool multiplexer
-├── pubsub/                  LISTEN/NOTIFY messaging
+├── cdc/
+│   └── cdc_manager.hpp      Change Data Capture (ALTER TABLE … ENABLE CDC)
+├── cache/
+│   └── statement_cache.hpp  LRU prepared statement cache
+├── pool/
+│   └── connection_pool.hpp  Session/Transaction/Statement mode pooling
+├── pubsub/                  LISTEN/NOTIFY pub-sub messaging
 ├── locking/                 Lock manager (SELECT FOR UPDATE)
-├── cursor/server_cursor.hpp Server-side cursor support
-├── profiler/slow_query_log.hpp Slow query log + fingerprinting
-├── fdw/                     Foreign Data Wrapper (CSV + HTTP)
-├── timeseries/              Time-series + time_bucket()
-├── extensions/              Extension system + built-ins
+├── cursor/
+│   └── server_cursor.hpp    Server-side cursor (DECLARE/OPEN/FETCH)
+├── profiler/
+│   └── slow_query_log.hpp   Slow query log + SQL fingerprinting
+├── fdw/                     Foreign Data Wrappers: CSV + HTTP/JSON
+├── timeseries/              Time-series: time_bucket(), retention policies
+├── extensions/              Extension system + milansql_math/crypto/uuid/text
 └── main.cpp                 REPL + CLI entry point
 ```
 
-## Concurrency Model
+## Key Design Decisions
 
-- **Per-table `std::shared_mutex`** — shared reads, exclusive writes (Phase 112)
-- **MVCC** — each transaction sees a snapshot; readers never block writers
-- **WAL** — all writes go to the WAL before the data file (Phase 114)
-- **Atomic counters** — statistics updated lock-free
+### Header-only Engine
+All engine logic lives in `.hpp` files. `main.cpp` is the only translation unit
+that includes the engine. Benefits: single compilation unit, no linker issues,
+trivially embeddable in other projects.
 
-## Network Protocols
+### Zero External Dependencies
+No third-party libraries. Everything — B-Tree indexes, MVCC, WAL, BM25,
+HNSW vector search, LZ4 compression, wire protocols — is implemented from scratch.
+Build with one command: `cmake -B build && ninja -C build`.
 
-| Protocol | Port | Library |
-|----------|------|---------|
-| Native TCP | 4406 | Custom binary framing |
-| MySQL Wire | 4407 | MySQL protocol v10 |
-| PostgreSQL Wire | 5433 | PG protocol v3 |
-| REST/HTTP | 8080 | Built-in HTTP server |
-| GraphQL | 8081 | Built-in GraphQL engine |
+### MVCC (Multi-Version Concurrency Control)
+Each row carries `xmin` (created by transaction ID) and `xmax` (deleted by
+transaction ID). Readers see a consistent snapshot without locking writers.
+Vacuum reclaims rows where `xmax` is below the oldest active transaction.
 
-## Testing
+### WAL (Write-Ahead Log)
+Every write is appended to the WAL before touching data pages. On crash:
+- Replay WAL from last checkpoint to restore committed transactions
+- Discard uncommitted entries
+Double-write buffer (Phase 114) prevents torn-page writes.
 
-```bash
-./build/milansql_tests.exe     # 285 unit/integration tests
-./build/milansql_stress.exe    # stress tests
+### Per-table Reader-Writer Lock
+`std::shared_mutex` per table (Phase 112):
+- `shared_lock` for SELECT — multiple readers run concurrently
+- `unique_lock` for INSERT/UPDATE/DELETE — exclusive write access
+Combined with MVCC this gives full snapshot isolation.
+
+### Join Strategy Selection
+| Condition | Strategy | Complexity |
+|-----------|----------|------------|
+| Both sides ≤ 10 rows | Nested Loop | O(n × m) |
+| No usable index | Hash Join | O(n + m) |
+| Both sides have index | Merge Join | O(n log n) |
+| 3+ tables | DP planner | O(2ⁿ × n²) |
+
+### BM25 Full-Text Search
+Okapi BM25 with k1 = 1.5, b = 0.75.
+IDF = log((N − df + 0.5) / (df + 0.5) + 1)
+TF  = (freq × (k1 + 1)) / (freq + k1 × (1 − b + b × dl/avgdl))
+Boolean mode supports `+required`, `-excluded`, and `"phrase"` terms.
+
+## Network Protocol Stack
+
+```
+┌────────┬───────────┬─────────────────┬───────┬──────────┐
+│  Port  │ Protocol  │   Compatible     │ Auth  │ TLS      │
+├────────┼───────────┼─────────────────┼───────┼──────────┤
+│  4406  │ Native TCP│ MilanSQL clients │ Yes   │ Phase110 │
+│  4407  │ MySQL Wire│ mysql, pymysql   │ Yes   │ Phase110 │
+│  5433  │ PG Wire v3│ psql, psycopg2   │ Yes   │ Phase110 │
+│  8080  │ HTTP REST │ curl, browser    │ Token │ Phase110 │
+│  8081  │ GraphQL   │ GraphQL clients  │ Token │ Phase110 │
+└────────┴───────────┴─────────────────┴───────┴──────────┘
 ```
 
-Tests cover: SQL correctness, MVCC, window functions, triggers,
-stored procedures, replication, compression, BM25, cursors,
-pgvector, slow query log, and more.
+## Storage File Format
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `*.milan` | Binary v9, 8 KB pages | Main data |
+| `*.milan.wal` | Sequential log entries | Crash recovery |
+| `*.checkpoint` | 8-byte LSN | Last checkpoint |
+| `*.config` | Key=value text | Runtime settings |
+| `*.stats` | Binary histogram | Optimizer statistics |
+| `*.mdb` | Page-based | Per-table page files |
+
+Each data page layout:
+```
+[PageHeader 16B][Slot array]...[Row data (grows from end)]
+PageHeader: magic(4) | lsn(8) | checksum(4)
+```

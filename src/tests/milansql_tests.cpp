@@ -17,6 +17,7 @@
 #include "types/array_type.hpp"
 #include "cdc/cdc_manager.hpp"
 #include "extensions/extension_manager.hpp"
+#include "dispatch_result.hpp"  // Phase 125/126: QueryResult + dispatch()
 
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
@@ -2653,6 +2654,143 @@ static void testGroup39() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Group 40: Phase 125 — Load Balancer + Adaptive Connection Routing
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup40() {
+    std::cout << "\n--- Group 40: Load Balancer + Adaptive Connection Routing ---\n";
+
+    auto check = [&](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // Test LoadBalancer directly (no Engine needed)
+    LoadBalancer lb;
+    lb.addBackend("localhost", 4406);
+    lb.addBackend("localhost", 4407);
+    lb.addBackend("localhost", 4408);
+
+    check(lb.size() == 3, "LB has 3 backends");
+    check(lb.backends()[0].isAlive, "Backend 0 alive");
+
+    // Write query -> master (index 0) in AUTO mode
+    lb.routingMode = RoutingMode::AUTO;
+    int writeIdx = lb.route("INSERT INTO t VALUES (1)");
+    check(writeIdx == 0, "Write routes to master (index 0)");
+
+    // Read query -> round-robin
+    int r1 = lb.route("SELECT * FROM t");
+    int r2 = lb.route("SELECT * FROM t");
+    check(r1 != r2 || lb.size() == 1, "Read routes round-robin");
+
+    // MASTER mode -- all to master
+    lb.routingMode = RoutingMode::MASTER;
+    check(lb.route("SELECT * FROM t") == 0, "MASTER mode routes SELECT to master");
+    check(lb.route("INSERT INTO t VALUES (1)") == 0, "MASTER mode routes INSERT to master");
+
+    // isWriteQuery
+    check(LoadBalancer::isWriteQuery("INSERT INTO t VALUES (1)"), "INSERT is write");
+    check(LoadBalancer::isWriteQuery("UPDATE t SET x=1"), "UPDATE is write");
+    check(!LoadBalancer::isWriteQuery("SELECT * FROM t"), "SELECT is not write");
+    check(!LoadBalancer::isWriteQuery("  select id from t"), "lowercase select is not write");
+
+    // Engine integration
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    engine.loadBalancer.addBackend("localhost", 4406);
+    engine.loadBalancer.addBackend("localhost", 4407);
+
+    auto r = execSQL("SHOW BACKENDS");
+    check(r.rows.size() == 2, "SHOW BACKENDS returns 2 rows");
+
+    execSQL("SET ROUTING = AUTO");
+    auto rs = execSQL("SHOW ROUTING STATUS");
+    check(!rs.rows.empty(), "SHOW ROUTING STATUS returns rows");
+    bool foundAuto = false;
+    for (auto& row : rs.rows)
+        if (!row.values.empty() && row.values[0] == "Routing Mode" && row.values[1] == "AUTO")
+            foundAuto = true;
+    check(foundAuto, "Routing mode is AUTO after SET");
+
+    execSQL("SET ROUTING = MASTER");
+    auto rs2 = execSQL("SHOW ROUTING STATUS");
+    bool foundMaster = false;
+    for (auto& row : rs2.rows)
+        if (!row.values.empty() && row.values[0] == "Routing Mode" && row.values[1] == "MASTER")
+            foundMaster = true;
+    check(foundMaster, "Routing mode is MASTER after SET");
+}
+
+// ══════════════════════════════════════════════════════════════
+// Group 41: Phase 126 — Plan Cache V2 + Query Hints + Optimizer Trace
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup41() {
+    std::cout << "\n--- Group 41: Plan Cache V2 + Query Hints + Optimizer Trace ---\n";
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+    auto check = [&](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // Setup tables
+    execSQL("CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, val INT)");
+    execSQL("CREATE TABLE t2 (id INT PRIMARY KEY AUTO_INCREMENT, t1_id INT, info TEXT)");
+    execSQL("INSERT INTO t1 VALUES (NULL, 100)");
+    execSQL("INSERT INTO t1 VALUES (NULL, 200)");
+    execSQL("INSERT INTO t2 VALUES (NULL, 1, 'hello')");
+    execSQL("INSERT INTO t2 VALUES (NULL, 2, 'world')");
+
+    // Optimizer trace
+    execSQL("SET OPTIMIZER_TRACE = ON");
+    execSQL("SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id");
+    auto trace1 = execSQL("SHOW OPTIMIZER TRACE");
+    check(!trace1.rows.empty(), "Optimizer trace has entries after JOIN");
+
+    // Query hint parsing
+    auto cmd = parser.parse("SELECT /*+ HASH_JOIN */ * FROM t1 JOIN t2 ON t1.id = t2.t1_id");
+    bool hasHashJoin = false;
+    for (auto& h : cmd.hints) if (h == "HASH_JOIN") { hasHashJoin = true; break; }
+    check(hasHashJoin, "Parser extracts HASH_JOIN hint");
+
+    auto cmd2 = parser.parse("SELECT /*+ NO_CACHE */ * FROM t1");
+    bool hasNoCache = false;
+    for (auto& h : cmd2.hints) if (h == "NO_CACHE") { hasNoCache = true; break; }
+    check(hasNoCache, "Parser extracts NO_CACHE hint");
+
+    // Plan cache
+    engine.planCache.store("SELECT * FROM t1", "t1", "SEQUENTIAL_SCAN", 1.5);
+    engine.planCache.store("SELECT * FROM t2", "t2", "SEQUENTIAL_SCAN", 2.0);
+    auto pc = execSQL("SHOW PLAN CACHE");
+    check(pc.rows.size() >= 2, "SHOW PLAN CACHE shows stored plans");
+
+    execSQL("FLUSH PLAN CACHE");
+    auto pc2 = execSQL("SHOW PLAN CACHE");
+    check(pc2.rows.empty(), "FLUSH PLAN CACHE empties the cache");
+
+    // Auto analyze status
+    auto aa = execSQL("SHOW AUTO ANALYZE STATUS");
+    check(!aa.rows.empty(), "SHOW AUTO ANALYZE STATUS returns rows");
+
+    // PlanCache invalidate
+    engine.planCache.store("SELECT * FROM orders", "orders", "SEQUENTIAL_SCAN", 1.0);
+    engine.planCache.store("SELECT * FROM customers", "customers", "INDEX_SCAN", 0.5);
+    check(engine.planCache.size() == 2, "Plan cache has 2 entries");
+    engine.planCache.invalidate("orders");
+    check(engine.planCache.size() == 1, "Invalidate removes specific table's plans");
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -2777,6 +2915,12 @@ int main() {
     }
     try { testGroup39(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 39 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup40(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 40 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup41(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 41 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -274,6 +274,14 @@ enum class CommandType {
     SHOW_INDEX_RECOMMENDATIONS_SQ,
     // Phase 121: pgvector V2
     SHOW_VECTOR_STATS,
+    // Phase 125: Load Balancer + Adaptive Connection Routing
+    SHOW_BACKENDS,
+    SHOW_ROUTING_STATUS,
+    // Phase 126: Plan Cache V2 + Query Hints + Optimizer Trace
+    SHOW_PLAN_CACHE,
+    FLUSH_PLAN_CACHE,
+    SHOW_OPTIMIZER_TRACE,
+    SHOW_AUTO_ANALYZE_STATUS,
     UNKNOWN
 };
 
@@ -583,6 +591,13 @@ struct ParsedCommand {
     int slowQueryLimit = 100;
     bool boolVal = false;       // for SET_SLOW_QUERY_LOG ON/OFF
     double slowThreshold = 0.0; // for SET_SLOW_QUERY_THRESHOLD
+
+    // Phase 125/126: SET generic varName/varValue (for SET ROUTING=, SET OPTIMIZER_TRACE=, etc.)
+    std::string varName;
+    std::string varValue;
+
+    // Phase 126: Query Hints (from /*+ HINT1 HINT2 */ in SELECT)
+    std::vector<std::string> hints;
 };
 
 class Parser {
@@ -904,6 +919,23 @@ public:
                 if (u == "UNION" || u == "INTERSECT" || u == "EXCEPT") {
                     parseSetOp(input, cmd);
                     return cmd;
+                }
+            }
+        }
+
+        // ── Phase 126: Extract optimizer hints early (before JOIN/etc. parsers) ──
+        {
+            auto hp126 = input.find("/*+");
+            if (hp126 != std::string::npos) {
+                auto he126 = input.find("*/", hp126);
+                if (he126 != std::string::npos) {
+                    std::string hblock = input.substr(hp126 + 3, he126 - hp126 - 3);
+                    for (char& c : hblock)
+                        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    std::istringstream hiss126(hblock);
+                    std::string htok126;
+                    while (hiss126 >> htok126)
+                        cmd.hints.push_back(htok126);
                 }
             }
         }
@@ -1397,6 +1429,7 @@ public:
         if (kw0 == "SELECT") {
             cmd.type = CommandType::SELECT;
             // Phase 77: /*+ PARALLEL(N) */ hint
+            // Phase 126: /*+ HINT1 HINT2 */ — collect all hints
             {
                 auto hp = input.find("/*+");
                 if (hp != std::string::npos) {
@@ -1413,6 +1446,14 @@ public:
                             if (lp != std::string::npos && rp != std::string::npos)
                                 try { cmd.parallelHint = std::stoi(h.substr(lp+1, rp-lp-1)); }
                                 catch (...) {}
+                        }
+                        // Phase 126: tokenize all hints from the block
+                        {
+                            std::istringstream hiss(hu);
+                            std::string htok;
+                            while (hiss >> htok) {
+                                cmd.hints.push_back(htok);
+                            }
                         }
                     }
                 }
@@ -2333,6 +2374,25 @@ public:
             } else if (kw1 == "VECTOR" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATS") {
                 cmd.type = CommandType::SHOW_VECTOR_STATS;
+            // Phase 125: SHOW BACKENDS
+            } else if (kw1 == "BACKENDS") {
+                cmd.type = CommandType::SHOW_BACKENDS;
+            // Phase 125: SHOW ROUTING STATUS
+            } else if (kw1 == "ROUTING" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_ROUTING_STATUS;
+            // Phase 126: SHOW PLAN CACHE
+            } else if (kw1 == "PLAN" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "CACHE") {
+                cmd.type = CommandType::SHOW_PLAN_CACHE;
+            // Phase 126: SHOW OPTIMIZER TRACE
+            } else if (kw1 == "OPTIMIZER" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "TRACE") {
+                cmd.type = CommandType::SHOW_OPTIMIZER_TRACE;
+            // Phase 126: SHOW AUTO ANALYZE STATUS
+            } else if (kw1 == "AUTO" && tokens.size() >= 4 &&
+                       toUpper(tokens[2]) == "ANALYZE" && toUpper(tokens[3]) == "STATUS") {
+                cmd.type = CommandType::SHOW_AUTO_ANALYZE_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2774,6 +2834,70 @@ public:
             cmd.type = CommandType::SET_CACHE;
             if (tokens.size() >= 3) cmd.cacheEnabled = toUpper(tokens[2]);
             else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 125: SET ROUTING = AUTO/MASTER/SLAVE ───────────────
+        // ── Phase 126: SET OPTIMIZER_TRACE = ON/OFF ──────────────────
+        // Generic SET varName = varValue  (also handles = inside token)
+        } else if (kw0 == "SET" && tokens.size() >= 2) {
+            // tokens[1] may be "ROUTING" and tokens[2] "=" tokens[3] "AUTO"
+            // or tokens[1] may be "ROUTING=AUTO" (all in one)
+            // Normalize: extract varName and varValue
+            {
+                std::string raw125 = input.substr(input.find_first_of(" \t") + 1); // everything after SET
+                // strip leading spaces
+                size_t sp125 = raw125.find_first_not_of(" \t");
+                if (sp125 != std::string::npos) raw125 = raw125.substr(sp125);
+                // find '='
+                auto eq125 = raw125.find('=');
+                if (eq125 != std::string::npos) {
+                    std::string lhs = raw125.substr(0, eq125);
+                    std::string rhs = raw125.substr(eq125 + 1);
+                    // trim
+                    while (!lhs.empty() && (lhs.back() == ' ' || lhs.back() == '\t')) lhs.pop_back();
+                    size_t rsp = rhs.find_first_not_of(" \t");
+                    if (rsp != std::string::npos) rhs = rhs.substr(rsp);
+                    while (!rhs.empty() && (rhs.back() == ' ' || rhs.back() == '\t' ||
+                                            rhs.back() == ';')) rhs.pop_back();
+                    for (char& c : lhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    for (char& c : rhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    cmd.varName  = lhs;
+                    cmd.varValue = rhs;
+                    // check for known Phase 125/126 varNames — use SET_CACHE as a carrier CommandType
+                    if (lhs == "ROUTING" || lhs == "OPTIMIZER_TRACE") {
+                        cmd.type = CommandType::SET_CACHE; // re-use existing SET handler
+                    }
+                    // else leave UNKNOWN (other SET commands not matched above)
+                }
+            }
+
+        // ── Phase 125: SHOW BACKENDS ─────────────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "BACKENDS") {
+            cmd.type = CommandType::SHOW_BACKENDS;
+
+        // ── Phase 125: SHOW ROUTING STATUS ───────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "ROUTING" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "STATUS") {
+            cmd.type = CommandType::SHOW_ROUTING_STATUS;
+
+        // ── Phase 126: SHOW PLAN CACHE ────────────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "PLAN" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "CACHE") {
+            cmd.type = CommandType::SHOW_PLAN_CACHE;
+
+        // ── Phase 126: FLUSH PLAN CACHE ───────────────────────────────
+        } else if (kw0 == "FLUSH" && kw1 == "PLAN" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "CACHE") {
+            cmd.type = CommandType::FLUSH_PLAN_CACHE;
+
+        // ── Phase 126: SHOW OPTIMIZER TRACE ───────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "OPTIMIZER" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "TRACE") {
+            cmd.type = CommandType::SHOW_OPTIMIZER_TRACE;
+
+        // ── Phase 126: SHOW AUTO ANALYZE STATUS ───────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "AUTO" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "ANALYZE" && toUpper(tokens[3]) == "STATUS") {
+            cmd.type = CommandType::SHOW_AUTO_ANALYZE_STATUS;
 
         // ── Phase 57: BACKUP DATABASE TO 'file' ──────────────────
         } else if (kw0 == "BACKUP" && kw1 == "DATABASE") {

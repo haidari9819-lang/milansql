@@ -86,6 +86,8 @@
 #include "../search/bm25.hpp"                  // Phase 119: BM25 Scorer
 #include "../search/boolean_mode.hpp"          // Phase 119: Boolean Mode Parser
 #include "../profiler/slow_query_log.hpp"      // Phase 120: Slow Query Log
+#include "../lb/load_balancer.hpp"             // Phase 125: Load Balancer
+#include "../cache/plan_cache.hpp"             // Phase 126: Plan Cache V2
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1050,6 +1052,28 @@ public:
     // ── Phase 120: Slow Query Log (public so dispatch can access) ──
     SlowQueryLog slowQueryLog;
 
+    // ── Phase 125: Load Balancer ──────────────────────────────────
+    LoadBalancer loadBalancer;
+
+    // ── Phase 126: Plan Cache V2 ──────────────────────────────────
+    PlanCache planCache;
+    bool optimizerTraceEnabled = false;
+    std::vector<std::string> optimizerTraceLog;
+
+    void addTrace(const std::string& msg) {
+        if (optimizerTraceEnabled) optimizerTraceLog.push_back(msg);
+    }
+    void clearTrace() { optimizerTraceLog.clear(); }
+
+    // ── Phase 126: Auto Analyze Status ───────────────────────────
+    struct AutoAnalyzeStatus {
+        bool enabled = true;
+        int intervalSeconds = 60;
+        int changeThresholdPct = 10;
+        long long lastRunMs = 0;
+        int tablesAnalyzed = 0;
+    } autoAnalyzeStatus;
+
     // ── Phase 75: Row-Level Security ──────────────────────────
     struct RlsPolicy {
         std::string name;
@@ -1681,7 +1705,7 @@ public:
     Table executeJoins(const std::string& baseNameRaw,
                        const std::vector<JoinClause>& joinsRaw,
                        const std::vector<WhereCondition>& whereConds,
-                       const std::string& whereLogic) const {
+                       const std::string& whereLogic) {
 
         auto baseName = resolveTableName(baseNameRaw);
         // Resolve table names in join clauses
@@ -1819,6 +1843,14 @@ public:
             }
             JoinStrategy strategy83 = JoinPlanner::choose(
                 current.rowCount(), right.rowCount(), leftHasIdx83, rightHasIdx83);
+
+            // Phase 126: Optimizer trace — log chosen join strategy
+            {
+                std::string stratName = JoinPlanner::name(strategy83);
+                addTrace("Chose " + stratName + ": left=" +
+                    std::to_string(current.rowCount()) + " rows, right=" +
+                    std::to_string(right.rowCount()) + " rows");
+            }
 
             // Dispatch: Hash Join or Merge Join for large tables;
             // Merge Join only supports INNER — fall back to Hash Join for others.

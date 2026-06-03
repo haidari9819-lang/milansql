@@ -166,7 +166,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v6.0.0 ===          \u2551\n"
+              << "  \u2551        === MilanSQL v6.1.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -202,6 +202,9 @@ int main(int argc, char* argv[]) {
     bool genCert     = false;
     std::string sslCert = "server.crt";
     std::string sslKey  = "server.key";
+    // Phase 125: Load Balancer
+    bool lbMode  = false;
+    int  lbPort  = 4405;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -220,8 +223,20 @@ int main(int argc, char* argv[]) {
         else if (arg == "--slave")       slaveMode  = true;
         else if (arg == "--ssl")         sslMode    = true;
         else if (arg == "--gen-cert")    genCert    = true;
+        else if (arg == "--lb")          lbMode     = true;
         else if (arg == "--ssl-cert"  && i + 1 < argc) sslCert = argv[++i];
         else if (arg == "--ssl-key"   && i + 1 < argc) sslKey  = argv[++i];
+        else if (arg == "--backend"   && i + 1 < argc) {
+            std::string backend = argv[++i];
+            auto colon = backend.rfind(':');
+            if (colon != std::string::npos) {
+                std::string host = backend.substr(0, colon);
+                int bport = std::stoi(backend.substr(colon + 1));
+                // engine not yet constructed here; store and apply after
+                // (deferred: engine constructed later, so we use a lambda)
+                (void)host; (void)bport; // handled below via pre-parsing
+            }
+        }
         else if (arg == "--port"          && i + 1 < argc) port        = std::stoi(argv[++i]);
         else if (arg == "--http-port"     && i + 1 < argc) httpPort    = std::stoi(argv[++i]);
         else if (arg == "--mysql-port"    && i + 1 < argc) mysqlPort   = std::stoi(argv[++i]);
@@ -233,6 +248,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
         else if (arg == "--master-port"   && i + 1 < argc) masterPort  = std::stoi(argv[++i]);
         else if (arg == "--repl-port"     && i + 1 < argc) replPort    = std::stoi(argv[++i]);
+        else if (arg == "--lb-port"       && i + 1 < argc) lbPort      = std::stoi(argv[++i]);
     }
 
     // Phase 79: apply DSN to client/server port if given
@@ -410,6 +426,25 @@ int main(int argc, char* argv[]) {
     milansql::Parser             parser;
     milansql::MilanBinaryStorage storage;
     std::string                  eingabe;
+
+    // ── Phase 125: Apply --backend arguments to loadBalancer ─────
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--backend" && i + 1 < argc) {
+            std::string backend = argv[++i];
+            auto colon = backend.rfind(':');
+            if (colon != std::string::npos) {
+                std::string host = backend.substr(0, colon);
+                int bport = 0;
+                try { bport = std::stoi(backend.substr(colon + 1)); } catch (...) {}
+                if (bport > 0) engine.loadBalancer.addBackend(host, bport);
+            }
+        }
+    }
+    if (lbMode) {
+        std::cout << "Load Balancer mode on port " << lbPort << "\n";
+        std::cout << "Backends: " << engine.loadBalancer.size() << "\n";
+    }
 
     // ── Phase 114: Double-Write Buffer Recovery ──────────────────
     {

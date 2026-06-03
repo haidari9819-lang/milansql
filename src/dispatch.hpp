@@ -3521,7 +3521,23 @@ inline bool dispatchCommand(
         break;
 
     case milansql::CommandType::SET_CACHE:
-        if (cmd.cacheEnabled == "ON") {
+        // Phase 125: SET ROUTING = AUTO/MASTER/SLAVE
+        if (cmd.varName == "ROUTING") {
+            if (cmd.varValue == "AUTO")
+                engine.loadBalancer.routingMode = RoutingMode::AUTO;
+            else if (cmd.varValue == "MASTER")
+                engine.loadBalancer.routingMode = RoutingMode::MASTER;
+            else if (cmd.varValue == "SLAVE")
+                engine.loadBalancer.routingMode = RoutingMode::SLAVE;
+            // silent success
+        }
+        // Phase 126: SET OPTIMIZER_TRACE = ON/OFF
+        else if (cmd.varName == "OPTIMIZER_TRACE") {
+            engine.optimizerTraceEnabled = (cmd.varValue == "ON" || cmd.varValue == "1");
+            engine.clearTrace();
+        }
+        // Original SET CACHE ON/OFF
+        else if (cmd.cacheEnabled == "ON") {
             engine.getQueryCache().setEnabled(true);
             std::cout << "  Query Cache aktiviert.\n\n";
         } else if (cmd.cacheEnabled == "OFF") {
@@ -6294,6 +6310,83 @@ inline bool dispatchCommand(
     // ── Phase 121: SHOW VECTOR STATS ─────────────────────────────
     case milansql::CommandType::SHOW_VECTOR_STATS: {
         std::cout << milansql::g_vectorIndexManager().showIndexes();
+        break;
+    }
+
+    // ── Phase 125: SHOW BACKENDS ──────────────────────────────────
+    case milansql::CommandType::SHOW_BACKENDS: {
+        std::cout << "\n  Backend | Port | Status | Connections\n";
+        std::cout << "  ----------------------------------------\n";
+        for (auto& b : engine.loadBalancer.backends()) {
+            std::cout << "  " << b.host << " | " << b.port
+                      << " | " << (b.isAlive ? "ALIVE" : "DOWN")
+                      << " | " << b.currentConnections.load() << "\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 125: SHOW ROUTING STATUS ────────────────────────────
+    case milansql::CommandType::SHOW_ROUTING_STATUS: {
+        int alive = 0;
+        for (auto& b : engine.loadBalancer.backends()) if (b.isAlive) alive++;
+        std::cout << "\n  Routing Mode: " << engine.loadBalancer.routingModeStr() << "\n";
+        std::cout << "  Backends: " << engine.loadBalancer.size() << "\n";
+        std::cout << "  Alive Backends: " << alive << "\n\n";
+        break;
+    }
+
+    // ── Phase 126: SHOW PLAN CACHE ────────────────────────────────
+    case milansql::CommandType::SHOW_PLAN_CACHE: {
+        auto plans = engine.planCache.all();
+        if (plans.empty()) {
+            std::cout << "  (plan cache empty)\n\n";
+        } else {
+            std::cout << "\n  Fingerprint | Table | Plan | Hits | Avg(ms)\n";
+            std::cout << "  -----------------------------------------------\n";
+            for (auto& p : plans) {
+                std::cout << "  " << p.fingerprint.substr(0, 50)
+                          << " | " << p.tableName
+                          << " | " << p.planDesc
+                          << " | " << p.hitCount
+                          << " | " << (int)p.avgExecMs << "ms\n";
+            }
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    // ── Phase 126: FLUSH PLAN CACHE ───────────────────────────────
+    case milansql::CommandType::FLUSH_PLAN_CACHE: {
+        engine.planCache.flush();
+        std::cout << "  Plan cache flushed.\n\n";
+        break;
+    }
+
+    // ── Phase 126: SHOW OPTIMIZER TRACE ───────────────────────────
+    case milansql::CommandType::SHOW_OPTIMIZER_TRACE: {
+        if (engine.optimizerTraceLog.empty()) {
+            std::cout << "  (optimizer trace empty — use SET OPTIMIZER_TRACE = ON first)\n\n";
+        } else {
+            std::cout << "\n  Step | Decision\n";
+            std::cout << "  ----------------------\n";
+            int step = 1;
+            for (auto& msg : engine.optimizerTraceLog) {
+                std::cout << "  " << step++ << " | " << msg << "\n";
+            }
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    // ── Phase 126: SHOW AUTO ANALYZE STATUS ───────────────────────
+    case milansql::CommandType::SHOW_AUTO_ANALYZE_STATUS: {
+        auto& s = engine.autoAnalyzeStatus;
+        std::cout << "\n  Auto Analyze Status:\n";
+        std::cout << "  Enabled: " << (s.enabled ? "ON" : "OFF") << "\n";
+        std::cout << "  Interval: " << s.intervalSeconds << "s\n";
+        std::cout << "  Threshold: " << s.changeThresholdPct << "%\n";
+        std::cout << "  Tables Analyzed: " << s.tablesAnalyzed << "\n\n";
         break;
     }
 

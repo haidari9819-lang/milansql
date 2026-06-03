@@ -1,5 +1,9 @@
 # MilanSQL
 
+> **Educational Project**: MilanSQL is built to understand
+> database internals from scratch. It uses Claude Code as
+> an AI pair programmer. Not a production MySQL/PostgreSQL replacement.
+
 ## Try It Online
 
 [Live Browser Demo](https://haidari9819-lang.github.io/milansql/demo.html) — Run SQL queries directly in your browser, no installation needed!

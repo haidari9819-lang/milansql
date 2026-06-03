@@ -3,6 +3,7 @@
 // Phase 99: Extended Test Suite (200+ Tests) + Stress Testing
 // Phase 127: Multi-Tenant Support (Group 42)
 // Phase 128: Automatic Failover + High Availability Sentinel (Group 43)
+// Phase 129: Connection String V2 + Service Discovery (Group 44)
 // ============================================================
 
 #include <iostream>
@@ -20,6 +21,7 @@
 #include "cdc/cdc_manager.hpp"
 #include "extensions/extension_manager.hpp"
 #include "dispatch_result.hpp"  // Phase 125/126: QueryResult + dispatch()
+#include "utils/connection_string.hpp"  // Phase 129: ConnectionStringParser
 
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
@@ -2935,6 +2937,104 @@ static void testGroup43() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Group 44: Phase 129 — Connection String V2 + Service Discovery
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup44() {
+    std::cout << "\n--- Group 44: Connection String V2 + Service Discovery ---\n";
+
+    using CSP = milansql::ConnectionStringParser;
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // Basic parse
+    {
+        auto cs = CSP::parse("milansql://root:secret@localhost:4406/mydb");
+        check(cs.valid, "Basic connection string valid");
+        check(cs.user == "root", "User parsed");
+        check(cs.password == "secret", "Password parsed");
+        check(cs.host() == "localhost", "Host parsed");
+        check(cs.port() == 4406, "Port parsed");
+        check(cs.database == "mydb", "Database parsed");
+    }
+
+    // Query params
+    {
+        auto cs = CSP::parse("milansql://root@localhost:4406/db?ssl=true&timeout=30&pool_size=5");
+        check(cs.valid, "Params connection string valid");
+        check(cs.ssl(), "SSL param parsed");
+        check(cs.timeout() == 30, "Timeout param parsed");
+        check(cs.poolSize() == 5, "Pool size param parsed");
+    }
+
+    // Multi-host
+    {
+        auto cs = CSP::parse("milansql://root@host1:4406,host2:4407/db");
+        check(cs.valid, "Multi-host valid");
+        check(cs.hosts.size() == 2, "Two hosts parsed");
+        check(cs.hosts[0].first == "host1", "First host");
+        check(cs.hosts[1].second == 4407, "Second host port");
+    }
+
+    // URL decode password
+    {
+        auto cs = CSP::parse("milansql://user:p%40ssw0rd@localhost/db");
+        check(cs.valid, "URL-encoded password valid");
+        check(cs.password == "p@ssw0rd", "Password URL-decoded");
+    }
+
+    // All params
+    {
+        auto cs = CSP::parse(
+            "milansql://root@localhost:4406/db?routing=auto&retry=3&tenant=acme&compress=true");
+        check(cs.routing() == "auto", "Routing param");
+        check(cs.retry() == 3, "Retry param");
+        check(cs.tenant() == "acme", "Tenant param");
+        check(cs.compress(), "Compress param");
+    }
+
+    // SRV scheme
+    {
+        auto cs = CSP::parse("milansql+srv://root@milansql.local/mydb");
+        check(cs.valid, "SRV scheme valid");
+        check(cs.srvLookup, "SRV lookup flag set");
+    }
+
+    // Invalid (no ://)
+    {
+        auto cs = CSP::parse("not-a-url");
+        check(!cs.valid, "Invalid connection string not valid");
+    }
+
+    // toDSN round-trip
+    {
+        auto cs = CSP::parse("milansql://root@localhost:4406/db?ssl=true");
+        std::string dsn = cs.toDSN();
+        check(dsn.find("milansql://") != std::string::npos, "toDSN has scheme");
+        check(dsn.find("localhost") != std::string::npos, "toDSN has host");
+    }
+
+    // SHOW DSN command
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        auto r = milansql::dispatch(parser.parse("SHOW DSN"), engine);
+        check(!r.rows.empty(), "SHOW DSN returns rows");
+    }
+
+    // parseParams standalone
+    {
+        auto params = CSP::parseParams("ssl=true&timeout=60&pool_size=20");
+        check(params["ssl"] == "true", "parseParams ssl");
+        check(params["timeout"] == "60", "parseParams timeout");
+        check(params.size() == 3, "parseParams count");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -3071,6 +3171,9 @@ int main() {
     }
     try { testGroup43(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 43 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup44(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 44 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

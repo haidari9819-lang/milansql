@@ -6521,6 +6521,21 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 129: SHOW DSN ────────────────────────────────────────
+    case milansql::CommandType::SHOW_DSN: {
+        std::cout << "\n  DSN / Connection Parameters:\n";
+        std::cout << "  Parameter  | Value\n";
+        std::cout << "  -----------+----------------\n";
+        std::cout << "  Host       | localhost\n";
+        std::cout << "  Port       | 4406\n";
+        std::cout << "  Database   | public\n";
+        std::cout << "  Tenant     | " << engine.tenantManager.activeTenant << "\n";
+        std::cout << "  SSL        | false\n";
+        std::cout << "  Routing    | " << engine.loadBalancer.routingModeStr() << "\n";
+        std::cout << "  Backends   | " << engine.loadBalancer.size() << "\n\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

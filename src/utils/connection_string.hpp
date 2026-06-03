@@ -1,8 +1,11 @@
 #pragma once
 // ============================================================
 // connection_string.hpp — Phase 79: DSN / Connection String Parser
+// Phase 129: Connection String V2 + Service Discovery
 // Supported formats:
 //   milansql://user:pass@host:port/database
+//   milansql://user:pass@host1:port,host2:port/database?ssl=true&pool_size=5
+//   milansql+srv://user@milansql.local/mydb
 //   mysql://user@host:port/database
 //   jdbc:milansql://host:port/database
 // ============================================================
@@ -10,6 +13,9 @@
 #include <string>
 #include <stdexcept>
 #include <cctype>
+#include <map>
+#include <vector>
+#include <sstream>
 
 namespace milansql {
 
@@ -72,6 +78,12 @@ struct ConnectionString {
             }
         }
 
+        // Strip query params before parsing host/db
+        auto qPos = str.find('?');
+        if (qPos != std::string::npos) {
+            str = str.substr(0, qPos);
+        }
+
         // Split remaining "host:port/database"
         auto slashPos = str.find('/');
         std::string hostport;
@@ -112,6 +124,159 @@ struct ConnectionString {
     // "milansql://user@host:port/db"  (password omitted)
     std::string toDisplayString() const {
         return protocol + "://" + user + "@" + host + ":" + std::to_string(port) + "/" + database;
+    }
+};
+
+// ============================================================
+// Phase 129: ConnectionStringParser — V2 with multi-host,
+// query params, URL decoding, and SRV service discovery
+// ============================================================
+
+struct ConnectionStringParser {
+
+    // URL decode: %20 → space, %40 → @, etc.
+    static std::string urlDecode(const std::string& s) {
+        std::string result;
+        for (size_t i = 0; i < s.size(); i++) {
+            if (s[i] == '%' && i+2 < s.size()) {
+                int val = 0;
+                std::istringstream hex(s.substr(i+1, 2));
+                hex >> std::hex >> val;
+                result += static_cast<char>(val);
+                i += 2;
+            } else if (s[i] == '+') {
+                result += ' ';
+            } else {
+                result += s[i];
+            }
+        }
+        return result;
+    }
+
+    // Parse query parameters: "ssl=true&timeout=30&pool_size=5"
+    static std::map<std::string, std::string> parseParams(const std::string& queryString) {
+        std::map<std::string, std::string> params;
+        std::istringstream iss(queryString);
+        std::string pair;
+        while (std::getline(iss, pair, '&')) {
+            auto eq = pair.find('=');
+            if (eq != std::string::npos) {
+                std::string key = urlDecode(pair.substr(0, eq));
+                std::string val = urlDecode(pair.substr(eq + 1));
+                params[key] = val;
+            }
+        }
+        return params;
+    }
+
+    // Parse multi-host: "host1:4406,host2:4407"
+    static std::vector<std::pair<std::string,int>> parseHosts(const std::string& hostStr) {
+        std::vector<std::pair<std::string,int>> hosts;
+        std::istringstream iss(hostStr);
+        std::string part;
+        while (std::getline(iss, part, ',')) {
+            auto colon = part.rfind(':');
+            if (colon != std::string::npos) {
+                std::string h = part.substr(0, colon);
+                int p = 4406;
+                try { p = std::stoi(part.substr(colon+1)); } catch(...) {}
+                hosts.push_back({h, p});
+            } else if (!part.empty()) {
+                hosts.push_back({part, 4406});
+            }
+        }
+        return hosts;
+    }
+
+    struct ParsedConnectionString {
+        std::string scheme;      // "milansql", "milansql+srv"
+        std::string user;
+        std::string password;
+        std::vector<std::pair<std::string,int>> hosts;
+        std::string database;
+        std::map<std::string, std::string> params;
+        bool srvLookup = false;
+        bool valid = false;
+        std::string error;
+
+        // Helper getters
+        bool ssl()        const { auto it=params.find("ssl");       return it!=params.end() && it->second=="true"; }
+        int timeout()     const { auto it=params.find("timeout");   return it!=params.end() ? std::stoi(it->second) : 30; }
+        std::string routing() const { auto it=params.find("routing"); return it!=params.end() ? it->second : "auto"; }
+        int poolSize()    const { auto it=params.find("pool_size"); return it!=params.end() ? std::stoi(it->second) : 10; }
+        int retry()       const { auto it=params.find("retry");     return it!=params.end() ? std::stoi(it->second) : 3; }
+        std::string tenant() const { auto it=params.find("tenant"); return it!=params.end() ? it->second : ""; }
+        bool compress()   const { auto it=params.find("compress");  return it!=params.end() && it->second=="true"; }
+
+        // Primary host
+        std::string host() const { return hosts.empty() ? "localhost" : hosts[0].first; }
+        int port()         const { return hosts.empty() ? 4406 : hosts[0].second; }
+
+        std::string toDSN() const {
+            std::string dsn = scheme + "://" + user;
+            if (!password.empty()) dsn += ":" + password;
+            if (!user.empty() || !password.empty()) dsn += "@";
+            for (size_t i = 0; i < hosts.size(); i++) {
+                if (i > 0) dsn += ",";
+                dsn += hosts[i].first + ":" + std::to_string(hosts[i].second);
+            }
+            dsn += "/" + database;
+            bool first = true;
+            for (auto& [k, v] : params) {
+                dsn += (first ? "?" : "&") + k + "=" + v;
+                first = false;
+            }
+            return dsn;
+        }
+    };
+
+    // Parse full connection string: milansql://user:pass@host1:port,host2:port/db?params
+    static ParsedConnectionString parse(const std::string& connStr) {
+        ParsedConnectionString result;
+        result.valid = false;
+
+        // Find scheme
+        auto schemeSep = connStr.find("://");
+        if (schemeSep == std::string::npos) { result.error = "Missing ://"; return result; }
+        result.scheme = connStr.substr(0, schemeSep);
+        result.srvLookup = (result.scheme == "milansql+srv");
+
+        std::string rest = connStr.substr(schemeSep + 3);
+
+        // Split on @ for user info
+        auto atPos = rest.find('@');
+        if (atPos != std::string::npos) {
+            std::string userInfo = rest.substr(0, atPos);
+            rest = rest.substr(atPos + 1);
+            auto colon = userInfo.find(':');
+            if (colon != std::string::npos) {
+                result.user     = urlDecode(userInfo.substr(0, colon));
+                result.password = urlDecode(userInfo.substr(colon + 1));
+            } else {
+                result.user = urlDecode(userInfo);
+            }
+        }
+
+        // Split on ? for params
+        auto qPos = rest.find('?');
+        if (qPos != std::string::npos) {
+            result.params = parseParams(rest.substr(qPos + 1));
+            rest = rest.substr(0, qPos);
+        }
+
+        // Split on / for database
+        auto slashPos = rest.find('/');
+        std::string hostPart;
+        if (slashPos != std::string::npos) {
+            hostPart        = rest.substr(0, slashPos);
+            result.database = rest.substr(slashPos + 1);
+        } else {
+            hostPart = rest;
+        }
+
+        result.hosts = parseHosts(hostPart);
+        result.valid = true;
+        return result;
     }
 };
 

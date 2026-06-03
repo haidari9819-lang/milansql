@@ -294,6 +294,8 @@ enum class CommandType {
     DEMOTE_TO_SLAVE,
     SHOW_SENTINEL_STATUS,
     SHOW_HA_STATUS,
+    // Phase 129: Connection String V2 + Service Discovery
+    SHOW_DSN,
     UNKNOWN
 };
 
@@ -2434,6 +2436,9 @@ public:
             } else if (kw1 == "HA" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_HA_STATUS;
+            // Phase 129: SHOW DSN
+            } else if (kw1 == "DSN") {
+                cmd.type = CommandType::SHOW_DSN;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3020,6 +3025,10 @@ public:
         } else if (kw0 == "SHOW" && kw1 == "HA" && tokens.size() >= 3 &&
                    toUpper(tokens[2]) == "STATUS") {
             cmd.type = CommandType::SHOW_HA_STATUS;
+
+        // ── Phase 129: SHOW DSN ────────────────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "DSN") {
+            cmd.type = CommandType::SHOW_DSN;
 
         // ── Phase 57: BACKUP DATABASE TO 'file' ──────────────────
         } else if (kw0 == "BACKUP" && kw1 == "DATABASE") {

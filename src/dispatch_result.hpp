@@ -201,6 +201,19 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── Phase 129: SHOW DSN ────────────────────────────────────
+    case milansql::CommandType::SHOW_DSN: {
+        qr.columns = {milansql::Column{"Parameter","TEXT"}, milansql::Column{"Value","TEXT"}};
+        qr.rows.push_back(milansql::Row({"Host", "localhost"}));
+        qr.rows.push_back(milansql::Row({"Port", "4406"}));
+        qr.rows.push_back(milansql::Row({"Database", "public"}));
+        qr.rows.push_back(milansql::Row({"Tenant", engine.tenantManager.activeTenant}));
+        qr.rows.push_back(milansql::Row({"SSL", "false"}));
+        qr.rows.push_back(milansql::Row({"Routing", engine.loadBalancer.routingModeStr()}));
+        qr.rows.push_back(milansql::Row({"Backends", std::to_string(engine.loadBalancer.size())}));
+        break;
+    }
+
     // For INSERT/CREATE/etc. in tests, delegate to engine directly
     case milansql::CommandType::CREATE_TABLE:
         engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);

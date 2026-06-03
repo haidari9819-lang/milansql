@@ -3035,6 +3035,185 @@ static void testGroup44() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Phase 131: TOAST Large Object Storage
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup45() {
+    std::cout << "\n--- Group 45: TOAST Large Object Storage ---\n";
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // ToastManager direct tests
+    milansql::ToastManager tm;
+
+    // Small value — no toast
+    std::string small = "Hello";
+    check(!tm.shouldToast(small), "Small value not toasted");
+
+    // Large value — toast
+    std::string large(3000, 'X'); // 3KB of X
+    check(tm.shouldToast(large), "Large value (3KB) should be toasted");
+
+    std::string ref = tm.toastValue(large);
+    check(ref.rfind("__toast:", 0) == 0, "Toast returns reference");
+    check(tm.toastedCount() == 1, "Toast count = 1");
+
+    // Fetch back
+    std::string fetched = tm.fetchToast(ref);
+    check(fetched == large, "Fetched value equals original");
+
+    // Compression test (repeated content compresses well)
+    std::string repeated = std::string(2500, 'A') + std::string(2500, 'B');
+    std::string ref2 = tm.toastValue(repeated);
+    (void)ref2;
+    auto stats = tm.stats();
+    check(stats.toastedValues == 2, "Toast count = 2 after second toast");
+
+    // Non-toast ref passthrough
+    std::string notRef = "just a normal string";
+    check(tm.fetchToast(notRef) == notRef, "Non-toast ref returns as-is");
+
+    // isToastRef
+    check(tm.isToastRef(ref), "isToastRef true for toast ref");
+    check(!tm.isToastRef("hello"), "isToastRef false for normal string");
+
+    // Compression / decompression roundtrip
+    std::string text = "AAAAAABBBBBCCCCC";
+    std::string compressed = milansql::ToastManager::simpleCompress(text);
+    std::string decompressed = milansql::ToastManager::simpleDecompress(compressed);
+    check(decompressed == text, "Compress/decompress roundtrip");
+
+    // SHOW TOAST STATUS via engine
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        auto r = milansql::dispatch(parser.parse("SHOW TOAST STATUS"), engine);
+        check(!r.rows.empty(), "SHOW TOAST STATUS returns rows");
+        check(r.rows.size() >= 3, "SHOW TOAST STATUS has at least 3 metrics");
+    }
+
+    // base64 encode
+    std::string encoded = milansql::ToastManager::base64Encode("Hello");
+    check(encoded == "SGVsbG8=", "base64 encode 'Hello' = 'SGVsbG8='");
+}
+
+// ══════════════════════════════════════════════════════════════
+// Phase 132: R-Tree Spatial Index V2 + Geographic Queries
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup46() {
+    std::cout << "\n--- Group 46: R-Tree Spatial Index V2 + Geographic Queries ---\n";
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // R-Tree direct tests
+    {
+        milansql::RTree rt;
+        rt.insert(1, 52.52, 13.41);  // Berlin
+        rt.insert(2, 48.14, 11.58);  // Munich
+        rt.insert(3, 53.55, 9.99);   // Hamburg
+        rt.insert(4, 50.93, 6.95);   // Cologne
+
+        check(rt.size() == 4, "RTree has 4 entries");
+
+        // Search around Berlin (bbox ~1 degree)
+        milansql::MBR bbox{51.5, 53.5, 12.0, 15.0};
+        auto results = rt.search(bbox);
+        check(!results.empty(), "RTree search finds Berlin");
+        bool foundBerlin = false;
+        for (auto id : results) if (id == 1) foundBerlin = true;
+        check(foundBerlin, "RTree search found Berlin (id=1)");
+    }
+
+    // Spatial function tests
+    {
+        // ST_GEOHASH — Berlin should start with 'u' (Europe)
+        std::string hash = milansql::SpatialUtils::stGeohash(52.52, 13.41);
+        check(!hash.empty(), "ST_GEOHASH returns non-empty string");
+        check(hash.size() == 6, "ST_GEOHASH returns 6-char hash");
+        check(hash[0] == 'u', "Berlin geohash starts with 'u'");
+    }
+
+    {
+        // ST_BEARING — from Berlin (52.52, 13.41) to Munich (48.14, 11.58) should be ~190-220 degrees
+        double bearing = milansql::SpatialUtils::stBearing(52.52, 13.41, 48.14, 11.58);
+        check(bearing >= 180.0 && bearing <= 240.0, "Bearing Berlin to Munich ~190-240 deg");
+    }
+
+    {
+        // ST_DESTINATION — 100km south of Berlin (bearing 180°)
+        std::string dest = milansql::SpatialUtils::stDestination(52.52, 13.41, 100.0, 180.0);
+        check(dest.find("POINT") != std::string::npos, "ST_DESTINATION returns POINT");
+        // Should be ~51.6 lat (100km south)
+        double lat = std::stod(dest.substr(6, dest.find(',') - 6));
+        check(lat > 51.0 && lat < 52.0, "ST_DESTINATION ~100km south of Berlin");
+    }
+
+    {
+        // ST_WITHIN (6-arg bbox variant)
+        bool within = milansql::SpatialUtils::stWithin(52.52, 13.41, 51.0, 54.0, 12.0, 15.0);
+        check(within, "Berlin is within bounding box");
+        bool outside = milansql::SpatialUtils::stWithin(48.14, 11.58, 51.0, 54.0, 12.0, 15.0);
+        check(!outside, "Munich is outside Berlin bounding box");
+    }
+
+    {
+        // ST_BBOX
+        std::string bbox = milansql::SpatialUtils::stBbox(52.52, 13.41, 50.0);
+        check(bbox.find("BBOX") != std::string::npos, "ST_BBOX returns BBOX string");
+    }
+
+    // Engine integration
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+
+        auto execSQLLocal = [&](const std::string& sql) {
+            milansql::ParsedCommand cmd = parser.parse(sql);
+            switch (cmd.type) {
+                case milansql::CommandType::CREATE_TABLE:
+                    engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+                    break;
+                case milansql::CommandType::INSERT: {
+                    const auto& rows = cmd.multiValues.empty()
+                        ? std::vector<std::vector<std::string>>{cmd.values}
+                        : cmd.multiValues;
+                    for (const auto& vals : rows)
+                        engine.insertRow(cmd.tableName, vals);
+                    break;
+                }
+                default: break;
+            }
+        };
+
+        execSQLLocal("CREATE TABLE staedte (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, pos POINT)");
+        execSQLLocal("INSERT INTO staedte VALUES (NULL, Berlin, 'POINT(52.5200, 13.4050)')");
+        execSQLLocal("INSERT INTO staedte VALUES (NULL, Munich, 'POINT(48.1351, 11.5820)')");
+        execSQLLocal("INSERT INTO staedte VALUES (NULL, Hamburg, 'POINT(53.5511, 9.9937)')");
+
+        // Distance query — Berlin to cities within 300km
+        auto r = executeSelect(engine, parser,
+            "SELECT name FROM staedte WHERE ST_DISTANCE(pos, 'POINT(52.5200, 13.4050)') < 300");
+        check(r.rows().size() >= 2, "At least 2 cities within 300km of Berlin");
+        bool foundBerlin = false, foundHamburg = false;
+        for (auto& row : r.rows()) {
+            if (!row.values.empty()) {
+                if (row.values[0] == "Berlin") foundBerlin = true;
+                if (row.values[0] == "Hamburg") foundHamburg = true;
+            }
+        }
+        check(foundBerlin, "Berlin found within 300km of itself");
+        check(foundHamburg, "Hamburg found within 300km of Berlin");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -3174,6 +3353,12 @@ int main() {
     }
     try { testGroup44(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 44 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup45(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 45 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup46(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 46 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

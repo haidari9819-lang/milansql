@@ -90,6 +90,8 @@
 #include "../cache/plan_cache.hpp"             // Phase 126: Plan Cache V2
 #include "../tenant/tenant_manager.hpp"        // Phase 127: Multi-Tenant Support
 #include "../ha/sentinel.hpp"                  // Phase 128: HA Sentinel
+#include "../storage/toast.hpp"               // Phase 131: TOAST Large Object Storage
+#include "../spatial/rtree.hpp"               // Phase 132: R-Tree Spatial Index V2
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1086,6 +1088,9 @@ public:
         long long lastRunMs = 0;
         int tablesAnalyzed = 0;
     } autoAnalyzeStatus;
+
+    // ── Phase 131: TOAST Large Object Storage ────────────────────
+    ToastManager toastManager;
 
     // ── Phase 75: Row-Level Security ──────────────────────────
     struct RlsPolicy {
@@ -5324,6 +5329,43 @@ private:
             return SpatialUtils::stWithin(p, center, radius);
         }
 
+        // ── Phase 132: V2 Spatial functions ──────────────────────
+        if (fn == "ST_GEOHASH") {
+            if (args.empty()) return "";
+            std::string p = resolvePointArg(args[0]);
+            auto [lat, lng] = SpatialUtils::parsePoint(p);
+            int prec = 6;
+            if (args.size() >= 2) { try { prec = std::stoi(resolveArg(args[1])); } catch (...) {} }
+            return SpatialUtils::stGeohash(lat, lng, prec);
+        }
+        if (fn == "ST_BEARING") {
+            if (args.size() < 2) return "0";
+            std::string p1 = resolvePointArg(args[0]);
+            std::string p2 = resolvePointArg(args[1]);
+            auto [lat1, lng1] = SpatialUtils::parsePoint(p1);
+            auto [lat2, lng2] = SpatialUtils::parsePoint(p2);
+            std::ostringstream ossBearing;
+            ossBearing << SpatialUtils::stBearing(lat1, lng1, lat2, lng2);
+            return ossBearing.str();
+        }
+        if (fn == "ST_DESTINATION") {
+            if (args.size() < 3) return "POINT(0,0)";
+            std::string p = resolvePointArg(args[0]);
+            auto [lat, lng] = SpatialUtils::parsePoint(p);
+            double dist = 0.0, bearing = 0.0;
+            try { dist    = std::stod(resolveArg(args[1])); } catch (...) {}
+            try { bearing = std::stod(resolveArg(args[2])); } catch (...) {}
+            return SpatialUtils::stDestination(lat, lng, dist, bearing);
+        }
+        if (fn == "ST_BBOX") {
+            if (args.size() < 2) return "BBOX(0,0,0,0)";
+            std::string p = resolvePointArg(args[0]);
+            auto [lat, lng] = SpatialUtils::parsePoint(p);
+            double radiusKm = 0.0;
+            try { radiusKm = std::stod(resolveArg(args[1])); } catch (...) {}
+            return SpatialUtils::stBbox(lat, lng, radiusKm);
+        }
+
         // ── Phase 88: Array functions ─────────────────────────────
         if (fn == "ARRAY_LENGTH") {
             if (args.empty()) return "0";
@@ -5448,6 +5490,8 @@ private:
              "JSON_CONTAINS", "JSON_TYPE", "JSON_VALID",
              // Phase 70: Spatial
              "ST_DISTANCE", "ST_X", "ST_Y", "ST_WITHIN", "ST_ASTEXT",
+             // Phase 132: V2 Spatial
+             "ST_GEOHASH", "ST_BEARING", "ST_DESTINATION", "ST_BBOX",
              // Phase 88: Array functions
              "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
              "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY",

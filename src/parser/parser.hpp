@@ -296,6 +296,10 @@ enum class CommandType {
     SHOW_HA_STATUS,
     // Phase 129: Connection String V2 + Service Discovery
     SHOW_DSN,
+    // Phase 131: TOAST Large Object Storage
+    SHOW_TOAST_STATUS,
+    // Phase 132: R-Tree Spatial Index V2
+    // (uses existing CREATE_SPATIAL_INDEX + new spatial functions)
     UNKNOWN
 };
 
@@ -2439,6 +2443,10 @@ public:
             // Phase 129: SHOW DSN
             } else if (kw1 == "DSN") {
                 cmd.type = CommandType::SHOW_DSN;
+            // Phase 131: SHOW TOAST STATUS
+            } else if (kw1 == "TOAST" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_TOAST_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3029,6 +3037,11 @@ public:
         // ── Phase 129: SHOW DSN ────────────────────────────────────
         } else if (kw0 == "SHOW" && kw1 == "DSN") {
             cmd.type = CommandType::SHOW_DSN;
+
+        // ── Phase 131: SHOW TOAST STATUS ─────────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "TOAST" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "STATUS") {
+            cmd.type = CommandType::SHOW_TOAST_STATUS;
 
         // ── Phase 57: BACKUP DATABASE TO 'file' ──────────────────
         } else if (kw0 == "BACKUP" && kw1 == "DATABASE") {

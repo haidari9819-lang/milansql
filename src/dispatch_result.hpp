@@ -214,6 +214,17 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── Phase 131: SHOW TOAST STATUS ─────────────────────────────
+    case milansql::CommandType::SHOW_TOAST_STATUS: {
+        qr.columns = {milansql::Column{"Metric","TEXT"}, milansql::Column{"Value","TEXT"}};
+        auto stats = engine.toastManager.stats();
+        qr.rows.push_back(milansql::Row({"Toasted Values", std::to_string(stats.toastedValues)}));
+        qr.rows.push_back(milansql::Row({"Saved Bytes", std::to_string(stats.savedBytes) + " bytes"}));
+        qr.rows.push_back(milansql::Row({"Compression Rate", std::to_string((int)stats.compressionRatio) + "%"}));
+        qr.rows.push_back(milansql::Row({"TOAST Threshold", std::to_string(milansql::ToastManager::TOAST_THRESHOLD) + " bytes"}));
+        break;
+    }
+
     // For INSERT/CREATE/etc. in tests, delegate to engine directly
     case milansql::CommandType::CREATE_TABLE:
         engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);

@@ -5829,6 +5829,45 @@ private:
         }
 
         size_t ci = colIdx(src, item.aggCol);
+        // Phase 121: Vector AVG — detect if this is a VECTOR column
+        if (item.aggFunc == "AVG" && !riList.empty()) {
+            // Peek at the first non-null value to check if it's a vector
+            for (size_t ri : riList) {
+                const Row& row = src.rows()[ri];
+                if (ci < row.values.size() && !row.values[ci].empty() &&
+                    row.values[ci].front() == '[') {
+                    // This is a vector column — compute element-wise AVG
+                    std::vector<double> sumVec;
+                    int count = 0;
+                    for (size_t ri2 : riList) {
+                        const Row& r2 = src.rows()[ri2];
+                        if (ci < r2.values.size()) {
+                            auto vec = milansql::vector_type::parse(r2.values[ci]);
+                            if (!vec.empty()) {
+                                if (sumVec.empty()) sumVec.resize(vec.size(), 0.0);
+                                for (size_t d = 0; d < vec.size() && d < sumVec.size(); ++d)
+                                    sumVec[d] += static_cast<double>(vec[d]);
+                                ++count;
+                            }
+                        }
+                    }
+                    if (count == 0 || sumVec.empty()) return "NULL";
+                    std::string result = "[";
+                    for (size_t d = 0; d < sumVec.size(); ++d) {
+                        if (d > 0) result += ",";
+                        double avg = sumVec[d] / static_cast<double>(count);
+                        // Format to 6 decimal places
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), "%.6g", avg);
+                        result += buf;
+                    }
+                    result += "]";
+                    return result;
+                }
+                break; // Only need to check one row
+            }
+        }
+
         std::vector<double> nums;
         nums.reserve(riList.size());
         for (size_t ri : riList) {

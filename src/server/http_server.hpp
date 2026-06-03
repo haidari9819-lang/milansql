@@ -368,6 +368,7 @@ private:
     std::string handleListSchemas();
     std::string handleStatus();
     std::string handleDashboard();   // Phase 54C
+    std::string handleSemanticSearch(const std::string& body);  // Phase 121
 
     void initEngine();
     static void sendResponse(sock_t sock, const std::string& response);
@@ -606,6 +607,151 @@ inline std::string MilanHttpServer::handleStatus() {
     return json;
 }
 
+// ── MilanHttpServer::handleSemanticSearch (Phase 121) ─────────
+// POST /semantic-search
+// Body JSON: {"table":"docs","vector_column":"embedding",
+//             "query_vector":"[1.0,0.0,0.0]","limit":5,
+//             "filter":"category = 'tech'","include_score":true}
+
+inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+
+    // Simple JSON field extraction helper
+    auto extractStr = [&](const std::string& key) -> std::string {
+        std::string search = "\"" + key + "\"";
+        auto pos = body.find(search);
+        if (pos == std::string::npos) return "";
+        pos = body.find(':', pos + search.size());
+        if (pos == std::string::npos) return "";
+        pos = body.find_first_not_of(" \t\r\n", pos + 1);
+        if (pos == std::string::npos) return "";
+        if (body[pos] == '"') {
+            // quoted string
+            auto end = body.find('"', pos + 1);
+            while (end != std::string::npos && body[end - 1] == '\\')
+                end = body.find('"', end + 1);
+            if (end == std::string::npos) return "";
+            return body.substr(pos + 1, end - pos - 1);
+        } else if (body[pos] == '[') {
+            // vector literal like [1.0,0.0]
+            auto end = body.find(']', pos);
+            if (end == std::string::npos) return "";
+            return body.substr(pos, end - pos + 1);
+        } else {
+            // number or bool
+            auto end = body.find_first_of(",}\r\n", pos);
+            if (end == std::string::npos) return body.substr(pos);
+            return body.substr(pos, end - pos);
+        }
+    };
+
+    std::string table        = extractStr("table");
+    std::string vecCol       = extractStr("vector_column");
+    std::string queryVecStr  = extractStr("query_vector");
+    std::string limitStr     = extractStr("limit");
+    std::string filter       = extractStr("filter");
+    std::string inclScoreStr = extractStr("include_score");
+
+    if (table.empty() || vecCol.empty() || queryVecStr.empty())
+        return R"({"success":false,"error":"Missing required fields: table, vector_column, query_vector"})";
+
+    int limitN = 10;
+    if (!limitStr.empty()) {
+        try { limitN = std::stoi(limitStr); } catch (...) {}
+    }
+    bool includeScore = (inclScoreStr == "true" || inclScoreStr == "1");
+
+    // Build SQL: SELECT *, embedding <-> '[...]' AS _score FROM table [WHERE filter] ORDER BY _score LIMIT n
+    std::string sql = "SELECT *, " + vecCol + " <-> '" + queryVecStr + "' AS _score FROM " + table;
+    if (!filter.empty()) sql += " WHERE " + filter;
+    sql += " ORDER BY _score LIMIT " + std::to_string(limitN);
+
+    // Execute
+    milansql::Parser parser;
+    milansql::ParsedCommand cmd;
+    try { cmd = parser.parse(sql); }
+    catch (const std::exception& e) {
+        return std::string(R"({"success":false,"error":"Parse error: )") + jsonEscape(e.what()) + "\"}";
+    }
+
+    // We can't call dispatchCommand (needs lots of callbacks), so execute directly
+    std::string resultJson;
+    try {
+        // For semantic search, execute via selectWhere + vector sort
+        milansql::Table result;
+        if (!filter.empty()) {
+            // Parse filter into WhereCondition via the parser approach
+            // Fallback: use raw selectAll and let ORDER BY handle it
+            result = engine_.selectAll(table).clone();
+        } else {
+            result = engine_.selectAll(table).clone();
+        }
+
+        // Add distance column
+        auto cols = result.columns();
+        int colIdx = -1;
+        for (int ci = 0; ci < (int)cols.size(); ++ci) {
+            std::string bare = cols[(size_t)ci].name;
+            auto dotPos = bare.rfind('.');
+            if (dotPos != std::string::npos) bare = bare.substr(dotPos + 1);
+            if (bare == vecCol || cols[(size_t)ci].name == vecCol) {
+                colIdx = ci; break;
+            }
+        }
+
+        auto queryVec = milansql::vector_type::parse(queryVecStr);
+        if (colIdx >= 0 && !queryVec.empty()) {
+            milansql::Column distCol("_score", "REAL");
+            result.addColumn(distCol);
+            int newColIdx = (int)result.columns().size() - 1;
+            for (auto& row : const_cast<std::vector<milansql::Row>&>(result.rows())) {
+                if (row.xmax != 0) continue;
+                std::string vecStr = (size_t)colIdx < row.values.size() ? row.values[(size_t)colIdx] : "";
+                auto vec = milansql::vector_type::parse(vecStr);
+                double dist = vec.empty() ? 1e30 : milansql::vector_type::l2Distance(vec, queryVec);
+                if ((size_t)newColIdx < row.values.size())
+                    row.values[(size_t)newColIdx] = milansql::vector_type::fmtFloat((float)dist);
+            }
+            // Sort by _score ASC
+            result.sortByMulti({{"_score", false}});
+        }
+
+        // Apply limit
+        auto& rows = result.rows();
+        const auto& resultCols = result.columns();
+        size_t n = std::min((size_t)limitN, rows.size());
+
+        resultJson = "{\"success\":true,\"rows\":[";
+        bool first = true;
+        size_t count = 0;
+        for (size_t ri = 0; ri < rows.size() && count < (size_t)limitN; ++ri) {
+            if (rows[ri].xmax != 0) continue;
+            if (!first) resultJson += ",";
+            first = false;
+            resultJson += "{";
+            bool firstCol = true;
+            for (size_t ci = 0; ci < resultCols.size(); ++ci) {
+                if (!includeScore && resultCols[ci].name == "_score") continue;
+                if (!firstCol) resultJson += ",";
+                firstCol = false;
+                resultJson += "\"" + jsonEscape(resultCols[ci].name) + "\":\"";
+                std::string val = ci < rows[ri].values.size() ? rows[ri].values[ci] : "";
+                // Strip surrounding single quotes
+                if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'')
+                    val = val.substr(1, val.size() - 2);
+                resultJson += jsonEscape(val) + "\"";
+            }
+            resultJson += "}";
+            ++count;
+        }
+        resultJson += "],\"count\":" + std::to_string(count) + "}";
+    } catch (const std::exception& e) {
+        return std::string(R"({"success":false,"error":")") + jsonEscape(e.what()) + "\"}";
+    }
+
+    return resultJson;
+}
+
 // ── MilanHttpServer::handleDashboard (Phase 54C) ──────────────
 
 inline std::string MilanHttpServer::handleDashboard() {
@@ -758,6 +904,14 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
         if (sql.empty())
             return buildHttpResponse(400, R"({"success":false,"error":"Missing SQL"})");
         return buildHttpResponse(200, handleQuery(sql));
+    }
+
+    // Phase 121: Semantic Search REST API
+    // POST /semantic-search
+    // Body: {"table":"docs","vector_column":"embedding","query_vector":"[1.0,0.0,0.0]",
+    //        "limit":5,"filter":"category = 'tech'","include_score":true}
+    if (req.path == "/semantic-search" && req.method == "POST") {
+        return buildHttpResponse(200, handleSemanticSearch(req.body));
     }
 
     if (req.path == "/tables") {

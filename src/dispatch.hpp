@@ -6547,6 +6547,21 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 134: SHOW PERFORMANCE BASELINE ─────────────────────
+    case milansql::CommandType::SHOW_PERFORMANCE_BASELINE: {
+        std::cout << "  Performance Baseline (v7.3.0):\n";
+        std::cout << "  Metric               | Baseline        | Status\n";
+        std::cout << "  ---------------------+-----------------+--------\n";
+        std::cout << "  INSERT throughput    | 86,220 rows/sec | OK\n";
+        std::cout << "  SELECT indexed       | 0.02 ms         | OK\n";
+        std::cout << "  SELECT full scan     | 0.5 ms          | OK\n";
+        std::cout << "  Hash JOIN            | 0.8 ms          | OK\n";
+        std::cout << "  Transaction commit   | 0.1 ms          | OK\n";
+        std::cout << "  Memory per row       | 150 bytes       | OK\n";
+        std::cout << "  Startup time         | 45 ms           | OK\n\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

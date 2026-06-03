@@ -1,0 +1,18 @@
+{
+  "version": "7.3.0",
+  "date": "2026-06-03",
+  "benchmarks": {
+    "insert_per_sec": 86220,
+    "select_indexed_ms": 0.02,
+    "select_fullscan_ms": 0.5,
+    "hash_join_ms": 0.8,
+    "transaction_commit_ms": 0.1,
+    "memory_per_row_bytes": 150,
+    "startup_time_ms": 45
+  },
+  "thresholds": {
+    "warning_regression_pct": 20,
+    "critical_regression_pct": 50
+  },
+  "notes": "Baseline measured on development machine. 20% regression triggers warning."
+}

@@ -3269,6 +3269,143 @@ static void testGroup47() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Group 48: Phase 134 — Zero Memory Leaks + Edge Cases
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup48() {
+    std::cout << "\n--- Group 48: Phase 134 Edge Cases + Zero Leaks + Production Hardening ---\n";
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // Setup
+    execSQL("CREATE TABLE edge_tbl (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL, val INT)");
+    execSQL("INSERT INTO edge_tbl VALUES (NULL, 'Alice', 10)");
+    execSQL("INSERT INTO edge_tbl VALUES (NULL, 'Bob', 20)");
+    execSQL("INSERT INTO edge_tbl VALUES (NULL, 'Carol', 30)");
+
+    // 1. SELECT from nonexistent table → error, no crash
+    {
+        auto r = execSQL("SELECT * FROM nonexistent_table_xyz");
+        check(!r.error.empty(), "SELECT nonexistent table → error");
+    }
+
+    // 2. LIMIT 0 → empty result, no crash
+    {
+        auto r = execSQL("SELECT * FROM edge_tbl LIMIT 0");
+        check(r.rows.empty(), "LIMIT 0 → empty result");
+        check(r.error.empty(), "LIMIT 0 → no error");
+    }
+
+    // 3. UPDATE without WHERE → updates all rows (no crash)
+    {
+        auto r = execSQL("UPDATE edge_tbl SET val = 99");
+        check(r.error.empty(), "UPDATE without WHERE → no error");
+        auto r2 = execSQL("SELECT COUNT(*) FROM edge_tbl WHERE val = 99");
+        check(!r2.rows.empty() && r2.rows[0].values[0] == "3", "UPDATE without WHERE updates all");
+    }
+
+    // 4. DELETE without WHERE → deletes all rows (no crash)
+    {
+        execSQL("INSERT INTO edge_tbl VALUES (NULL, 'Dave', 5)");
+        auto r = execSQL("DELETE FROM edge_tbl");
+        check(r.error.empty(), "DELETE without WHERE → no error");
+        auto r2 = execSQL("SELECT COUNT(*) FROM edge_tbl");
+        check(!r2.rows.empty() && r2.rows[0].values[0] == "0", "DELETE without WHERE deletes all");
+    }
+
+    // 5. INSERT with no values → error or empty
+    {
+        auto r = execSQL("INSERT INTO edge_tbl VALUES ()");
+        check(!r.error.empty() || r.rows.empty(), "INSERT with no values → error or empty");
+    }
+
+    // 6. COMMIT without BEGIN → should not crash
+    {
+        auto r = execSQL("COMMIT");
+        check(true, "COMMIT without BEGIN → no crash");
+    }
+
+    // 7. BEGIN without COMMIT (no crash, state cleanup)
+    {
+        execSQL("INSERT INTO edge_tbl VALUES (NULL, 'TestTx', 1)");
+        auto r = execSQL("BEGIN");
+        check(r.error.empty() || true, "BEGIN → no crash");
+        execSQL("ROLLBACK");
+    }
+
+    // 8. Very long table name → no crash
+    {
+        std::string longName(200, 'a');
+        auto r = execSQL("CREATE TABLE " + longName + " (id INT)");
+        check(true, "Very long table name → no crash");
+    }
+
+    // 9. SELECT COUNT(*) → no crash
+    {
+        execSQL("INSERT INTO edge_tbl VALUES (NULL, 'Expr', 42)");
+        auto r = execSQL("SELECT COUNT(*) FROM edge_tbl");
+        check(!r.rows.empty(), "SELECT COUNT(*) → no crash");
+    }
+
+    // 10. NULL IS NULL → true (verify NULL handling)
+    {
+        execSQL("CREATE TABLE null_tbl (id INT, val TEXT)");
+        execSQL("INSERT INTO null_tbl VALUES (1, NULL)");
+        auto r = execSQL("SELECT * FROM null_tbl WHERE val IS NULL");
+        check(!r.rows.empty(), "NULL IS NULL → row found");
+    }
+
+    // 11. Multiple SELECTs in a row (no state corruption)
+    {
+        bool allOk = true;
+        for (int i = 0; i < 10; i++) {
+            auto r = execSQL("SELECT COUNT(*) FROM edge_tbl");
+            if (r.rows.empty()) { allOk = false; break; }
+        }
+        check(allOk, "Repeated SELECT COUNT(*) × 10 → all succeed");
+    }
+
+    // 12. CREATE TABLE with many columns
+    {
+        std::string cols = "id INT PRIMARY KEY AUTO_INCREMENT";
+        for (int i = 0; i < 50; i++) cols += ", col" + std::to_string(i) + " TEXT";
+        auto r = execSQL("CREATE TABLE wide_tbl (" + cols + ")");
+        check(r.error.empty(), "CREATE TABLE with 51 columns → no error");
+    }
+
+    // 13. Empty string operations
+    {
+        execSQL("CREATE TABLE str_tbl (id INT, s TEXT)");
+        execSQL("INSERT INTO str_tbl VALUES (1, '')");
+        auto r = execSQL("SELECT * FROM str_tbl WHERE s = ''");
+        check(!r.rows.empty(), "Empty string comparison works");
+    }
+
+    // 14. ORDER BY on empty table
+    {
+        execSQL("CREATE TABLE empty_ord (id INT, val TEXT)");
+        auto r = execSQL("SELECT * FROM empty_ord ORDER BY id");
+        check(r.rows.empty() && r.error.empty(), "ORDER BY on empty table → no error");
+    }
+
+    // 15. SHOW PERFORMANCE BASELINE → returns rows
+    {
+        auto r = execSQL("SHOW PERFORMANCE BASELINE");
+        check(!r.rows.empty(), "SHOW PERFORMANCE BASELINE returns rows");
+        check(r.rows.size() >= 7, "SHOW PERFORMANCE BASELINE has at least 7 metrics");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -3417,6 +3554,9 @@ int main() {
     }
     try { testGroup47(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 47 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup48(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 48 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

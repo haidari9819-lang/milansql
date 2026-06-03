@@ -302,6 +302,8 @@ enum class CommandType {
     // (uses existing CREATE_SPATIAL_INDEX + new spatial functions)
     // Phase 133: Production Readiness
     SHOW_MEMORY_USAGE,
+    // Phase 134: Zero Memory Leaks + Production Hardening V2
+    SHOW_PERFORMANCE_BASELINE,
     UNKNOWN
 };
 
@@ -2256,6 +2258,10 @@ public:
             } else if (kw1 == "MEMORY" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "USAGE") {
                 cmd.type = CommandType::SHOW_MEMORY_USAGE;
+            // Phase 134: SHOW PERFORMANCE BASELINE
+            } else if (kw1 == "PERFORMANCE" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "BASELINE") {
+                cmd.type = CommandType::SHOW_PERFORMANCE_BASELINE;
             // Phase 73: SHOW BUFFER POOL STATUS
             } else if (kw1 == "BUFFER" && tokens.size() >= 4 &&
                        toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {
@@ -3048,6 +3054,11 @@ public:
         } else if (kw0 == "SHOW" && kw1 == "TOAST" && tokens.size() >= 3 &&
                    toUpper(tokens[2]) == "STATUS") {
             cmd.type = CommandType::SHOW_TOAST_STATUS;
+
+        // ── Phase 134: SHOW PERFORMANCE BASELINE ─────────────────
+        } else if (kw0 == "SHOW" && kw1 == "PERFORMANCE" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "BASELINE") {
+            cmd.type = CommandType::SHOW_PERFORMANCE_BASELINE;
 
         // ── Phase 57: BACKUP DATABASE TO 'file' ──────────────────
         } else if (kw0 == "BACKUP" && kw1 == "DATABASE") {

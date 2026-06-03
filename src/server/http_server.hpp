@@ -368,6 +368,7 @@ private:
     std::string handleListSchemas();
     std::string handleStatus();
     std::string handleDashboard();   // Phase 54C
+    std::string handleWebUI();       // Phase 135: Professional Admin Dashboard
     std::string handleSemanticSearch(const std::string& body);  // Phase 121
 
     void initEngine();
@@ -598,12 +599,25 @@ inline std::string MilanHttpServer::handleStatus() {
     auto tables  = engine_.getAllTableNames();
     auto schemas = engine_.showSchemas();
 
-    std::string json = "{\"success\":true,\"status\":{";
-    json += "\"version\":\"MilanSQL v7.0.0\",";
+    // Count total rows via public countRows API
+    long long totalRows = 0;
+    for (const auto& tname : tables) {
+        try { totalRows += (long long)engine_.countRows(tname, true); } catch (...) {}
+    }
+
+    std::string json = "{";
+    json += "\"success\":true,";
+    json += "\"status\":\"healthy\",";
+    json += "\"version\":\"MilanSQL v7.4.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
+    json += "\"tables\":"    + std::to_string(tables.size()) + ",";
+    json += "\"rows\":"      + std::to_string(totalRows) + ",";
+    json += "\"queries\":0,";
+    json += "\"connections\":0,";
+    json += "\"slow_queries\":" + std::to_string(engine_.slowQueryLog.size()) + ",";
     json += "\"tableCount\":" + std::to_string(tables.size()) + ",";
     json += "\"schemaCount\":" + std::to_string(schemas.size());
-    json += "}}";
+    json += "}";
     return json;
 }
 
@@ -887,13 +901,536 @@ loadSidebar();
 </html>)HTML";
 }
 
+// ── MilanHttpServer::handleWebUI (Phase 135) ─────────────────
+
+inline std::string MilanHttpServer::handleWebUI() {
+    static const std::string html = R"WEBUIEND(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+
+/* TOPBAR */
+#topbar{height:48px;background:#161b22;border-bottom:1px solid #21262d;display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:100}
+#topbar .brand{font-weight:700;font-size:1rem;color:#e6edf3;margin-right:8px}
+#topbar .brand span{color:#f0a500}
+.badge{display:inline-flex;align-items:center;gap:4px;background:#21262d;border:1px solid #30363d;border-radius:20px;padding:3px 10px;font-size:0.75rem;color:#8b949e}
+.badge.green{color:#3fb950}.badge.green::before{content:'';margin-right:2px;color:#3fb950}
+.badge.yellow{color:#d29922}.badge.yellow::before{content:'';margin-right:2px;color:#d29922}
+.badge.blue{color:#58a6ff}
+.topbar-right{margin-left:auto;display:flex;gap:8px}
+
+/* LAYOUT */
+#layout{display:flex;flex:1;overflow:hidden}
+
+/* SIDEBAR */
+#sidebar{width:220px;background:#0d1117;border-right:1px solid #21262d;display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.nav-section{padding:8px 0}
+.nav-label{font-size:0.7rem;text-transform:uppercase;letter-spacing:.08em;color:#8b949e;padding:8px 16px 4px}
+.nav-item{display:flex;align-items:center;gap:8px;padding:7px 16px;font-size:0.85rem;color:#8b949e;cursor:pointer;border-radius:4px;margin:1px 8px;transition:background .15s,color .15s}
+.nav-item:hover{background:#161b22;color:#e6edf3}
+.nav-item.active{background:#1c2128;color:#58a6ff}
+.nav-item .icon{font-size:0.9rem;width:16px;text-align:center}
+.tables-list{padding:0 8px}
+.table-item{padding:5px 8px;font-size:0.82rem;color:#8b949e;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:6px;transition:background .15s,color .15s}
+.table-item:hover{background:#161b22;color:#58a6ff}
+.table-item::before{content:'\229E';font-size:0.75rem;color:#30363d}
+.sidebar-footer{margin-top:auto;padding:12px;font-size:0.72rem;color:#8b949e;border-top:1px solid #21262d}
+
+/* MAIN */
+#main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+/* PAGE VIEWS */
+.page{display:none;flex:1;flex-direction:column;overflow:hidden}
+.page.active{display:flex}
+
+/* SQL EDITOR PAGE */
+#editor-area{padding:12px;display:flex;flex-direction:column;gap:8px;flex-shrink:0}
+.editor-toolbar{display:flex;gap:8px;align-items:center}
+.editor-toolbar .exec-time{margin-left:auto;font-size:0.75rem;color:#8b949e}
+#sql-editor{width:100%;height:140px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4}
+#sql-editor:focus{border-color:#388bfd}
+
+/* BUTTONS */
+.btn{padding:6px 14px;border-radius:6px;border:none;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s}
+.btn:hover{opacity:.85}
+.btn-green{background:#238636;color:#fff}
+.btn-blue{background:#1f6feb;color:#fff}
+.btn-gray{background:#21262d;color:#8b949e;border:1px solid #30363d}
+.btn-red{background:#da3633;color:#fff}
+
+/* RESULTS */
+#results-area{flex:1;overflow:auto;padding:0 12px 12px}
+.result-header{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:0.8rem;color:#8b949e;margin-bottom:4px}
+.result-header .pill{background:#1c2128;border:1px solid #238636;color:#3fb950;border-radius:20px;padding:2px 10px;font-size:0.75rem}
+.result-header .pill.error{border-color:#da3633;color:#f85149}
+.result-header .pill.info{border-color:#1f6feb;color:#58a6ff}
+#result-table-wrap{overflow:auto;border:1px solid #21262d;border-radius:6px}
+table{width:100%;border-collapse:collapse;font-size:0.82rem}
+th{background:#161b22;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #21262d;font-weight:500;white-space:nowrap;position:sticky;top:0}
+td{padding:7px 12px;border-bottom:1px solid #161b22;color:#e6edf3;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
+tr:hover td{background:#1c2128}
+td.num{color:#58a6ff;font-family:monospace}
+td.null-val{color:#484f58;font-style:italic}
+.error-box{background:#1a0f0f;border:1px solid #da3633;border-radius:6px;padding:12px;color:#f85149;font-family:monospace;font-size:0.82rem;margin-top:4px}
+.affected-box{background:#0d1f0d;border:1px solid #238636;border-radius:6px;padding:12px;color:#3fb950;font-size:0.85rem;margin-top:4px}
+
+/* STATUS BAR */
+#statusbar{height:26px;background:#161b22;border-top:1px solid #21262d;display:flex;align-items:center;padding:0 12px;gap:16px;font-size:0.72rem;color:#8b949e;flex-shrink:0}
+.status-item{display:flex;align-items:center;gap:4px}
+.status-dot{width:6px;height:6px;border-radius:50%;background:#3fb950}
+.status-dot.warn{background:#d29922}
+.status-dot.err{background:#f85149}
+
+/* MONITORING PAGE */
+#page-monitoring .mon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:16px}
+.stat-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
+.stat-card .label{font-size:0.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.stat-card .value{font-size:1.6rem;font-weight:700;color:#e6edf3}
+.stat-card .unit{font-size:0.75rem;color:#8b949e;margin-left:4px}
+.slow-queries-section{padding:0 16px 16px}
+.slow-queries-section h3{font-size:0.8rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
+
+/* TABLE BROWSER PAGE */
+#page-browser .browser-wrap{display:flex;flex:1;gap:0;overflow:hidden}
+#page-browser .tbl-list{width:200px;border-right:1px solid #21262d;overflow-y:auto;padding:8px}
+#page-browser .tbl-list .tbl-btn{width:100%;text-align:left;padding:7px 10px;background:none;border:none;color:#8b949e;font-size:0.82rem;cursor:pointer;border-radius:4px;display:block;transition:background .1s,color .1s}
+#page-browser .tbl-list .tbl-btn:hover{background:#161b22;color:#e6edf3}
+#page-browser .tbl-list .tbl-btn.active{background:#1c2128;color:#58a6ff}
+#page-browser .tbl-detail{flex:1;overflow:auto;padding:12px}
+#page-browser .tbl-detail h3{font-size:0.9rem;color:#e6edf3;margin-bottom:8px}
+
+/* HISTORY PAGE */
+#page-history{overflow-y:auto;padding:12px}
+.hist-item{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 14px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
+.hist-item:hover{border-color:#388bfd}
+.hist-item .hist-sql{font-family:monospace;font-size:0.82rem;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist-item .hist-meta{font-size:0.72rem;color:#8b949e;margin-top:4px}
+
+/* SCROLLBAR */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+</style>
+</head>
+<body>
+
+<!-- TOPBAR -->
+<div id="topbar">
+  <div class="brand"><span>&#x26A1;</span> MilanSQL</div>
+  <span class="badge" id="health-badge">checking...</span>
+  <span class="badge blue" id="conn-badge">0 connections</span>
+  <span class="badge blue" id="test-badge">426 tests</span>
+  <div class="topbar-right">
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v7.4.0</span>
+  </div>
+</div>
+
+<!-- LAYOUT -->
+<div id="layout">
+
+  <!-- SIDEBAR -->
+  <nav id="sidebar">
+    <div class="nav-section">
+      <div class="nav-label">Navigation</div>
+      <div class="nav-item active" data-page="editor" onclick="showPage('editor',this)">
+        <span class="icon">&#x270F;</span> SQL Editor
+      </div>
+      <div class="nav-item" data-page="browser" onclick="showPage('browser',this)">
+        <span class="icon">&#x1F5C3;</span> Table Browser
+      </div>
+      <div class="nav-item" data-page="monitoring" onclick="showPage('monitoring',this)">
+        <span class="icon">&#x1F4CA;</span> Monitoring
+      </div>
+      <div class="nav-item" data-page="history" onclick="showPage('history',this)">
+        <span class="icon">&#x1F550;</span> Query History
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Tables</div>
+      <div class="tables-list" id="sidebar-tables">
+        <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
+      </div>
+    </div>
+    <div class="sidebar-footer">MilanSQL Admin v7.4.0</div>
+  </nav>
+
+  <!-- MAIN -->
+  <div id="main">
+
+    <!-- SQL EDITOR PAGE -->
+    <div class="page active" id="page-editor">
+      <div id="editor-area">
+        <div class="editor-toolbar">
+          <button class="btn btn-green" onclick="runQuery()" title="Ctrl+Enter">&#x25B6; Run</button>
+          <button class="btn btn-blue" onclick="explainQuery()">&#x26A1; EXPLAIN</button>
+          <button class="btn btn-gray" onclick="formatSQL()">Format</button>
+          <button class="btn btn-gray" onclick="clearEditor()">&#x2715; Clear</button>
+          <span class="exec-time" id="exec-time"></span>
+        </div>
+        <textarea id="sql-editor" placeholder="-- Enter SQL here (Ctrl+Enter to run)&#10;SELECT * FROM employees LIMIT 10;">SELECT version();</textarea>
+      </div>
+      <div id="results-area">
+        <div class="result-header" id="result-header" style="display:none">
+          <span class="pill" id="result-pill"></span>
+          <span id="result-info"></span>
+        </div>
+        <div id="result-content"></div>
+      </div>
+    </div>
+
+    <!-- TABLE BROWSER PAGE -->
+    <div class="page" id="page-browser">
+      <div class="browser-wrap" style="display:flex;flex:1;overflow:hidden">
+        <div class="tbl-list" id="browser-tbl-list">
+          <div style="font-size:0.75rem;color:#484f58;padding:4px">Loading...</div>
+        </div>
+        <div class="tbl-detail" id="browser-tbl-detail">
+          <div style="color:#484f58;font-size:0.85rem;margin-top:20px">Select a table to browse</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MONITORING PAGE -->
+    <div class="page" id="page-monitoring">
+      <div class="mon-grid" id="mon-grid">
+        <div class="stat-card"><div class="label">Tables</div><div class="value" id="m-tables">--</div></div>
+        <div class="stat-card"><div class="label">Total Rows</div><div class="value" id="m-rows">--</div></div>
+        <div class="stat-card"><div class="label">Queries Run</div><div class="value" id="m-queries">--</div></div>
+        <div class="stat-card"><div class="label">Uptime</div><div class="value" id="m-uptime">--</div></div>
+        <div class="stat-card"><div class="label">Slow Queries</div><div class="value" id="m-slow">--</div></div>
+        <div class="stat-card"><div class="label">Active Connections</div><div class="value" id="m-conns">--</div></div>
+      </div>
+      <div class="slow-queries-section">
+        <h3>Recent Slow Queries</h3>
+        <div id="slow-queries-list" style="font-size:0.8rem;color:#8b949e">Run SHOW SLOW QUERIES to see data.</div>
+      </div>
+    </div>
+
+    <!-- HISTORY PAGE -->
+    <div class="page" id="page-history">
+      <div style="padding:12px;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center">
+        <span style="font-size:0.85rem;color:#8b949e">Query History</span>
+        <button class="btn btn-gray" style="margin-left:auto;font-size:0.75rem" onclick="clearHistory()">Clear</button>
+      </div>
+      <div id="history-list" style="flex:1;overflow-y:auto;padding:12px"></div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /layout -->
+
+<!-- STATUS BAR -->
+<div id="statusbar">
+  <div class="status-item"><div class="status-dot" id="sb-dot"></div><span id="sb-health">healthy</span></div>
+  <div class="status-item">Tables: <b id="sb-tables">--</b></div>
+  <div class="status-item">Rows: <b id="sb-rows">--</b></div>
+  <div class="status-item">Queries: <b id="sb-queries">--</b></div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v7.4.0 &middot; Press Ctrl+Enter to run</div>
+</div>
+
+<script>
+// Page navigation
+function showPage(name, el) {
+  document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active');});
+  document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active');});
+  document.getElementById('page-' + name).classList.add('active');
+  if (el) el.classList.add('active');
+  if (name === 'browser') loadBrowserTables();
+  if (name === 'history') renderHistory();
+  if (name === 'monitoring') loadMonitoring();
+}
+
+// SQL Execution
+async function runQuery(sql) {
+  var q = sql || document.getElementById('sql-editor').value.trim();
+  if (!q) return;
+  var t0 = performance.now();
+  document.getElementById('result-content').innerHTML = '<div style="color:#8b949e;padding:8px;font-size:0.8rem">Running...</div>';
+  document.getElementById('result-header').style.display = 'none';
+  try {
+    var resp = await fetch('/api/query', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sql: q})
+    });
+    var data = await resp.json();
+    var ms = (performance.now() - t0).toFixed(1);
+    document.getElementById('exec-time').textContent = ms + 'ms';
+    renderResult(data, ms);
+    saveHistory(q, ms);
+  } catch(e) {
+    showError('Network error: ' + e.message);
+  }
+}
+
+function renderResult(data, ms) {
+  var hdr = document.getElementById('result-header');
+  var pill = document.getElementById('result-pill');
+  var info = document.getElementById('result-info');
+  var content = document.getElementById('result-content');
+  hdr.style.display = 'flex';
+
+  var err = data.error || (!data.success && data.success !== undefined ? data.error : null);
+  if (err) {
+    pill.className = 'pill error'; pill.textContent = 'Error';
+    info.textContent = '';
+    content.innerHTML = '<div class="error-box">&#x26A0; ' + escHtml(err) + '</div>';
+    return;
+  }
+
+  var rows = data.rows || [];
+  var cols = data.columns || [];
+
+  if (cols.length === 0) {
+    var aff = data.affected_rows !== undefined ? data.affected_rows : (data.rowsAffected || 0);
+    pill.className = 'pill'; pill.textContent = 'OK';
+    info.textContent = aff + ' rows affected \u00b7 ' + ms + 'ms';
+    content.innerHTML = '<div class="affected-box">&#x2713; Query executed successfully. ' + aff + ' row(s) affected.</div>';
+    return;
+  }
+
+  pill.className = 'pill'; pill.textContent = rows.length + ' rows';
+  info.textContent = 'returned \u00b7 ' + ms + 'ms';
+
+  var html = '<div id="result-table-wrap"><table><thead><tr>';
+  cols.forEach(function(c){ html += '<th>' + escHtml(typeof c === 'string' ? c : (c.name || String(c))) + '</th>'; });
+  html += '</tr></thead><tbody>';
+  rows.forEach(function(row) {
+    html += '<tr>';
+    var vals = Array.isArray(row) ? row : (row.values || Object.values(row));
+    vals.forEach(function(v) {
+      if (v === null || v === 'NULL' || v === '') {
+        html += '<td class="null-val">NULL</td>';
+      } else if (!isNaN(v) && v !== '') {
+        html += '<td class="num">' + escHtml(String(v)) + '</td>';
+      } else {
+        html += '<td>' + escHtml(String(v)) + '</td>';
+      }
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  content.innerHTML = html;
+}
+
+function showError(msg) {
+  document.getElementById('result-header').style.display = 'flex';
+  document.getElementById('result-pill').className = 'pill error';
+  document.getElementById('result-pill').textContent = 'Error';
+  document.getElementById('result-info').textContent = '';
+  document.getElementById('result-content').innerHTML = '<div class="error-box">' + escHtml(msg) + '</div>';
+}
+
+async function explainQuery() {
+  var q = document.getElementById('sql-editor').value.trim();
+  if (!q) return;
+  await runQuery('EXPLAIN ' + q);
+}
+
+function formatSQL() {
+  var ed = document.getElementById('sql-editor');
+  var kws = ['SELECT','FROM','WHERE','JOIN','LEFT','RIGHT','INNER','OUTER','ON',
+             'GROUP BY','ORDER BY','HAVING','LIMIT','OFFSET','INSERT INTO',
+             'VALUES','UPDATE','SET','DELETE FROM','CREATE TABLE','DROP TABLE',
+             'ALTER TABLE','BEGIN','COMMIT','ROLLBACK','AND','OR','NOT'];
+  var s = ed.value;
+  kws.forEach(function(k){ s = s.replace(new RegExp('\\b' + k + '\\b','gi'), k); });
+  ed.value = s;
+}
+
+function clearEditor() {
+  document.getElementById('sql-editor').value = '';
+  document.getElementById('result-header').style.display = 'none';
+  document.getElementById('result-content').innerHTML = '';
+  document.getElementById('exec-time').textContent = '';
+}
+
+// Keyboard shortcuts
+document.getElementById('sql-editor').addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); runQuery(); }
+  if (e.ctrlKey && e.key === 'e')     { e.preventDefault(); explainQuery(); }
+  if (e.ctrlKey && e.key === 'l')     { e.preventDefault(); clearEditor(); }
+  if (e.ctrlKey && e.key === 'h')     { e.preventDefault(); showPage('history', document.querySelector('[data-page=history]')); }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    var ta = e.target;
+    var s = ta.selectionStart;
+    ta.value = ta.value.substring(0,s) + '    ' + ta.value.substring(ta.selectionEnd);
+    ta.selectionStart = ta.selectionEnd = s + 4;
+  }
+});
+
+// Table sidebar
+async function loadSidebarTables() {
+  try {
+    var r = await fetch('/tables');
+    var data = await r.json();
+    var tables = Array.isArray(data) ? data : (data.tables || []);
+    var el = document.getElementById('sidebar-tables');
+    if (!tables.length) { el.innerHTML = '<div style="font-size:0.75rem;color:#484f58;padding:4px 8px">No tables</div>'; return; }
+    el.innerHTML = tables.map(function(t) {
+      var name = typeof t === 'string' ? t : t.name;
+      return '<div class="table-item" onclick="selectFromTable(\'' + escAttr(name) + '\')">' + escHtml(name) + '</div>';
+    }).join('');
+  } catch(e) { /* silent */ }
+}
+
+function selectFromTable(name) {
+  document.getElementById('sql-editor').value = 'SELECT * FROM ' + name + ' LIMIT 100;';
+  showPage('editor', document.querySelector('[data-page=editor]'));
+  runQuery();
+}
+
+// Table Browser
+async function loadBrowserTables() {
+  try {
+    var r = await fetch('/tables');
+    var data = await r.json();
+    var tables = Array.isArray(data) ? data : (data.tables || []);
+    var listEl = document.getElementById('browser-tbl-list');
+    listEl.innerHTML = tables.map(function(t) {
+      var name = typeof t === 'string' ? t : t.name;
+      return '<button class="tbl-btn" onclick="browseTable(\'' + escAttr(name) + '\',this)">' + escHtml(name) + '</button>';
+    }).join('') || '<div style="font-size:0.75rem;color:#484f58">No tables</div>';
+  } catch(e) {}
+}
+
+async function browseTable(name, btn) {
+  document.querySelectorAll('.tbl-btn').forEach(function(b){b.classList.remove('active');});
+  if (btn) btn.classList.add('active');
+  var detail = document.getElementById('browser-tbl-detail');
+  detail.innerHTML = '<div style="color:#8b949e;font-size:0.8rem">Loading...</div>';
+  try {
+    var descR = await fetch('/api/query', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DESCRIBE ' + name})});
+    var dataR = await fetch('/api/query', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SELECT * FROM ' + name + ' LIMIT 50'})});
+    var desc = await descR.json();
+    var data = await dataR.json();
+    var html = '<h3 style="margin-bottom:12px">&#x1F4CB; ' + escHtml(name) + '</h3>';
+    if (desc.columns && desc.rows) {
+      html += '<div style="font-size:0.75rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
+      html += '<div id="result-table-wrap" style="margin-bottom:16px"><table><thead><tr>';
+      desc.columns.forEach(function(c){ html += '<th>' + escHtml(typeof c==='string'?c:(c.name||String(c))) + '</th>'; });
+      html += '</tr></thead><tbody>';
+      (desc.rows||[]).forEach(function(row) {
+        html += '<tr>';
+        (row.values||row||[]).forEach(function(v){ html += '<td>' + escHtml(String(v != null ? v : '')) + '</td>'; });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+    }
+    var rows = data.rows||[], cols = data.columns||[];
+    html += '<div style="font-size:0.75rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Data (first 50 rows)</div>';
+    html += '<div id="result-table-wrap"><table><thead><tr>';
+    cols.forEach(function(c){ html += '<th>' + escHtml(typeof c==='string'?c:(c.name||String(c))) + '</th>'; });
+    html += '</tr></thead><tbody>';
+    rows.forEach(function(row) {
+      html += '<tr>';
+      (row.values||row||[]).forEach(function(v) {
+        var sv = String(v != null ? v : '');
+        html += (!isNaN(sv)&&sv!=='') ? '<td class="num">'+escHtml(sv)+'</td>' : '<td>'+escHtml(sv)+'</td>';
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+    detail.innerHTML = html;
+  } catch(e) { detail.innerHTML = '<div class="error-box">' + escHtml(e.message) + '</div>'; }
+}
+
+// Monitoring
+async function loadMonitoring() {
+  try {
+    var r = await fetch('/status');
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    set('m-tables',  d.tables   != null ? d.tables   : '--');
+    set('m-rows',    d.rows     != null ? d.rows     : '--');
+    set('m-queries', d.queries  != null ? d.queries  : (d.query_count != null ? d.query_count : '--'));
+    set('m-uptime',  d.uptime   != null ? (d.uptime + 's') : '--');
+    set('m-slow',    d.slow_queries != null ? d.slow_queries : '0');
+    set('m-conns',   d.connections != null ? d.connections : (d.active_connections != null ? d.active_connections : '0'));
+  } catch(e) {}
+}
+
+// History
+function saveHistory(sql, ms) {
+  var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
+  hist.unshift({sql: sql, ms: ms, ts: new Date().toLocaleTimeString()});
+  if (hist.length > 50) hist.pop();
+  localStorage.setItem('mq_hist', JSON.stringify(hist));
+}
+
+function renderHistory() {
+  var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
+  var el = document.getElementById('history-list');
+  if (!hist.length) { el.innerHTML = '<div style="color:#484f58;font-size:0.85rem;padding:8px">No history yet.</div>'; return; }
+  el.innerHTML = hist.map(function(h,i) {
+    return '<div class="hist-item" onclick="loadHistItem(' + i + ')">' +
+      '<div class="hist-sql">' + escHtml(h.sql) + '</div>' +
+      '<div class="hist-meta">' + h.ts + ' \u00b7 ' + h.ms + 'ms</div>' +
+      '</div>';
+  }).join('');
+}
+
+function loadHistItem(i) {
+  var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
+  if (!hist[i]) return;
+  document.getElementById('sql-editor').value = hist[i].sql;
+  showPage('editor', document.querySelector('[data-page=editor]'));
+}
+
+function clearHistory() {
+  localStorage.removeItem('mq_hist');
+  renderHistory();
+}
+
+// Status bar polling
+async function pollStatus() {
+  try {
+    var r = await fetch('/status');
+    var d = await r.json();
+    var healthy = d.status === 'healthy' || d.status === 'ok' || !d.status;
+    var hb = document.getElementById('health-badge');
+    var dot = document.getElementById('sb-dot');
+    hb.textContent = (d.status || 'healthy');
+    hb.className = 'badge ' + (healthy ? 'green' : 'yellow');
+    dot.className = 'status-dot' + (healthy ? '' : ' warn');
+    document.getElementById('sb-health').textContent = d.status || 'healthy';
+    document.getElementById('sb-tables').textContent  = d.tables != null ? d.tables : '--';
+    document.getElementById('sb-rows').textContent    = d.rows   != null ? d.rows   : '--';
+    document.getElementById('sb-queries').textContent = d.queries != null ? d.queries : (d.query_count != null ? d.query_count : '--');
+    if (d.connections !== undefined)
+      document.getElementById('conn-badge').textContent = d.connections + ' connections';
+  } catch(e) {}
+}
+
+// Utilities
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) { return String(s).replace(/'/g,"\\'"); }
+
+// Init
+loadSidebarTables();
+pollStatus();
+setInterval(pollStatus, 5000);
+setInterval(loadSidebarTables, 30000);
+</script>
+</body>
+</html>)WEBUIEND";
+    return html;
+}
+
 // ── MilanHttpServer::handleRequest ────────────────────────────
 
 inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
 
-    if (req.path == "/query") {
+    if (req.path == "/query" || req.path == "/api/query") {
         std::string sql;
         if (req.method == "GET") {
             sql = getQueryParam(req.query, "sql");
@@ -991,14 +1528,22 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
         return buildHttpResponse(200, "{\"alive\":true}");
     }
 
-    if (req.path == "/dashboard" || req.path == "/") {
-        std::string html = handleDashboard();
+    if (req.path == "/webui") {
+        std::string html = handleWebUI();
         return "HTTP/1.1 200 OK\r\n"
                "Content-Type: text/html; charset=utf-8\r\n"
                "Content-Length: " + std::to_string(html.size()) + "\r\n"
                "Access-Control-Allow-Origin: *\r\n"
                "Connection: close\r\n"
                "\r\n" + html;
+    }
+
+    if (req.path == "/dashboard" || req.path == "/") {
+        return "HTTP/1.1 302 Found\r\n"
+               "Location: /webui\r\n"
+               "Content-Length: 0\r\n"
+               "Connection: close\r\n"
+               "\r\n";
     }
 
     if (req.path == "/ws-playground") {

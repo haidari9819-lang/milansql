@@ -3405,6 +3405,327 @@ static void testGroup48() {
     }
 }
 
+static void testGroup49() {
+    std::cout << "\n--- Group 49: Phase 136 ROLLUP / CUBE / GROUPING SETS ---\n";
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // Setup: sales table
+    execSQL("CREATE TABLE sales136 (id INT, region TEXT, product TEXT, amount INT)");
+    execSQL("INSERT INTO sales136 VALUES (1, 'East', 'Widget', 100)");
+    execSQL("INSERT INTO sales136 VALUES (2, 'East', 'Gadget', 200)");
+    execSQL("INSERT INTO sales136 VALUES (3, 'West', 'Widget', 150)");
+    execSQL("INSERT INTO sales136 VALUES (4, 'West', 'Gadget', 250)");
+    execSQL("INSERT INTO sales136 VALUES (5, 'East', 'Widget', 50)");
+
+    // 1. Normal GROUP BY still works
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY region ORDER BY region");
+        check(r.error.empty(), "Normal GROUP BY region → no error");
+    }
+
+    // 2. ROLLUP basic — no error
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY ROLLUP(region)");
+        check(r.error.empty(), "ROLLUP(region) → no error");
+    }
+
+    // 3. ROLLUP basic — produces more rows than plain GROUP BY
+    {
+        auto rg = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY region");
+        auto rr = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY ROLLUP(region)");
+        check(rr.rows.size() > rg.rows.size(), "ROLLUP(region) → more rows than plain GROUP BY");
+    }
+
+    // 4. ROLLUP grand total row present (empty key)
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY ROLLUP(region)");
+        bool hasGrandTotal = false;
+        for (const auto& row : r.rows)
+            if (!row.values.empty() && row.values[0].empty()) { hasGrandTotal = true; break; }
+        check(hasGrandTotal, "ROLLUP → grand total row present");
+    }
+
+    // 5. ROLLUP grand total SUM = 750
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY ROLLUP(region)");
+        std::string gt;
+        for (const auto& row : r.rows)
+            if (!row.values.empty() && row.values[0].empty() && row.values.size() > 1) gt = row.values[1];
+        check(gt == "750", "ROLLUP grand total SUM = 750");
+    }
+
+    // 6. ROLLUP two columns → no error
+    {
+        auto r = execSQL("SELECT region, product, SUM(amount) FROM sales136 GROUP BY ROLLUP(region, product)");
+        check(r.error.empty(), "ROLLUP(region, product) → no error");
+    }
+
+    // 7. CUBE two columns → no error
+    {
+        auto r = execSQL("SELECT region, product, SUM(amount) FROM sales136 GROUP BY CUBE(region, product)");
+        check(r.error.empty(), "CUBE(region, product) → no error");
+    }
+
+    // 8. CUBE result has 3 columns
+    {
+        auto r = execSQL("SELECT region, product, SUM(amount) FROM sales136 GROUP BY CUBE(region, product)");
+        check(r.columns.size() == 3, "CUBE → result has 3 columns");
+    }
+
+    // 9. CUBE result ≥ plain GROUP BY count
+    {
+        auto rg = execSQL("SELECT region, product, SUM(amount) FROM sales136 GROUP BY region, product");
+        auto rc = execSQL("SELECT region, product, SUM(amount) FROM sales136 GROUP BY CUBE(region, product)");
+        check(rc.rows.size() >= rg.rows.size(), "CUBE result ≥ plain GROUP BY count");
+    }
+
+    // 10. GROUPING SETS explicit → no error
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY GROUPING SETS((region),())");
+        check(r.error.empty(), "GROUPING SETS((region),()) → no error");
+    }
+
+    // 11. GROUPING SETS produces grand total
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY GROUPING SETS((region),())");
+        bool hasGT = false;
+        for (const auto& row : r.rows)
+            if (!row.values.empty() && row.values[0].empty()) { hasGT = true; break; }
+        check(hasGT, "GROUPING SETS with () → grand total row present");
+    }
+
+    // 12. GROUPING SETS single set = plain GROUP BY rows
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY GROUPING SETS((region))");
+        check(r.rows.size() == 2, "GROUPING SETS single set → 2 rows");
+    }
+
+    // 13. ROLLUP with COUNT
+    {
+        auto r = execSQL("SELECT region, COUNT(*) FROM sales136 GROUP BY ROLLUP(region)");
+        check(r.error.empty(), "ROLLUP COUNT(*) → no error");
+    }
+
+    // 14. ROLLUP with WHERE
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 WHERE product = 'Widget' GROUP BY ROLLUP(region)");
+        check(r.error.empty(), "ROLLUP with WHERE → no error");
+    }
+
+    // 15. ROLLUP with HAVING
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales136 GROUP BY ROLLUP(region) HAVING SUM(amount) > 100");
+        check(r.error.empty(), "ROLLUP with HAVING → no error");
+    }
+
+    // 16. CUBE single column → no error
+    {
+        auto r = execSQL("SELECT product, SUM(amount) FROM sales136 GROUP BY CUBE(product)");
+        check(r.error.empty(), "CUBE(product) single col → no error");
+    }
+
+    // 17. ROLLUP three columns → no error
+    {
+        execSQL("CREATE TABLE gs_tbl (a TEXT, b TEXT, c TEXT, v INT)");
+        execSQL("INSERT INTO gs_tbl VALUES ('x','p','1',10)");
+        execSQL("INSERT INTO gs_tbl VALUES ('x','p','2',20)");
+        execSQL("INSERT INTO gs_tbl VALUES ('y','q','1',30)");
+        auto r = execSQL("SELECT a, b, c, SUM(v) FROM gs_tbl GROUP BY ROLLUP(a, b, c)");
+        check(r.error.empty(), "ROLLUP three cols → no error");
+    }
+
+    // 18. CUBE three columns → no error
+    {
+        auto r = execSQL("SELECT a, b, c, SUM(v) FROM gs_tbl GROUP BY CUBE(a, b, c)");
+        check(r.error.empty(), "CUBE three cols → no error");
+    }
+
+    // 19. GROUPING SETS disjoint sets → no error
+    {
+        auto r = execSQL("SELECT region, product, SUM(amount) FROM sales136 GROUP BY GROUPING SETS((region),(product))");
+        check(r.error.empty(), "GROUPING SETS disjoint sets → no error");
+    }
+
+    // 20. ROLLUP AVG → no error
+    {
+        auto r = execSQL("SELECT region, AVG(amount) FROM sales136 GROUP BY ROLLUP(region)");
+        check(r.error.empty(), "ROLLUP AVG → no error");
+    }
+
+    // 21. GROUPING SETS three groups → no error
+    {
+        auto r = execSQL("SELECT a, b, SUM(v) FROM gs_tbl GROUP BY GROUPING SETS((a,b),(a),(b))");
+        check(r.error.empty(), "GROUPING SETS 3 groups → no error");
+    }
+}
+
+static void testGroup50() {
+    std::cout << "\n--- Group 50: Phase 137 TABLESAMPLE + DISTINCT ON ---\n";
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // Setup: populate table with 20 rows
+    execSQL("CREATE TABLE sample_tbl (id INT, category TEXT, value INT)");
+    for (int i = 1; i <= 20; ++i) {
+        std::string cat = (i % 2 == 0) ? "Even" : "Odd";
+        execSQL("INSERT INTO sample_tbl VALUES (" + std::to_string(i) + ", '" + cat + "', " + std::to_string(i * 10) + ")");
+    }
+
+    // 1. TABLESAMPLE BERNOULLI(100) → no error
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 100 )");
+        check(r.error.empty(), "TABLESAMPLE BERNOULLI(100) → no error");
+    }
+
+    // 2. TABLESAMPLE BERNOULLI(100) → all rows
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 100 )");
+        check(r.rows.size() == 20, "TABLESAMPLE BERNOULLI(100) → all 20 rows");
+    }
+
+    // 3. TABLESAMPLE BERNOULLI(0) → no error
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 0 )");
+        check(r.error.empty(), "TABLESAMPLE BERNOULLI(0) → no error");
+    }
+
+    // 4. TABLESAMPLE BERNOULLI(0) → 0 rows
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 0 )");
+        check(r.rows.empty(), "TABLESAMPLE BERNOULLI(0) → 0 rows");
+    }
+
+    // 5. TABLESAMPLE deterministic
+    {
+        auto r1 = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 50 )");
+        auto r2 = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 50 )");
+        check(r1.rows.size() == r2.rows.size(), "TABLESAMPLE deterministic same count");
+    }
+
+    // 6. TABLESAMPLE result has correct column count
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 100 )");
+        check(r.columns.size() == 3, "TABLESAMPLE → result has 3 columns");
+    }
+
+    // 7. TABLESAMPLE SYSTEM(100) → no error
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE SYSTEM ( 100 )");
+        check(r.error.empty(), "TABLESAMPLE SYSTEM(100) → no error");
+    }
+
+    // 8. TABLESAMPLE on empty table → no error
+    {
+        execSQL("CREATE TABLE empty_sample (id INT)");
+        auto r = execSQL("SELECT * FROM empty_sample TABLESAMPLE BERNOULLI ( 100 )");
+        check(r.error.empty(), "TABLESAMPLE on empty table → no error");
+    }
+
+    // 9. TABLESAMPLE with ORDER BY → no error
+    {
+        auto r = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 100 ) ORDER BY id");
+        check(r.error.empty(), "TABLESAMPLE with ORDER BY → no error");
+    }
+
+    // 10. TABLESAMPLE 100% same count as plain SELECT
+    {
+        auto r1 = execSQL("SELECT * FROM sample_tbl TABLESAMPLE BERNOULLI ( 100 )");
+        auto r2 = execSQL("SELECT * FROM sample_tbl");
+        check(r1.rows.size() == r2.rows.size(), "TABLESAMPLE 100% same count as plain SELECT");
+    }
+
+    // 11. DISTINCT ON (category) → no error
+    {
+        auto r = execSQL("SELECT DISTINCT ON (category) id, category, value FROM sample_tbl");
+        check(r.error.empty(), "DISTINCT ON (category) → no error");
+    }
+
+    // 12. DISTINCT ON (category) → 2 rows
+    {
+        auto r = execSQL("SELECT DISTINCT ON (category) id, category, value FROM sample_tbl");
+        check(r.rows.size() == 2, "DISTINCT ON (category) → 2 rows (Even, Odd)");
+    }
+
+    // 13. DISTINCT ON result column count
+    {
+        auto r = execSQL("SELECT DISTINCT ON (category) id, category, value FROM sample_tbl");
+        check(r.columns.size() == 3, "DISTINCT ON → result has 3 columns");
+    }
+
+    // 14. DISTINCT ON unique key → all rows
+    {
+        auto r = execSQL("SELECT DISTINCT ON (id) id, category FROM sample_tbl");
+        check(r.rows.size() == 20, "DISTINCT ON (id) unique → all 20 rows");
+    }
+
+    // 15. DISTINCT ON two-column key → no error
+    {
+        execSQL("CREATE TABLE two_key_tbl (a TEXT, b TEXT, val INT)");
+        execSQL("INSERT INTO two_key_tbl VALUES ('x','p',1)");
+        execSQL("INSERT INTO two_key_tbl VALUES ('x','p',2)");
+        execSQL("INSERT INTO two_key_tbl VALUES ('x','q',3)");
+        execSQL("INSERT INTO two_key_tbl VALUES ('y','p',4)");
+        auto r = execSQL("SELECT DISTINCT ON (a, b) a, b, val FROM two_key_tbl");
+        check(r.error.empty(), "DISTINCT ON (a, b) → no error");
+    }
+
+    // 16. DISTINCT ON two-column key → correct count
+    {
+        auto r = execSQL("SELECT DISTINCT ON (a, b) a, b, val FROM two_key_tbl");
+        check(r.rows.size() == 3, "DISTINCT ON (a, b) → 3 distinct pairs");
+    }
+
+    // 17. DISTINCT ON on empty table → no error
+    {
+        auto r = execSQL("SELECT DISTINCT ON (id) id FROM empty_sample");
+        check(r.error.empty(), "DISTINCT ON on empty table → no error");
+    }
+
+    // 18. DISTINCT ON on empty table → 0 rows
+    {
+        auto r = execSQL("SELECT DISTINCT ON (id) id FROM empty_sample");
+        check(r.rows.empty(), "DISTINCT ON on empty table → 0 rows");
+    }
+
+    // 19. DISTINCT ON nonexistent col → no crash
+    {
+        auto r = execSQL("SELECT DISTINCT ON (nonexistent) id FROM sample_tbl");
+        check(true, "DISTINCT ON nonexistent col → no crash");
+    }
+
+    // 20. DISTINCT ON with LIMIT → no error
+    {
+        auto r = execSQL("SELECT DISTINCT ON (category) id, category FROM sample_tbl LIMIT 1");
+        check(r.error.empty(), "DISTINCT ON with LIMIT → no error");
+    }
+
+    // 21. DISTINCT ON independent calls same result
+    {
+        auto r1 = execSQL("SELECT DISTINCT ON (category) category FROM sample_tbl");
+        auto r2 = execSQL("SELECT DISTINCT ON (category) category FROM sample_tbl");
+        check(r1.rows.size() == r2.rows.size(), "DISTINCT ON independent calls same result");
+    }
+}
+
 // ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
@@ -3557,6 +3878,12 @@ int main() {
     }
     try { testGroup48(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 48 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup49(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 49 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup50(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 50 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

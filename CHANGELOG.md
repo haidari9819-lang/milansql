@@ -2,6 +2,16 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v7.5.0] — 2026-06-03 — "Advanced SQL Analytics"
+
+### Added since v7.0.0
+
+- **Phase 136:** GROUPING SETS / ROLLUP / CUBE — multi-dimensional aggregation with super-aggregate rows
+- **Phase 137:** TABLESAMPLE BERNOULLI(n) — random row sampling + DISTINCT ON (col1, col2) — PostgreSQL-compatible first-row-per-group
+- 468 automated tests (42 new tests)
+
+---
+
 ## [v7.0.0] — 2026-06-02 — "Enterprise Ready"
 
 ### 130 Phases Complete

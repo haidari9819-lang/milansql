@@ -357,6 +357,13 @@ struct ParsedCommand {
     std::vector<HavingCondition>  havingConds;
     std::string                   havingLogic = "AND";
 
+    // Phase 136: ROLLUP / CUBE / GROUPING SETS
+    std::vector<std::vector<std::string>> groupingSets;  // expanded sets; non-empty → multi-pass
+
+    // Phase 137: TABLESAMPLE + DISTINCT ON
+    float       tableSamplePercent = -1.0f; // -1 = off; 0-100 = Bernoulli %
+    std::vector<std::string> distinctOnCols; // DISTINCT ON (col1, col2, ...)
+
     // JOIN (Phase 12: mehrere JOINs, INNER + LEFT)
     bool                     isJoin      = false;
     std::vector<JoinClause>  joinClauses;
@@ -983,13 +990,15 @@ public:
             }
         }
 
-        // ── IN / BETWEEN / EXISTS / MATCH-Erkennung ──────────────
+        // ── IN / BETWEEN / EXISTS / MATCH / TABLESAMPLE / DISTINCT ON ──
         {
             auto st = tokenize(input);
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
-                for (const auto& tok : st) {
-                    std::string u = toUpper(tok);
-                    if (u == "IN" || u == "BETWEEN" || u == "EXISTS" || u == "MATCH") {
+                for (size_t i = 0; i < st.size(); ++i) {
+                    std::string u = toUpper(st[i]);
+                    if (u == "IN" || u == "BETWEEN" || u == "EXISTS" || u == "MATCH" ||
+                        u == "TABLESAMPLE" ||
+                        (u == "DISTINCT" && i + 1 < st.size() && toUpper(st[i+1]) == "ON")) {
                         parseSelectFull(input, cmd);
                         return cmd;
                     }
@@ -5301,6 +5310,24 @@ private:
         }
         cmd.tableName = ft[fromPos + 1];
 
+        // Phase 137: TABLESAMPLE — FROM tbl TABLESAMPLE BERNOULLI(n)
+        {
+            size_t ti = fromPos + 2;
+            while (ti < N && toUpper(ft[ti]) != "TABLESAMPLE" &&
+                   toUpper(ft[ti]) != "WHERE" && toUpper(ft[ti]) != "ORDER" &&
+                   toUpper(ft[ti]) != "LIMIT" && toUpper(ft[ti]) != "GROUP") ++ti;
+            if (ti < N && toUpper(ft[ti]) == "TABLESAMPLE") {
+                // skip method name (BERNOULLI / SYSTEM)
+                size_t pct_i = ti + 1;
+                if (pct_i < N && toUpper(ft[pct_i]) != "(") ++pct_i; // method token
+                // find '(' num ')'
+                while (pct_i < N && ft[pct_i] != "(") ++pct_i;
+                if (pct_i + 2 < N) {
+                    try { cmd.tableSamplePercent = std::stof(ft[pct_i + 1]); } catch (...) {}
+                }
+            }
+        }
+
         // Phase 37: Alias nach Tabellenname erkennen (FROM tbl alias)
         if (fromPos + 2 < N) {
             std::string next = toUpper(ft[fromPos + 2]);
@@ -5309,6 +5336,7 @@ private:
                 next != "LEFT" && next != "RIGHT" && next != "FULL" &&
                 next != "JOIN" && next != "ON" && next != "UNION" &&
                 next != "INTERSECT" && next != "EXCEPT" &&
+                next != "TABLESAMPLE" &&
                 ft[fromPos + 2] != "," && ft[fromPos + 2] != "(" &&
                 ft[fromPos + 2] != ")") {
                 cmd.tableAlias = ft[fromPos + 2];
@@ -5318,7 +5346,22 @@ private:
         // SELECT-Spalten
         size_t selStart = 1;
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
-            cmd.isDistinct = true; ++selStart;
+            cmd.isDistinct = true;
+            // Phase 137: DISTINCT ON (col1, col2, ...) — PostgreSQL extension
+            if (selStart + 1 < fromPos && toUpper(ft[selStart + 1]) == "ON") {
+                selStart += 2; // skip DISTINCT ON
+                if (selStart < fromPos && ft[selStart] == "(") {
+                    ++selStart; // skip '('
+                    while (selStart < fromPos && ft[selStart] != ")") {
+                        if (ft[selStart] != ",")
+                            cmd.distinctOnCols.push_back(ft[selStart]);
+                        ++selStart;
+                    }
+                    if (selStart < fromPos) ++selStart; // skip ')'
+                }
+            } else {
+                ++selStart; // skip just DISTINCT
+            }
         }
         // Phase 31/32/64: CASE oder String-Funktion im Spaltenbereich?
         static const std::vector<std::string> SFUNCS32 =
@@ -6113,12 +6156,100 @@ private:
         }
 
         // GROUP BY-Spalten (nach BY bis HAVING/ORDER/LIMIT)
+        // Phase 136: detect ROLLUP / CUBE / GROUPING SETS
         if (groupPos != N && byPos != N) {
             size_t gcEnd = std::min({havingPos, orderPos, limitPos, N});
-            for (size_t i = byPos + 1; i < gcEnd; ++i) {
-                const std::string& t = ft[i];
-                if (t != "," && t != "(" && t != ")")
-                    cmd.groupByCols.push_back(t);
+            size_t bi = byPos + 1;
+            if (bi < gcEnd) {
+                std::string next = toUpper(ft[bi]);
+                if (next == "ROLLUP" || next == "CUBE" ||
+                    (next == "GROUPING" && bi + 1 < gcEnd && toUpper(ft[bi + 1]) == "SETS")) {
+
+                    // Helper: parse comma-separated col list inside one (...)
+                    auto parseColSet = [&](size_t start, size_t end_) -> std::vector<std::string> {
+                        std::vector<std::string> cols;
+                        for (size_t k = start; k < end_; ++k) {
+                            if (ft[k] != "," && ft[k] != "(" && ft[k] != ")")
+                                cols.push_back(ft[k]);
+                        }
+                        return cols;
+                    };
+
+                    if (next == "ROLLUP") {
+                        // ROLLUP(a,b,c) → {a,b,c},{a,b},{a},{}
+                        size_t lp = bi + 1;
+                        while (lp < gcEnd && ft[lp] != "(") ++lp;
+                        size_t rp = lp + 1; int depth = 1;
+                        while (rp < gcEnd && depth > 0) {
+                            if (ft[rp] == "(") ++depth;
+                            else if (ft[rp] == ")") --depth;
+                            ++rp;
+                        }
+                        std::vector<std::string> baseCols = parseColSet(lp + 1, rp - 1);
+                        for (size_t sz = baseCols.size(); ; --sz) {
+                            std::vector<std::string> s(baseCols.begin(), baseCols.begin() + sz);
+                            cmd.groupingSets.push_back(s);
+                            cmd.groupByCols = baseCols;
+                            if (sz == 0) break;
+                        }
+                    } else if (next == "CUBE") {
+                        // CUBE(a,b) → all 2^n subsets
+                        size_t lp = bi + 1;
+                        while (lp < gcEnd && ft[lp] != "(") ++lp;
+                        size_t rp = lp + 1; int depth2 = 1;
+                        while (rp < gcEnd && depth2 > 0) {
+                            if (ft[rp] == "(") ++depth2;
+                            else if (ft[rp] == ")") --depth2;
+                            ++rp;
+                        }
+                        std::vector<std::string> baseCols = parseColSet(lp + 1, rp - 1);
+                        cmd.groupByCols = baseCols;
+                        size_t n = baseCols.size();
+                        size_t total = (size_t(1) << n);
+                        for (size_t mask = total - 1; ; --mask) {
+                            std::vector<std::string> s;
+                            for (size_t bit = 0; bit < n; ++bit) {
+                                if (mask & (size_t(1) << bit)) s.push_back(baseCols[bit]);
+                            }
+                            cmd.groupingSets.push_back(s);
+                            if (mask == 0) break;
+                        }
+                    } else {
+                        // GROUPING SETS((a,b),(a),(b),())
+                        size_t k = bi + 2; // skip "GROUPING" "SETS"
+                        while (k < gcEnd && ft[k] != "(") ++k;
+                        ++k; // skip outer '('
+                        while (k < gcEnd && ft[k] != ")") {
+                            if (ft[k] == "(") {
+                                size_t lp2 = k;
+                                size_t rp2 = lp2 + 1; int depth3 = 1;
+                                while (rp2 < gcEnd && depth3 > 0) {
+                                    if (ft[rp2] == "(") ++depth3;
+                                    else if (ft[rp2] == ")") --depth3;
+                                    ++rp2;
+                                }
+                                std::vector<std::string> s = parseColSet(lp2 + 1, rp2 - 1);
+                                cmd.groupingSets.push_back(s);
+                                k = rp2;
+                            } else { ++k; }
+                        }
+                        std::vector<std::string> allCols;
+                        for (auto& gset : cmd.groupingSets)
+                            for (auto& c : gset) {
+                                bool found = false;
+                                for (auto& ac : allCols) if (ac == c) { found = true; break; }
+                                if (!found) allCols.push_back(c);
+                            }
+                        cmd.groupByCols = allCols;
+                    }
+                } else {
+                    // Normal GROUP BY
+                    for (size_t i = bi; i < gcEnd; ++i) {
+                        const std::string& t = ft[i];
+                        if (t != "," && t != "(" && t != ")")
+                            cmd.groupByCols.push_back(t);
+                    }
+                }
             }
         }
 

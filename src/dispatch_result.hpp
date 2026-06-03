@@ -363,6 +363,44 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                     qr.columns.push_back(c);
                 for (const auto& r : tbl.rows())
                     if (r.xmax == 0) qr.rows.push_back(r);
+            } else if (cmd.isGroupBy) {
+                // Phase 136: GROUP BY / ROLLUP / CUBE / GROUPING SETS
+                milansql::Table tbl;
+                if (!cmd.groupingSets.empty()) {
+                    tbl = engine.groupByMulti(cmd.tableName,
+                        cmd.whereConds, cmd.whereLogic,
+                        cmd.groupingSets, cmd.selectItems,
+                        cmd.havingConds, cmd.havingLogic);
+                } else {
+                    tbl = engine.groupBy(cmd.tableName,
+                        cmd.whereConds, cmd.whereLogic,
+                        cmd.groupByCols, cmd.selectItems,
+                        cmd.havingConds, cmd.havingLogic);
+                }
+                if (!cmd.orderByCols.empty()) {
+                    auto& rows = const_cast<std::vector<milansql::Row>&>(tbl.rows());
+                    std::stable_sort(rows.begin(), rows.end(),
+                        [&](const milansql::Row& a, const milansql::Row& b) {
+                            for (const auto& ob : cmd.orderByCols) {
+                                size_t ci = 0;
+                                for (size_t i = 0; i < tbl.columns().size(); ++i) {
+                                    if (tbl.columns()[i].name == ob.first) { ci = i; break; }
+                                }
+                                const std::string& va = ci < a.values.size() ? a.values[ci] : "";
+                                const std::string& vb = ci < b.values.size() ? b.values[ci] : "";
+                                if (va != vb) return ob.second ? va > vb : va < vb;
+                            }
+                            return false;
+                        });
+                }
+                for (const auto& c : tbl.columns()) qr.columns.push_back(c);
+                int limitCount = cmd.limit;
+                size_t count = 0;
+                for (const auto& r : tbl.rows()) {
+                    if (limitCount >= 0 && (int)count >= limitCount) break;
+                    qr.rows.push_back(r);
+                    ++count;
+                }
             } else {
                 // COUNT(*)
                 if (cmd.isCount) {
@@ -373,32 +411,60 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                     qr.rows.push_back(milansql::Row({std::to_string(cnt)}));
                     break;
                 }
-                // WHERE filter
+                // Get rows
+                milansql::Table result;
                 if (!cmd.whereConds.empty()) {
                     auto wr = engine.selectWhere(cmd.tableName, cmd.whereConds, cmd.whereLogic);
-                    for (const auto& c : wr.table.columns())
-                        qr.columns.push_back(c);
-                    auto& allRows = wr.table.rows();
-                    int limitCount = cmd.limit;
-                    size_t count = 0;
-                    for (const auto& r : allRows) {
-                        if (r.xmax != 0) continue;
-                        if (limitCount >= 0 && (int)count >= limitCount) break;
-                        qr.rows.push_back(r);
-                        ++count;
-                    }
+                    result = std::move(wr.table);
                 } else {
-                    const milansql::Table& tbl = engine.selectAll(cmd.tableName);
-                    for (const auto& c : tbl.columns())
-                        qr.columns.push_back(c);
-                    int limitCount = cmd.limit;
-                    size_t count = 0;
-                    for (const auto& r : tbl.rows()) {
-                        if (r.xmax != 0) continue;
-                        if (limitCount >= 0 && (int)count >= limitCount) break;
-                        qr.rows.push_back(r);
-                        ++count;
+                    result = engine.selectAll(cmd.tableName).clone();
+                }
+
+                // Phase 137: TABLESAMPLE BERNOULLI
+                if (cmd.tableSamplePercent >= 0.0f && cmd.tableSamplePercent <= 100.0f) {
+                    milansql::Table sampled(result.name(), result.columns());
+                    uint32_t seed = 12345;
+                    for (const auto& row : result.rows()) {
+                        if (row.xmax != 0) continue;
+                        seed = seed * 1664525u + 1013904223u;
+                        float r = static_cast<float>(seed >> 8) / static_cast<float>(1 << 24);
+                        if (r * 100.0f < cmd.tableSamplePercent)
+                            sampled.insert(row);
                     }
+                    result = std::move(sampled);
+                }
+
+                // Phase 137: DISTINCT ON (col1, col2)
+                if (!cmd.distinctOnCols.empty()) {
+                    std::set<std::string> seen;
+                    milansql::Table distResult(result.name(), result.columns());
+                    for (const auto& row : result.rows()) {
+                        if (row.xmax != 0) continue;
+                        std::string key;
+                        for (const auto& col : cmd.distinctOnCols) {
+                            for (size_t ci = 0; ci < result.columns().size(); ++ci) {
+                                if (result.columns()[ci].name == col) {
+                                    key += (ci < row.values.size() ? row.values[ci] : "") + "\x01";
+                                    break;
+                                }
+                            }
+                        }
+                        if (!seen.count(key)) {
+                            seen.insert(key);
+                            distResult.insert(row);
+                        }
+                    }
+                    result = std::move(distResult);
+                }
+
+                for (const auto& c : result.columns()) qr.columns.push_back(c);
+                int limitCount = cmd.limit;
+                size_t count = 0;
+                for (const auto& r : result.rows()) {
+                    if (r.xmax != 0) continue;
+                    if (limitCount >= 0 && (int)count >= limitCount) break;
+                    qr.rows.push_back(r);
+                    ++count;
                 }
             }
         } catch (const std::exception& e) {

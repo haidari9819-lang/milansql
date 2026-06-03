@@ -1659,6 +1659,91 @@ public:
         return result;
     }
 
+    // ── Phase 136: GROUPING SETS / ROLLUP / CUBE ─────────────
+
+    // Compute a single global aggregate (no GROUP BY — one result row).
+    Table globalAgg(const std::string& tblNameRaw,
+                    const std::vector<WhereCondition>& whereConds,
+                    const std::string& whereLogic,
+                    const std::vector<SelectItem>& selectItems,
+                    const std::vector<HavingCondition>& havingConds,
+                    const std::string& havingLogic) const {
+        auto tblName = resolveTableName(tblNameRaw);
+        const Table& src = getTable(tblName);
+
+        std::vector<size_t> filtered;
+        for (size_t i = 0; i < src.rows().size(); ++i) {
+            if (src.rows()[i].xmax != 0) continue;
+            if (rowMatches(src, src.rows()[i], whereConds, whereLogic))
+                filtered.push_back(i);
+        }
+
+        std::vector<Column> resultCols;
+        for (const auto& item : selectItems)
+            resultCols.emplace_back(item.alias.empty() ?
+                (item.isAgg ? item.aggFunc + "(" + item.aggCol + ")" : item.colName)
+                : item.alias, "");
+        Table result("", std::move(resultCols));
+
+        std::vector<std::string> vals;
+        vals.reserve(selectItems.size());
+        for (const auto& item : selectItems) {
+            if (item.isAgg)
+                vals.push_back(computeAggForGroup(src, item, filtered));
+            else
+                vals.push_back("");
+        }
+        if (satisfiesHaving(havingConds, havingLogic, selectItems, vals))
+            result.insert(Row(vals));
+        return result;
+    }
+
+    // Multi-pass GROUP BY for ROLLUP/CUBE/GROUPING SETS.
+    Table groupByMulti(const std::string& tblName,
+                       const std::vector<WhereCondition>& whereConds,
+                       const std::string& whereLogic,
+                       const std::vector<std::vector<std::string>>& groupingSets,
+                       const std::vector<SelectItem>& selectItems,
+                       const std::vector<HavingCondition>& havingConds,
+                       const std::string& havingLogic) const {
+        Table combined("", {});
+        bool first = true;
+
+        for (const auto& gset : groupingSets) {
+            Table partResult;
+            if (gset.empty()) {
+                partResult = globalAgg(tblName, whereConds, whereLogic,
+                                       selectItems, havingConds, havingLogic);
+            } else {
+                partResult = groupBy(tblName, whereConds, whereLogic,
+                                     gset, selectItems, havingConds, havingLogic);
+            }
+
+            std::set<std::string> setColSet(gset.begin(), gset.end());
+            std::vector<size_t> nullIdx;
+            for (size_t i = 0; i < selectItems.size(); ++i) {
+                const auto& item = selectItems[i];
+                if (!item.isAgg && !item.isFuncExpr &&
+                    !setColSet.count(item.colName) &&
+                    !setColSet.count(item.alias))
+                    nullIdx.push_back(i);
+            }
+
+            if (first) {
+                combined = Table("", partResult.columns());
+                first = false;
+            }
+
+            for (const auto& row : partResult.rows()) {
+                auto vals = row.values;
+                for (size_t idx : nullIdx)
+                    if (idx < vals.size()) vals[idx] = "";
+                combined.insert(Row(vals));
+            }
+        }
+        return combined;
+    }
+
     // ── Phase 11: INNER JOIN ──────────────────────────────────
 
     // Nested-Loop INNER JOIN zweier Tabellen.

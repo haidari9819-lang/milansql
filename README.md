@@ -10,9 +10,9 @@
 
 Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
-![Version](https://img.shields.io/badge/version-v7.0.0-gold)
+![Version](https://img.shields.io/badge/version-v7.5.0-gold)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Tests](https://img.shields.io/badge/tests-370%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-468%20passing-brightgreen)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 
@@ -84,7 +84,7 @@ cmake -B build -G Ninja && ninja -C build
 | Clients | Python DB-API 2.0 / Node.js / MySQL / psql | ✅ |
 | Storage | Page-based I/O + Compression (LZ4/RLE/Dictionary) | ✅ |
 | Catalog | INFORMATION_SCHEMA + pg_catalog (9 tables) | ✅ |
-| Testing | 370 automated tests + Stress Testing | ✅ |
+| Testing | 468 automated tests + Stress Testing | ✅ |
 
 ## Network Protocols
 

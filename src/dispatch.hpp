@@ -857,13 +857,32 @@ static inline milansql::Table dispatch_executeSelectToTable(
     }
 
     if (cmd.isGroupBy) {
-        auto result = engine.groupBy(
-            cmd.tableName,
-            cmd.whereConds, cmd.whereLogic,
-            cmd.groupByCols,
-            cmd.selectItems,
-            cmd.havingConds, cmd.havingLogic);
+        milansql::Table result;
+        if (!cmd.groupingSets.empty()) {
+            // Phase 136: ROLLUP / CUBE / GROUPING SETS
+            result = engine.groupByMulti(
+                cmd.tableName,
+                cmd.whereConds, cmd.whereLogic,
+                cmd.groupingSets,
+                cmd.selectItems,
+                cmd.havingConds, cmd.havingLogic);
+        } else {
+            result = engine.groupBy(
+                cmd.tableName,
+                cmd.whereConds, cmd.whereLogic,
+                cmd.groupByCols,
+                cmd.selectItems,
+                cmd.havingConds, cmd.havingLogic);
+        }
         if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
+        if (cmd.limit >= 0) {
+            milansql::Table lim(result.name(), result.columns());
+            size_t off = cmd.limitOffset > 0 ? static_cast<size_t>(cmd.limitOffset) : 0;
+            size_t cnt = 0;
+            for (size_t ri = off; ri < result.rows().size() && cnt < static_cast<size_t>(cmd.limit); ++ri, ++cnt)
+                lim.insert(result.rows()[ri]);
+            return lim;
+        }
         return result;
     }
 
@@ -895,6 +914,41 @@ static inline milansql::Table dispatch_executeSelectToTable(
         result = std::move(qr.table);
     } else {
         result = engine.selectAllFiltered(cmd.tableName); // Phase 75: RLS
+    }
+
+    // Phase 137: TABLESAMPLE BERNOULLI — randomly keep ~p% of rows
+    if (cmd.tableSamplePercent >= 0.0f && cmd.tableSamplePercent <= 100.0f) {
+        milansql::Table sampled(result.name(), result.columns());
+        uint32_t seed = 12345;
+        for (const auto& row : result.rows()) {
+            seed = seed * 1664525u + 1013904223u; // LCG
+            float r = static_cast<float>(seed >> 8) / static_cast<float>(1 << 24);
+            if (r * 100.0f < cmd.tableSamplePercent)
+                sampled.insert(row);
+        }
+        result = std::move(sampled);
+    }
+
+    // Phase 137: DISTINCT ON (col1, col2) — keep first row per unique key
+    if (!cmd.distinctOnCols.empty()) {
+        std::set<std::string> seen;
+        milansql::Table distResult(result.name(), result.columns());
+        for (const auto& row : result.rows()) {
+            std::string key;
+            for (const auto& col : cmd.distinctOnCols) {
+                for (size_t ci = 0; ci < result.columns().size(); ++ci) {
+                    if (result.columns()[ci].name == col) {
+                        key += (ci < row.values.size() ? row.values[ci] : "") + "\x01";
+                        break;
+                    }
+                }
+            }
+            if (!seen.count(key)) {
+                seen.insert(key);
+                distResult.insert(row);
+            }
+        }
+        result = std::move(distResult);
     }
 
     if (cmd.hasCaseItems && !cmd.selectItems.empty()) {

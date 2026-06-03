@@ -1,5 +1,30 @@
 #pragma once
 
+/**
+ * MilanSQL Engine — Core Database Engine
+ *
+ * Architecture:
+ *   SQL Input → Parser → ParsedCommand → Dispatcher →
+ *   Engine methods → QueryResult → Client
+ *
+ * Key components:
+ *   Table        — in-memory row store with B-Tree indexes
+ *   MVCC         — snapshot isolation via version chains
+ *   WAL          — write-ahead log, crash recovery (Phase 114)
+ *   BufferPool   — LRU page cache (Phase 80)
+ *   FullTextIndex — inverted index with BM25 scoring (Phase 119)
+ *   VectorIndex  — HNSW graph for approximate nearest-neighbour (Phase 111)
+ *
+ * Threading model:
+ *   Per-table std::shared_mutex — shared reads, exclusive writes (Phase 112)
+ *   Atomic statistics counters  — lock-free updates
+ *   Thread-local savepoint stacks
+ *
+ * Storage:
+ *   Page-based binary format v9 (src/storage/storage.hpp)
+ *   8 KB pages, CRC-32 checksums, double-write buffer
+ */
+
 #include <string>
 #include <vector>
 #include <map>
@@ -1099,6 +1124,20 @@ public:
 
     // ── DML ───────────────────────────────────────────────────
 
+    /**
+     * Insert a new row into the table.
+     *
+     * Validation order:
+     * 1. Apply DEFAULT values
+     * 2. Apply AUTO_INCREMENT
+     * 3. Check NOT NULL / UNIQUE / CHECK constraints
+     * 4. Check FK constraints
+     * 5. Acquire write lock
+     * 6. Insert row + update all indexes
+     * 7. Fire AFTER INSERT triggers
+     * 8. Append to WAL + update CDC log
+     * 9. Release write lock
+     */
     void insertRow(const std::string& tblRaw, std::vector<std::string> vals) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
@@ -1240,6 +1279,19 @@ public:
         return result;
     }
 
+    /**
+     * Execute a SELECT query with filtering, projection, and ordering.
+     *
+     * Execution order:
+     * 1. Acquire shared read lock on table
+     * 2. Apply RLS policies (if enabled)
+     * 3. Filter rows via rowMatches()
+     * 4. Apply window functions / aggregations
+     * 5. Apply ORDER BY, LIMIT, OFFSET
+     * 6. Release read lock
+     *
+     * Complexity: O(n) table scan without index, O(log n) with B-Tree index.
+     */
     // SELECT mit WHERE (AND / OR, alle Operatoren inkl. LIKE)
     WhereResult selectWhere(const std::string& tblNameRaw,
                             const std::vector<WhereCondition>& conds,

@@ -6,24 +6,25 @@
 
 Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
-![Version](https://img.shields.io/badge/version-v5.8.0-gold)
+![Version](https://img.shields.io/badge/version-v7.0.0-gold)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-370%20passing-brightgreen)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 
 <!-- Topics: database sql cpp c-plus-plus query-engine btree replication mvcc window-functions postgresql-compatible -->
 
-**From Zero to v5.8.0 — 117 phases, pure C++17**
+**From Zero to v7.0.0 — 130 phases, pure C++17 — Enterprise Ready**
 
 > A complete relational database engine built from scratch in C++17.  
-> 117 development phases. Zero external dependencies. 5 network protocols.
+> 130 development phases. Zero external dependencies. 5 network protocols.  
+> Multi-Tenant, High Availability, Load Balancer, pgvector AI/ML, Connection String V2.
 
 ## Documentation
 
 | Guide | Description |
 |-------|-------------|
-| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 117 phases |
+| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 130 phases |
 | [Tutorial](docs/tutorial.html) | Step-by-step getting started guide |
 | [Architecture](docs/architecture.html) | Internal architecture deep-dive |
 | [Live Demo](docs/demo.html) | Try MilanSQL in your browser |
@@ -79,7 +80,7 @@ cmake -B build -G Ninja && ninja -C build
 | Clients | Python DB-API 2.0 / Node.js / MySQL / psql | ✅ |
 | Storage | Page-based I/O + Compression (LZ4/RLE/Dictionary) | ✅ |
 | Catalog | INFORMATION_SCHEMA + pg_catalog (9 tables) | ✅ |
-| Testing | 223 automated tests + Stress Testing | ✅ |
+| Testing | 370 automated tests + Stress Testing | ✅ |
 
 ## Network Protocols
 

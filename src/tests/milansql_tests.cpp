@@ -3214,6 +3214,61 @@ static void testGroup46() {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Phase 133: Production Readiness Suite (Group 47)
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup47() {
+    std::cout << "\n--- Group 47: Production Readiness (Memory Tracker + SHOW MEMORY USAGE) ---\n";
+
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // Memory tracker basic operations
+    {
+        milansql::MemoryTracker tracker;
+        tracker.recordAlloc(1024);
+        tracker.recordAlloc(2048);
+        auto stats = tracker.stats();
+        check(stats.allocatedObjects == 2, "MemoryTracker: 2 allocations");
+        check(stats.allocatedBytes == 3072, "MemoryTracker: 3072 bytes");
+        check(stats.peakBytes == 3072, "MemoryTracker: peak 3072");
+        tracker.recordFree(1024);
+        stats = tracker.stats();
+        check(stats.allocatedObjects == 1, "MemoryTracker: after free, 1 object");
+        check(stats.allocatedBytes == 2048, "MemoryTracker: after free, 2048 bytes");
+    }
+
+    // SHOW MEMORY USAGE command
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        auto r = dispatch(parser.parse("SHOW MEMORY USAGE"), engine);
+        check(!r.rows.empty(), "SHOW MEMORY USAGE returns rows");
+        check(r.rows.size() >= 3, "SHOW MEMORY USAGE has at least 3 metrics");
+    }
+
+    // Global tracker singleton
+    {
+        auto& g = milansql::MemoryTracker::global();
+        auto before = g.stats().allocatedObjects;
+        g.recordAlloc(512);
+        auto after = g.stats();
+        check(after.allocatedObjects >= before + 1, "Global tracker increments");
+        g.recordFree(512);
+    }
+
+    // Prometheus metrics — tableCount method exists
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        dispatch(parser.parse("CREATE TABLE pm_test (id INT)"), engine);
+        check(engine.tableCount() >= 1, "tableCount() >= 1 after CREATE TABLE");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════════════════════════════
 
@@ -3359,6 +3414,9 @@ int main() {
     }
     try { testGroup46(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 46 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup47(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 47 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

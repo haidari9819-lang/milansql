@@ -300,6 +300,8 @@ enum class CommandType {
     SHOW_TOAST_STATUS,
     // Phase 132: R-Tree Spatial Index V2
     // (uses existing CREATE_SPATIAL_INDEX + new spatial functions)
+    // Phase 133: Production Readiness
+    SHOW_MEMORY_USAGE,
     UNKNOWN
 };
 
@@ -2250,6 +2252,10 @@ public:
             // Phase 72: SHOW MATERIALIZED VIEWS
             } else if (kw1 == "MATERIALIZED" && tokens.size() >= 3 && toUpper(tokens[2]) == "VIEWS") {
                 cmd.type = CommandType::SHOW_MATERIALIZED_VIEWS;
+            // Phase 133: SHOW MEMORY USAGE
+            } else if (kw1 == "MEMORY" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "USAGE") {
+                cmd.type = CommandType::SHOW_MEMORY_USAGE;
             // Phase 73: SHOW BUFFER POOL STATUS
             } else if (kw1 == "BUFFER" && tokens.size() >= 4 &&
                        toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {

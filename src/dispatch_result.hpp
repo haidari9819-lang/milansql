@@ -225,6 +225,17 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── Phase 133: SHOW MEMORY USAGE ────────────────────────────
+    case milansql::CommandType::SHOW_MEMORY_USAGE: {
+        qr.columns = {milansql::Column{"Metric","TEXT"}, milansql::Column{"Value","TEXT"}};
+        auto stats = milansql::MemoryTracker::global().stats();
+        qr.rows.push_back(milansql::Row({"Allocated Objects", std::to_string(stats.allocatedObjects)}));
+        qr.rows.push_back(milansql::Row({"Allocated Bytes", std::to_string(stats.allocatedBytes) + " bytes"}));
+        qr.rows.push_back(milansql::Row({"Peak Bytes", std::to_string(stats.peakBytes) + " bytes"}));
+        qr.rows.push_back(milansql::Row({"Leaks", std::to_string(stats.leaks)}));
+        break;
+    }
+
     // For INSERT/CREATE/etc. in tests, delegate to engine directly
     case milansql::CommandType::CREATE_TABLE:
         engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);

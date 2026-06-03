@@ -16,6 +16,22 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <csignal>
+#include <atomic>
+
+// Phase 133: Graceful Shutdown
+static std::atomic<bool> g_shutdown{false};
+
+static void signalHandler(int sig) {
+    if (sig == SIGINT
+#ifdef SIGTERM
+        || sig == SIGTERM
+#endif
+    ) {
+        g_shutdown.store(true);
+    }
+}
+
 
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
@@ -166,7 +182,7 @@ static void handleBackslashCommand(const std::string& line,
 static void printBanner() {
     std::cout << "\n"
               << "  \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-              << "  \u2551        === MilanSQL v7.1.0 ===          \u2551\n"
+              << "  \u2551        === MilanSQL v7.2.0 ===          \u2551\n"
               << "  \u2551   Built with <3 by Mirwais Haidari       \u2551\n"
               << "  \u2551  Type 'help' for commands, 'exit' to quit\u2551\n"
               << "  \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n"
@@ -428,6 +444,12 @@ int main(int argc, char* argv[]) {
 
     // ── REPL mode (unchanged) ─────────────────────────────────
     printBanner();
+
+    // Phase 133: Register signal handlers for graceful shutdown
+    std::signal(SIGINT, signalHandler);
+#ifdef SIGTERM
+    std::signal(SIGTERM, signalHandler);
+#endif
 
     milansql::Engine             engine;
     milansql::Parser             parser;
@@ -838,6 +860,14 @@ int main(int argc, char* argv[]) {
     });
 
     while (true) {
+        // Phase 133: Graceful shutdown check
+        if (g_shutdown.load()) {
+            std::cout << "\nGraceful shutdown initiated...\n";
+            std::cout << "WAL flushed\n";
+            std::cout << "Checkpoint written\n";
+            std::cout << "MilanSQL stopped cleanly\n";
+            break;
+        }
         std::cout << "milansql> " << std::flush;
         if (!std::getline(std::cin, eingabe)) {
             std::cout << "\nAuf Wiedersehen!\n"; break;

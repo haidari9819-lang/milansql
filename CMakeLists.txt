@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Projektname und Version
-project(milansql VERSION 7.1.0 LANGUAGES CXX)
+project(milansql VERSION 7.2.0 LANGUAGES CXX)
 
 # C++17 Standard festlegen
 set(CMAKE_CXX_STANDARD 17)
@@ -45,7 +45,7 @@ endif()
 # ── Test-Suite (Phase 99) ────────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent)
+target_include_directories(milansql_tests PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()
@@ -58,7 +58,7 @@ endif()
 # ── Stress Test (Phase 99) ───────────────────────────────────
 add_executable(milansql_stress src/tests/stress_test.cpp)
 target_compile_features(milansql_stress PRIVATE cxx_std_17)
-target_include_directories(milansql_stress PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage)
+target_include_directories(milansql_stress PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/debug)
 if(MSVC)
     target_compile_options(milansql_stress PRIVATE /W4)
 else()
@@ -139,6 +139,25 @@ if(WIN32)
     # Force console subsystem so WinMain is not required
     target_compile_options(milansql_embedded_test PRIVATE -mconsole)
     target_link_options(milansql_embedded_test PRIVATE -mconsole)
+endif()
+
+# AddressSanitizer build option
+option(ASAN "Enable AddressSanitizer" OFF)
+if(ASAN)
+  foreach(tgt milansql milansql_tests)
+    if(TARGET ${tgt})
+      target_compile_options(${tgt} PRIVATE
+        -fsanitize=address
+        -fsanitize=undefined
+        -fno-omit-frame-pointer
+        -g
+      )
+      target_link_options(${tgt} PRIVATE
+        -fsanitize=address
+        -fsanitize=undefined
+      )
+    endif()
+  endforeach()
 endif()
 
 # ── CTest Integration ────────────────────────────────────────

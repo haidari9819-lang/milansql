@@ -6536,6 +6536,17 @@ inline bool dispatchCommand(
         break;
     }
 
+    // ── Phase 133: SHOW MEMORY USAGE ────────────────────────────
+    case milansql::CommandType::SHOW_MEMORY_USAGE: {
+        auto stats = milansql::MemoryTracker::global().stats();
+        std::cout << "  Memory Usage:\n";
+        std::cout << "  Allocated Objects : " << stats.allocatedObjects << "\n";
+        std::cout << "  Allocated Bytes   : " << stats.allocatedBytes << " bytes\n";
+        std::cout << "  Peak Bytes        : " << stats.peakBytes << " bytes\n";
+        std::cout << "  Leaks             : " << stats.leaks << "\n\n";
+        break;
+    }
+
     case milansql::CommandType::UNKNOWN:
     default:
         std::cout << "  Unbekannter Befehl: '" << eingabe

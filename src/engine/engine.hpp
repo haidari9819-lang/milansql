@@ -92,6 +92,7 @@
 #include "../ha/sentinel.hpp"                  // Phase 128: HA Sentinel
 #include "../storage/toast.hpp"               // Phase 131: TOAST Large Object Storage
 #include "../spatial/rtree.hpp"               // Phase 132: R-Tree Spatial Index V2
+#include "../debug/memory_tracker.hpp"       // Phase 133: Memory Tracker
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1091,6 +1092,16 @@ public:
 
     // ── Phase 131: TOAST Large Object Storage ────────────────────
     ToastManager toastManager;
+
+    // ── Phase 133: Memory Tracker + Error Counters ───────────────
+    milansql::MemoryTracker memoryTracker;
+    std::atomic<int64_t> syntaxErrors_{0};
+    std::atomic<int64_t> constraintErrors_{0};
+    std::atomic<int64_t> runtimeErrors_{0};
+
+    size_t tableCount() const {
+        return tables_.size();
+    }
 
     // ── Phase 75: Row-Level Security ──────────────────────────
     struct RlsPolicy {

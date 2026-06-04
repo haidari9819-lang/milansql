@@ -2,6 +2,7 @@
 // ============================================================
 // dispatch_result.hpp — Lightweight QueryResult + dispatch()
 // Phase 125/126: Data-returning dispatch helper for tests
+// Phase 145-148: Audit, Online DDL, Continuous Aggregates, Distributed TX
 // ============================================================
 
 #include "engine/engine.hpp"
@@ -41,6 +42,37 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         }
         else if (cmd.varName == "PARALLEL_THRESHOLD") {
             try { engine.setParallelThreshold(std::stoll(cmd.varValue)); } catch (...) {}
+        }
+        // Phase 145: Security settings
+        else if (cmd.varName == "AUDIT_LOG") {
+            engine.auditLogger.setEnabled(cmd.varValue == "ON" || cmd.varValue == "1");
+        }
+        else if (cmd.varName == "AUDIT_LOG_FILE") {
+            engine.auditLogger.setLogFile(cmd.varValue);
+        }
+        else if (cmd.varName == "ALLOW_HOST") {
+            engine.accessControl.addAllowHost(cmd.varValue);
+        }
+        else if (cmd.varName == "DENY_HOST") {
+            engine.accessControl.addDenyHost(cmd.varValue);
+        }
+        else if (cmd.varName == "BLACKLIST_QUERY") {
+            // varValue may contain underscores => reconstruct with spaces
+            std::string bq = cmd.varValue;
+            for (auto& c : bq) if (c == '_') c = ' ';
+            engine.accessControl.addBlacklistQuery(bq);
+        }
+        else if (cmd.varName == "PASSWORD_MIN_LENGTH") {
+            try { engine.accessControl.setPasswordMinLength(std::stoi(cmd.varValue)); } catch (...) {}
+        }
+        else if (cmd.varName == "PASSWORD_REQUIRE_SPECIAL") {
+            engine.accessControl.setPasswordRequireSpecial(cmd.varValue == "ON" || cmd.varValue == "1");
+        }
+        else if (cmd.varName == "MAX_CONNECTIONS_PER_IP") {
+            try { engine.accessControl.setMaxConnectionsPerIp(std::stoi(cmd.varValue)); } catch (...) {}
+        }
+        else if (cmd.varName == "CONNECTION_RATE_LIMIT") {
+            try { engine.accessControl.setConnectionRateLimit(std::stoi(cmd.varValue)); } catch (...) {}
         }
         break;
 
@@ -520,8 +552,247 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── Phase 145: Audit Logging ──────────────────────────────────
+    case milansql::CommandType::SHOW_AUDIT_LOG: {
+        qr.columns = {milansql::Column{"Timestamp","TEXT"}, milansql::Column{"User","TEXT"},
+                      milansql::Column{"IP","TEXT"},        milansql::Column{"Op","TEXT"},
+                      milansql::Column{"Table","TEXT"},     milansql::Column{"Rows","TEXT"},
+                      milansql::Column{"Duration","TEXT"}};
+        auto addEntries = [&](const std::vector<milansql::AuditEntry>& entries) {
+            for (const auto& e : entries)
+                qr.rows.push_back(milansql::Row({e.timestamp, e.user, e.ip, e.op, e.table,
+                                                 std::to_string(e.rows),
+                                                 std::to_string(e.duration) + "ms"}));
+        };
+        if (!cmd.auditFilterField.empty()) {
+            addEntries(engine.auditLogger.getEntriesWhere(cmd.auditFilterField, cmd.auditFilterValue));
+        } else if (cmd.auditLimit > 0) {
+            addEntries(engine.auditLogger.getLimited(cmd.auditLimit));
+        } else {
+            const auto& buf = engine.auditLogger.getEntries();
+            for (const auto& e : buf)
+                qr.rows.push_back(milansql::Row({e.timestamp, e.user, e.ip, e.op, e.table,
+                                                 std::to_string(e.rows), std::to_string(e.duration) + "ms"}));
+        }
+        break;
+    }
+
+    case milansql::CommandType::FLUSH_AUDIT_LOG:
+        engine.auditLogger.flush();
+        break;
+
+    case milansql::CommandType::SHOW_ALLOWED_HOSTS: {
+        qr.columns = {milansql::Column{"Type","TEXT"}, milansql::Column{"Host","TEXT"}};
+        for (const auto& h : engine.accessControl.getAllowHosts())
+            qr.rows.push_back(milansql::Row({"ALLOW", h}));
+        for (const auto& h : engine.accessControl.getDenyHosts())
+            qr.rows.push_back(milansql::Row({"DENY", h}));
+        break;
+    }
+
+    // ── Phase 146: Online DDL ──────────────────────────────────────
+    case milansql::CommandType::ALTER_TABLE:
+        try {
+            engine.alterTable(cmd.tableName, cmd.alterOp, cmd.alterColName,
+                              cmd.alterColType, cmd.alterColNew, cmd.alterColDefault);
+        } catch (const std::exception& e) { qr.error = e.what(); }
+        break;
+
+    case milansql::CommandType::CREATE_INDEX_CONCURRENTLY: {
+        try {
+            if (!cmd.indexColumns.empty())
+                engine.createIndex(cmd.tableName, cmd.indexColumns, cmd.indexName);
+        } catch (const std::exception& e) { qr.error = e.what(); }
+        if (qr.error.empty()) engine.onlineDdl.recordChange(cmd.raw);
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SCHEMA_VERSION: {
+        qr.columns = {milansql::Column{"Version","INT"}, milansql::Column{"Last Changed","TEXT"}};
+        int ver = engine.onlineDdl.getVersion();
+        const auto& hist = engine.onlineDdl.getHistory();
+        std::string lastTs = hist.empty() ? "" : hist.back().timestamp;
+        qr.rows.push_back(milansql::Row({std::to_string(ver), lastTs}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SCHEMA_HISTORY: {
+        qr.columns = {milansql::Column{"Version","INT"}, milansql::Column{"Timestamp","TEXT"}, milansql::Column{"SQL","TEXT"}};
+        for (const auto& sc : engine.onlineDdl.getHistory())
+            qr.rows.push_back(milansql::Row({std::to_string(sc.version), sc.timestamp, sc.sql}));
+        break;
+    }
+
+    case milansql::CommandType::BEGIN_DDL:
+        engine.beginDdlTransaction();
+        break;
+
+    case milansql::CommandType::ROLLBACK_DDL:
+        engine.rollbackDdlTransaction();
+        break;
+
+    case milansql::CommandType::COMMIT_DDL:
+        engine.commitDdlTransaction();
+        break;
+
+    // ── Phase 147: Continuous Aggregates ──────────────────────────
+    case milansql::CommandType::CREATE_CONTINUOUS_AGGREGATE:
+        engine.caManager.createAggregate(cmd.continuousAggName, cmd.continuousAggSql, cmd.continuousAggInterval);
+        break;
+
+    case milansql::CommandType::SHOW_CONTINUOUS_AGGREGATES: {
+        qr.columns = {milansql::Column{"Name","TEXT"}, milansql::Column{"Refresh Interval","TEXT"},
+                      milansql::Column{"Last Refresh","TEXT"}, milansql::Column{"SQL","TEXT"}};
+        for (const auto& [name, def] : engine.caManager.getAllAggregates())
+            qr.rows.push_back(milansql::Row({def.name, def.refreshInterval, def.lastRefresh, def.sql}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_CHUNKS: {
+        qr.columns = {milansql::Column{"Table","TEXT"}, milansql::Column{"Chunk","TEXT"},
+                      milansql::Column{"Start","TEXT"}, milansql::Column{"End","TEXT"},
+                      milansql::Column{"Compressed","TEXT"}, milansql::Column{"Size","TEXT"}};
+        engine.caManager.ensureChunks(cmd.chunkTable);
+        for (const auto& c : engine.caManager.getChunks(cmd.chunkTable))
+            qr.rows.push_back(milansql::Row({c.tableName, c.chunkName, c.startTs, c.endTs,
+                                             c.compressed ? "yes" : "no",
+                                             std::to_string(c.sizeBytes)}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_RETENTION_POLICIES: {
+        qr.columns = {milansql::Column{"Table","TEXT"}, milansql::Column{"Interval (days)","INT"},
+                      milansql::Column{"Last Run","TEXT"}};
+        for (const auto& [tbl, rp] : engine.caManager.getRetentionPolicies())
+            qr.rows.push_back(milansql::Row({rp.tableName, std::to_string(rp.intervalDays), rp.lastRun}));
+        break;
+    }
+
+    case milansql::CommandType::ADD_RETENTION_POLICY:
+        engine.caManager.addRetentionPolicy(cmd.retentionTable, cmd.retentionDays > 0 ? cmd.retentionDays : 90);
+        qr.columns = {milansql::Column{"Result","TEXT"}};
+        qr.rows.push_back(milansql::Row({"ok"}));
+        break;
+
+    case milansql::CommandType::COMPRESS_CHUNK:
+        engine.caManager.ensureChunks(cmd.chunkTable);
+        engine.caManager.compressChunksOlderThan(cmd.chunkTable, cmd.chunkBeforeDays);
+        qr.columns = {milansql::Column{"Result","TEXT"}};
+        qr.rows.push_back(milansql::Row({"ok"}));
+        break;
+
+    // ── Phase 148: Distributed Transactions + 2PC ─────────────────
+    case milansql::CommandType::PREPARE_TRANSACTION:
+        try {
+            engine.prepareTx(cmd.preparedTxName);
+        } catch (const std::exception& e) { qr.error = e.what(); }
+        break;
+
+    case milansql::CommandType::COMMIT_PREPARED:
+        if (!engine.commitPrepared(cmd.preparedTxName))
+            qr.error = "prepared transaction not found: " + cmd.preparedTxName;
+        break;
+
+    case milansql::CommandType::ROLLBACK_PREPARED:
+        if (!engine.rollbackPrepared(cmd.preparedTxName))
+            qr.error = "prepared transaction not found: " + cmd.preparedTxName;
+        break;
+
+    case milansql::CommandType::SHOW_PREPARED_TRANSACTIONS: {
+        qr.columns = {milansql::Column{"XID","TEXT"}, milansql::Column{"State","TEXT"},
+                      milansql::Column{"Prepared At","TEXT"}};
+        for (const auto& [xid, tx] : engine.distTxManager.getAllPrepared())
+            qr.rows.push_back(milansql::Row({tx.xid, "prepared", tx.preparedAt}));
+        break;
+    }
+
+    case milansql::CommandType::XA_START:
+        try { engine.xaStart(cmd.xaXid); } catch (const std::exception& e) { qr.error = e.what(); }
+        break;
+
+    case milansql::CommandType::XA_END:
+        try { engine.xaEnd(cmd.xaXid); } catch (...) {}
+        break;
+
+    case milansql::CommandType::XA_PREPARE:
+        try { engine.xaPrepare(cmd.xaXid); } catch (const std::exception& e) { qr.error = e.what(); }
+        break;
+
+    case milansql::CommandType::XA_COMMIT:
+        engine.xaCommit(cmd.xaXid);
+        break;
+
+    case milansql::CommandType::XA_ROLLBACK:
+        engine.xaRollback(cmd.xaXid);
+        break;
+
+    case milansql::CommandType::BEGIN_DISTRIBUTED:
+        try { engine.beginTransaction("/tmp/milansql_dist_tx.wal"); } catch (const std::exception& e) { qr.error = e.what(); }
+        break;
+
+    case milansql::CommandType::GET_LOCK: {
+        bool got = engine.getLock(cmd.lockName, cmd.lockTimeout);
+        qr.columns = {milansql::Column{"Result","INT"}};
+        qr.rows.push_back(milansql::Row({got ? "1" : "0"}));
+        break;
+    }
+
+    case milansql::CommandType::RELEASE_LOCK: {
+        bool ok = engine.releaseLock(cmd.lockName);
+        qr.columns = {milansql::Column{"Result","INT"}};
+        qr.rows.push_back(milansql::Row({ok ? "1" : "0"}));
+        break;
+    }
+
+    case milansql::CommandType::IS_FREE_LOCK: {
+        bool free = engine.isFreeLock(cmd.lockName);
+        qr.columns = {milansql::Column{"Result","INT"}};
+        qr.rows.push_back(milansql::Row({free ? "1" : "0"}));
+        break;
+    }
+
     default:
         break;
+    }
+
+    // ── Phase 145: Audit hook (after switch) ──────────────────────
+    if (engine.auditLogger.isEnabled() && qr.error.empty()) {
+        std::string opStr;
+        switch (cmd.type) {
+        case milansql::CommandType::SELECT:       opStr = "SELECT";       break;
+        case milansql::CommandType::INSERT:       opStr = "INSERT";       break;
+        case milansql::CommandType::UPDATE:       opStr = "UPDATE";       break;
+        case milansql::CommandType::DELETE:       opStr = "DELETE";       break;
+        case milansql::CommandType::CREATE_TABLE: opStr = "CREATE_TABLE"; break;
+        case milansql::CommandType::DROP_TABLE:   opStr = "DROP_TABLE";   break;
+        case milansql::CommandType::ALTER_TABLE:  opStr = "ALTER_TABLE";  break;
+        case milansql::CommandType::CREATE_INDEX: opStr = "CREATE_INDEX"; break;
+        case milansql::CommandType::DROP_INDEX:   opStr = "DROP_INDEX";   break;
+        case milansql::CommandType::TRUNCATE:     opStr = "TRUNCATE";     break;
+        default: break;
+        }
+        if (!opStr.empty()) {
+            milansql::AuditEntry ae;
+            ae.op = opStr; ae.table = cmd.tableName; ae.rows = (int64_t)qr.rows.size();
+            engine.auditLogger.log(ae);
+        }
+    }
+
+    // ── Phase 146: Schema versioning hook ────────────────────────
+    {
+        bool isDdl = false;
+        switch (cmd.type) {
+        case milansql::CommandType::CREATE_TABLE:
+        case milansql::CommandType::DROP_TABLE:
+        case milansql::CommandType::ALTER_TABLE:
+        case milansql::CommandType::CREATE_INDEX:
+        case milansql::CommandType::DROP_INDEX:
+        case milansql::CommandType::CREATE_INDEX_CONCURRENTLY:
+            isDdl = true; break;
+        default: break;
+        }
+        if (isDdl && qr.error.empty())
+            engine.onlineDdl.recordChange(cmd.raw);
     }
 
     return qr;

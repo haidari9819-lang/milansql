@@ -95,6 +95,12 @@
 #include "../debug/memory_tracker.hpp"       // Phase 133: Memory Tracker
 #include "../executor/parallel_executor.hpp" // Phase 141: Parallel Query Execution V2
 #include "../storage/column_store_v2.hpp"    // Phase 142: Column Store V2 + OLAP
+#include "../security/audit_log.hpp"         // Phase 145: Audit Logging
+#include "../security/access_control.hpp"    // Phase 145: Access Control
+#include "../ddl/online_ddl.hpp"             // Phase 146: Online DDL
+#include "../timeseries/continuous_aggregate.hpp" // Phase 147: Continuous Aggregates
+#include "../transaction/distributed_tx.hpp" // Phase 148: Distributed Transactions
+#include "../lock/distributed_lock.hpp"      // Phase 148: Distributed Locks
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1094,6 +1100,86 @@ public:
 
     // ── Phase 131: TOAST Large Object Storage ────────────────────
     ToastManager toastManager;
+
+    // ── Phase 145: Security ───────────────────────────────────────
+    AuditLogger    auditLogger;
+    AccessControl  accessControl;
+
+    // ── Phase 146: Online DDL ─────────────────────────────────────
+    OnlineDdl      onlineDdl;
+    bool           ddlTxnActive_   = false;
+    std::set<std::string> ddlTxnSnapshot_;
+
+    void beginDdlTransaction() {
+        ddlTxnActive_ = true; ddlTxnSnapshot_.clear();
+        for (const auto& kv : tables_) ddlTxnSnapshot_.insert(kv.first);
+        onlineDdl.beginDdlTransaction();
+    }
+    void rollbackDdlTransaction() {
+        std::vector<std::string> toRemove;
+        for (const auto& kv : tables_)
+            if (!ddlTxnSnapshot_.count(kv.first)) toRemove.push_back(kv.first);
+        for (const auto& t : toRemove) tables_.erase(t);
+        onlineDdl.rollbackDdlTransaction();
+        ddlTxnActive_ = false; ddlTxnSnapshot_.clear();
+    }
+    void commitDdlTransaction() {
+        onlineDdl.commitDdlTransaction(); ddlTxnActive_ = false; ddlTxnSnapshot_.clear();
+    }
+
+    // ── Phase 147: Continuous Aggregates ─────────────────────────
+    ContinuousAggregateManager caManager;
+
+    // ── Phase 148: Distributed Transactions + Locks ───────────────
+    DistributedTxManager   distTxManager;
+    DistributedLockManager distLockManager;
+    std::map<std::string, std::string> xaPhase_;  // xid -> "started"|"ended"|"prepared"
+
+    // Phase 148: PREPARE TRANSACTION
+    void prepareTx(const std::string& xid) {
+        if (!inTransaction_)
+            throw std::runtime_error("PREPARE TRANSACTION: no active transaction.");
+        distTxManager.prepare(xid);
+        for (const auto& op : txBuffer_) applyOp(op);
+        txBuffer_.clear();
+        savepointStack_.clear();
+        g_lockManager.releaseRowLocks(std::this_thread::get_id());
+        if (mvccTxId_ != 0) { txManager_.commitTx(mvccTxId_); mvccTxId_ = 0; }
+        inTransaction_ = false;
+        checkpointMgr_.onCommit();
+    }
+    bool commitPrepared(const std::string& xid) {
+        return distTxManager.removePrepared(xid);
+    }
+    bool rollbackPrepared(const std::string& xid) {
+        return distTxManager.removePrepared(xid);
+    }
+
+    // Phase 148: XA transactions
+    void xaStart(const std::string& xid) {
+        beginTransaction("/tmp/milansql_xa_" + xid + ".wal");
+        xaPhase_[xid] = "started";
+    }
+    void xaEnd(const std::string& xid) {
+        xaPhase_[xid] = "ended";
+    }
+    void xaPrepare(const std::string& xid) {
+        prepareTx(xid);
+        xaPhase_[xid] = "prepared";
+    }
+    bool xaCommit(const std::string& xid) {
+        xaPhase_.erase(xid);
+        return distTxManager.removePrepared(xid);
+    }
+    bool xaRollback(const std::string& xid) {
+        xaPhase_.erase(xid);
+        return distTxManager.removePrepared(xid);
+    }
+
+    // Phase 148: Distributed Locks
+    bool getLock    (const std::string& name, int timeout) { return distLockManager.getLock(name, timeout); }
+    bool releaseLock(const std::string& name)              { return distLockManager.releaseLock(name);      }
+    bool isFreeLock (const std::string& name) const        { return distLockManager.isFreeLock(name);       }
 
     // ── Phase 133: Memory Tracker + Error Counters ───────────────
     milansql::MemoryTracker memoryTracker;
@@ -2109,7 +2195,8 @@ public:
                     const std::string& op,
                     const std::string& colName,
                     const std::string& colType,    // nur für ADD
-                    const std::string& newName) {  // nur für RENAME
+                    const std::string& newName,    // nur für RENAME
+                    const std::string& defaultVal = "") {  // Phase 146: DEFAULT value for ADD
         auto tblName = resolveTableName(tblNameRaw);
         if (inTransaction_) {
             BufferedOp bufOp;
@@ -2128,7 +2215,9 @@ public:
             if (t.colOf(colName) >= 0)
                 throw std::runtime_error(
                     "ALTER TABLE: Spalte '" + colName + "' existiert bereits.");
-            t.addColumn(Column(colName, colType.empty() ? "TEXT" : colType));
+            Column col(colName, colType.empty() ? "TEXT" : colType);
+            if (!defaultVal.empty()) { col.hasDefault = true; col.defaultValue = defaultVal; }
+            t.addColumn(col);
         } else if (op == "DROP") {
             t.dropColumn(colName);
         } else if (op == "RENAME") {

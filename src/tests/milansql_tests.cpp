@@ -22,6 +22,12 @@
 #include "extensions/extension_manager.hpp"
 #include "dispatch_result.hpp"  // Phase 125/126: QueryResult + dispatch()
 #include "utils/connection_string.hpp"  // Phase 129: ConnectionStringParser
+#include "security/audit_log.hpp"
+#include "security/access_control.hpp"
+#include "ddl/online_ddl.hpp"
+#include "timeseries/continuous_aggregate.hpp"
+#include "transaction/distributed_tx.hpp"
+#include "lock/distributed_lock.hpp"
 
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
@@ -3921,6 +3927,333 @@ static void testGroup54() {
 }
 
 // ============================================================
+// ============================================================
+// Group 57: Phase 145 Advanced Security V2 + Audit Logging
+// ============================================================
+
+static void testGroup57() {
+    std::cout << "\n--- Group 57: Phase 145 Advanced Security V2 + Audit Logging ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // 1. SET AUDIT_LOG = ON
+    { auto r = execSQL("SET AUDIT_LOG = ON"); check(r.error.empty(), "SET AUDIT_LOG ON -> no error"); }
+    // 2. Setup: table + operations
+    execSQL("CREATE TABLE audit_test (id INT, val TEXT)");
+    execSQL("INSERT INTO audit_test VALUES (1, 'hello')");
+    execSQL("SELECT * FROM audit_test");
+    execSQL("DELETE FROM audit_test WHERE id = 1");
+    // 3. SHOW AUDIT LOG -> has entries
+    { auto r = execSQL("SHOW AUDIT LOG"); check(!r.rows.empty(), "SHOW AUDIT LOG -> has entries"); }
+    // 4. SHOW AUDIT LOG contains SELECT op
+    { auto r = execSQL("SHOW AUDIT LOG");
+      bool found = false;
+      for (const auto& row : r.rows) for (const auto& v : row.values) if (v == "SELECT") found = true;
+      check(found, "SHOW AUDIT LOG -> contains SELECT op"); }
+    // 5. SHOW AUDIT LOG WHERE op = SELECT
+    { auto r = execSQL("SHOW AUDIT LOG WHERE op = SELECT");
+      bool allSel = !r.rows.empty();
+      for (const auto& row : r.rows) { bool has = false; for (const auto& v : row.values) if (v=="SELECT") has=true; if (!has) allSel=false; }
+      check(allSel, "SHOW AUDIT LOG WHERE op = SELECT -> only SELECT"); }
+    // 6. SHOW AUDIT LOG WHERE op = DELETE
+    { auto r = execSQL("SHOW AUDIT LOG WHERE op = DELETE"); check(!r.rows.empty(), "SHOW AUDIT LOG WHERE op = DELETE -> has entries"); }
+    // 7. FLUSH AUDIT LOG
+    { auto r = execSQL("FLUSH AUDIT LOG"); check(r.error.empty(), "FLUSH AUDIT LOG -> no error"); }
+    // 8. SHOW AUDIT LOG after flush -> empty
+    { auto r = execSQL("SHOW AUDIT LOG"); check(r.rows.empty(), "SHOW AUDIT LOG after flush -> empty"); }
+    // 9. SET ALLOW_HOST
+    { auto r = execSQL("SET ALLOW_HOST = 192.168.1.1"); check(r.error.empty(), "SET ALLOW_HOST -> no error"); }
+    // 10. SET DENY_HOST
+    { auto r = execSQL("SET DENY_HOST = 10.0.0.5"); check(r.error.empty(), "SET DENY_HOST -> no error"); }
+    // 11. SHOW ALLOWED HOSTS -> no error
+    { auto r = execSQL("SHOW ALLOWED HOSTS"); check(r.error.empty(), "SHOW ALLOWED HOSTS -> no error"); }
+    // 12. SHOW ALLOWED HOSTS has entries
+    { auto r = execSQL("SHOW ALLOWED HOSTS"); check(!r.rows.empty(), "SHOW ALLOWED HOSTS -> has entries"); }
+    // 13. SET BLACKLIST_QUERY
+    { auto r = execSQL("SET BLACKLIST_QUERY = DROP DATABASE"); check(r.error.empty(), "SET BLACKLIST_QUERY -> no error"); }
+    // 14. SET PASSWORD_MIN_LENGTH
+    { auto r = execSQL("SET PASSWORD_MIN_LENGTH = 12"); check(r.error.empty(), "SET PASSWORD_MIN_LENGTH -> no error"); }
+    // 15. SET MAX_CONNECTIONS_PER_IP
+    { auto r = execSQL("SET MAX_CONNECTIONS_PER_IP = 10"); check(r.error.empty(), "SET MAX_CONNECTIONS_PER_IP -> no error"); }
+    // 16. AuditLogger direct API
+    { milansql::AuditLogger logger; logger.setEnabled(true);
+      milansql::AuditEntry e; e.op = "SELECT"; e.table = "t"; e.user = "root"; e.ip = "127.0.0.1"; logger.log(e);
+      check(!logger.getEntries().empty(), "AuditLogger direct log -> entry stored"); }
+    // 17. AuditLogger filter by op
+    { milansql::AuditLogger logger; logger.setEnabled(true);
+      milansql::AuditEntry e1; e1.op="SELECT"; e1.table="t"; e1.user="u"; e1.ip="127.0.0.1";
+      milansql::AuditEntry e2; e2.op="DELETE"; e2.table="t"; e2.user="u"; e2.ip="127.0.0.1";
+      logger.log(e1); logger.log(e2);
+      auto sel = logger.getEntriesWhere("op","SELECT");
+      check(sel.size()==1 && sel[0].op=="SELECT", "AuditLogger filter by op"); }
+    // 18. AccessControl allow host
+    { milansql::AccessControl ac; ac.addAllowHost("192.168.1.1"); check(ac.isHostAllowed("192.168.1.1"), "AccessControl allow host -> allowed"); }
+    // 19. AccessControl deny host
+    { milansql::AccessControl ac; ac.addDenyHost("10.0.0.5"); check(!ac.isHostAllowed("10.0.0.5"), "AccessControl deny host -> blocked"); }
+    // 20. AccessControl blacklist
+    { milansql::AccessControl ac; ac.addBlacklistQuery("DROP DATABASE");
+      check(!ac.isQueryAllowed("DROP DATABASE mydb"), "AccessControl blacklist -> blocked");
+      check( ac.isQueryAllowed("SELECT * FROM t"),    "AccessControl allowed query -> ok"); }
+}
+
+// ============================================================
+// Group 58: Phase 146 Online DDL + Zero-Downtime Schema Changes
+// ============================================================
+
+static void testGroup58() {
+    std::cout << "\n--- Group 58: Phase 146 Online DDL + Zero-Downtime Schema Changes ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), engine); };
+
+    // Setup
+    execSQL("CREATE TABLE online_test (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT)");
+    execSQL("INSERT INTO online_test VALUES (NULL, 'Alice')");
+    execSQL("INSERT INTO online_test VALUES (NULL, 'Bob')");
+
+    // 1. ALTER TABLE ADD COLUMN with DEFAULT
+    { auto r = execSQL("ALTER TABLE online_test ADD COLUMN email TEXT DEFAULT 'unknown'");
+      check(r.error.empty(), "ALTER TABLE ADD COLUMN online -> no error"); }
+    // 2. SELECT shows new column
+    { auto r = execSQL("SELECT * FROM online_test");
+      bool hasEmail = false;
+      for (const auto& c : r.columns) if (c.name.find("email") != std::string::npos) hasEmail = true;
+      check(hasEmail, "ALTER ADD COLUMN -> column visible in SELECT"); }
+    // 3. Old rows have default value
+    { auto r = execSQL("SELECT * FROM online_test WHERE id = 1");
+      bool hasDefault = false;
+      for (const auto& row : r.rows) for (const auto& v : row.values) if (v == "unknown") hasDefault = true;
+      check(hasDefault, "Old rows have default after ADD COLUMN"); }
+    // 4. INSERT with new column
+    { auto r = execSQL("INSERT INTO online_test VALUES (NULL, 'Carol', 'carol@test.de')");
+      check(r.error.empty(), "INSERT with new column -> no error"); }
+    // 5. New row has correct email
+    { auto r = execSQL("SELECT * FROM online_test WHERE id = 3");
+      bool found = false;
+      for (const auto& row : r.rows) for (const auto& v : row.values) {
+          if (v == "carol@test.de" || v == "'carol@test.de'") found = true;
+      }
+      check(found, "New row has correct email value"); }
+    // 6. CREATE INDEX CONCURRENTLY -> no error
+    { auto r = execSQL("CREATE INDEX CONCURRENTLY idx_name ON online_test (name)");
+      check(r.error.empty(), "CREATE INDEX CONCURRENTLY -> no error"); }
+    // 7. SELECT after CONCURRENTLY index
+    { auto r = execSQL("SELECT * FROM online_test WHERE name = 'Alice'");
+      check(!r.rows.empty(), "SELECT after CONCURRENTLY index -> works"); }
+    // 8. ALTER TABLE RENAME COLUMN
+    { auto r = execSQL("ALTER TABLE online_test RENAME COLUMN name TO full_name");
+      check(r.error.empty(), "ALTER TABLE RENAME COLUMN -> no error"); }
+    // 9. SELECT with renamed column
+    { auto r = execSQL("SELECT full_name FROM online_test");
+      check(!r.rows.empty(), "SELECT full_name after RENAME COLUMN -> works"); }
+    // 10. SHOW SCHEMA VERSION -> no error
+    { auto r = execSQL("SHOW SCHEMA VERSION"); check(r.error.empty(), "SHOW SCHEMA VERSION -> no error"); }
+    // 11. SHOW SCHEMA VERSION has version > 0
+    { auto r = execSQL("SHOW SCHEMA VERSION");
+      bool hasV = false;
+      for (const auto& row : r.rows) if (!row.values.empty()) { try { if (std::stoi(row.values[0]) > 0) hasV = true; } catch (...) {} }
+      check(hasV, "SHOW SCHEMA VERSION -> version > 0"); }
+    // 12. SHOW SCHEMA HISTORY -> no error
+    { auto r = execSQL("SHOW SCHEMA HISTORY"); check(r.error.empty(), "SHOW SCHEMA HISTORY -> no error"); }
+    // 13. SHOW SCHEMA HISTORY has entries
+    { auto r = execSQL("SHOW SCHEMA HISTORY"); check(!r.rows.empty(), "SHOW SCHEMA HISTORY -> has entries"); }
+    // 14. BEGIN DDL -> no error
+    { auto r = execSQL("BEGIN DDL"); check(r.error.empty(), "BEGIN DDL -> no error"); }
+    // 15. CREATE TABLE in DDL txn
+    execSQL("CREATE TABLE ddl_txn_test (id INT, val TEXT)");
+    // 16. ROLLBACK DDL -> no error
+    { auto r = execSQL("ROLLBACK DDL"); check(r.error.empty(), "ROLLBACK DDL -> no error"); }
+    // 17. Table was rolled back
+    { auto r = execSQL("SELECT * FROM ddl_txn_test"); check(!r.error.empty(), "After ROLLBACK DDL -> table gone"); }
+    // 18. OnlineDdl version increments
+    { milansql::OnlineDdl ddl; int v0 = ddl.getVersion(); ddl.recordChange("ALTER TABLE t ADD COLUMN x INT"); check(ddl.getVersion() == v0+1, "OnlineDdl version increments on recordChange"); }
+    // 19. OnlineDdl history
+    { milansql::OnlineDdl ddl; ddl.recordChange("CREATE TABLE foo (id INT)"); check(!ddl.getHistory().empty(), "OnlineDdl history has entries"); }
+    // 20. OnlineDdl DDL txn rollback
+    { milansql::OnlineDdl ddl;
+      ddl.recordChange("ALTER TABLE t ADD COLUMN c1 INT");
+      ddl.recordChange("ALTER TABLE t ADD COLUMN c2 INT");
+      int v = ddl.getVersion();
+      ddl.beginDdlTransaction();
+      ddl.recordChange("ALTER TABLE t ADD COLUMN c3 INT");
+      ddl.rollbackDdlTransaction();
+      check(ddl.getVersion() == v, "OnlineDdl DDL txn rollback clears changes"); }
+}
+
+// ============================================================
+// Group 59: Phase 147 Time-Series V2 + Continuous Aggregates
+// ============================================================
+
+static void testGroup59() {
+    std::cout << "\n--- Group 59: Phase 147 Time-Series V2 + Continuous Aggregates ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), engine); };
+
+    // Setup sensor data
+    execSQL("CREATE TABLE sensor_data (ts TEXT, sensor_id INT, temp REAL, humidity REAL)");
+    execSQL("INSERT INTO sensor_data VALUES ('2026-01-01 00:00:00', 1, 20.5, 65.0)");
+    execSQL("INSERT INTO sensor_data VALUES ('2026-01-01 01:00:00', 1, 21.0, 63.5)");
+    execSQL("INSERT INTO sensor_data VALUES ('2026-01-01 02:00:00', 1, 19.8, 67.0)");
+    execSQL("INSERT INTO sensor_data VALUES ('2026-01-01 00:00:00', 2, 18.5, 70.0)");
+    execSQL("INSERT INTO sensor_data VALUES ('2026-01-01 01:00:00', 2, 19.0, 68.5)");
+
+    // 1. time_bucket in GROUP BY -> no error
+    { auto r = execSQL("SELECT time_bucket('1 HOUR', ts) AS hour, sensor_id, AVG(temp) AS avg_temp FROM sensor_data GROUP BY hour, sensor_id ORDER BY hour, sensor_id");
+      check(r.error.empty(), "time_bucket GROUP BY -> no error"); }
+    // 2. time_bucket returns rows
+    { auto r = execSQL("SELECT time_bucket('1 HOUR', ts) AS hour, sensor_id, AVG(temp) AS avg_temp FROM sensor_data GROUP BY hour, sensor_id ORDER BY hour, sensor_id");
+      check(!r.rows.empty(), "time_bucket GROUP BY -> has rows"); }
+    // 3. first() aggregate -> no error
+    { auto r = execSQL("SELECT FIRST(temp, ts) AS first_temp FROM sensor_data WHERE sensor_id = 1");
+      check(r.error.empty(), "first() aggregate -> no error"); }
+    // 4. last() aggregate -> no error
+    { auto r = execSQL("SELECT LAST(temp, ts) AS last_temp FROM sensor_data WHERE sensor_id = 1");
+      check(r.error.empty(), "last() aggregate -> no error"); }
+    // 5. delta temp via MAX-MIN -> works
+    { auto r = execSQL("SELECT sensor_id, MAX(temp) FROM sensor_data GROUP BY sensor_id");
+      check(!r.rows.empty(), "MAX(temp) GROUP BY sensor_id -> works"); }
+    // 6. CREATE CONTINUOUS AGGREGATE -> no error
+    { auto r = execSQL("CREATE CONTINUOUS AGGREGATE hourly_avg AS SELECT time_bucket('1 HOUR', ts) AS hour, sensor_id, AVG(temp) AS avg_temp FROM sensor_data GROUP BY hour, sensor_id WITH (refresh_interval = 10m)");
+      check(r.error.empty(), "CREATE CONTINUOUS AGGREGATE -> no error"); }
+    // 7. SHOW CONTINUOUS AGGREGATES -> has entries
+    { auto r = execSQL("SHOW CONTINUOUS AGGREGATES"); check(!r.rows.empty(), "SHOW CONTINUOUS AGGREGATES -> has entries"); }
+    // 8. add_retention_policy -> no error
+    { auto r = execSQL("SELECT add_retention_policy('sensor_data', 90)");
+      check(r.error.empty(), "add_retention_policy -> no error"); }
+    // 9. SHOW RETENTION POLICIES -> has entries
+    { auto r = execSQL("SHOW RETENTION POLICIES"); check(!r.rows.empty(), "SHOW RETENTION POLICIES -> has entries"); }
+    // 10. SHOW CHUNKS -> no error
+    { auto r = execSQL("SHOW CHUNKS sensor_data"); check(r.error.empty(), "SHOW CHUNKS -> no error"); }
+    // 11. SHOW CHUNKS has entries
+    { auto r = execSQL("SHOW CHUNKS sensor_data"); check(!r.rows.empty(), "SHOW CHUNKS -> has entries"); }
+    // 12. compress_chunk -> no error
+    { auto r = execSQL("SELECT compress_chunk('sensor_data', 7)");
+      check(r.error.empty(), "compress_chunk -> no error"); }
+    // 13. ContinuousAggregateManager direct API
+    { milansql::ContinuousAggregateManager mgr;
+      mgr.createAggregate("test_agg", "SELECT AVG(x) FROM t", "1h");
+      check(mgr.hasAggregate("test_agg"), "ContinuousAggregateManager: create+has aggregate"); }
+    // 14. Retention policy direct API
+    { milansql::ContinuousAggregateManager mgr;
+      mgr.addRetentionPolicy("my_table", 30);
+      check(!mgr.getRetentionPolicies().empty(), "RetentionPolicy: add + get"); }
+    // 15. ChunkInfo direct API
+    { milansql::ContinuousAggregateManager mgr;
+      milansql::ChunkInfo ci; ci.tableName="t"; ci.chunkName="chunk1"; ci.startTs="2026-01-01"; ci.endTs="2026-01-02";
+      mgr.addChunk("t", ci);
+      check(!mgr.getChunks("t").empty(), "ChunkInfo: add + get chunks"); }
+    // 16. timeBucket 1h
+    { std::string bucket = milansql::TimeSeriesManager::timeBucket("1 HOUR", "2026-01-01 08:30:00");
+      check(bucket == "2026-01-01 08:00:00", "timeBucket 1h -> truncated"); }
+    // 17. timeBucket 1d
+    { std::string bucket = milansql::TimeSeriesManager::timeBucket("1 DAY", "2026-01-15 14:25:00");
+      check(bucket.substr(0,10) == "2026-01-15", "timeBucket 1d -> date only"); }
+    // 18. timeBucket 1 month
+    { std::string bucket = milansql::TimeSeriesManager::timeBucket("1 MONTH", "2026-03-15 10:00:00");
+      check(!bucket.empty(), "timeBucket 1 month -> non-empty"); }
+    // 19. TimeSeriesManager define + isTimeSeries
+    { milansql::TimeSeriesManager tsm;
+      milansql::TimeSeriesDef def;
+      def.tableName = "metrics"; def.timeColumn = "ts"; def.partitionBy = milansql::TsPartitionBy::DAY;
+      tsm.define(def);
+      check(tsm.isTimeSeries("metrics"), "TimeSeriesManager: define + isTimeSeries"); }
+    // 20. SHOW CONTINUOUS AGGREGATES no error initially
+    { auto r = execSQL("SHOW CONTINUOUS AGGREGATES"); check(r.error.empty(), "SHOW CONTINUOUS AGGREGATES -> no error"); }
+}
+
+// ============================================================
+// Group 60: Phase 148 Distributed Transactions + 2PC
+// ============================================================
+
+static void testGroup60() {
+    std::cout << "\n--- Group 60: Phase 148 Distributed Transactions + 2PC ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), engine); };
+
+    // Setup
+    execSQL("CREATE TABLE tx_test (id INT PRIMARY KEY AUTO_INCREMENT, name TEXT, email TEXT)");
+
+    // 1. BEGIN + INSERT + PREPARE TRANSACTION
+    execSQL("BEGIN");
+    execSQL("INSERT INTO tx_test VALUES (NULL, 'PreparedTest', 'test@test.de')");
+    { auto r = execSQL("PREPARE TRANSACTION my_tx_001"); check(r.error.empty(), "PREPARE TRANSACTION -> no error"); }
+    // 2. SHOW PREPARED TRANSACTIONS -> has entry
+    { auto r = execSQL("SHOW PREPARED TRANSACTIONS"); check(!r.rows.empty(), "SHOW PREPARED TRANSACTIONS -> has entries"); }
+    // 3. COMMIT PREPARED
+    { auto r = execSQL("COMMIT PREPARED my_tx_001"); check(r.error.empty(), "COMMIT PREPARED -> no error"); }
+    // 4. SELECT finds PreparedTest row
+    { auto r = execSQL("SELECT * FROM tx_test WHERE name = 'PreparedTest'");
+      check(!r.rows.empty(), "After COMMIT PREPARED -> row exists"); }
+    // 5. BEGIN + INSERT + PREPARE TRANSACTION my_tx_002
+    execSQL("BEGIN");
+    execSQL("INSERT INTO tx_test VALUES (NULL, 'RollbackTest', 'rb@test.de')");
+    { auto r = execSQL("PREPARE TRANSACTION my_tx_002"); check(r.error.empty(), "PREPARE TRANSACTION 2 -> no error"); }
+    // 6. ROLLBACK PREPARED
+    { auto r = execSQL("ROLLBACK PREPARED my_tx_002"); check(r.error.empty(), "ROLLBACK PREPARED -> no error"); }
+    // 7. SHOW PREPARED TRANSACTIONS after rollback -> empty
+    { auto r = execSQL("SHOW PREPARED TRANSACTIONS"); check(r.rows.empty(), "After all commits/rollbacks -> no prepared tx"); }
+    // 8. XA START -> no error
+    { auto r = execSQL("XA START myxid_001"); check(r.error.empty(), "XA START -> no error"); }
+    // 9. INSERT in XA
+    execSQL("INSERT INTO tx_test VALUES (NULL, 'XATest', 'xa@test.de')");
+    // 10. XA END -> no error
+    { auto r = execSQL("XA END myxid_001"); check(r.error.empty(), "XA END -> no error"); }
+    // 11. XA PREPARE -> no error
+    { auto r = execSQL("XA PREPARE myxid_001"); check(r.error.empty(), "XA PREPARE -> no error"); }
+    // 12. XA COMMIT -> no error
+    { auto r = execSQL("XA COMMIT myxid_001"); check(r.error.empty(), "XA COMMIT -> no error"); }
+    // 13. SELECT finds XATest
+    { auto r = execSQL("SELECT * FROM tx_test WHERE name = 'XATest'");
+      check(!r.rows.empty(), "After XA COMMIT -> XATest row exists"); }
+    // 14. GET_LOCK -> 1
+    { auto r = execSQL("SELECT GET_LOCK('my_resource', 5)");
+      check(!r.rows.empty() && !r.rows[0].values.empty() && r.rows[0].values[0] == "1", "GET_LOCK -> 1"); }
+    // 15. IS_FREE_LOCK -> 0
+    { auto r = execSQL("SELECT IS_FREE_LOCK('my_resource')");
+      check(!r.rows.empty() && !r.rows[0].values.empty() && r.rows[0].values[0] == "0", "IS_FREE_LOCK while held -> 0"); }
+    // 16. RELEASE_LOCK -> 1
+    { auto r = execSQL("SELECT RELEASE_LOCK('my_resource')");
+      check(!r.rows.empty() && !r.rows[0].values.empty() && r.rows[0].values[0] == "1", "RELEASE_LOCK -> 1"); }
+    // 17. IS_FREE_LOCK after release -> 1
+    { auto r = execSQL("SELECT IS_FREE_LOCK('my_resource')");
+      check(!r.rows.empty() && !r.rows[0].values.empty() && r.rows[0].values[0] == "1", "IS_FREE_LOCK after release -> 1"); }
+    // 18. BEGIN DISTRIBUTED -> no error
+    { auto r = execSQL("BEGIN DISTRIBUTED"); check(r.error.empty(), "BEGIN DISTRIBUTED -> no error"); }
+    // 19. ROLLBACK the distributed tx
+    { auto r = execSQL("ROLLBACK"); check(r.error.empty(), "ROLLBACK after BEGIN DISTRIBUTED -> no error"); }
+    // 20. DistributedTxManager direct API
+    { milansql::DistributedTxManager dtm;
+      dtm.prepare("xid_test");
+      check(dtm.hasPrepared("xid_test"), "DistributedTxManager: prepare + has"); }
+    // 21. DistributedLockManager direct API
+    { milansql::DistributedLockManager dlm;
+      check(dlm.getLock("res1", 5), "DistributedLockManager: getLock -> true");
+      check(!dlm.isFreeLock("res1"), "DistributedLockManager: isFreeLock while held -> false");
+      check(dlm.releaseLock("res1"), "DistributedLockManager: releaseLock -> true");
+      check(dlm.isFreeLock("res1"), "DistributedLockManager: isFreeLock after release -> true"); }
+}
+
 // MAIN
 // ============================================================
 
@@ -4084,6 +4417,18 @@ int main() {
     }
     try { testGroup54(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 54 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup57(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 57 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup58(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 58 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup59(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 59 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup60(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 60 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

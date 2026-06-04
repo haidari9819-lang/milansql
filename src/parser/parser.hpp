@@ -308,6 +308,38 @@ enum class CommandType {
     // Phase 142: Column Store V2 + OLAP
     CREATE_COLUMNSTORE_INDEX,
     BENCHMARK_OLAP,
+    // Phase 145: Advanced Security V2 + Audit Logging
+    SHOW_AUDIT_LOG,
+    FLUSH_AUDIT_LOG,
+    SHOW_ALLOWED_HOSTS,
+    // Phase 146: Online DDL + Zero-Downtime Schema Changes
+    CREATE_INDEX_CONCURRENTLY,
+    SHOW_SCHEMA_VERSION,
+    SHOW_SCHEMA_HISTORY,
+    BEGIN_DDL,
+    ROLLBACK_DDL,
+    COMMIT_DDL,
+    // Phase 147: Time-Series V2 + Continuous Aggregates
+    CREATE_CONTINUOUS_AGGREGATE,
+    SHOW_CONTINUOUS_AGGREGATES,
+    SHOW_CHUNKS,
+    SHOW_RETENTION_POLICIES,
+    ADD_RETENTION_POLICY,
+    COMPRESS_CHUNK,
+    // Phase 148: Distributed Transactions + 2-Phase Commit
+    PREPARE_TRANSACTION,
+    COMMIT_PREPARED,
+    ROLLBACK_PREPARED,
+    SHOW_PREPARED_TRANSACTIONS,
+    XA_START,
+    XA_END,
+    XA_PREPARE,
+    XA_COMMIT,
+    XA_ROLLBACK,
+    BEGIN_DISTRIBUTED,
+    GET_LOCK,
+    RELEASE_LOCK,
+    IS_FREE_LOCK,
     UNKNOWN
 };
 
@@ -640,6 +672,28 @@ struct ParsedCommand {
     std::string columnStoreIndexName;
     std::vector<std::string> columnStoreCols;
     std::string benchmarkOlapTable;
+
+    // Phase 145/146: Audit + Security + Online DDL
+    std::string auditFilterField;
+    std::string auditFilterValue;
+    int         auditLimit = -1;
+    bool        isConcurrent = false;
+    std::string alterColDefault;  // DEFAULT value for ADD COLUMN
+
+    // Phase 147: Continuous Aggregates
+    std::string continuousAggName;
+    std::string continuousAggSql;
+    std::string continuousAggInterval;
+    std::string retentionTable;
+    int         retentionDays = -1;
+    std::string chunkTable;
+    int         chunkBeforeDays = 7;
+
+    // Phase 148: Distributed Transactions + Locks
+    std::string preparedTxName;
+    std::string xaXid;
+    std::string lockName;
+    int         lockTimeout = 0;
 };
 
 class Parser {
@@ -841,6 +895,16 @@ public:
             auto st = tokenize(input);
             if (!st.empty()) {
                 std::string k = toUpper(st[0]);
+                // Phase 146: DDL transactions (must check BEFORE plain BEGIN/COMMIT/ROLLBACK)
+                if (k == "BEGIN"    && st.size() >= 2 && toUpper(st[1]) == "DDL") { cmd.type = CommandType::BEGIN_DDL;    return cmd; }
+                if (k == "COMMIT"   && st.size() >= 2 && toUpper(st[1]) == "DDL") { cmd.type = CommandType::COMMIT_DDL;   return cmd; }
+                if (k == "ROLLBACK" && st.size() >= 2 && toUpper(st[1]) == "DDL") { cmd.type = CommandType::ROLLBACK_DDL; return cmd; }
+                // Phase 148: Distributed BEGIN
+                if (k == "BEGIN" && st.size() >= 2 && toUpper(st[1]) == "DISTRIBUTED") { cmd.type = CommandType::BEGIN_DISTRIBUTED; return cmd; }
+                // Phase 148: PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED
+                if (k == "PREPARE"  && st.size() >= 3 && toUpper(st[1]) == "TRANSACTION") { cmd.type = CommandType::PREPARE_TRANSACTION; cmd.preparedTxName = st[2]; return cmd; }
+                if (k == "COMMIT"   && st.size() >= 3 && toUpper(st[1]) == "PREPARED") { cmd.type = CommandType::COMMIT_PREPARED; cmd.preparedTxName = st[2]; return cmd; }
+                if (k == "ROLLBACK" && st.size() >= 3 && toUpper(st[1]) == "PREPARED") { cmd.type = CommandType::ROLLBACK_PREPARED; cmd.preparedTxName = st[2]; return cmd; }
                 if (k == "BEGIN")    { cmd.type = CommandType::BEGIN;    return cmd; }
                 if (k == "COMMIT")   { cmd.type = CommandType::COMMIT;   return cmd; }
                 if (k == "ROLLBACK") {
@@ -962,11 +1026,14 @@ public:
         // ── Phase 30: Mengenoperationen (UNION/INTERSECT/EXCEPT) ──
         {
             auto st = tokenize(input);
-            for (size_t i = 0; i < st.size(); ++i) {
-                std::string u = toUpper(st[i]);
-                if (u == "UNION" || u == "INTERSECT" || u == "EXCEPT") {
-                    parseSetOp(input, cmd);
-                    return cmd;
+            // Only route to set-op parser if the outermost statement is a SELECT
+            if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                for (size_t i = 0; i < st.size(); ++i) {
+                    std::string u = toUpper(st[i]);
+                    if (u == "UNION" || u == "INTERSECT" || u == "EXCEPT") {
+                        parseSetOp(input, cmd);
+                        return cmd;
+                    }
                 }
             }
         }
@@ -991,10 +1058,13 @@ public:
         // ── JOIN-Erkennung (vor GROUP BY) ────────────────────────
         {
             auto st = tokenize(input);
-            for (const auto& tok : st) {
-                if (toUpper(tok) == "JOIN") {
-                    parseJoinQuery(input, cmd);
-                    return cmd;
+            // Only route to JOIN parser if the outermost statement is a SELECT
+            if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                for (const auto& tok : st) {
+                    if (toUpper(tok) == "JOIN") {
+                        parseJoinQuery(input, cmd);
+                        return cmd;
+                    }
                 }
             }
         }
@@ -1018,10 +1088,14 @@ public:
         // ── GROUP BY-Erkennung ────────────────────────────────────
         {
             auto st = tokenize(input);
-            for (size_t i = 0; i + 1 < st.size(); ++i) {
-                if (toUpper(st[i]) == "GROUP" && toUpper(st[i + 1]) == "BY") {
-                    parseGroupByQuery(input, cmd);
-                    return cmd;
+            // Only route to GROUP BY parser if the outermost statement is a SELECT
+            bool outerIsSelect = !st.empty() && toUpper(st[0]) == "SELECT";
+            if (outerIsSelect) {
+                for (size_t i = 0; i + 1 < st.size(); ++i) {
+                    if (toUpper(st[i]) == "GROUP" && toUpper(st[i + 1]) == "BY") {
+                        parseGroupByQuery(input, cmd);
+                        return cmd;
+                    }
                 }
             }
         }
@@ -1111,6 +1185,111 @@ public:
                 }
             }
             (void)WFUNCS;  // suppress unused warning
+        }
+
+        // ── Phase 147/148: Special SELECT function detection (must be BEFORE Phase 90) ──
+        // Detect: SELECT add_retention_policy(...), SELECT compress_chunk(...),
+        //         SELECT GET_LOCK(...), SELECT RELEASE_LOCK(...), SELECT IS_FREE_LOCK(...)
+        {
+            auto st = tokenize(input);
+            if (!st.empty() && toUpper(st[0]) == "SELECT" && st.size() >= 2) {
+                // Extract function name from token which may be "funcname('arg1'," or "funcname("
+                std::string fn = toUpper(st[1]);
+                // Extract only the part before '('
+                auto parenPos = fn.find('(');
+                if (parenPos != std::string::npos) fn = fn.substr(0, parenPos);
+                if (fn == "ADD_RETENTION_POLICY") {
+                    // SELECT add_retention_policy('table', days)
+                    cmd.type = CommandType::ADD_RETENTION_POLICY;
+                    // Extract from paren content
+                    auto p1 = input.find('(');
+                    auto p2 = input.rfind(')');
+                    if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1) {
+                        std::string args = input.substr(p1+1, p2-p1-1);
+                        auto comma = args.find(',');
+                        if (comma != std::string::npos) {
+                            std::string tbl = args.substr(0, comma);
+                            std::string days = args.substr(comma+1);
+                            // trim spaces and quotes
+                            while (!tbl.empty() && (tbl.front()==' '||tbl.front()=='\'')) tbl.erase(tbl.begin());
+                            while (!tbl.empty() && (tbl.back()==' '||tbl.back()=='\'')) tbl.pop_back();
+                            while (!days.empty() && (days.front()==' '||days.front()=='\'')) days.erase(days.begin());
+                            while (!days.empty() && (days.back()==' '||days.back()=='\'')) days.pop_back();
+                            cmd.retentionTable = tbl;
+                            try { cmd.retentionDays = std::stoi(days); } catch (...) { cmd.retentionDays = 90; }
+                        }
+                    }
+                    return cmd;
+                } else if (fn == "COMPRESS_CHUNK") {
+                    // SELECT compress_chunk('table', before_days)
+                    cmd.type = CommandType::COMPRESS_CHUNK;
+                    auto p1 = input.find('(');
+                    auto p2 = input.rfind(')');
+                    if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1) {
+                        std::string args = input.substr(p1+1, p2-p1-1);
+                        auto comma = args.find(',');
+                        if (comma != std::string::npos) {
+                            std::string tbl = args.substr(0, comma);
+                            std::string days = args.substr(comma+1);
+                            while (!tbl.empty() && (tbl.front()==' '||tbl.front()=='\'')) tbl.erase(tbl.begin());
+                            while (!tbl.empty() && (tbl.back()==' '||tbl.back()=='\'')) tbl.pop_back();
+                            while (!days.empty() && (days.front()==' '||days.front()=='\'')) days.erase(days.begin());
+                            while (!days.empty() && (days.back()==' '||days.back()=='\'')) days.pop_back();
+                            cmd.chunkTable = tbl;
+                            try { cmd.chunkBeforeDays = std::stoi(days); } catch (...) { cmd.chunkBeforeDays = 7; }
+                        } else {
+                            std::string tbl = args;
+                            while (!tbl.empty() && (tbl.front()==' '||tbl.front()=='\'')) tbl.erase(tbl.begin());
+                            while (!tbl.empty() && (tbl.back()==' '||tbl.back()=='\'')) tbl.pop_back();
+                            cmd.chunkTable = tbl;
+                            cmd.chunkBeforeDays = 7;
+                        }
+                    }
+                    return cmd;
+                } else if (fn == "GET_LOCK") {
+                    // SELECT GET_LOCK('name', timeout)
+                    cmd.type = CommandType::GET_LOCK;
+                    auto p1 = input.find('(');
+                    auto p2 = input.rfind(')');
+                    if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1) {
+                        std::string args = input.substr(p1+1, p2-p1-1);
+                        auto comma = args.find(',');
+                        std::string name = (comma != std::string::npos) ? args.substr(0, comma) : args;
+                        std::string tout = (comma != std::string::npos) ? args.substr(comma+1) : "0";
+                        while (!name.empty() && (name.front()==' '||name.front()=='\'')) name.erase(name.begin());
+                        while (!name.empty() && (name.back()==' '||name.back()=='\'')) name.pop_back();
+                        while (!tout.empty() && (tout.front()==' '||tout.front()=='\'')) tout.erase(tout.begin());
+                        while (!tout.empty() && (tout.back()==' '||tout.back()=='\'')) tout.pop_back();
+                        cmd.lockName = name;
+                        try { cmd.lockTimeout = std::stoi(tout); } catch (...) { cmd.lockTimeout = 0; }
+                    }
+                    return cmd;
+                } else if (fn == "RELEASE_LOCK") {
+                    // SELECT RELEASE_LOCK('name')
+                    cmd.type = CommandType::RELEASE_LOCK;
+                    auto p1 = input.find('(');
+                    auto p2 = input.rfind(')');
+                    if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1) {
+                        std::string name = input.substr(p1+1, p2-p1-1);
+                        while (!name.empty() && (name.front()==' '||name.front()=='\'')) name.erase(name.begin());
+                        while (!name.empty() && (name.back()==' '||name.back()=='\'')) name.pop_back();
+                        cmd.lockName = name;
+                    }
+                    return cmd;
+                } else if (fn == "IS_FREE_LOCK") {
+                    // SELECT IS_FREE_LOCK('name')
+                    cmd.type = CommandType::IS_FREE_LOCK;
+                    auto p1 = input.find('(');
+                    auto p2 = input.rfind(')');
+                    if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1) {
+                        std::string name = input.substr(p1+1, p2-p1-1);
+                        while (!name.empty() && (name.front()==' '||name.front()=='\'')) name.erase(name.begin());
+                        while (!name.empty() && (name.back()==' '||name.back()=='\'')) name.pop_back();
+                        cmd.lockName = name;
+                    }
+                    return cmd;
+                }
+            }
         }
 
         // ── Phase 90: Generic function call detection ─────────────
@@ -1467,6 +1646,22 @@ public:
             }
         }
 
+        // ── Phase 148: XA transactions ───────────────────────────────
+        {
+            auto st = tokenize(input);
+            if (!st.empty() && toUpper(st[0]) == "XA" && st.size() >= 2) {
+                std::string xaCmd = toUpper(st[1]);
+                std::string xid = st.size() >= 3 ? st[2] : "";
+                if (xid.size()>=2 && xid.front()=='\'' && xid.back()=='\'')
+                    xid = xid.substr(1, xid.size()-2);
+                if (xaCmd == "START")    { cmd.type = CommandType::XA_START;    cmd.xaXid = xid; return cmd; }
+                if (xaCmd == "END")      { cmd.type = CommandType::XA_END;      cmd.xaXid = xid; return cmd; }
+                if (xaCmd == "PREPARE")  { cmd.type = CommandType::XA_PREPARE;  cmd.xaXid = xid; return cmd; }
+                if (xaCmd == "COMMIT")   { cmd.type = CommandType::XA_COMMIT;   cmd.xaXid = xid; return cmd; }
+                if (xaCmd == "ROLLBACK") { cmd.type = CommandType::XA_ROLLBACK; cmd.xaXid = xid; return cmd; }
+            }
+        }
+
         auto tokens = tokenize(beforeParen);
         if (tokens.empty()) { cmd.type = CommandType::UNKNOWN; return cmd; }
 
@@ -1477,6 +1672,73 @@ public:
 
         // ── SELECT ──────────────────────────────────────────────
         if (kw0 == "SELECT") {
+            // Phase 147/148: Detect function calls SELECT func(...)
+            {
+                std::string up = input;
+                for (auto& c : up) c = (char)std::toupper((unsigned char)c);
+                auto findParenContent = [&](const std::string& funcUp) -> std::string {
+                    auto pos = up.find(funcUp + "(");
+                    if (pos == std::string::npos) return "";
+                    auto lp = up.find('(', pos);
+                    if (lp == std::string::npos) return "";
+                    auto rp = up.find(')', lp);
+                    if (rp == std::string::npos) return "";
+                    return input.substr(lp + 1, rp - lp - 1);
+                };
+                auto stripQuotes = [](const std::string& s) -> std::string {
+                    std::string r = s;
+                    while (!r.empty() && (r.front()==' '||r.front()=='\t')) r = r.substr(1);
+                    while (!r.empty() && (r.back()==' '||r.back()=='\t')) r.pop_back();
+                    if (r.size()>=2 && r.front()=='\'' && r.back()=='\'') r = r.substr(1, r.size()-2);
+                    return r;
+                };
+                if (up.find("ADD_RETENTION_POLICY(") != std::string::npos) {
+                    cmd.type = CommandType::ADD_RETENTION_POLICY;
+                    std::string pc = findParenContent("ADD_RETENTION_POLICY");
+                    auto parts = splitTrim(pc, ',');
+                    if (parts.size() >= 1) cmd.retentionTable = stripQuotes(parts[0]);
+                    if (parts.size() >= 2) { try { cmd.retentionDays = std::stoi(stripQuotes(parts[1])); } catch (...) { cmd.retentionDays = 90; } }
+                    return cmd;
+                }
+                if (up.find("COMPRESS_CHUNK(") != std::string::npos) {
+                    cmd.type = CommandType::COMPRESS_CHUNK;
+                    std::string pc = findParenContent("COMPRESS_CHUNK");
+                    auto parts = splitTrim(pc, ',');
+                    if (parts.size() >= 1) cmd.chunkTable = stripQuotes(parts[0]);
+                    cmd.chunkBeforeDays = 7;
+                    for (size_t pi = 1; pi < parts.size(); ++pi) {
+                        auto& p = parts[pi];
+                        auto eq = p.find("=>");
+                        if (eq != std::string::npos) {
+                            std::string v = trim(p.substr(eq + 2));
+                            try { cmd.chunkBeforeDays = std::stoi(v); } catch (...) {}
+                        } else {
+                            try { cmd.chunkBeforeDays = std::stoi(trim(p)); } catch (...) {}
+                        }
+                    }
+                    return cmd;
+                }
+                if (up.find("GET_LOCK(") != std::string::npos) {
+                    cmd.type = CommandType::GET_LOCK;
+                    std::string pc = findParenContent("GET_LOCK");
+                    auto parts = splitTrim(pc, ',');
+                    if (parts.size() >= 1) cmd.lockName = stripQuotes(parts[0]);
+                    if (parts.size() >= 2) { try { cmd.lockTimeout = std::stoi(trim(parts[1])); } catch (...) {} }
+                    return cmd;
+                }
+                if (up.find("RELEASE_LOCK(") != std::string::npos) {
+                    cmd.type = CommandType::RELEASE_LOCK;
+                    std::string pc = findParenContent("RELEASE_LOCK");
+                    cmd.lockName = stripQuotes(pc);
+                    return cmd;
+                }
+                if (up.find("IS_FREE_LOCK(") != std::string::npos) {
+                    cmd.type = CommandType::IS_FREE_LOCK;
+                    std::string pc = findParenContent("IS_FREE_LOCK");
+                    cmd.lockName = stripQuotes(pc);
+                    return cmd;
+                }
+            }
             cmd.type = CommandType::SELECT;
             // Phase 77: /*+ PARALLEL(N) */ hint
             // Phase 126: /*+ HINT1 HINT2 */ — collect all hints
@@ -1950,6 +2212,49 @@ public:
                 }
             }
 
+        // ── Phase 147: CREATE CONTINUOUS AGGREGATE ───────────────
+        } else if (kw0 == "CREATE" && kw1 == "CONTINUOUS" && tokens.size() >= 4 &&
+                   toUpper(tokens[2]) == "AGGREGATE") {
+            cmd.type = CommandType::CREATE_CONTINUOUS_AGGREGATE;
+            cmd.continuousAggName = tokens[3];
+            {
+                std::string up = input;
+                for (auto& c : up) c = (char)std::toupper((unsigned char)c);
+                auto asPos = up.find(" AS ");
+                if (asPos != std::string::npos) {
+                    std::string rest = input.substr(asPos + 4);
+                    std::string urest = rest;
+                    for (auto& c : urest) c = (char)std::toupper((unsigned char)c);
+                    auto withPos = urest.find("WITH (");
+                    if (withPos != std::string::npos) {
+                        cmd.continuousAggSql = trim(rest.substr(0, withPos));
+                        std::string withPart = rest.substr(withPos + 6);
+                        auto eqPos = withPart.find('=');
+                        if (eqPos != std::string::npos) {
+                            std::string iv = trim(withPart.substr(eqPos + 1));
+                            size_t ep = iv.find(')'); if (ep != std::string::npos) iv = iv.substr(0, ep);
+                            cmd.continuousAggInterval = trim(iv);
+                        }
+                    } else {
+                        cmd.continuousAggSql = trim(rest);
+                    }
+                }
+            }
+
+        // ── Phase 146: CREATE INDEX CONCURRENTLY ─────────────────
+        } else if (kw0 == "CREATE" && kw1 == "INDEX" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "CONCURRENTLY") {
+            cmd.type = CommandType::CREATE_INDEX_CONCURRENTLY;
+            cmd.isConcurrent = true;
+            if (tokens.size() >= 4) cmd.indexName = tokens[3];
+            if (tokens.size() >= 6 && toUpper(tokens[4]) == "ON") {
+                cmd.tableName = tokens[5];
+            }
+            {
+                auto cols = splitTrim(trim(parenContent), ',');
+                for (const auto& c : cols) if (!c.empty()) cmd.indexColumns.push_back(c);
+            }
+
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
             // Phase 111: detect USING hnsw/ivfflat for vector indexes
@@ -2225,8 +2530,8 @@ public:
             // Phase 44: SHOW PROCEDURES
             } else if (kw1 == "PROCEDURES") {
                 cmd.type = CommandType::SHOW_PROCEDURES;
-            // Phase 45: SHOW PREPARED
-            } else if (kw1 == "PREPARED") {
+            // Phase 45: SHOW PREPARED (but not SHOW PREPARED TRANSACTIONS which is Phase 148)
+            } else if (kw1 == "PREPARED" && !(tokens.size() >= 3 && toUpper(tokens[2]) == "TRANSACTIONS")) {
                 cmd.type = CommandType::SHOW_PREPARED;
             // Phase 46: SHOW USERS
             } else if (kw1 == "USERS") {
@@ -2494,6 +2799,59 @@ public:
             } else if (kw1 == "TOAST" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_TOAST_STATUS;
+            // Phase 145: SHOW AUDIT LOG [WHERE field = value | LIMIT n]
+            } else if (kw1 == "AUDIT" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "LOG") {
+                cmd.type = CommandType::SHOW_AUDIT_LOG;
+                // Parse optional WHERE field = value
+                {
+                    std::string up = input;
+                    for (auto& c : up) c = (char)std::toupper((unsigned char)c);
+                    auto wherePos = up.find(" WHERE ");
+                    if (wherePos != std::string::npos) {
+                        auto wt = tokenize(input.substr(wherePos + 7));
+                        if (wt.size() >= 3 && wt[1] == "=") {
+                            cmd.auditFilterField = wt[0];
+                            for (auto& c : cmd.auditFilterField) c = (char)std::tolower((unsigned char)c);
+                            cmd.auditFilterValue = wt[2];
+                            if (cmd.auditFilterValue.size()>=2 && cmd.auditFilterValue.front()=='\'' && cmd.auditFilterValue.back()=='\'')
+                                cmd.auditFilterValue = cmd.auditFilterValue.substr(1, cmd.auditFilterValue.size()-2);
+                        }
+                    }
+                    auto limitPos = up.find(" LIMIT ");
+                    if (limitPos != std::string::npos) {
+                        auto lt = tokenize(input.substr(limitPos + 7));
+                        if (!lt.empty()) { try { cmd.auditLimit = std::stoi(lt[0]); } catch (...) {} }
+                    }
+                }
+            // Phase 145: SHOW ALLOWED HOSTS
+            } else if (kw1 == "ALLOWED" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "HOSTS") {
+                cmd.type = CommandType::SHOW_ALLOWED_HOSTS;
+            // Phase 146: SHOW SCHEMA VERSION
+            } else if (kw1 == "SCHEMA" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "VERSION") {
+                cmd.type = CommandType::SHOW_SCHEMA_VERSION;
+            // Phase 146: SHOW SCHEMA HISTORY
+            } else if (kw1 == "SCHEMA" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "HISTORY") {
+                cmd.type = CommandType::SHOW_SCHEMA_HISTORY;
+            // Phase 147: SHOW CONTINUOUS AGGREGATES
+            } else if (kw1 == "CONTINUOUS" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "AGGREGATES") {
+                cmd.type = CommandType::SHOW_CONTINUOUS_AGGREGATES;
+            // Phase 147: SHOW CHUNKS tablename
+            } else if (kw1 == "CHUNKS" && tokens.size() >= 3) {
+                cmd.type = CommandType::SHOW_CHUNKS;
+                cmd.chunkTable = tokens[2];
+            // Phase 147: SHOW RETENTION POLICIES
+            } else if (kw1 == "RETENTION" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "POLICIES") {
+                cmd.type = CommandType::SHOW_RETENTION_POLICIES;
+            // Phase 148: SHOW PREPARED TRANSACTIONS
+            } else if (kw1 == "PREPARED" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "TRANSACTIONS") {
+                cmd.type = CommandType::SHOW_PREPARED_TRANSACTIONS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -2963,10 +3321,15 @@ public:
                     for (char& c : rhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                     cmd.varName  = lhs;
                     cmd.varValue = rhs;
-                    // check for known Phase 125/126/141 varNames — use SET_CACHE as a carrier CommandType
-                    if (lhs == "ROUTING" || lhs == "OPTIMIZER_TRACE" ||
-                        lhs == "MAX_PARALLEL_WORKERS" || lhs == "PARALLEL_THRESHOLD") {
-                        cmd.type = CommandType::SET_CACHE; // re-use existing SET handler
+                    // check for known Phase 125/126/141/145 varNames — use SET_CACHE as a carrier CommandType
+                    static const std::vector<std::string> knownSetVars = {
+                        "ROUTING", "OPTIMIZER_TRACE", "MAX_PARALLEL_WORKERS", "PARALLEL_THRESHOLD",
+                        "AUDIT_LOG", "AUDIT_LOG_FILE", "ALLOW_HOST", "DENY_HOST", "BLACKLIST_QUERY",
+                        "PASSWORD_MIN_LENGTH", "PASSWORD_REQUIRE_SPECIAL",
+                        "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT"
+                    };
+                    for (const auto& kv : knownSetVars) {
+                        if (lhs == kv) { cmd.type = CommandType::SET_CACHE; break; }
                     }
                     // else leave UNKNOWN (other SET commands not matched above)
                 }
@@ -2990,6 +3353,11 @@ public:
         } else if (kw0 == "FLUSH" && kw1 == "PLAN" && tokens.size() >= 3 &&
                    toUpper(tokens[2]) == "CACHE") {
             cmd.type = CommandType::FLUSH_PLAN_CACHE;
+
+        // ── Phase 145: FLUSH AUDIT LOG ────────────────────────────────
+        } else if (kw0 == "FLUSH" && kw1 == "AUDIT" && tokens.size() >= 3 &&
+                   toUpper(tokens[2]) == "LOG") {
+            cmd.type = CommandType::FLUSH_AUDIT_LOG;
 
         // ── Phase 126: SHOW OPTIMIZER TRACE ───────────────────────────
         } else if (kw0 == "SHOW" && kw1 == "OPTIMIZER" && tokens.size() >= 3 &&
@@ -4780,6 +5148,16 @@ private:
             cmd.alterOp      = "ADD";
             cmd.alterColName = tokens[5];
             cmd.alterColType = tokens.size() >= 7 ? toUpper(tokens[6]) : "TEXT";
+            // Phase 146: Parse optional DEFAULT value
+            for (size_t di = 7; di + 1 < tokens.size(); ++di) {
+                if (toUpper(tokens[di]) == "DEFAULT") {
+                    cmd.alterColDefault = tokens[di + 1];
+                    if (cmd.alterColDefault.size() >= 2 &&
+                        cmd.alterColDefault.front() == '\'' && cmd.alterColDefault.back() == '\'')
+                        cmd.alterColDefault = cmd.alterColDefault.substr(1, cmd.alterColDefault.size() - 2);
+                    break;
+                }
+            }
 
         } else if (op == "DROP" && kw4 == "COLUMN" && tokens.size() >= 6) {
             cmd.alterOp      = "DROP";

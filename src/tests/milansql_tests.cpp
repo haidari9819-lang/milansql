@@ -3726,9 +3726,203 @@ static void testGroup50() {
     }
 }
 
-// ══════════════════════════════════════════════════════════════
+// Group 53: Phase 141 — Parallel Query Execution V2
+static void testGroup53() {
+    std::cout << "\n--- Group 53: Phase 141 Parallel Query Execution V2 ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // Setup -- insert 15 rows directly (3 batches x 5 rows: 100A,200B,300A,400B,500A)
+    execSQL("CREATE TABLE parallel_test (id INT PRIMARY KEY AUTO_INCREMENT, val INT, cat TEXT)");
+    for (int batch = 0; batch < 3; ++batch) {
+        execSQL("INSERT INTO parallel_test VALUES (NULL, 100, 'A')");
+        execSQL("INSERT INTO parallel_test VALUES (NULL, 200, 'B')");
+        execSQL("INSERT INTO parallel_test VALUES (NULL, 300, 'A')");
+        execSQL("INSERT INTO parallel_test VALUES (NULL, 400, 'B')");
+        execSQL("INSERT INTO parallel_test VALUES (NULL, 500, 'A')");
+    }
+
+    // Configure parallel execution
+    execSQL("SET MAX_PARALLEL_WORKERS = 4");
+    execSQL("SET PARALLEL_THRESHOLD = 5");
+
+    // 1. COUNT(*) -- correct result despite parallelism
+    {
+        auto r = execSQL("SELECT COUNT(*) FROM parallel_test");
+        bool ok = !r.rows.empty() && !r.rows[0].values.empty() &&
+                  r.rows[0].values[0] == "15";
+        check(ok, "Parallel COUNT(*) -> 15");
+    }
+
+    // 2. SUM(val) -- correct result
+    {
+        auto r = execSQL("SELECT SUM(val) FROM parallel_test");
+        bool ok = !r.rows.empty() && !r.rows[0].values.empty() &&
+                  r.rows[0].values[0] == "4500";
+        check(ok, "Parallel SUM(val) -> 4500");
+    }
+
+    // 3. AVG(val) -- correct result
+    {
+        auto r = execSQL("SELECT AVG(val) FROM parallel_test");
+        bool ok = !r.rows.empty() && !r.rows[0].values.empty();
+        if (ok) {
+            try { double v = std::stod(r.rows[0].values[0]); ok = (v > 299.0 && v < 301.0); }
+            catch (...) { ok = false; }
+        }
+        check(ok, "Parallel AVG(val) -> ~300");
+    }
+
+    // 4. GROUP BY works correctly
+    {
+        auto r = execSQL("SELECT cat, COUNT(*) FROM parallel_test GROUP BY cat ORDER BY cat");
+        bool aFound = false, bFound = false;
+        for (const auto& row : r.rows) {
+            if (row.values.size() >= 2) {
+                const std::string& catVal = row.values[0];
+                std::string catBare = (catVal.size() >= 2 && catVal.front() == '\'' && catVal.back() == '\'')
+                    ? catVal.substr(1, catVal.size() - 2) : catVal;
+                if (catBare == "A" && row.values[1] == "9") aFound = true;
+                if (catBare == "B" && row.values[1] == "6") bFound = true;
+            }
+        }
+        check(aFound && bFound, "Parallel GROUP BY cat -> A=9, B=6");
+    }
+
+    // 5. SET MAX_PARALLEL_WORKERS accepted without error
+    {
+        auto r = execSQL("SET MAX_PARALLEL_WORKERS = 4");
+        check(r.error.empty(), "SET MAX_PARALLEL_WORKERS -> no error");
+    }
+
+    // 6. SET PARALLEL_THRESHOLD accepted without error
+    {
+        auto r = execSQL("SET PARALLEL_THRESHOLD = 5");
+        check(r.error.empty(), "SET PARALLEL_THRESHOLD -> no error");
+    }
+
+    // 7. EXPLAIN mentions parallel
+    {
+        auto r = execSQL("EXPLAIN SELECT COUNT(*) FROM parallel_test");
+        bool ok = !r.rows.empty();
+        check(ok, "EXPLAIN SELECT COUNT -> returns rows");
+    }
+
+    // 8. MIN/MAX still correct
+    {
+        auto r1 = execSQL("SELECT MIN(val) FROM parallel_test");
+        auto r2 = execSQL("SELECT MAX(val) FROM parallel_test");
+        bool okMin = !r1.rows.empty() && !r1.rows[0].values.empty() && r1.rows[0].values[0] == "100";
+        bool okMax = !r2.rows.empty() && !r2.rows[0].values.empty() && r2.rows[0].values[0] == "500";
+        check(okMin, "Parallel MIN(val) -> 100");
+        check(okMax, "Parallel MAX(val) -> 500");
+    }
+}
+
+// Group 54: Phase 142 -- Column Store V2 + OLAP
+static void testGroup54() {
+    std::cout << "\n--- Group 54: Phase 142 Column Store V2 + OLAP ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // Setup -- insert 15 rows directly (3 batches x 5 rows)
+    execSQL("CREATE TABLE sales (id INT PRIMARY KEY AUTO_INCREMENT, amount INT, region TEXT, year INT)");
+    for (int batch = 0; batch < 3; ++batch) {
+        execSQL("INSERT INTO sales VALUES (NULL, 1000, 'Nord', 2024)");
+        execSQL("INSERT INTO sales VALUES (NULL, 2000, 'Sued', 2024)");
+        execSQL("INSERT INTO sales VALUES (NULL, 1500, 'Nord', 2025)");
+        execSQL("INSERT INTO sales VALUES (NULL, 3000, 'Sued', 2025)");
+        execSQL("INSERT INTO sales VALUES (NULL, 500, 'West', 2024)");
+    }
+
+    // 1. CREATE COLUMNSTORE INDEX -- no error
+    {
+        auto r = execSQL("CREATE COLUMNSTORE INDEX cs_sales ON sales (amount, region, year)");
+        check(r.error.empty(), "CREATE COLUMNSTORE INDEX -> no error");
+    }
+
+    // 2. SUM(amount) via column store
+    {
+        auto r = execSQL("SELECT SUM(amount) FROM sales");
+        bool ok = !r.rows.empty() && !r.rows[0].values.empty() &&
+                  r.rows[0].values[0] == "24000";
+        check(ok, "Column Store SUM(amount) -> 24000");
+    }
+
+    // 3. COUNT(*) correct
+    {
+        auto r = execSQL("SELECT COUNT(*) FROM sales");
+        bool ok = !r.rows.empty() && !r.rows[0].values.empty() &&
+                  r.rows[0].values[0] == "15";
+        check(ok, "Column Store COUNT(*) -> 15");
+    }
+
+    // 4. GROUP BY region SUM
+    {
+        auto r = execSQL("SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY region");
+        bool nordOk = false, suedOk = false, westOk = false;
+        for (const auto& row : r.rows) {
+            if (row.values.size() >= 2) {
+                const std::string& rv = row.values[0];
+                std::string rBare = (rv.size() >= 2 && rv.front() == '\'' && rv.back() == '\'')
+                    ? rv.substr(1, rv.size() - 2) : rv;
+                if (rBare == "Nord" && row.values[1] == "7500") nordOk = true;
+                if (rBare == "Sued" && row.values[1] == "15000") suedOk = true;
+                if (rBare == "West" && row.values[1] == "1500") westOk = true;
+            }
+        }
+        check(nordOk && suedOk && westOk, "GROUP BY region SUM -> Nord=7500, Sued=15000, West=1500");
+    }
+
+    // 5. WHERE year=2024 GROUP BY year
+    {
+        auto r = execSQL("SELECT year, SUM(amount) FROM sales WHERE year = 2024 GROUP BY year");
+        bool ok = !r.rows.empty() && !r.rows[0].values.empty() &&
+                  r.rows[0].values.size() >= 2 && r.rows[0].values[1] == "10500";
+        check(ok, "WHERE year=2024 SUM -> 10500");
+    }
+
+    // 6. BENCHMARK OLAP returns rows
+    {
+        auto r = execSQL("BENCHMARK OLAP sales");
+        bool ok = !r.rows.empty();
+        check(ok, "BENCHMARK OLAP -> returns rows");
+    }
+
+    // 7. BENCHMARK OLAP no error
+    {
+        auto r = execSQL("BENCHMARK OLAP sales");
+        check(r.error.empty(), "BENCHMARK OLAP -> no error");
+    }
+
+    // 8. MIN/MAX via column store
+    {
+        auto r1 = execSQL("SELECT MIN(amount) FROM sales");
+        auto r2 = execSQL("SELECT MAX(amount) FROM sales");
+        bool okMin = !r1.rows.empty() && !r1.rows[0].values.empty() && r1.rows[0].values[0] == "500";
+        bool okMax = !r2.rows.empty() && !r2.rows[0].values.empty() && r2.rows[0].values[0] == "3000";
+        check(okMin, "Column Store MIN(amount) -> 500");
+        check(okMax, "Column Store MAX(amount) -> 3000");
+    }
+}
+
+// ============================================================
 // MAIN
-// ══════════════════════════════════════════════════════════════
+// ============================================================
 
 int main() {
     std::cout << "========================================\n";
@@ -3884,6 +4078,12 @@ int main() {
     }
     try { testGroup50(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 50 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup53(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 53 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup54(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 54 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

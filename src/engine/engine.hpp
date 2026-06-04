@@ -93,6 +93,8 @@
 #include "../storage/toast.hpp"               // Phase 131: TOAST Large Object Storage
 #include "../spatial/rtree.hpp"               // Phase 132: R-Tree Spatial Index V2
 #include "../debug/memory_tracker.hpp"       // Phase 133: Memory Tracker
+#include "../executor/parallel_executor.hpp" // Phase 141: Parallel Query Execution V2
+#include "../storage/column_store_v2.hpp"    // Phase 142: Column Store V2 + OLAP
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -4059,6 +4061,43 @@ public:
                   << (parallelExec_.numWorkers > 1 ? "ENABLED" : "DISABLED") << "\n\n";
     }
 
+    // ── Phase 141/142: Column Store V2 + OLAP public methods ─────
+    void createColumnStoreIndex(const std::string& idxName,
+                                 const std::string& tblName,
+                                 const std::vector<std::string>& cols) {
+        auto key = resolveTableName(tblName);
+        const Table& src = getTable(key);
+        std::vector<std::vector<std::string>> colData;
+        for (const auto& col : cols) {
+            std::vector<std::string> vals;
+            for (const auto& row : src.rows()) {
+                if (row.xmax != 0) continue;
+                size_t ci = 0;
+                for (size_t i = 0; i < src.columns().size(); ++i)
+                    if (src.columns()[i].name == col) { ci = i; break; }
+                vals.push_back(ci < row.values.size() ? row.values[ci] : "NULL");
+            }
+            colData.push_back(std::move(vals));
+        }
+        ColumnStoreIndex csIdx;
+        csIdx.build(key, idxName, cols, {}, colData);
+        columnStoreIndexes_[idxName] = std::move(csIdx);
+    }
+
+    bool hasColumnStoreIndex(const std::string& tblName) const {
+        auto key = resolveTableName(tblName);
+        for (const auto& kv : columnStoreIndexes_)
+            if (kv.second.tableName == key) return true;
+        return false;
+    }
+
+    const ColumnStoreIndex* getColumnStoreIndex(const std::string& tblName) const {
+        auto key = resolveTableName(tblName);
+        for (const auto& kv : columnStoreIndexes_)
+            if (kv.second.tableName == key) return &kv.second;
+        return nullptr;
+    }
+
     void grantPrivilege(const std::string& userName, const std::string& tableName,
                         const std::vector<std::string>& privs) {
         auto it = users_.find(userName);
@@ -6909,6 +6948,13 @@ public:
 
     // Phase 77: Parallel Query Execution
     ParallelExecutor parallelExec_;
+
+    // Phase 141: Parallel Query Execution V2
+    int parallelThreshold_v2_  = 1000;
+    int maxParallelWorkers_v2_ = 4;
+
+    // Phase 142: Column Store Indexes
+    std::map<std::string, ColumnStoreIndex> columnStoreIndexes_;
 
     // Phase 78: Table Inheritance
     std::map<std::string, std::string>              tableParent_;    // child key → parent key

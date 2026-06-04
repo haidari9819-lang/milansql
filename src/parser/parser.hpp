@@ -304,6 +304,10 @@ enum class CommandType {
     SHOW_MEMORY_USAGE,
     // Phase 134: Zero Memory Leaks + Production Hardening V2
     SHOW_PERFORMANCE_BASELINE,
+    // Phase 141: Parallel Query Execution V2
+    // Phase 142: Column Store V2 + OLAP
+    CREATE_COLUMNSTORE_INDEX,
+    BENCHMARK_OLAP,
     UNKNOWN
 };
 
@@ -631,6 +635,11 @@ struct ParsedCommand {
     // Phase 127: Multi-Tenant Support
     std::string tenantName;
     std::map<std::string, std::string> tenantOptions; // max_connections, max_storage_gb, max_tables
+
+    // Phase 141/142: Column Store V2 + OLAP
+    std::string columnStoreIndexName;
+    std::vector<std::string> columnStoreCols;
+    std::string benchmarkOlapTable;
 };
 
 class Parser {
@@ -1924,6 +1933,23 @@ public:
                 }
             }
 
+        // ── Phase 142: CREATE COLUMNSTORE INDEX ──────────────────
+        // Syntax: CREATE COLUMNSTORE INDEX name ON table (col1, col2, ...)
+        } else if (kw0 == "CREATE" && kw1 == "COLUMNSTORE" && kw2 == "INDEX") {
+            cmd.type = CommandType::CREATE_COLUMNSTORE_INDEX;
+            {
+                auto ft = tokenizeFull(input);
+                size_t i = 3; // skip CREATE COLUMNSTORE INDEX
+                if (i < ft.size()) cmd.columnStoreIndexName = ft[i++];
+                if (i < ft.size() && toUpper(ft[i]) == "ON") ++i;
+                if (i < ft.size()) cmd.tableName = ft[i++];
+                if (i < ft.size() && ft[i] == "(") ++i;
+                while (i < ft.size() && ft[i] != ")") {
+                    if (ft[i] != ",") cmd.columnStoreCols.push_back(ft[i]);
+                    ++i;
+                }
+            }
+
         // ── CREATE INDEX ─────────────────────────────────────────
         } else if (kw0 == "CREATE" && kw1 == "INDEX") {
             // Phase 111: detect USING hnsw/ivfflat for vector indexes
@@ -2937,8 +2963,9 @@ public:
                     for (char& c : rhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                     cmd.varName  = lhs;
                     cmd.varValue = rhs;
-                    // check for known Phase 125/126 varNames — use SET_CACHE as a carrier CommandType
-                    if (lhs == "ROUTING" || lhs == "OPTIMIZER_TRACE") {
+                    // check for known Phase 125/126/141 varNames — use SET_CACHE as a carrier CommandType
+                    if (lhs == "ROUTING" || lhs == "OPTIMIZER_TRACE" ||
+                        lhs == "MAX_PARALLEL_WORKERS" || lhs == "PARALLEL_THRESHOLD") {
                         cmd.type = CommandType::SET_CACHE; // re-use existing SET handler
                     }
                     // else leave UNKNOWN (other SET commands not matched above)
@@ -3100,6 +3127,11 @@ public:
                     fp = fp.substr(1, fp.size() - 2);
                 cmd.backupFile = fp;
             } else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 142: BENCHMARK OLAP table ──────────────────────
+        } else if (kw0 == "BENCHMARK" && kw1 == "OLAP") {
+            cmd.type = CommandType::BENCHMARK_OLAP;
+            if (tokens.size() >= 3) cmd.benchmarkOlapTable = tokens[2];
 
         // ── Phase 58: BENCHMARK n SQL ─────────────────────────────
         } else if (kw0 == "BENCHMARK") {

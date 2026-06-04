@@ -2,6 +2,18 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v7.6.0] — 2026-06-04 — "LATERAL + JSONB Complete"
+
+### Fixed in Phase 138–139
+
+- **Phase 138 LATERAL JOIN:** Fixed parser bug where `table.column` references in LATERAL subqueries were tokenized with spaces (`u2 . id`), breaking correlated substitution. LATERAL JOINs now correctly re-execute the subquery for each outer row.
+- **Phase 139 JSONB_AGG:** Detected as aggregate function and routed through `parseGroupByQuery` with implicit whole-table aggregation via `globalAgg()`. Returns proper JSON array with all values.
+- **Phase 139 JSONB_BUILD_OBJECT:** Added to SFUNCS routing list and `parseSelectFull`; now evaluated as scalar function per-row via `projectWithItems`, returning one JSON object per row.
+- **dispatch.hpp compile errors:** Fixed 3 compile errors in the server binary — deleted Table copy constructor usage (→ `std::move`), wrong `dispatch()` return type (→ `dispatch_executeSelectToTable`).
+- 494 automated tests (26 new tests)
+
+---
+
 ## [v7.5.0] — 2026-06-03 — "Advanced SQL Analytics"
 
 ### Added since v7.0.0

@@ -272,14 +272,26 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
-    // ── Phase 133: SHOW MEMORY USAGE ────────────────────────────
+    // ── Phase 133/151: SHOW MEMORY USAGE ────────────────────────────
     case milansql::CommandType::SHOW_MEMORY_USAGE: {
         qr.columns = {milansql::Column{"Metric","TEXT"}, milansql::Column{"Value","TEXT"}};
-        auto stats = milansql::MemoryTracker::global().stats();
-        qr.rows.push_back(milansql::Row({"Allocated Objects", std::to_string(stats.allocatedObjects)}));
-        qr.rows.push_back(milansql::Row({"Allocated Bytes", std::to_string(stats.allocatedBytes) + " bytes"}));
-        qr.rows.push_back(milansql::Row({"Peak Bytes", std::to_string(stats.peakBytes) + " bytes"}));
-        qr.rows.push_back(milansql::Row({"Leaks", std::to_string(stats.leaks)}));
+        // Count tables
+        size_t tableCount = engine.tableCount();
+        qr.rows.push_back(milansql::Row({"Allocated Tables", std::to_string(tableCount)}));
+        // Count indexes across all tables
+        size_t indexCount = 0;
+        for (const auto& [name, tbl] : engine.getTables())
+            indexCount += tbl.getIndexes().size();
+        qr.rows.push_back(milansql::Row({"Allocated Indexes", std::to_string(indexCount)}));
+        // Query cache entries
+        size_t cacheEntries = engine.getQueryCache().size();
+        qr.rows.push_back(milansql::Row({"Cache Entries", std::to_string(cacheEntries)}));
+        // WAL entries (txBuffer size if in transaction, else 0)
+        size_t walEntries = engine.txBufferSize();
+        qr.rows.push_back(milansql::Row({"WAL Entries", std::to_string(walEntries)}));
+        // Prepared transactions
+        size_t preparedCount = engine.distTxManager.getAllPrepared().size();
+        qr.rows.push_back(milansql::Row({"Prepared Transactions", std::to_string(preparedCount)}));
         break;
     }
 

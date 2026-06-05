@@ -1200,6 +1200,11 @@ public:
         return tables_.size();
     }
 
+    // Phase 151: return pending WAL buffer size
+    size_t txBufferSize() const {
+        return txBuffer_.size();
+    }
+
     // ── Phase 75: Row-Level Security ──────────────────────────
     struct RlsPolicy {
         std::string name;

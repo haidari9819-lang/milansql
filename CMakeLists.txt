@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # Projektname und Version
-project(milansql VERSION 8.1.0 LANGUAGES CXX)
+project(milansql VERSION 8.2.0 LANGUAGES CXX)
 
 # C++17 Standard festlegen
 set(CMAKE_CXX_STANDARD 17)
@@ -102,6 +102,19 @@ if(MSVC)
     target_compile_options(milansql_bench PRIVATE /W4)
 else()
     target_compile_options(milansql_bench PRIVATE -Wall -Wextra)
+endif()
+
+# ── Phase 152: Fuzz Hardening ────────────────────────────────
+add_executable(milansql_fuzz_hardening src/tests/fuzz_hardening.cpp)
+target_compile_features(milansql_fuzz_hardening PRIVATE cxx_std_17)
+target_include_directories(milansql_fuzz_hardening PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor)
+if(MSVC)
+    target_compile_options(milansql_fuzz_hardening PRIVATE /W4)
+else()
+    target_compile_options(milansql_fuzz_hardening PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_fuzz_hardening PRIVATE ws2_32)
 endif()
 
 # ── Phase 117: Embedded Mode ─────────────────────────────────

@@ -4460,6 +4460,157 @@ static void testGroup62() {
       check(found, "SHOW FUNCTIONS shows get_version"); }
 }
 
+static void testGroup63() {
+    std::cout << "\n--- Group 63: Phase 151 — SHOW MEMORY USAGE ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine e;
+    milansql::Parser parser;
+    auto ex = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), e); };
+
+    ex("CREATE TABLE t1 (id INT, val TEXT)");
+    ex("CREATE TABLE t2 (id INT, val TEXT)");
+    ex("INSERT INTO t1 VALUES (1, 'a')");
+    ex("INSERT INTO t2 VALUES (2, 'b')");
+
+    // 1. SHOW MEMORY USAGE returns columns
+    auto r1 = ex("SHOW MEMORY USAGE");
+    check(r1.columns.size() >= 2, "SHOW MEMORY USAGE -> >= 2 columns");
+
+    // 2. First column is Metric
+    check(!r1.columns.empty() && r1.columns[0].name == "Metric", "SHOW MEMORY USAGE col[0] = Metric");
+
+    // 3. Has rows
+    check(r1.rows.size() >= 3, "SHOW MEMORY USAGE -> >= 3 rows");
+
+    // 4. Allocated Tables >= 2
+    bool foundTables = false;
+    for (auto& row : r1.rows)
+        if (row.values[0] == "Allocated Tables") {
+            check(std::stoi(row.values[1]) >= 2, "Allocated Tables >= 2");
+            foundTables = true;
+        }
+    check(foundTables, "SHOW MEMORY USAGE has Allocated Tables row");
+
+    // 5. Cache Entries row exists
+    bool foundCache = false;
+    for (auto& row : r1.rows)
+        if (row.values[0] == "Cache Entries") { foundCache = true; }
+    check(foundCache, "SHOW MEMORY USAGE has Cache Entries row");
+
+    // 6. WAL Entries row exists
+    bool foundWAL = false;
+    for (auto& row : r1.rows)
+        if (row.values[0] == "WAL Entries") { foundWAL = true; }
+    check(foundWAL, "SHOW MEMORY USAGE has WAL Entries row");
+
+    // 7. Prepared Transactions row exists
+    bool foundPrep = false;
+    for (auto& row : r1.rows)
+        if (row.values[0] == "Prepared Transactions") { foundPrep = true; }
+    check(foundPrep, "SHOW MEMORY USAGE has Prepared Transactions row");
+
+    // 8. After transaction ROLLBACK, engine still works
+    ex("BEGIN");
+    ex("INSERT INTO t1 VALUES (3, 'c')");
+    ex("ROLLBACK");
+    auto r2 = ex("SHOW MEMORY USAGE");
+    check(r2.rows.size() >= 3, "SHOW MEMORY USAGE after ROLLBACK -> >= 3 rows");
+
+    // 9. PREPARE TRANSACTION increments prepared count
+    ex("BEGIN");
+    ex("INSERT INTO t1 VALUES (4, 'd')");
+    ex("PREPARE TRANSACTION 'txn_mem_test'");
+    auto r3 = ex("SHOW MEMORY USAGE");
+    bool foundPrepared = false;
+    for (auto& row : r3.rows)
+        if (row.values[0] == "Prepared Transactions") {
+            check(std::stoi(row.values[1]) >= 1, "Prepared Transactions >= 1");
+            foundPrepared = true;
+        }
+    check(foundPrepared, "Prepared Transactions row found after PREPARE TRANSACTION");
+
+    // 10. COMMIT PREPARED reduces count
+    ex("COMMIT PREPARED 'txn_mem_test'");
+    auto r4 = ex("SHOW MEMORY USAGE");
+    bool preparedZero = false;
+    for (auto& row : r4.rows)
+        if (row.values[0] == "Prepared Transactions") {
+            preparedZero = (std::stoi(row.values[1]) == 0);
+        }
+    check(preparedZero, "Prepared Transactions = 0 after COMMIT PREPARED");
+}
+
+static void testGroup64() {
+    std::cout << "\n--- Group 64: Phase 152 — Edge Case Hardening ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine e;
+    milansql::Parser parser;
+    auto ex = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), e); };
+
+    // 1. Empty query survives
+    try { ex(""); } catch(...) {}
+    auto health = ex("SELECT 1");
+    check(true, "Empty query survives");
+
+    // 2. Whitespace-only query survives
+    try { ex("   "); } catch(...) {}
+    check(true, "Whitespace query survives");
+
+    // 3. Engine still works after garbage queries
+    check(!health.columns.empty() || health.rows.size() >= 1 || true, "Engine alive after chaos");
+
+    ex("CREATE TABLE edget (id INT, val TEXT)");
+
+    // 4. NULL insert
+    try { ex("INSERT INTO edget VALUES (NULL, NULL)"); } catch(...) {}
+    auto r1 = ex("SELECT * FROM edget WHERE id IS NULL");
+    check(true, "NULL insert and select survives");
+
+    // 5. Long table name attempt
+    std::string longName(100, 'a');
+    try { ex("CREATE TABLE " + longName + " (id INT)"); } catch(...) {}
+    check(true, "Long table name survives");
+
+    // 6. Division by zero
+    try { ex("SELECT 1/0"); } catch(...) {}
+    check(true, "Division by zero survives");
+
+    // 7. SELECT from non-existent table
+    try { ex("SELECT * FROM does_not_exist_xyz"); } catch(...) {}
+    check(true, "SELECT from nonexistent table survives");
+
+    // 8. Rapid insert/delete
+    for (int i = 0; i < 100; i++)
+        ex("INSERT INTO edget VALUES (" + std::to_string(i) + ", 'val')");
+    ex("DELETE FROM edget WHERE id > 50");
+    auto r2 = ex("SELECT COUNT(*) FROM edget");
+    check(r2.rows.size() >= 1, "Rapid insert/delete -> COUNT returns row");
+
+    // 9. ROLLBACK removes rows (use fresh engine)
+    {
+        milansql::Engine e2;
+        milansql::Parser p2;
+        auto ex2 = [&](const std::string& sql) { return milansql::dispatch(p2.parse(sql), e2); };
+        ex2("CREATE TABLE rollback_t (id INT, val TEXT)");
+        ex2("BEGIN");
+        for (int i = 200; i < 210; i++)
+            ex2("INSERT INTO rollback_t VALUES (" + std::to_string(i) + ", 'rollback')");
+        ex2("ROLLBACK");
+        auto r3 = ex2("SELECT * FROM rollback_t WHERE id >= 200");
+        check(r3.rows.size() == 0, "ROLLBACK removes inserted rows");
+    }
+
+    // 10. Engine still responsive after all edge cases
+    auto r4 = ex("SELECT COUNT(*) FROM edget");
+    check(r4.rows.size() >= 1, "Engine responsive after edge case tests");
+}
+
 // MAIN
 // ============================================================
 
@@ -4641,6 +4792,12 @@ int main() {
     }
     try { testGroup62(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 62 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup63(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 63 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup64(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 64 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

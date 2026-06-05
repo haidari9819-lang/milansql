@@ -608,7 +608,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v7.4.0\",";
+    json += "\"version\":\"MilanSQL v8.2.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1505,7 +1505,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"7.2.0\","
+            "\"version\":\"8.2.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"

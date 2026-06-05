@@ -10,25 +10,30 @@
 
 Features: Full SQL, table browser, example queries, query sharing, dark theme.
 
-![Version](https://img.shields.io/badge/version-v7.5.0-gold)
+![Version](https://img.shields.io/badge/version-v8.2.0-gold)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Tests](https://img.shields.io/badge/tests-468%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-636%20passing-brightgreen)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
+![Production](https://img.shields.io/badge/status-Production%20Ready-success)
 
 <!-- Topics: database sql cpp c-plus-plus query-engine btree replication mvcc window-functions postgresql-compatible -->
 
-**From Zero to v7.0.0 — 130 phases, pure C++17 — Enterprise Ready**
+**v8.2.0 — 152 phases, pure C++17 — Production Ready**
 
 > A complete relational database engine built from scratch in C++17.  
-> 130 development phases. Zero external dependencies. 5 network protocols.  
-> Multi-Tenant, High Availability, Load Balancer, pgvector AI/ML, Connection String V2.
+> 152 development phases. Zero external dependencies. 5 network protocols.  
+> Multi-Tenant, High Availability, Load Balancer, pgvector AI/ML, 10k Fuzz-Tested.
+
+## Live Demo
+
+**[http://178.105.206.36:8080/webui](http://178.105.206.36:8080/webui)** — Live server running on Hetzner, no installation needed!
 
 ## Documentation
 
 | Guide | Description |
 |-------|-------------|
-| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 130 phases |
+| [SQL Reference](docs/sql-reference.html) | Complete SQL command reference — all 152 phases |
 | [Tutorial](docs/tutorial.html) | Step-by-step getting started guide |
 | [Architecture](docs/architecture.html) | Internal architecture deep-dive |
 | [Live Demo](docs/demo.html) | Try MilanSQL in your browser |
@@ -84,7 +89,9 @@ cmake -B build -G Ninja && ninja -C build
 | Clients | Python DB-API 2.0 / Node.js / MySQL / psql | ✅ |
 | Storage | Page-based I/O + Compression (LZ4/RLE/Dictionary) | ✅ |
 | Catalog | INFORMATION_SCHEMA + pg_catalog (9 tables) | ✅ |
-| Testing | 468 automated tests + Stress Testing | ✅ |
+| Testing | 636 automated tests + 10k Fuzz Hardening | ✅ |
+| Statistics | ANALYZE TABLE / CREATE STATISTICS / Optimizer Hints | ✅ |
+| UDF | CREATE FUNCTION / CREATE PROCEDURE / CALL / SHOW FUNCTIONS | ✅ |
 
 ## Network Protocols
 

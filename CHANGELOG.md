@@ -2,6 +2,65 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v8.2.0] — 2026-06-05 — "Production Ready — Stable Release"
+
+### Phase 151: Zero Warning Build + Static Analysis
+- Strict `-Wall -Wextra` build: **0 warnings** across all source files
+- `SHOW MEMORY USAGE` — live engine metrics (tables, indexes, WAL entries, prepared transactions)
+- Static analysis: raw pointer audit, file handle RAII verification, thread join/detach checks
+
+### Phase 152: 10k Fuzz Test + Edge Case Hardening
+- New standalone executable `milansql_fuzz_hardening` — 10,000 random queries across 5 categories
+- **Syntax Chaos** (2000): garbage SQL, injections, half-formed queries, Unicode, NULL bytes
+- **Type Chaos** (2000): overflow values, NULL arithmetic, wrong types, empty strings
+- **Structure Chaos** (2000): non-existent tables/columns, circular CTEs, bad JOINs
+- **Concurrency Chaos** (2000): 20 threads, no deadlocks
+- **Recovery Chaos** (2000): orphaned BEGIN/COMMIT, PREPARE TRANSACTION cycles
+- 19 edge case tests: 50-column tables, 1000-char strings, MAX INT32, rapid CREATE/DROP
+- Chaos Monkey: 4 threads × 10 seconds, engine alive after all chaos
+
+### Phase 149: Advanced Statistics + Optimizer Hints
+- `ANALYZE TABLE` — collects row/page statistics per table
+- `CREATE STATISTICS name ON col1, col2 FROM table` — multi-column statistics objects
+- `SHOW STATISTICS [FOR table]` / `SHOW TABLE STATS [FOR table]`
+- `SET enable_seqscan/enable_indexscan/enable_hashjoin/enable_nestloop = OFF/ON`
+
+### Phase 150: User-Defined Functions + Stored Procedures V2
+- `CREATE FUNCTION name(params) RETURNS type AS $$ body $$ LANGUAGE sql`
+- `CREATE PROCEDURE name(params) AS $$ body $$ LANGUAGE sql`
+- `CALL procedure_name(args)`
+- `DROP FUNCTION` / `DROP PROCEDURE`
+- `SHOW FUNCTIONS` / `SHOW PROCEDURES`
+
+### Phase 147: Time-Series V2 + Continuous Aggregates
+- `CREATE TABLE ... HYPERTABLE` — time-series optimized tables
+- `CREATE CONTINUOUS AGGREGATE` with auto-refresh
+- `time_bucket()`, `first()`, `last()` aggregate functions
+- `add_retention_policy()`, `SHOW RETENTION POLICIES`
+- `compress_chunk()`, `SHOW CHUNKS`
+
+### Phase 148: Distributed Transactions + 2-Phase Commit
+- `BEGIN DISTRIBUTED` / `PREPARE TRANSACTION xid` / `COMMIT PREPARED` / `ROLLBACK PREPARED`
+- `SHOW PREPARED TRANSACTIONS`
+- XA protocol: `XA START/END/PREPARE/COMMIT/ROLLBACK`
+- `GET_LOCK()` / `RELEASE_LOCK()` / `IS_FREE_LOCK()`
+
+### Phase 145: Advanced Security V2 + Audit Logging
+- `SET audit_log = ON/OFF`, `SHOW AUDIT LOG [LIMIT n]`, `SHOW AUDIT LOG WHERE field = value`
+- `SET audit_log_file = path`, `SET password_min_length`, `SET password_require_special`
+- `SET allow_host`, `SET deny_host`, `SET blacklist_query`
+- `SET max_connections_per_ip`, `SET connection_rate_limit`
+
+### Phase 146: Online DDL + Zero-Downtime Schema Changes
+- `CREATE INDEX CONCURRENTLY` — non-blocking index builds
+- `BEGIN DDL TRANSACTION` / `COMMIT DDL TRANSACTION` / `ROLLBACK DDL TRANSACTION`
+- `SHOW DDL HISTORY`, `SHOW SCHEMA VERSION`
+- `ALTER TABLE ... ADD COLUMN ... DEFAULT value`
+
+**636/636 tests pass. Zero external dependencies. Production Ready.**
+
+---
+
 ## [v7.6.0] — 2026-06-04 — "LATERAL + JSONB Complete"
 
 ### Fixed in Phase 138–139

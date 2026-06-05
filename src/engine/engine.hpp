@@ -101,6 +101,8 @@
 #include "../timeseries/continuous_aggregate.hpp" // Phase 147: Continuous Aggregates
 #include "../transaction/distributed_tx.hpp" // Phase 148: Distributed Transactions
 #include "../lock/distributed_lock.hpp"      // Phase 148: Distributed Locks
+#include "../stats/statistics_manager.hpp"   // Phase 149: Statistics Manager
+#include "../routines/routine_manager.hpp"   // Phase 150: Routine Manager
 
 // ============================================================
 // engine.hpp — MilanSQL Engine (Phase 24)
@@ -1180,6 +1182,13 @@ public:
     bool getLock    (const std::string& name, int timeout) { return distLockManager.getLock(name, timeout); }
     bool releaseLock(const std::string& name)              { return distLockManager.releaseLock(name);      }
     bool isFreeLock (const std::string& name) const        { return distLockManager.isFreeLock(name);       }
+
+    // ── Phase 149: Advanced Statistics + Optimizer Hints ─────────
+    StatisticsManager statsManager;
+    std::map<std::string, std::string> optimizerHints;
+
+    // ── Phase 150: User-Defined Functions + Stored Procedures V2 ─
+    RoutineManager routineManager;
 
     // ── Phase 133: Memory Tracker + Error Counters ───────────────
     milansql::MemoryTracker memoryTracker;

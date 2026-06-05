@@ -340,6 +340,14 @@ enum class CommandType {
     GET_LOCK,
     RELEASE_LOCK,
     IS_FREE_LOCK,
+    // Phase 149: Advanced Statistics + Optimizer Hints
+    CREATE_STATISTICS,
+    SHOW_STATISTICS,
+    SHOW_TABLE_STATS,
+    // Phase 150: User-Defined Functions V2
+    CREATE_FUNCTION,
+    DROP_FUNCTION,
+    SHOW_FUNCTIONS,
     UNKNOWN
 };
 
@@ -694,6 +702,19 @@ struct ParsedCommand {
     std::string xaXid;
     std::string lockName;
     int         lockTimeout = 0;
+
+    // Phase 149: Advanced Statistics
+    std::string statsName;           // for CREATE STATISTICS
+    std::string statsTable;          // table name for ANALYZE/SHOW STATS
+    std::vector<std::string> statsCols; // columns for CREATE STATISTICS
+    bool explainAnalyze2 = false;    // for EXPLAIN (ANALYZE,...) SELECT (phase 149 extended)
+    bool explainBuffers = false;
+
+    // Phase 150: User-Defined Functions V2
+    std::string routineName;
+    std::string routineBody;
+    std::string routineReturnType;
+    std::vector<std::string> routineParams;  // raw param list (one string)
 };
 
 class Parser {
@@ -2095,6 +2116,64 @@ public:
                 cmd.procedureBody = body;
             }
 
+        // ── Phase 150: CREATE FUNCTION ───────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "FUNCTION") {
+            cmd.type = CommandType::CREATE_FUNCTION;
+            if (tokens.size() >= 3) cmd.routineName = tokens[2];
+            // Extract params between first ( and )
+            {
+                size_t lp = input.find('('), rp = input.find(')');
+                if (lp != std::string::npos && rp != std::string::npos && rp > lp)
+                    cmd.routineParams.push_back(input.substr(lp + 1, rp - lp - 1));
+            }
+            // RETURNS type
+            {
+                std::string upInp = input;
+                for (auto& c : upInp) c = (char)std::toupper((unsigned char)c);
+                size_t retPos = upInp.find("RETURNS");
+                if (retPos != std::string::npos) {
+                    std::istringstream ss(input.substr(retPos + 7));
+                    ss >> cmd.routineReturnType;
+                    // uppercase it
+                    for (auto& c : cmd.routineReturnType)
+                        c = (char)std::toupper((unsigned char)c);
+                    // strip trailing comma or paren
+                    while (!cmd.routineReturnType.empty() &&
+                           (cmd.routineReturnType.back() == ',' ||
+                            cmd.routineReturnType.back() == ')' ||
+                            cmd.routineReturnType.back() == '('))
+                        cmd.routineReturnType.pop_back();
+                }
+            }
+            // Body between $$ ... $$
+            {
+                size_t b1 = input.find("$$");
+                size_t b2 = (b1 != std::string::npos) ? input.find("$$", b1 + 2) : std::string::npos;
+                if (b1 != std::string::npos && b2 != std::string::npos)
+                    cmd.routineBody = trim(input.substr(b1 + 2, b2 - b1 - 2));
+            }
+
+        // ── Phase 149: CREATE STATISTICS ─────────────────────────
+        } else if (kw0 == "CREATE" && kw1 == "STATISTICS") {
+            cmd.type = CommandType::CREATE_STATISTICS;
+            if (tokens.size() >= 3) cmd.statsName = tokens[2];
+            // parse: CREATE STATISTICS name ON col1, col2 FROM tablename
+            {
+                int onIdx = -1, fromIdx = -1;
+                for (int i = 0; i < (int)tokens.size(); i++) {
+                    if (toUpper(tokens[i]) == "ON") onIdx = i;
+                    if (toUpper(tokens[i]) == "FROM") fromIdx = i;
+                }
+                if (onIdx > 0 && fromIdx > onIdx) {
+                    for (int i = onIdx + 1; i < fromIdx; i++) {
+                        std::string col = tokens[i];
+                        if (!col.empty() && col.back() == ',') col.pop_back();
+                        if (!col.empty()) cmd.statsCols.push_back(col);
+                    }
+                    cmd.statsTable = tokens[fromIdx + 1];
+                }
+            }
+
         // ── Phase 44: CALL ────────────────────────────────────────
         // Syntax: CALL name(arg1, arg2, ...)
         } else if (kw0 == "CALL") {
@@ -2140,6 +2219,12 @@ public:
                     if (!cur.empty()) cmd.callArgs.push_back(cur);
                 }
             }
+
+        // ── Phase 150: DROP FUNCTION ──────────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "FUNCTION") {
+            cmd.type = CommandType::DROP_FUNCTION;
+            if (tokens.size() >= 3) cmd.routineName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
 
         // ── Phase 44: DROP PROCEDURE ──────────────────────────────
         } else if (kw0 == "DROP" && kw1 == "PROCEDURE") {
@@ -2663,11 +2748,21 @@ public:
             } else if (kw1 == "VACUUM" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_VACUUM_STATUS;
-            // Phase 86: SHOW STATISTICS FOR <table>
-            } else if (kw1 == "STATISTICS" && tokens.size() >= 4 &&
-                       toUpper(tokens[2]) == "FOR") {
-                cmd.type = CommandType::SHOW_STATISTICS_FOR;
-                cmd.tableName = tokens[3];
+            // Phase 149: SHOW STATISTICS [FOR tablename]
+            } else if (kw1 == "STATISTICS") {
+                cmd.type = CommandType::SHOW_STATISTICS;
+                // optional: FOR tablename
+                for (int i = 0; i < (int)tokens.size() - 1; i++)
+                    if (toUpper(tokens[i]) == "FOR") { cmd.statsTable = tokens[i + 1]; break; }
+            // Phase 149: SHOW TABLE STATS [FOR tablename]
+            } else if (kw1 == "TABLE" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATS") {
+                cmd.type = CommandType::SHOW_TABLE_STATS;
+                for (int i = 0; i < (int)tokens.size() - 1; i++)
+                    if (toUpper(tokens[i]) == "FOR") { cmd.statsTable = tokens[i + 1]; break; }
+            // Phase 150: SHOW FUNCTIONS
+            } else if (kw1 == "FUNCTIONS") {
+                cmd.type = CommandType::SHOW_FUNCTIONS;
             // Phase 89: SHOW SERVERS
             } else if (kw1 == "SERVERS") {
                 cmd.type = CommandType::SHOW_SERVERS;
@@ -3326,7 +3421,9 @@ public:
                         "ROUTING", "OPTIMIZER_TRACE", "MAX_PARALLEL_WORKERS", "PARALLEL_THRESHOLD",
                         "AUDIT_LOG", "AUDIT_LOG_FILE", "ALLOW_HOST", "DENY_HOST", "BLACKLIST_QUERY",
                         "PASSWORD_MIN_LENGTH", "PASSWORD_REQUIRE_SPECIAL",
-                        "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT"
+                        "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT",
+                        // Phase 149: Optimizer hints
+                        "ENABLE_SEQSCAN", "ENABLE_INDEXSCAN", "ENABLE_HASHJOIN", "ENABLE_NESTLOOP"
                     };
                     for (const auto& kv : knownSetVars) {
                         if (lhs == kv) { cmd.type = CommandType::SET_CACHE; break; }

@@ -4254,6 +4254,212 @@ static void testGroup60() {
       check(dlm.isFreeLock("res1"), "DistributedLockManager: isFreeLock after release -> true"); }
 }
 
+static void testGroup61() {
+    std::cout << "\n--- Group 61: Phase 149 Advanced Statistics + Optimizer Hints ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto e = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), engine); };
+
+    e("CREATE TABLE products (id INT, name TEXT, price FLOAT)");
+    e("INSERT INTO products VALUES (1, 'Apple', 1.5)");
+    e("INSERT INTO products VALUES (2, 'Banana', 0.8)");
+    e("INSERT INTO products VALUES (3, 'Cherry', 3.2)");
+
+    // 1. ANALYZE TABLE
+    { auto r = e("ANALYZE TABLE products");
+      check(r.message == "ANALYZE 1", "ANALYZE TABLE -> ANALYZE 1"); }
+
+    // 2. SHOW TABLE STATS FOR products — has rows
+    { auto r = e("SHOW TABLE STATS FOR products");
+      check(!r.columns.empty() && r.columns[0].name == "Table", "SHOW TABLE STATS cols[0] = Table");
+      check(!r.rows.empty(), "SHOW TABLE STATS FOR products -> has rows");
+      check(!r.rows.empty() && r.rows[0].values[0] == "products", "SHOW TABLE STATS table name = products"); }
+
+    // 3. SHOW TABLE STATS FOR products -> row count = 3
+    { auto r = e("SHOW TABLE STATS FOR products");
+      check(!r.rows.empty() && r.rows[0].values[1] == "3", "SHOW TABLE STATS row count = 3"); }
+
+    // 4. SHOW TABLE STATS (all)
+    { auto r = e("SHOW TABLE STATS");
+      check(!r.rows.empty(), "SHOW TABLE STATS -> at least 1 row"); }
+
+    // 5. CREATE STATISTICS
+    { auto r = e("CREATE STATISTICS price_stats ON name, price FROM products");
+      check(r.message == "CREATE STATISTICS", "CREATE STATISTICS -> CREATE STATISTICS"); }
+
+    // 6. SHOW STATISTICS -> has cols
+    { auto r = e("SHOW STATISTICS");
+      check(!r.columns.empty() && r.columns[0].name == "Name", "SHOW STATISTICS cols[0] = Name");
+      check(!r.rows.empty(), "SHOW STATISTICS -> at least 1 row"); }
+
+    // 7. SHOW STATISTICS -> first row is price_stats
+    { auto r = e("SHOW STATISTICS");
+      check(!r.rows.empty() && r.rows[0].values[0] == "price_stats", "SHOW STATISTICS first row = price_stats"); }
+
+    // 8. SHOW STATISTICS FOR products
+    { auto r = e("SHOW STATISTICS FOR products");
+      check(!r.rows.empty(), "SHOW STATISTICS FOR products -> rows >= 1"); }
+
+    // 9. SHOW STATISTICS FOR unknown table (empty)
+    { auto r = e("SHOW STATISTICS FOR unknowntable");
+      check(r.rows.empty(), "SHOW STATISTICS FOR unknowntable -> empty"); }
+
+    // 10. SET enable_seqscan = OFF
+    { auto r = e("SET enable_seqscan = OFF");
+      check(r.message == "SET", "SET enable_seqscan = OFF -> SET"); }
+
+    // 11. SET enable_indexscan = OFF
+    { auto r = e("SET enable_indexscan = OFF");
+      check(r.message == "SET", "SET enable_indexscan = OFF -> SET"); }
+
+    // 12. SET enable_hashjoin = OFF
+    { auto r = e("SET enable_hashjoin = OFF");
+      check(r.message == "SET", "SET enable_hashjoin = OFF -> SET"); }
+
+    // 13. SET enable_nestloop = OFF
+    { auto r = e("SET enable_nestloop = OFF");
+      check(r.message == "SET", "SET enable_nestloop = OFF -> SET"); }
+
+    // 14. SET enable_seqscan = ON
+    { auto r = e("SET enable_seqscan = ON");
+      check(r.message == "SET", "SET enable_seqscan = ON -> SET"); }
+
+    // 15. ANALYZE after more inserts
+    e("INSERT INTO products VALUES (4, 'Date', 5.0)");
+    { auto r = e("ANALYZE TABLE products");
+      check(r.message == "ANALYZE 1", "ANALYZE TABLE after insert -> ANALYZE 1"); }
+    { auto r = e("SHOW TABLE STATS FOR products");
+      check(!r.rows.empty() && r.rows[0].values[1] == "4", "SHOW TABLE STATS after insert -> 4 rows"); }
+
+    // 16. Multiple stats objects
+    { auto r = e("CREATE STATISTICS id_stats ON id FROM products");
+      check(r.message == "CREATE STATISTICS", "CREATE STATISTICS id_stats -> ok"); }
+    { auto r = e("SHOW STATISTICS FOR products");
+      check(r.rows.size() >= 2, "SHOW STATISTICS FOR products -> >= 2 objects"); }
+
+    // 17. CREATE STATISTICS with 3 columns
+    { auto r = e("CREATE STATISTICS full_stats ON id, name, price FROM products");
+      check(r.message == "CREATE STATISTICS", "CREATE STATISTICS 3 cols -> ok"); }
+    { auto r = e("SHOW STATISTICS");
+      check(r.rows.size() >= 3, "SHOW STATISTICS -> >= 3 objects"); }
+
+    // 18. Table stats pages > 0
+    { auto r = e("SHOW TABLE STATS FOR products");
+      int pages = (!r.rows.empty()) ? std::stoi(r.rows[0].values[2]) : 0;
+      check(pages >= 1, "SHOW TABLE STATS pages >= 1"); }
+
+    // 19-20. Stats for big table
+    e("CREATE TABLE bigtable (id INT, val TEXT)");
+    for (int i = 0; i < 200; i++)
+        e("INSERT INTO bigtable VALUES (" + std::to_string(i) + ", 'v" + std::to_string(i) + "')");
+    { auto r = e("ANALYZE TABLE bigtable");
+      check(r.message == "ANALYZE 1", "ANALYZE bigtable -> ANALYZE 1"); }
+    { auto r = e("SHOW TABLE STATS FOR bigtable");
+      int bigpages = (!r.rows.empty()) ? std::stoi(r.rows[0].values[2]) : 0;
+      check(bigpages >= 2, "bigtable pages >= 2 (200 rows / 100)"); }
+}
+
+static void testGroup62() {
+    std::cout << "\n--- Group 62: Phase 150 User-Defined Functions + Stored Procedures V2 ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto e = [&](const std::string& sql) { return milansql::dispatch(parser.parse(sql), engine); };
+
+    // 1. CREATE FUNCTION
+    { auto r = e("CREATE FUNCTION add_nums(a INT, b INT) RETURNS INT AS $$ SELECT a + b $$ LANGUAGE sql");
+      check(r.message == "CREATE FUNCTION", "CREATE FUNCTION add_nums -> CREATE FUNCTION"); }
+
+    // 2. SHOW FUNCTIONS -> has columns
+    { auto r = e("SHOW FUNCTIONS");
+      check(!r.columns.empty() && r.columns[0].name == "Name", "SHOW FUNCTIONS cols[0] = Name"); }
+
+    // 3. SHOW FUNCTIONS -> has rows
+    { auto r = e("SHOW FUNCTIONS");
+      check(!r.rows.empty(), "SHOW FUNCTIONS -> at least 1 row"); }
+
+    // 4. SHOW FUNCTIONS -> first row is add_nums
+    { auto r = e("SHOW FUNCTIONS");
+      check(!r.rows.empty() && r.rows[0].values[0] == "add_nums", "SHOW FUNCTIONS first row = add_nums"); }
+
+    // 5. SHOW FUNCTIONS -> return type is INT
+    { auto r = e("SHOW FUNCTIONS");
+      check(!r.rows.empty() && r.rows[0].values[1] == "INT", "SHOW FUNCTIONS ReturnType = INT"); }
+
+    // 6. CREATE PROCEDURE
+    { auto r = e("CREATE PROCEDURE log_event(msg TEXT) AS $$ INSERT INTO logs VALUES (1, msg) $$ LANGUAGE sql");
+      check(r.message == "CREATE PROCEDURE", "CREATE PROCEDURE log_event -> CREATE PROCEDURE"); }
+
+    // 7. SHOW PROCEDURES -> has columns
+    { auto r = e("SHOW PROCEDURES");
+      check(!r.columns.empty() && r.columns[0].name == "Name", "SHOW PROCEDURES cols[0] = Name"); }
+
+    // 8. SHOW PROCEDURES -> has rows
+    { auto r = e("SHOW PROCEDURES");
+      check(!r.rows.empty(), "SHOW PROCEDURES -> at least 1 row"); }
+
+    // 9. SHOW PROCEDURES -> first row is log_event
+    { auto r = e("SHOW PROCEDURES");
+      check(!r.rows.empty() && r.rows[0].values[0] == "log_event", "SHOW PROCEDURES first row = log_event"); }
+
+    // 10. SHOW FUNCTIONS does not show procedures
+    { auto r = e("SHOW FUNCTIONS");
+      bool found = false;
+      for (auto& row : r.rows) if (row.values[0] == "log_event") found = true;
+      check(!found, "SHOW FUNCTIONS does not show log_event"); }
+
+    // 11. SHOW PROCEDURES does not show functions
+    { auto r = e("SHOW PROCEDURES");
+      bool found = false;
+      for (auto& row : r.rows) if (row.values[0] == "add_nums") found = true;
+      check(!found, "SHOW PROCEDURES does not show add_nums"); }
+
+    // 12. CALL procedure
+    { auto r = e("CALL log_event('hello')");
+      check(r.error.empty(), "CALL log_event -> no error"); }
+
+    // 13. CREATE second function
+    { auto r = e("CREATE FUNCTION greet(name TEXT) RETURNS TEXT AS $$ SELECT 'Hello, ' || name $$ LANGUAGE sql");
+      check(r.message == "CREATE FUNCTION", "CREATE FUNCTION greet -> CREATE FUNCTION"); }
+
+    // 14. SHOW FUNCTIONS shows both
+    { auto r = e("SHOW FUNCTIONS");
+      check(r.rows.size() >= 2, "SHOW FUNCTIONS shows >= 2 functions"); }
+
+    // 15. DROP FUNCTION
+    { auto r = e("DROP FUNCTION greet");
+      check(r.message == "DROP FUNCTION", "DROP FUNCTION greet -> DROP FUNCTION"); }
+
+    // 16. SHOW FUNCTIONS after drop -> 1
+    { auto r = e("SHOW FUNCTIONS");
+      check(r.rows.size() == 1, "SHOW FUNCTIONS after drop -> 1 function"); }
+
+    // 17. DROP PROCEDURE
+    { auto r = e("DROP PROCEDURE log_event");
+      check(r.error.empty(), "DROP PROCEDURE log_event -> no error"); }
+
+    // 18. SHOW PROCEDURES after drop -> 0
+    { auto r = e("SHOW PROCEDURES");
+      check(r.rows.size() == 0, "SHOW PROCEDURES after drop -> 0 procedures"); }
+
+    // 19. CREATE FUNCTION no params
+    { auto r = e("CREATE FUNCTION get_version() RETURNS TEXT AS $$ SELECT '8.1.0' $$ LANGUAGE sql");
+      check(r.message == "CREATE FUNCTION", "CREATE FUNCTION no params -> CREATE FUNCTION"); }
+
+    // 20. SHOW FUNCTIONS shows get_version
+    { auto r = e("SHOW FUNCTIONS");
+      bool found = false;
+      for (auto& row : r.rows) if (row.values[0] == "get_version") found = true;
+      check(found, "SHOW FUNCTIONS shows get_version"); }
+}
+
 // MAIN
 // ============================================================
 
@@ -4429,6 +4635,12 @@ int main() {
     }
     try { testGroup60(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 60 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup61(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 61 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup62(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 62 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

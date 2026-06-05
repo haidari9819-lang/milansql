@@ -15,6 +15,7 @@ struct QueryResult {
     std::vector<milansql::Column> columns;
     std::vector<milansql::Row>    rows;
     std::string                   error;  // non-empty on failure
+    std::string                   message; // Phase 149/150: command result message
 };
 
 inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engine) {
@@ -74,6 +75,13 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         else if (cmd.varName == "CONNECTION_RATE_LIMIT") {
             try { engine.accessControl.setConnectionRateLimit(std::stoi(cmd.varValue)); } catch (...) {}
         }
+        // Phase 149: Optimizer hints
+        else if (cmd.varName == "ENABLE_SEQSCAN" || cmd.varName == "ENABLE_INDEXSCAN" ||
+                 cmd.varName == "ENABLE_HASHJOIN" || cmd.varName == "ENABLE_NESTLOOP") {
+            engine.optimizerHints[cmd.varName] = cmd.varValue;
+            qr.message = "SET";
+        }
+        if (qr.message.empty()) qr.message = "SET";
         break;
 
     case milansql::CommandType::SHOW_BACKENDS: {
@@ -748,6 +756,142 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         bool free = engine.isFreeLock(cmd.lockName);
         qr.columns = {milansql::Column{"Result","INT"}};
         qr.rows.push_back(milansql::Row({free ? "1" : "0"}));
+        break;
+    }
+
+    // ── Phase 149: Advanced Statistics + Optimizer Hints ─────────
+    case milansql::CommandType::ANALYZE_TABLE: {
+        // Phase 149: populate statsManager
+        std::string tblTarget = !cmd.statsTable.empty() ? cmd.statsTable : cmd.tableName;
+        if (!tblTarget.empty() && tblTarget != "*") {
+            try {
+                const auto& tbl = engine.selectAll(tblTarget);
+                std::vector<std::string> cols;
+                for (auto& c : tbl.columns()) cols.push_back(c.name);
+                engine.statsManager.analyzeTable(tblTarget, (long long)tbl.rows().size(), cols);
+                qr.message = "ANALYZE 1";
+            } catch (...) {
+                qr.error = "Table not found: " + tblTarget;
+            }
+        } else {
+            qr.message = "ANALYZE 1";
+        }
+        break;
+    }
+
+    case milansql::CommandType::CREATE_STATISTICS: {
+        engine.statsManager.createStatistics(cmd.statsName, cmd.statsTable, cmd.statsCols);
+        qr.message = "CREATE STATISTICS";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_STATISTICS: {
+        qr.columns = {milansql::Column{"Name","TEXT"}, milansql::Column{"Table","TEXT"},
+                      milansql::Column{"Columns","TEXT"}, milansql::Column{"Created","TEXT"}};
+        auto& defs = engine.statsManager.getAllStatsDefs();
+        for (auto& [k, v] : defs) {
+            if (!cmd.statsTable.empty() && v.tableName != cmd.statsTable) continue;
+            std::string colList;
+            for (auto& c : v.columns) colList += c + ",";
+            if (!colList.empty()) colList.pop_back();
+            qr.rows.push_back(milansql::Row({v.name, v.tableName, colList, v.createdAt}));
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_TABLE_STATS: {
+        qr.columns = {milansql::Column{"Table","TEXT"}, milansql::Column{"Rows","INT"},
+                      milansql::Column{"Pages","INT"}, milansql::Column{"LastAnalyzed","TEXT"}};
+        auto& all = engine.statsManager.getAllTableStats();
+        for (auto& [k, v] : all) {
+            if (!cmd.statsTable.empty() && v.tableName != cmd.statsTable) continue;
+            qr.rows.push_back(milansql::Row({v.tableName, std::to_string(v.rowCount),
+                                             std::to_string(v.pageCount), v.lastAnalyzed}));
+        }
+        break;
+    }
+
+    // ── Phase 150: CREATE_PROCEDURE (also register in routineManager) ─
+    case milansql::CommandType::CREATE_PROCEDURE: {
+        milansql::Routine rp;
+        rp.name = cmd.procedureName;
+        rp.kind = "PROCEDURE";
+        // Get body from either procedureBody or routineBody
+        rp.body = !cmd.routineBody.empty() ? cmd.routineBody : cmd.procedureBody;
+        rp.language = "sql";
+        rp.createdAt = "2026-06-05";
+        for (auto& p : cmd.procedureParams) {
+            std::string t2 = p.second;
+            for (auto& c : t2) c = (char)std::toupper((unsigned char)c);
+            rp.params.push_back({p.first, t2});
+        }
+        engine.routineManager.createRoutine(rp);
+        qr.message = "CREATE PROCEDURE";
+        break;
+    }
+
+    case milansql::CommandType::DROP_PROCEDURE: {
+        engine.routineManager.dropRoutine(cmd.procedureName);
+        qr.message = "DROP PROCEDURE";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_PROCEDURES: {
+        qr.columns = {milansql::Column{"Name","TEXT"}, milansql::Column{"Params","TEXT"},
+                      milansql::Column{"Language","TEXT"}, milansql::Column{"Created","TEXT"}};
+        for (auto& r : engine.routineManager.getByKind("PROCEDURE")) {
+            std::string params;
+            for (auto& p : r.params) params += p.name + " " + p.type + ",";
+            if (!params.empty()) params.pop_back();
+            qr.rows.push_back(milansql::Row({r.name, params, r.language, r.createdAt}));
+        }
+        break;
+    }
+
+    // ── Phase 150: User-Defined Functions V2 ─────────────────────
+    case milansql::CommandType::CREATE_FUNCTION: {
+        milansql::Routine r;
+        r.name = cmd.routineName;
+        r.kind = "FUNCTION";
+        r.body = cmd.routineBody;
+        r.returnType = cmd.routineReturnType;
+        if (!cmd.routineParams.empty()) {
+            // parse "p1 TYPE, p2 TYPE"
+            std::istringstream ss(cmd.routineParams[0]);
+            std::string token;
+            std::vector<std::string> ptokens;
+            while (ss >> token) ptokens.push_back(token);
+            for (size_t i = 0; i + 1 < ptokens.size(); i += 2) {
+                std::string t2 = ptokens[i + 1];
+                if (!t2.empty() && t2.back() == ',') t2.pop_back();
+                // uppercase type
+                for (auto& c : t2) c = (char)std::toupper((unsigned char)c);
+                r.params.push_back({ptokens[i], t2});
+            }
+        }
+        r.createdAt = "2026-06-05";
+        r.language = "sql";
+        engine.routineManager.createRoutine(r);
+        qr.message = "CREATE FUNCTION";
+        break;
+    }
+
+    case milansql::CommandType::DROP_FUNCTION: {
+        engine.routineManager.dropRoutine(cmd.routineName);
+        qr.message = "DROP FUNCTION";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_FUNCTIONS: {
+        qr.columns = {milansql::Column{"Name","TEXT"}, milansql::Column{"ReturnType","TEXT"},
+                      milansql::Column{"Params","TEXT"}, milansql::Column{"Language","TEXT"},
+                      milansql::Column{"Created","TEXT"}};
+        for (auto& r : engine.routineManager.getByKind("FUNCTION")) {
+            std::string params;
+            for (auto& p : r.params) params += p.name + " " + p.type + ",";
+            if (!params.empty()) params.pop_back();
+            qr.rows.push_back(milansql::Row({r.name, r.returnType, params, r.language, r.createdAt}));
+        }
         break;
     }
 

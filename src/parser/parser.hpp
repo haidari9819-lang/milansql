@@ -1334,7 +1334,9 @@ public:
                         }
                     }
                 }
-                if (hasFuncTok) {
+                // Bug Fix: also route any no-FROM SELECT to parseSelectFull
+                // (handles NULL IS NULL, 1+2, -1*-1, string concat, etc.)
+                if (hasFuncTok || !hasFrom) {
                     parseSelectFull(input, cmd);
                     return cmd;
                 }

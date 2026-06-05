@@ -10,6 +10,116 @@
 
 namespace milansql {
 
+// ── Bug Fix: Scalar expression evaluator for SELECT without FROM ──────────
+// Handles: NULL IS NULL/NOT NULL, arithmetic, string concat ||
+inline std::string evalScalarExpr(const std::string& expr) {
+    // Quote-aware tokenizer (respects single-quoted strings as single tokens)
+    std::vector<std::string> toks;
+    {
+        std::string cur;
+        bool inQuote = false;
+        for (char c : expr) {
+            if (inQuote) {
+                cur += c;
+                if (c == '\'') { inQuote = false; toks.push_back(cur); cur.clear(); }
+            } else if (c == '\'') {
+                if (!cur.empty()) { toks.push_back(cur); cur.clear(); }
+                cur += c; inQuote = true;
+            } else if (c == ' ' || c == '\t') {
+                if (!cur.empty()) { toks.push_back(cur); cur.clear(); }
+            } else if (c == '(' || c == ')' || c == ',') {
+                if (!cur.empty()) { toks.push_back(cur); cur.clear(); }
+                toks.push_back(std::string(1, c));
+            } else {
+                cur += c;
+            }
+        }
+        if (!cur.empty()) toks.push_back(cur);
+    }
+    if (toks.empty()) return expr;
+
+    // Single token: strip quotes or return as-is
+    if (toks.size() == 1) {
+        const std::string& t = toks[0];
+        if (t.size() >= 2 && t.front() == '\'' && t.back() == '\'')
+            return t.substr(1, t.size() - 2);
+        return t;
+    }
+
+    auto toUp = [](std::string s) { for (char& c : s) c = (char)std::toupper((unsigned char)c); return s; };
+    auto stripQ = [](const std::string& s) -> std::string {
+        if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'')
+            return s.substr(1, s.size() - 2);
+        return s;
+    };
+
+    // IS NULL / IS NOT NULL: "val IS NULL" or "val IS NOT NULL"
+    if (toks.size() == 3 && toUp(toks[1]) == "IS" && toUp(toks[2]) == "NULL") {
+        std::string v = stripQ(toks[0]);
+        return (toUp(v) == "NULL") ? "1" : "0";
+    }
+    if (toks.size() == 4 && toUp(toks[1]) == "IS" && toUp(toks[2]) == "NOT" && toUp(toks[3]) == "NULL") {
+        std::string v = stripQ(toks[0]);
+        return (toUp(v) == "NULL") ? "0" : "1";
+    }
+
+    // String concat: a || b || c ...
+    {
+        bool isConcat = false;
+        for (size_t i = 1; i < toks.size(); i += 2) {
+            if (i < toks.size() && toks[i] == "||") { isConcat = true; }
+            else if (i < toks.size() && toks[i] != "||") { isConcat = false; break; }
+        }
+        if (isConcat && toks.size() >= 3 && (toks.size() % 2) == 1) {
+            std::string result;
+            for (size_t i = 0; i < toks.size(); i += 2)
+                result += stripQ(toks[i]);
+            return result;
+        }
+    }
+
+    // Arithmetic: a +/-/*/  b (3 tokens or handle negatives)
+    // Flatten negative numbers: -1 * -1 → tokens ["-","1","*","-","1"] → treat as "-1", "*", "-1"
+    std::vector<std::string> numToks;
+    {
+        bool prevWasOp = true;  // start as if after operator
+        for (size_t i = 0; i < toks.size(); ++i) {
+            if (prevWasOp && toks[i] == "-" && i + 1 < toks.size()) {
+                numToks.push_back("-" + toks[i + 1]);
+                ++i;
+                prevWasOp = false;
+            } else if (toks[i] == "+" || toks[i] == "-" || toks[i] == "*" || toks[i] == "/") {
+                numToks.push_back(toks[i]);
+                prevWasOp = true;
+            } else {
+                numToks.push_back(toks[i]);
+                prevWasOp = false;
+            }
+        }
+    }
+    // Simple left-to-right evaluation of * / then + -
+    if (numToks.size() >= 3 && (numToks.size() % 2) == 1) {
+        try {
+            // Left-to-right evaluation (no precedence, simple)
+            double result = std::stod(stripQ(numToks[0]));
+            for (size_t i = 1; i + 1 < numToks.size(); i += 2) {
+                double rhs = std::stod(stripQ(numToks[i + 1]));
+                const std::string& op = numToks[i];
+                if (op == "+") result += rhs;
+                else if (op == "-") result -= rhs;
+                else if (op == "*") result *= rhs;
+                else if (op == "/" && rhs != 0) result /= rhs;
+                else return expr;
+            }
+            if (result == std::floor(result) && std::abs(result) < 1e15)
+                return std::to_string(static_cast<long long>(result));
+            return std::to_string(result);
+        } catch (...) {}
+    }
+
+    return expr;  // fallback: return as-is
+}
+
 // Lightweight structured result (used by tests instead of stdout output)
 struct QueryResult {
     std::vector<milansql::Column> columns;
@@ -415,6 +525,47 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
 
     case milansql::CommandType::SELECT: {
         try {
+            // ── Bug Fix: Resolve subqueries (IN/NOT IN SELECT) ──────────────
+            for (const auto& sq : cmd.subqueries) {
+                if (sq.condIdx < cmd.whereConds.size()) {
+                    cmd.whereConds[sq.condIdx].inList =
+                        engine.subqueryValues(sq.subTable, sq.subCol,
+                                              sq.subWhere, sq.subWhereLogic);
+                }
+            }
+
+            // ── Bug Fix: Scalar SELECT without FROM ──────────────────────────
+            if (cmd.tableName.empty() && cmd.hasCaseItems && !cmd.selectItems.empty()) {
+                std::vector<milansql::Column> resCols;
+                std::vector<std::string>      resVals;
+                for (const auto& item : cmd.selectItems) {
+                    std::string header = item.alias;
+                    if (header.empty() && item.isFuncExpr) {
+                        header = item.funcName + "(";
+                        for (size_t ai = 0; ai < item.funcArgs.size(); ++ai) {
+                            if (ai) header += ",";
+                            header += item.funcArgs[ai];
+                        }
+                        header += ")";
+                    }
+                    if (header.empty()) header = item.colName;
+                    resCols.push_back(milansql::Column(header, "TEXT"));
+
+                    std::string val;
+                    if (item.isFuncExpr) {
+                        val = engine.evalFuncPublic(item.funcName, item.funcArgs);
+                    } else {
+                        // Bug Fix: evaluate scalar expressions (arithmetic, IS NULL, concat)
+                        val = evalScalarExpr(item.colName);
+                    }
+                    resVals.push_back(val);
+                }
+                for (const auto& c : resCols) qr.columns.push_back(c);
+                qr.rows.push_back(milansql::Row(std::move(resVals)));
+                break;
+            }
+            if (cmd.tableName.empty()) break;  // nothing to do
+
             if (cmd.isJoin) {
                 milansql::Table tbl = engine.executeJoins(cmd.tableName, cmd.joinClauses,
                                                           cmd.whereConds, cmd.whereLogic);
@@ -526,11 +677,51 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                     result = std::move(distResult);
                 }
 
+                // ── Bug Fix: Column projection (including window functions) ─────
+                if (cmd.hasCaseItems && !cmd.selectItems.empty()) {
+                    bool hasWin = false;
+                    for (const auto& si : cmd.selectItems)
+                        if (si.isWindowFunc) { hasWin = true; break; }
+                    if (hasWin)
+                        result = engine.projectWithWindowItems(result, cmd.selectItems);
+                    else
+                        result = engine.projectWithItems(result, cmd.selectItems);
+                } else if (!cmd.selectColumns.empty()) {
+                    result = result.project(cmd.selectColumns);
+                }
+
+                // ── Bug Fix: ORDER BY for regular SELECT ─────────────────────
+                if (!cmd.orderByCols.empty()) {
+                    auto& rows = const_cast<std::vector<milansql::Row>&>(result.rows());
+                    std::stable_sort(rows.begin(), rows.end(),
+                        [&](const milansql::Row& a, const milansql::Row& b) {
+                            for (const auto& ob : cmd.orderByCols) {
+                                size_t ci = 0;
+                                for (size_t i = 0; i < result.columns().size(); ++i) {
+                                    if (result.columns()[i].name == ob.first) { ci = i; break; }
+                                }
+                                const std::string& va = ci < a.values.size() ? a.values[ci] : "";
+                                const std::string& vb = ci < b.values.size() ? b.values[ci] : "";
+                                // Try numeric comparison
+                                try {
+                                    double da = std::stod(va), db = std::stod(vb);
+                                    if (da != db) return ob.second ? da > db : da < db;
+                                } catch (...) {
+                                    if (va != vb) return ob.second ? va > vb : va < vb;
+                                }
+                            }
+                            return false;
+                        });
+                }
+
                 for (const auto& c : result.columns()) qr.columns.push_back(c);
                 int limitCount = cmd.limit;
+                int offsetCount = cmd.limitOffset;  // ── Bug Fix: OFFSET support
                 size_t count = 0;
+                size_t skipped = 0;
                 for (const auto& r : result.rows()) {
                     if (r.xmax != 0) continue;
+                    if (offsetCount > 0 && (int)skipped < offsetCount) { ++skipped; continue; }
                     if (limitCount >= 0 && (int)count >= limitCount) break;
                     qr.rows.push_back(r);
                     ++count;

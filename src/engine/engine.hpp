@@ -5215,12 +5215,13 @@ private:
             for (const auto& a : args) result += resolveArg(a);
             return result;
         }
-        if (fn == "SUBSTR") {
-            if (args.size() < 3) return args.empty() ? "" : resolveArg(args[0]);
+        if (fn == "SUBSTR" || fn == "SUBSTRING") {
+            if (args.size() < 2) return args.empty() ? "" : resolveArg(args[0]);
             std::string v = resolveArg(args[0]);
             int pos = 1, len = -1;
             try { pos = std::stoi(resolveArg(args[1])); } catch (...) {}
-            try { len = std::stoi(resolveArg(args[2])); } catch (...) {}
+            if (args.size() >= 3)
+                try { len = std::stoi(resolveArg(args[2])); } catch (...) {}
             if (pos < 1) pos = 1;
             size_t start = static_cast<size_t>(pos - 1);
             if (start >= v.size()) return "";
@@ -5348,10 +5349,40 @@ private:
         }
         // ── Phase 40: CAST ───────────────────────────────────────
         if (fn == "CAST") {
-            if (args.size() < 2) return "";
+            // Bug Fix: handle malformed CAST where arg contains "expr AS TYPE"
+            std::vector<std::string> castArgs = args;
+            if (castArgs.size() == 1) {
+                // Try splitting "expr AS TYPE" → ["expr", "TYPE"]
+                std::string& a = castArgs[0];
+                std::string au = a;
+                for (char& c : au) c = (char)std::toupper((unsigned char)c);
+                auto asPos = au.rfind(" AS ");
+                if (asPos == std::string::npos) {
+                    // Also try space-separated: "expr AS TYPE" tokenized
+                    std::vector<std::string> at;
+                    std::istringstream iss(a);
+                    std::string tok;
+                    while (iss >> tok) at.push_back(tok);
+                    for (size_t ki = 0; ki + 1 < at.size(); ++ki) {
+                        std::string uk = at[ki];
+                        for (char& c : uk) c = (char)std::toupper((unsigned char)c);
+                        if (uk == "AS") {
+                            // Rejoin before AS as castArgs[0], after AS as castArgs[1]
+                            std::string before, after;
+                            for (size_t bi = 0; bi < ki; ++bi) { if (bi) before += " "; before += at[bi]; }
+                            for (size_t bi = ki + 1; bi < at.size(); ++bi) { if (bi > ki + 1) after += " "; after += at[bi]; }
+                            castArgs = {before, after};
+                            break;
+                        }
+                    }
+                } else {
+                    castArgs = {a.substr(0, asPos), a.substr(asPos + 4)};
+                }
+            }
+            if (castArgs.size() < 2) return args.empty() ? "" : evalExprStr(args[0], tbl.columns(), row);
             // args[0] = inner expression (token string), args[1] = target type
-            std::string inner = evalExprStr(args[0], tbl.columns(), row);
-            std::string type  = toUpperStatic(args[1]);
+            std::string inner = evalExprStr(castArgs[0], tbl.columns(), row);
+            std::string type  = toUpperStatic(castArgs[1]);
             if (type == "INT") {
                 try { return std::to_string((long long)std::stold(inner)); }
                 catch (...) { return "0"; }

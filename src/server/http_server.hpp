@@ -94,6 +94,8 @@ static HttpRequest parseHttpRequest(sock_t sock) {
         if (n <= 0) break;
         buf[n] = '\0';
         raw += buf;
+        // Guard: reject headers larger than 64 KB (likely attack)
+        if (raw.size() > 65536) return {};
     }
 
     HttpRequest req;
@@ -134,7 +136,20 @@ static HttpRequest parseHttpRequest(sock_t sock) {
 
     auto clIt = req.headers.find("content-length");
     if (clIt != req.headers.end()) {
-        int contentLen = std::stoi(clIt->second);
+        int contentLen = 0;
+        try { contentLen = std::stoi(clIt->second); } catch (...) { return req; }
+        // 10 MB body limit — return 413 and discard connection
+        if (contentLen < 0 || contentLen > 10 * 1024 * 1024) {
+            static const char resp413[] =
+                "HTTP/1.1 413 Request Entity Too Large\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 35\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Request body too large\"}";
+            ::send(sock, resp413, static_cast<int>(sizeof(resp413) - 1), 0);
+            return {};  // empty method → handleClient closes socket immediately
+        }
         size_t headerEnd = raw.find("\r\n\r\n");
         size_t bodyStart = headerEnd + 4;
         std::string bodyPart = raw.substr(bodyStart);

@@ -6065,7 +6065,15 @@ private:
                  "ARRAY_LENGTH", "ARRAY_APPEND", "ARRAY_REMOVE", "ARRAY_CONTAINS",
                  "ARRAY_GET", "ARRAY_TO_STRING", "STRING_TO_ARRAY", "UNNEST",
                  // Phase 97: Time-Series
-                 "TIME_BUCKET"};
+                 "TIME_BUCKET",
+                 // Phase 157: System info + new string/math functions
+                 "VERSION", "DATABASE", "USER", "CURRENT_USER", "SESSION_USER",
+                 "SYSTEM_USER", "CONNECTION_ID", "CHARSET", "COLLATION",
+                 "LEFT", "RIGHT", "LOCATE", "INSTR", "REVERSE", "REPEAT",
+                 "LPAD", "RPAD", "CONCAT_WS", "SPACE", "ASCII",
+                 "CHAR_LENGTH", "CHARACTER_LENGTH",
+                 "PI", "TRUNCATE", "TRUNC", "SIGN", "GREATEST", "LEAST",
+                 "SUBSTRING_INDEX"};
                 bool isStrFunc = false;
                 for (const auto& f : SFUNCS32) if (u == f) { isStrFunc = true; break; }
 

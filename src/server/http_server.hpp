@@ -755,6 +755,16 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                    << "\t" << t.tableName << "\t" << t.body << "\n";
     };
 
+    // Phase 157: Set current user in engine so USER()/CURRENT_USER() work
+    {
+        std::string uname = "root";
+        if (!isRoot && userId > 0) {
+            const AuthUser* au = authMgr_.getUserById(userId);
+            if (au) uname = au->username;
+        }
+        engine_.setCurrentUserDirect(uname);
+    }
+
     // Intercept special SQL commands
     auto sqlUp = [](std::string s) {
         for (auto& c : s) c = (char)toupper((unsigned char)c);
@@ -764,6 +774,34 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     while (!trimmed.empty() && (trimmed[0]==' '||trimmed[0]=='\t'||trimmed[0]=='\n'||trimmed[0]=='\r'))
         trimmed.erase(0,1);
     std::string upper = sqlUp(trimmed);
+
+    // Phase 157: @@variable intercepts (MySQL compatibility)
+    // Handle: SELECT @@version, SELECT @@version_comment, SELECT @@global.version, etc.
+    {
+        // Strip trailing semicolons for comparison
+        std::string u2 = upper;
+        while (!u2.empty() && (u2.back()==';'||u2.back()==' ')) u2.pop_back();
+        auto makeScalar = [](const std::string& col, const std::string& val) -> std::string {
+            return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
+        };
+        if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
+            return makeScalar("@@version", "8.7.0");
+        if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
+            return makeScalar("@@version_comment", "MilanSQL Database Engine");
+        if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
+            u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"8.7.0\",\"MilanSQL Database Engine\"]]}";
+        if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
+            return makeScalar("@@max_allowed_packet", "67108864");
+        if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
+            return makeScalar("@@sql_mode", "");
+        if (u2 == "SELECT @@CHARACTER_SET_CLIENT" || u2 == "SELECT @@GLOBAL.CHARACTER_SET_CLIENT")
+            return makeScalar("@@character_set_client", "utf8mb4");
+        if (u2 == "SELECT @@AUTOCOMMIT")
+            return makeScalar("@@autocommit", "1");
+        if (u2 == "SELECT @@TRANSACTION_ISOLATION" || u2 == "SELECT @@TX_ISOLATION")
+            return makeScalar("@@transaction_isolation", "READ-COMMITTED");
+    }
 
     // SHOW USERS
     if (upper == "SHOW USERS") {
@@ -945,20 +983,20 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                 // (after prefixing, check if user has shared access)
                 if (!cmd.tableName.empty()) {
                     std::string op = "SELECT";
-                    if (cmd.type == milansql::CmdType::INSERT) op = "INSERT";
-                    else if (cmd.type == milansql::CmdType::UPDATE) op = "UPDATE";
-                    else if (cmd.type == milansql::CmdType::DELETE_ROWS) op = "DELETE";
+                    if (cmd.type == milansql::CommandType::INSERT) op = "INSERT";
+                    else if (cmd.type == milansql::CommandType::UPDATE) op = "UPDATE";
+                    else if (cmd.type == milansql::CommandType::DELETE) op = "DELETE";
                     // Check if table belongs to this user OR they have a grant
                     bool ownTable = true; // will be their own after prefixing
                     (void)ownTable; (void)op;
                     cmd.tableName = prefix + cmd.tableName;
                 }
                 // Prefix join tables
-                for (auto& jt : cmd.joinTables) {
-                    if (!jt.tableName.empty() &&
-                        !(jt.tableName.size()>=2 && jt.tableName[0]=='_' && jt.tableName[1]=='_') &&
-                        !(jt.tableName.size()>2 && jt.tableName[0]=='u' && std::isdigit((unsigned char)jt.tableName[1])))
-                        jt.tableName = prefix + jt.tableName;
+                for (auto& jc : cmd.joinClauses) {
+                    if (!jc.table.empty() &&
+                        !(jc.table.size()>=2 && jc.table[0]=='_' && jc.table[1]=='_') &&
+                        !(jc.table.size()>2 && jc.table[0]=='u' && std::isdigit((unsigned char)jc.table[1])))
+                        jc.table = prefix + jc.table;
                 }
             } else {
                 // Root: handle "user.table" notation (cross-user)
@@ -1183,7 +1221,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v8.6.0\",";
+    json += "\"version\":\"MilanSQL v8.7.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1395,7 +1433,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v8.6.0</div>
+  <div class="logo">&#9889; MilanSQL v8.7.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -2059,7 +2097,7 @@ else{
 <div id="ms-login-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.88);z-index:9999;justify-content:center;align-items:center;">
   <div style="background:#1e1e2e;border:1px solid #313244;border-radius:14px;padding:44px 40px;width:340px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)">
     <div style="font-size:30px;font-weight:bold;color:#89dceb;margin-bottom:6px">&#9889; MilanSQL</div>
-    <div style="color:#a6adc8;margin-bottom:26px;font-size:12px">v8.6.0 &mdash; Multi-User Secure Database</div>
+    <div style="color:#a6adc8;margin-bottom:26px;font-size:12px">v8.7.0 &mdash; Multi-User Secure Database</div>
     <input id="ms-lu" type="text" placeholder="Username" autocomplete="username"
       style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:6px;padding:10px 12px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box">
     <input id="ms-lp" type="password" placeholder="Password" autocomplete="current-password"

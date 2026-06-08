@@ -3800,6 +3800,7 @@ public:
     }
 
     const std::string& getCurrentUser() const { return currentUser_; }
+    void setCurrentUserDirect(const std::string& name) { currentUser_ = name; }
 
     // ── Phase 78: Table Inheritance ──────────────────────────────
     bool tableHasParent(const std::string& tbl) const {
@@ -5699,6 +5700,153 @@ private:
             return vector_ext::evalVector(fn, rargs);
         }
 
+        // ── Phase 157: String functions (LEFT, RIGHT, LOCATE, REVERSE, etc.) ──
+        if (fn == "LEFT") {
+            if (args.size() < 2) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v = resolveArg(args[0]);
+            int n = 0;
+            try { n = std::stoi(resolveArg(args[1])); } catch (...) {}
+            if (n <= 0) return "";
+            return v.substr(0, static_cast<size_t>(n) > v.size() ? v.size() : static_cast<size_t>(n));
+        }
+        if (fn == "RIGHT") {
+            if (args.size() < 2) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v = resolveArg(args[0]);
+            int n = 0;
+            try { n = std::stoi(resolveArg(args[1])); } catch (...) {}
+            if (n <= 0) return "";
+            size_t sz = static_cast<size_t>(n);
+            if (sz >= v.size()) return v;
+            return v.substr(v.size() - sz);
+        }
+        if (fn == "LOCATE" || fn == "INSTR") {
+            // LOCATE(substr, str[, pos]) / INSTR(str, substr)
+            if (args.size() < 2) return "0";
+            std::string needle, haystack;
+            if (fn == "INSTR") { haystack = resolveArg(args[0]); needle = resolveArg(args[1]); }
+            else                { needle = resolveArg(args[0]); haystack = resolveArg(args[1]); }
+            size_t startPos = 0;
+            if (fn == "LOCATE" && args.size() >= 3) {
+                int p = 1;
+                try { p = std::stoi(resolveArg(args[2])); } catch (...) {}
+                if (p > 1) startPos = static_cast<size_t>(p - 1);
+            }
+            auto found = haystack.find(needle, startPos);
+            if (found == std::string::npos) return "0";
+            return std::to_string(found + 1);
+        }
+        if (fn == "REVERSE") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            std::reverse(v.begin(), v.end());
+            return v;
+        }
+        if (fn == "REPEAT") {
+            if (args.size() < 2) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v = resolveArg(args[0]);
+            int n = 0;
+            try { n = std::stoi(resolveArg(args[1])); } catch (...) {}
+            if (n <= 0) return "";
+            std::string res;
+            res.reserve(v.size() * static_cast<size_t>(n));
+            for (int k = 0; k < n; ++k) res += v;
+            return res;
+        }
+        if (fn == "LPAD") {
+            if (args.size() < 3) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v   = resolveArg(args[0]);
+            int width = 0;
+            try { width = std::stoi(resolveArg(args[1])); } catch (...) {}
+            std::string pad = resolveArg(args[2]);
+            if (pad.empty()) return v.substr(0, static_cast<size_t>(width));
+            while ((int)v.size() < width) v = pad + v;
+            return v.substr(v.size() > static_cast<size_t>(width) ? v.size() - static_cast<size_t>(width) : 0);
+        }
+        if (fn == "RPAD") {
+            if (args.size() < 3) return args.empty() ? "" : resolveArg(args[0]);
+            std::string v   = resolveArg(args[0]);
+            int width = 0;
+            try { width = std::stoi(resolveArg(args[1])); } catch (...) {}
+            std::string pad = resolveArg(args[2]);
+            if (pad.empty()) return v.substr(0, static_cast<size_t>(width));
+            while ((int)v.size() < width) v += pad;
+            return v.substr(0, static_cast<size_t>(width));
+        }
+        if (fn == "CONCAT_WS") {
+            // CONCAT_WS(sep, str1, str2, ...)
+            if (args.size() < 2) return "";
+            std::string sep = resolveArg(args[0]);
+            std::string res;
+            for (size_t k = 1; k < args.size(); ++k) {
+                if (k > 1) res += sep;
+                res += resolveArg(args[k]);
+            }
+            return res;
+        }
+        if (fn == "SPACE") {
+            int n = 0;
+            if (!args.empty()) try { n = std::stoi(resolveArg(args[0])); } catch (...) {}
+            if (n <= 0) return "";
+            return std::string(static_cast<size_t>(n), ' ');
+        }
+        if (fn == "ASCII") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            if (v.empty()) return "0";
+            return std::to_string(static_cast<unsigned char>(v[0]));
+        }
+        if (fn == "CHAR_LENGTH" || fn == "CHARACTER_LENGTH") {
+            std::string v = args.empty() ? "" : resolveArg(args[0]);
+            return std::to_string(v.size());
+        }
+        if (fn == "PI") {
+            return "3.14159265358979";
+        }
+        if (fn == "TRUNCATE" || fn == "TRUNC") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                int dec = 0;
+                if (args.size() >= 2) try { dec = std::stoi(resolveArg(args[1])); } catch (...) {}
+                double factor = std::pow(10.0, dec);
+                double tr = std::trunc(v * factor) / factor;
+                if (dec <= 0) {
+                    long long iv = static_cast<long long>(tr);
+                    return std::to_string(iv);
+                }
+                std::ostringstream oss;
+                oss << std::fixed;
+                oss.precision(dec);
+                oss << tr;
+                return oss.str();
+            } catch (...) { return "NaN"; }
+        }
+        if (fn == "SIGN") {
+            if (args.empty()) return "0";
+            try {
+                double v = std::stod(resolveArg(args[0]));
+                return v > 0 ? "1" : v < 0 ? "-1" : "0";
+            } catch (...) { return "0"; }
+        }
+        if (fn == "GREATEST") {
+            if (args.empty()) return "NULL";
+            std::string best = resolveArg(args[0]);
+            for (size_t k = 1; k < args.size(); ++k) {
+                std::string v = resolveArg(args[k]);
+                try { if (std::stod(v) > std::stod(best)) best = v; }
+                catch (...) { if (v > best) best = v; }
+            }
+            return best;
+        }
+        if (fn == "LEAST") {
+            if (args.empty()) return "NULL";
+            std::string best = resolveArg(args[0]);
+            for (size_t k = 1; k < args.size(); ++k) {
+                std::string v = resolveArg(args[k]);
+                try { if (std::stod(v) < std::stod(best)) best = v; }
+                catch (...) { if (v < best) best = v; }
+            }
+            return best;
+        }
+
         // ── Phase 119: SNIPPET(col, query [, maxLen]) ─────────────
         if (fn == "SNIPPET") {
             if (args.size() < 2) return "";
@@ -7137,6 +7285,16 @@ public:
     std::string evalFuncPublic(const std::string& fn,
                                const std::vector<std::string>& args) {
         ExtMgrGuard guard(&extensionMgr_);
+        // Phase 157: System info functions (instance-level, know currentUser_)
+        std::string fnUp = fn;
+        for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (fnUp == "VERSION") return "MilanSQL v8.7.0";
+        if (fnUp == "DATABASE") return "public";
+        if (fnUp == "USER" || fnUp == "CURRENT_USER" || fnUp == "SESSION_USER" || fnUp == "SYSTEM_USER")
+            return currentUser_.empty() ? "root" : currentUser_;
+        if (fnUp == "CONNECTION_ID") return "1";
+        if (fnUp == "CHARSET") return "utf8mb4";
+        if (fnUp == "COLLATION") return "utf8mb4_general_ci";
         Table tmpTbl("", {Column("_", "TEXT")});
         Row  emptyRow(std::vector<std::string>{"NULL"});
         return evaluateFunc(fn, args, tmpTbl, emptyRow);

@@ -1937,7 +1937,10 @@ static inline milansql::Table dispatch_executeRecursiveCTE(
     milansql::Table anchor;
     milansql::ParsedCommand anchorCmd = parser.parse(anchorSql);
 
-    if (anchorCmd.type == milansql::CommandType::UNKNOWN) {
+    // SELECT without FROM (type may be SELECT or UNKNOWN when parser sees literal)
+    bool anchorIsLiteral = (anchorCmd.type == milansql::CommandType::UNKNOWN) ||
+                           (anchorCmd.tableName.empty());
+    if (anchorIsLiteral) {
         // Literal SELECT (no FROM): e.g. SELECT 1 AS n, 0 AS a, 1 AS b
         if (!dispatch_executeLiteralSelect(anchorSql, anchor))
             throw std::runtime_error("WITH RECURSIVE: Anchor konnte nicht ausgewertet werden: " + anchorSql);

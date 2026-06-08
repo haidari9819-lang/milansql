@@ -33,6 +33,9 @@
 #include "auth/auth_manager.hpp"
 #include "auth/rate_limiter.hpp"
 
+// Phase 157: dispatch.hpp for recursive CTE tests
+#include "dispatch.hpp"
+
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
 static int failed = 0;
@@ -5016,6 +5019,248 @@ static void testGroup67() {
             "SHOW ALL USERS contains 'root'"); }
 }
 
+// ══════════════════════════════════════════════════════════════
+// Group 68: Phase 157 — version() fix + String/Date/Math/CTE/Window
+// ══════════════════════════════════════════════════════════════
+
+static void testGroup68() {
+    std::cout << "\n--- Group 68: Phase 157 Bug Fixes ---\n";
+
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto e = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v8.7.0",
+          "version() returns MilanSQL v8.7.0");
+    check(engine.evalFuncPublic("DATABASE", {}) == "public",
+          "database() returns 'public'");
+    check(engine.evalFuncPublic("USER", {}) == "root",
+          "user() returns 'root' (default)");
+    check(engine.evalFuncPublic("CURRENT_USER", {}) == "root",
+          "current_user() returns 'root' (default)");
+    check(engine.evalFuncPublic("CONNECTION_ID", {}) == "1",
+          "connection_id() returns 1");
+
+    // setCurrentUserDirect → user() reflects change
+    engine.setCurrentUserDirect("alice");
+    check(engine.evalFuncPublic("USER", {}) == "alice",
+          "user() returns 'alice' after setCurrentUserDirect");
+    engine.setCurrentUserDirect("root");
+
+    // ── SCHRITT 2: String-Funktionen ───────────────────────────
+    check(engine.evalFuncPublic("LEFT",    {"'Hello World'", "5"}) == "Hello",
+          "LEFT('Hello World', 5) = 'Hello'");
+    check(engine.evalFuncPublic("RIGHT",   {"'Hello World'", "5"}) == "World",
+          "RIGHT('Hello World', 5) = 'World'");
+    check(engine.evalFuncPublic("REVERSE", {"'Hello'"}) == "olleH",
+          "REVERSE('Hello') = 'olleH'");
+    check(engine.evalFuncPublic("LOCATE",  {"'World'", "'Hello World'"}) == "7",
+          "LOCATE('World', 'Hello World') = 7");
+    check(engine.evalFuncPublic("REPEAT",  {"'ab'", "3"}) == "ababab",
+          "REPEAT('ab', 3) = 'ababab'");
+    check(engine.evalFuncPublic("LPAD",    {"'42'", "5", "'0'"}) == "00042",
+          "LPAD('42', 5, '0') = '00042'");
+    check(engine.evalFuncPublic("RPAD",    {"'42'", "5", "'0'"}) == "42000",
+          "RPAD('42', 5, '0') = '42000'");
+    check(engine.evalFuncPublic("CONCAT",  {"'Hello'", "' '", "'World'"}) == "Hello World",
+          "CONCAT('Hello',' ','World') = 'Hello World'");
+    check(engine.evalFuncPublic("REPLACE", {"'Hello World'", "'World'", "'MilanSQL'"}) == "Hello MilanSQL",
+          "REPLACE works");
+    check(engine.evalFuncPublic("CONCAT_WS", {"'-'", "'a'", "'b'", "'c'"}) == "a-b-c",
+          "CONCAT_WS('-','a','b','c') = 'a-b-c'");
+    check(engine.evalFuncPublic("LEFT",    {"'Hi'", "10"}) == "Hi",
+          "LEFT with n > length returns full string");
+    check(engine.evalFuncPublic("RIGHT",   {"'Hi'", "10"}) == "Hi",
+          "RIGHT with n > length returns full string");
+    check(engine.evalFuncPublic("LOCATE",  {"'xyz'", "'Hello'"}) == "0",
+          "LOCATE returns 0 when not found");
+
+    // ── SCHRITT 3: Date-Funktionen ──────────────────────────────
+    check(!engine.evalFuncPublic("NOW", {}).empty(),
+          "NOW() returns non-empty string");
+    check(!engine.evalFuncPublic("CURRENT_DATE", {}).empty(),
+          "CURRENT_DATE returns non-empty");
+    check(!engine.evalFuncPublic("CURRENT_TIME", {}).empty(),
+          "CURRENT_TIME returns non-empty");
+    check(engine.evalFuncPublic("YEAR",     {"'2026-06-08'"}) == "2026",
+          "YEAR('2026-06-08') = 2026");
+    check(engine.evalFuncPublic("MONTH",    {"'2026-06-08'"}) == "6",
+          "MONTH('2026-06-08') = 6");
+    check(engine.evalFuncPublic("DAY",      {"'2026-06-08'"}) == "8",
+          "DAY('2026-06-08') = 8");
+    {
+        std::string diff = engine.evalFuncPublic("DATEDIFF", {"'2026-12-31'", "'2026-01-01'"});
+        check(!diff.empty() && diff != "NULL", "DATEDIFF returns a value");
+        int d = std::stoi(diff);
+        check(d > 0, "DATEDIFF('2026-12-31','2026-01-01') > 0");
+    }
+    {
+        std::string added = engine.evalFuncPublic("DATE_ADD", {"'2026-01-01'", "INTERVAL 30 DAY"});
+        check(!added.empty() && added != "NULL", "DATE_ADD returns a value");
+    }
+
+    // ── SCHRITT 4: Math-Funktionen ──────────────────────────────
+    check(engine.evalFuncPublic("ABS",   {"-42"}) == "42",
+          "ABS(-42) = 42");
+    check(engine.evalFuncPublic("CEIL",  {"3.2"}) == "4",
+          "CEIL(3.2) = 4");
+    check(engine.evalFuncPublic("FLOOR", {"3.9"}) == "3",
+          "FLOOR(3.9) = 3");
+    check(engine.evalFuncPublic("ROUND", {"3.456", "2"}) == "3.46",
+          "ROUND(3.456, 2) = 3.46");
+    check(engine.evalFuncPublic("POWER", {"2", "10"}) == "1024",
+          "POWER(2, 10) = 1024");
+    check(engine.evalFuncPublic("SQRT",  {"144"}) == "12",
+          "SQRT(144) = 12");
+    check(engine.evalFuncPublic("PI",    {}).substr(0, 6) == "3.1415",
+          "PI() starts with 3.1415");
+
+    // ── SCHRITT 5: Aggregate Edge Cases (leere Tabelle) ─────────
+    e("CREATE TABLE empty_t (id INT, val INT)");
+    {
+        auto r = e("SELECT COUNT(*) FROM empty_t");
+        check(!r.rows.empty() && r.rows[0].values[0] == "0",
+              "COUNT(*) on empty table = 0");
+    }
+    {
+        auto r = e("SELECT SUM(val) FROM empty_t");
+        check(!r.rows.empty(), "SUM on empty table returns a row");
+        check(r.rows[0].values[0] == "NULL" || r.rows[0].values[0] == "0",
+              "SUM on empty table is NULL or 0");
+    }
+    {
+        auto r = e("SELECT AVG(val) FROM empty_t");
+        check(!r.rows.empty() && r.rows[0].values[0] == "NULL",
+              "AVG on empty table = NULL");
+    }
+    {
+        auto r = e("SELECT MAX(val) FROM empty_t");
+        check(!r.rows.empty() && r.rows[0].values[0] == "NULL",
+              "MAX on empty table = NULL");
+    }
+    {
+        auto r = e("SELECT MIN(val) FROM empty_t");
+        check(!r.rows.empty() && r.rows[0].values[0] == "NULL",
+              "MIN on empty table = NULL");
+    }
+
+    // ── SCHRITT 6: JOIN Edge Cases ──────────────────────────────
+    e("CREATE TABLE ja (id INT, val TEXT)");
+    e("CREATE TABLE jb (id INT, val TEXT)");
+    e("INSERT INTO ja VALUES (1, 'Alpha')");
+    e("INSERT INTO jb VALUES (2, 'Beta')");
+
+    // Helper: strip outer single quotes from value
+    auto stripQ = [](const std::string& s) -> std::string {
+        if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'')
+            return s.substr(1, s.size() - 2);
+        return s;
+    };
+    {
+        // LEFT JOIN: Alpha + NULL (dispatch_result returns all columns, no projection)
+        auto r = e("SELECT * FROM ja LEFT JOIN jb ON ja.id = jb.id");
+        check(r.rows.size() == 1, "LEFT JOIN returns 1 row");
+        bool foundAlpha = false, foundNullRight = false;
+        if (!r.rows.empty()) {
+            for (const auto& v : r.rows[0].values)
+                if (stripQ(v) == "Alpha") foundAlpha = true;
+            int nullCount = 0;
+            for (const auto& v : r.rows[0].values) if (v == "NULL") ++nullCount;
+            foundNullRight = nullCount >= 2;
+        }
+        check(foundAlpha, "LEFT JOIN left side = Alpha");
+        check(foundNullRight, "LEFT JOIN right side = NULL (2 NULLs from jb)");
+    }
+    {
+        // RIGHT JOIN: NULL + Beta
+        auto r = e("SELECT * FROM ja RIGHT JOIN jb ON ja.id = jb.id");
+        check(r.rows.size() == 1, "RIGHT JOIN returns 1 row");
+        bool foundBeta = false;
+        if (!r.rows.empty())
+            for (const auto& v : r.rows[0].values)
+                if (stripQ(v) == "Beta") foundBeta = true;
+        check(foundBeta, "RIGHT JOIN right side = Beta");
+    }
+    {
+        // FULL OUTER JOIN: 2 rows
+        auto r = e("SELECT * FROM ja FULL OUTER JOIN jb ON ja.id = jb.id");
+        check(r.rows.size() == 2, "FULL OUTER JOIN returns 2 rows");
+    }
+
+    // ── SCHRITT 7: Transaction Rollback ────────────────────────
+    e("BEGIN");
+    e("INSERT INTO ja VALUES (3, 'Gamma')");
+    e("ROLLBACK");
+    {
+        auto r = e("SELECT * FROM ja WHERE val = 'Gamma'");
+        check(r.rows.empty(), "After ROLLBACK, Gamma is not in table");
+    }
+    check(e("SELECT * FROM ja").rows.size() == 1,
+          "After ROLLBACK, ja still has exactly 1 row");
+
+    // ── SCHRITT 8: Recursive CTE ───────────────────────────────
+    // Use dispatch_executeRecursiveCTE directly (dispatch_result.hpp doesn't support CTEs)
+    {
+        milansql::Table cteResult = dispatch_executeRecursiveCTE(
+            engine, parser,
+            "nums",
+            "SELECT 1 AS n UNION ALL SELECT n + 1 FROM nums WHERE n < 10",
+            100);
+        check(cteResult.rowCount() == 10, "Recursive CTE produces 10 rows");
+        check(cteResult.rowCount() >= 1 && cteResult.rows()[0].values[0] == "1",
+              "Recursive CTE first row = 1");
+        check(cteResult.rowCount() == 10 && cteResult.rows()[9].values[0] == "10",
+              "Recursive CTE last row = 10");
+        // Cleanup temp table
+        engine.dropTempTable("nums");
+    }
+
+    // ── SCHRITT 9: Window Functions ────────────────────────────
+    e("CREATE TABLE wf (id INT, dept TEXT, sal INT)");
+    e("INSERT INTO wf VALUES (1, 'IT', 5000)");
+    e("INSERT INTO wf VALUES (2, 'IT', 6000)");
+    e("INSERT INTO wf VALUES (3, 'HR', 4000)");
+    e("INSERT INTO wf VALUES (4, 'HR', 4500)");
+    {
+        auto r = e(
+            "SELECT dept, sal, "
+            "RANK() OVER (PARTITION BY dept ORDER BY sal DESC) AS rnk, "
+            "SUM(sal) OVER (PARTITION BY dept) AS dept_total "
+            "FROM wf");
+        check(r.rows.size() == 4, "Window function returns 4 rows");
+        // Find column indices by name
+        int deptIdx = -1, salIdx = -1, rnkIdx = -1, totalIdx = -1;
+        for (int ci = 0; ci < (int)r.columns.size(); ++ci) {
+            const auto& cn = r.columns[ci].name;
+            if (cn == "dept") deptIdx = ci;
+            else if (cn == "sal") salIdx = ci;
+            else if (cn == "rnk") rnkIdx = ci;
+            else if (cn == "dept_total") totalIdx = ci;
+        }
+        // Fallback to positional if aliases differ
+        if (deptIdx < 0 && r.columns.size() >= 4) { deptIdx=0; salIdx=1; rnkIdx=2; totalIdx=3; }
+        bool foundITrank1 = false, foundITtotal = false;
+        for (const auto& row : r.rows) {
+            if (deptIdx >= 0 && salIdx >= 0 && rnkIdx >= 0 &&
+                (int)row.values.size() > rnkIdx &&
+                stripQ(row.values[deptIdx]) == "IT" &&
+                row.values[salIdx] == "6000" &&
+                row.values[rnkIdx] == "1")
+                foundITrank1 = true;
+            if (deptIdx >= 0 && totalIdx >= 0 &&
+                (int)row.values.size() > totalIdx &&
+                stripQ(row.values[deptIdx]) == "IT" &&
+                row.values[totalIdx] == "11000")
+                foundITtotal = true;
+        }
+        check(foundITrank1, "IT dept: sal=6000 has RANK=1");
+        check(foundITtotal, "IT dept_total = 11000");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -5212,6 +5457,9 @@ int main() {
     }
     try { testGroup67(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 67 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup68(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 68 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

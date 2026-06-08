@@ -1388,6 +1388,7 @@ inline std::string MilanHttpServer::handleDashboard() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MilanSQL Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#1e1e2e;color:#cdd6f4;font-family:'Courier New',monospace;font-size:14px;display:flex;flex-direction:column;height:100vh;overflow:hidden}
@@ -1527,6 +1528,7 @@ inline std::string MilanHttpServer::handleWebUI() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MilanSQL Admin</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
@@ -2119,6 +2121,16 @@ else{
 inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const std::string& clientIp) {
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
+
+    // ── Favicon: ⚡ lightning bolt SVG (no 404 in browser console) ──
+    if (req.path == "/favicon.ico" || req.path == "/favicon.svg") {
+        static const std::string FAVICON_SVG =
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+            "<rect width='32' height='32' rx='5' fill='#1e1e2e'/>"
+            "<polygon points='21,2 11,18 18,18 11,30 25,14 18,14' fill='#00d9ff'/>"
+            "</svg>";
+        return buildHttpResponse(200, FAVICON_SVG, "image/svg+xml");
+    }
 
     // ── Phase 154: Auth routes ────────────────────────────────
     if (req.path == "/auth/register" && req.method == "POST")

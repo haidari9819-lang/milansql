@@ -2052,7 +2052,7 @@ async function msLogin(u, p) {
     if (d.success) {
       msToken=d.token; msUser=u;
       localStorage.setItem('ms_token',d.token); localStorage.setItem('ms_user',u);
-      document.getElementById('ms-login-overlay').style.display='none';
+      hidLoginPage();
       var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=u;
       return true;
     }
@@ -2062,17 +2062,16 @@ async function msLogin(u, p) {
 async function msLogout() {
   if(msToken) { try{await fetch('/auth/logout',{method:'POST',headers:getAuthHdr()});}catch(e){} }
   msToken=''; msUser=''; localStorage.removeItem('ms_token'); localStorage.removeItem('ms_user');
-  showLoginOverlay();
+  showLoginPage();
 }
-function showLoginOverlay() { var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='flex'; }
 async function msSubmitLogin() {
   var u=document.getElementById('ms-lu').value.trim();
   var p=document.getElementById('ms-lp').value;
   var err=document.getElementById('ms-lerr');
-  if(!u||!p){err.textContent='Enter username and password';return;}
-  err.textContent='Logging in...';
+  if(!u||!p){err.style.color='#f38ba8';err.textContent='Enter username and password';return;}
+  err.style.color='#a6adc8';err.textContent='Signing in...';
   var res=await msLogin(u,p);
-  if(res===true){err.textContent='';}else{err.textContent=res;}
+  if(res===true){err.textContent='';}else{err.style.color='#f38ba8';err.textContent=res;}
 }
 // Patch all fetch calls to include auth token
 var _origFetch2=window.fetch;
@@ -2082,33 +2081,109 @@ window.fetch=function(url,opts){
     if(!opts.headers['Authorization'])opts.headers['Authorization']='Bearer '+msToken;
   }
   return _origFetch2.apply(this,arguments).then(function(resp){
-    if(resp.status===401){showLoginOverlay();}
+    if(resp.status===401){showLoginPage();}
     return resp;
   });
 };
-// Check auth on load
-if(!msToken){showLoginOverlay();}
-else{
-  fetch('/auth/me').then(r=>r.json()).then(d=>{
-    if(!d.success)showLoginOverlay();
-    else{var ub=document.getElementById('ms-user-badge');if(ub)ub.textContent=d.username||msUser;}
-  }).catch(()=>{});
+// ── Phase 158: Auth check on load ─────────────────────────────
+function showLoginPage(){
+  var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='flex';
+}
+function hidLoginPage(){
+  var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='none';
+}
+function msShowTab(tab){
+  document.getElementById('ms-tab-login').style.borderBottom=tab==='login'?'2px solid #a6e3a1':'2px solid transparent';
+  document.getElementById('ms-tab-reg').style.borderBottom=tab==='reg'?'2px solid #a6e3a1':'2px solid transparent';
+  document.getElementById('ms-tab-login').style.color=tab==='login'?'#cdd6f4':'#585b70';
+  document.getElementById('ms-tab-reg').style.color=tab==='reg'?'#cdd6f4':'#585b70';
+  document.getElementById('ms-form-login').style.display=tab==='login'?'block':'none';
+  document.getElementById('ms-form-reg').style.display=tab==='reg'?'block':'none';
+  document.getElementById('ms-lerr').textContent='';
+}
+async function msSubmitRegister(){
+  var u=document.getElementById('ms-ru').value.trim();
+  var p=document.getElementById('ms-rp').value;
+  var p2=document.getElementById('ms-rp2').value;
+  var err=document.getElementById('ms-rerr');
+  if(!u||!p){err.textContent='Username and password required';return;}
+  if(p!==p2){err.textContent='Passwords do not match';return;}
+  err.textContent='';
+  try{
+    var r=await fetch('/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    var d=await r.json();
+    if(d.success){
+      document.getElementById('ms-lu').value=u;
+      document.getElementById('ms-lp').value=p;
+      msShowTab('login');
+      var lerr=document.getElementById('ms-lerr');
+      if(lerr){lerr.style.color='#a6e3a1';lerr.textContent='Registered! Signing in...';}
+      setTimeout(msSubmitLogin,400);
+    } else {
+      err.style.color='#f38ba8'; err.textContent=d.error||'Registration failed';
+    }
+  }catch(e){err.style.color='#f38ba8';err.textContent='Network error';}
+}
+// Start: show login page immediately if no token (no flash!)
+if(!msToken){
+  showLoginPage();
+} else {
+  fetch('/auth/me',{headers:getAuthHdr()}).then(r=>r.json()).then(d=>{
+    if(!d.success){ msToken=''; msUser=''; localStorage.removeItem('ms_token'); localStorage.removeItem('ms_user'); showLoginPage(); }
+    else{ hidLoginPage(); var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=d.username||msUser; }
+  }).catch(()=>{ showLoginPage(); });
 }
 </script>
-<!-- Phase 154: Login Overlay -->
-<div id="ms-login-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.88);z-index:9999;justify-content:center;align-items:center;">
-  <div style="background:#1e1e2e;border:1px solid #313244;border-radius:14px;padding:44px 40px;width:340px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)">
-    <div style="font-size:30px;font-weight:bold;color:#89dceb;margin-bottom:6px">&#9889; MilanSQL</div>
-    <div style="color:#a6adc8;margin-bottom:26px;font-size:12px">v8.7.0 &mdash; Multi-User Secure Database</div>
-    <input id="ms-lu" type="text" placeholder="Username" autocomplete="username"
-      style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:6px;padding:10px 12px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box">
-    <input id="ms-lp" type="password" placeholder="Password" autocomplete="current-password"
-      style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-      onkeydown="if(event.key==='Enter')msSubmitLogin()">
-    <button onclick="msSubmitLogin()"
-      style="width:100%;background:#89b4fa;color:#11111b;border:none;border-radius:6px;padding:12px;font-size:14px;font-weight:bold;cursor:pointer;font-family:inherit">Login</button>
-    <div id="ms-lerr" style="color:#f38ba8;font-size:12px;margin-top:10px;min-height:16px"></div>
-    <div style="margin-top:18px;font-size:11px;color:#45475a">Default admin: <b style="color:#585b70">root</b> / <b style="color:#585b70">root</b></div>
+<!-- Phase 158: Full-screen Login Page (starts visible, hidden after auth) -->
+<div id="ms-login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:#11111b;z-index:9999;justify-content:center;align-items:center;">
+  <div style="background:#1e1e2e;border:1px solid #313244;border-radius:16px;padding:0;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.7);overflow:hidden">
+    <!-- Header -->
+    <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
+      <div style="font-size:36px;line-height:1">&#9889;</div>
+      <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v8.7.0 &mdash; Multi-User Database</div>
+    </div>
+    <!-- Tabs -->
+    <div style="display:flex;border-bottom:1px solid #313244">
+      <button id="ms-tab-login" onclick="msShowTab('login')"
+        style="flex:1;background:none;border:none;border-bottom:2px solid #a6e3a1;color:#cdd6f4;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s">Sign In</button>
+      <button id="ms-tab-reg" onclick="msShowTab('reg')"
+        style="flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#585b70;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s">Register</button>
+    </div>
+    <!-- Login Form -->
+    <div id="ms-form-login" style="padding:24px 32px 28px">
+      <input id="ms-lu" type="text" placeholder="Username" autocomplete="username"
+        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .15s"
+        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+      <input id="ms-lp" type="password" placeholder="Password" autocomplete="current-password"
+        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .15s"
+        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'"
+        onkeydown="if(event.key==='Enter')msSubmitLogin()">
+      <button onclick="msSubmitLogin()"
+        style="width:100%;background:#a6e3a1;color:#1e1e2e;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;letter-spacing:0.3px;transition:background .15s"
+        onmouseover="this.style.background='#94d68f'" onmouseout="this.style.background='#a6e3a1'">Sign In</button>
+      <div id="ms-lerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
+      <div style="margin-top:16px;text-align:center;font-size:11px;color:#45475a">
+        Default: <b style="color:#6c7086">root</b> / <b style="color:#6c7086">root</b>
+      </div>
+    </div>
+    <!-- Register Form -->
+    <div id="ms-form-reg" style="display:none;padding:24px 32px 28px">
+      <input id="ms-ru" type="text" placeholder="Username" autocomplete="username"
+        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+      <input id="ms-rp" type="password" placeholder="Password"
+        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+      <input id="ms-rp2" type="password" placeholder="Confirm Password"
+        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'"
+        onkeydown="if(event.key==='Enter')msSubmitRegister()">
+      <button onclick="msSubmitRegister()"
+        style="width:100%;background:#89b4fa;color:#1e1e2e;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s"
+        onmouseover="this.style.background='#74c7ec'" onmouseout="this.style.background='#89b4fa'">Create Account</button>
+      <div id="ms-rerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
+    </div>
   </div>
 </div>
 </body>

@@ -1346,7 +1346,6 @@ inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body
         // Apply limit
         auto& rows = result.rows();
         const auto& resultCols = result.columns();
-        size_t n = std::min((size_t)limitN, rows.size());
 
         resultJson = "{\"success\":true,\"rows\":[";
         bool first = true;

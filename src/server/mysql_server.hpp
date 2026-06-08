@@ -206,7 +206,7 @@ private:
         return true;
     }
 
-    // Read one MySQL packet: returns {seq, payload} or {255, empty} on error
+    // Read one MySQL packet: returns {seq, payload} or {255, empty} on error/oversize
     std::pair<uint8_t, std::vector<uint8_t>> readPacket(sock_t sock) {
         uint8_t header[4];
         if (!recvAll(sock, header, 4))
@@ -215,13 +215,16 @@ private:
                      | (static_cast<uint32_t>(header[1]) << 8)
                      | (static_cast<uint32_t>(header[2]) << 16);
         uint8_t seq = header[3];
+        // Reject packets larger than 16 MiB (protocol max) to prevent OOM
+        if (len > 16u * 1024u * 1024u)
+            return {255, {}};
         std::vector<uint8_t> payload(len);
         if (len > 0 && !recvAll(sock, payload.data(), static_cast<int>(len)))
             return {255, {}};
         return {seq, std::move(payload)};
     }
 
-    // Send a MySQL packet — header + payload in one send() to avoid TCP segmentation
+    // Send a MySQL packet (loops to handle partial sends)
     bool sendPacket(sock_t sock, uint8_t seq, const std::vector<uint8_t>& payload) {
         uint32_t len = static_cast<uint32_t>(payload.size());
         std::vector<uint8_t> frame;
@@ -232,8 +235,13 @@ private:
         frame.push_back(seq);
         frame.insert(frame.end(), payload.begin(), payload.end());
         int total = static_cast<int>(frame.size());
-        int sent = MILAN_SEND(sock, frame.data(), total, 0);
-        return sent == total;
+        int sent  = 0;
+        while (sent < total) {
+            int r = MILAN_SEND(sock, frame.data() + sent, total - sent, 0);
+            if (r <= 0) return false;
+            sent += r;
+        }
+        return true;
     }
 
     // ── OK / ERR / EOF packets ─────────────────────────────────

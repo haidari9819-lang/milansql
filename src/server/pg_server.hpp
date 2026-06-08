@@ -159,11 +159,16 @@ private:
         return true;
     }
 
-    // Send all bytes in buf
+    // Send all bytes in buf (loops to handle partial sends)
     bool sendAll(pg_sock_t sock, const std::vector<uint8_t>& buf) {
         int total = static_cast<int>(buf.size());
-        int sent = PG_SEND(sock, buf.data(), total, 0);
-        return sent == total;
+        int sent  = 0;
+        while (sent < total) {
+            int r = PG_SEND(sock, buf.data() + sent, total - sent, 0);
+            if (r <= 0) return false;
+            sent += r;
+        }
+        return true;
     }
 
     // ── Big-endian helpers ────────────────────────────────────
@@ -597,6 +602,10 @@ private:
     // ── Client handler ────────────────────────────────────────
 
     void handleClient(pg_sock_t sock) {
+        try { handleClientImpl(sock); } catch (...) { /* never let exception escape a thread */ }
+    }
+
+    void handleClientImpl(pg_sock_t sock) {
         // ── Step 1: Read startup message ───────────────────────
         // The first message may be an SSL request (protocol = 0x04D2162F)
         // or a real StartupMessage.
@@ -608,8 +617,8 @@ private:
             if (!recvAll(sock, lenBuf, 4)) return;
             int32_t msgLen = readInt32BE(lenBuf);
 
-            if (msgLen < 8) {
-                // Invalid
+            if (msgLen < 8 || msgLen > 65536) {
+                // Invalid length or too large (reject to prevent OOM)
                 return;
             }
 
@@ -696,6 +705,11 @@ private:
 
             // Read message body (msgLen - 4 bytes, since length includes itself)
             int32_t bodyLen = msgLen - 4;
+            if (bodyLen < 0 || bodyLen > 16 * 1024 * 1024) {
+                // Negative length or oversized body → reject connection
+                sendAll(sock, makeErrorResponse("invalid message length"));
+                break;
+            }
             std::vector<uint8_t> body;
             if (bodyLen > 0) {
                 body.resize(static_cast<size_t>(bodyLen));

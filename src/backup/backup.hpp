@@ -24,7 +24,7 @@ public:
     // Erzeugt timestamped Dateinamen: milansql_YYYYMMDD_HHMMSS.sql
     static std::string generateFilename() {
         auto t = dateutils::currentTm();
-        char buf[32];
+        char buf[64];
         std::snprintf(buf, sizeof(buf),
                       "milansql_%04d%02d%02d_%02d%02d%02d.sql",
                       t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,

@@ -6,6 +6,13 @@
 #include <sstream>
 #include <cstdint>
 #include <stdexcept>
+#ifdef _WIN32
+#  include <io.h>      // _get_osfhandle
+#  include <windows.h> // FlushFileBuffers
+#else
+#  include <unistd.h>  // fsync
+#  include <fcntl.h>   // open
+#endif
 
 #include "engine/engine.hpp"
 
@@ -57,6 +64,24 @@ public:
         if (!f) throw std::runtime_error("Kann nicht schreiben: " + filepath_);
         f << toJson(engine);
         f.flush();
+        // fsync: ensure data survives a crash (flush OS page cache → disk)
+        f.close();
+#ifdef _WIN32
+        {
+            HANDLE hf = CreateFileA(filepath_.c_str(), GENERIC_WRITE,
+                                    FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hf != INVALID_HANDLE_VALUE) {
+                FlushFileBuffers(hf);
+                CloseHandle(hf);
+            }
+        }
+#else
+        {
+            int fd = ::open(filepath_.c_str(), O_RDONLY);
+            if (fd >= 0) { ::fsync(fd); ::close(fd); }
+        }
+#endif
     }
 
     // ── JSON-Datei lesen und Engine befüllen ──────────────────

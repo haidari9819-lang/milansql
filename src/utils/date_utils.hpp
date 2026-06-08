@@ -39,7 +39,7 @@ inline std::tm currentTm() {
 
 inline std::string currentDateStr() {
     auto t = currentTm();
-    char buf[16];
+    char buf[32];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
     return buf;
@@ -55,7 +55,7 @@ inline std::string currentTimeStr() {
 
 inline std::string currentDatetimeStr() {
     auto t = currentTm();
-    char buf[24];
+    char buf[48];
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
                   t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                   t.tm_hour, t.tm_min, t.tm_sec);

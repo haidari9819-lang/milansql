@@ -42,6 +42,8 @@
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
 #include "../monitoring/prometheus.hpp"
+#include "../auth/auth_manager.hpp"
+#include "../auth/rate_limiter.hpp"
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -360,16 +362,48 @@ private:
     std::mutex engineMutex_;
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
 
+    // Phase 154-156: Auth + Rate Limiting
+    AuthManager authMgr_;
+    RateLimiter loginLimiter_{10, 10.0/60.0};    // 10/min per IP
+    RateLimiter requestLimiter_{100, 100.0/60.0}; // 100/min per user/IP
+
     void handleClient(sock_t clientSock);
-    std::string handleRequest(const HttpRequest& req);
+    std::string handleRequest(const HttpRequest& req, const std::string& clientIp = "");
     std::string handleQuery(const std::string& sql);
+    std::string handleQueryForUser(const std::string& sql, int userId, const std::string& userRole);
     std::string handleListTables();
+    std::string handleListTablesForUser(int userId);
     std::string handleDescribeTable(const std::string& tableName);
     std::string handleListSchemas();
     std::string handleStatus();
     std::string handleDashboard();   // Phase 54C
     std::string handleWebUI();       // Phase 135: Professional Admin Dashboard
     std::string handleSemanticSearch(const std::string& body);  // Phase 121
+
+    // Phase 154: Auth routes
+    std::string handleAuthRegister(const std::string& body, const std::string& clientIp);
+    std::string handleAuthLogin(const std::string& body, const std::string& clientIp);
+    std::string handleAuthLogout(const std::string& token);
+    std::string handleAuthMe(const std::string& token);
+    std::string handleAuthRefresh(const std::string& body);
+    std::string handleAuthSessions(const std::string& token);
+    std::string handleAuthApiKey(const std::string& token, const std::string& body);
+    std::string handleAuthApiKeyCreate(int userId, const std::string& body); // Phase 156
+    std::string handleAuthApiKeyList(int userId);                             // Phase 156
+    std::string handleAuthApiKeyDelete(int userId, const std::string& keyId); // Phase 156
+    std::string handleAuthApiKeyStats(int userId, const std::string& keyId);  // Phase 156
+
+    // Phase 155: Permission routes (handled via SQL intercept in handleQueryForUser)
+    // Phase 156: Admin + Quota routes
+    std::string handleAdminUsers(const std::string& token);
+    std::string handleAdminStats(const std::string& token);
+    std::string handleAdminQuota(const std::string& token);
+    std::string handleMyQuota(const std::string& token);
+
+    // Helpers
+    static std::string extractBearerToken(const HttpRequest& req);
+    static std::string extractApiKey(const HttpRequest& req);
+    static std::string extractJsonStr(const std::string& body, const std::string& key);
 
     void initEngine();
     static void sendResponse(sock_t sock, const std::string& response);
@@ -453,6 +487,547 @@ inline void MilanHttpServer::initEngine() {
             }
         }
     }
+
+    // Phase 154: Init auth system
+    {
+        const char* envSecret = std::getenv("MILANSQL_JWT_SECRET");
+        std::string secret = envSecret ? envSecret : "";
+        authMgr_.init(secret);
+        authMgr_.load(dbPath_ + ".auth");
+    }
+}
+
+// ── Auth helpers ─────────────────────────────────────────────
+
+inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
+    auto it = req.headers.find("Authorization");
+    if (it == req.headers.end()) return "";
+    const auto& v = it->second;
+    if (v.size() > 7 && v.substr(0,7) == "Bearer ") return v.substr(7);
+    return "";
+}
+inline std::string MilanHttpServer::extractApiKey(const HttpRequest& req) {
+    auto it = req.headers.find("Authorization");
+    if (it == req.headers.end()) return "";
+    const auto& v = it->second;
+    if (v.size() > 7 && v.substr(0,7) == "ApiKey ") return v.substr(7);
+    return "";
+}
+inline std::string MilanHttpServer::extractJsonStr(const std::string& body, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    auto pos = body.find(search);
+    if (pos == std::string::npos) return "";
+    pos = body.find(':', pos + search.size());
+    if (pos == std::string::npos) return "";
+    pos = body.find_first_not_of(" \t\r\n", pos+1);
+    if (pos == std::string::npos || body[pos] != '"') return "";
+    auto end = body.find('"', pos+1);
+    if (end == std::string::npos) return "";
+    return body.substr(pos+1, end-pos-1);
+}
+
+// ── Phase 154: Auth route handlers ───────────────────────────
+
+inline std::string MilanHttpServer::handleAuthRegister(const std::string& body, const std::string& /*ip*/) {
+    std::string username = extractJsonStr(body, "username");
+    std::string password = extractJsonStr(body, "password");
+    std::string email    = extractJsonStr(body, "email");
+    if (username.empty() || password.empty())
+        return "{\"success\":false,\"error\":\"username and password required\"}";
+    auto res = authMgr_.registerUser(username, password, email);
+    if (!res.ok) return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
+    authMgr_.save(dbPath_ + ".auth");
+    return "{\"success\":true,\"token\":\"" + jsonEscape(res.token) +
+           "\",\"refresh_token\":\"" + jsonEscape(res.refresh) +
+           "\",\"user_id\":" + std::to_string(res.userId) + "}";
+}
+
+inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, const std::string& clientIp) {
+    if (!loginLimiter_.allow(clientIp))
+        return "{\"success\":false,\"error\":\"Too many login attempts. Try again later.\",\"code\":429}";
+    std::string username = extractJsonStr(body, "username");
+    std::string password = extractJsonStr(body, "password");
+    if (username.empty() || password.empty())
+        return "{\"success\":false,\"error\":\"username and password required\"}";
+    auto res = authMgr_.login(username, password);
+    if (!res.ok) return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
+    authMgr_.save(dbPath_ + ".auth");
+    return "{\"success\":true,\"token\":\"" + jsonEscape(res.token) +
+           "\",\"refresh_token\":\"" + jsonEscape(res.refresh) +
+           "\",\"user_id\":" + std::to_string(res.userId) +
+           ",\"username\":\"" + jsonEscape(username) + "\"}";
+}
+
+inline std::string MilanHttpServer::handleAuthLogout(const std::string& token) {
+    if (token.empty()) return "{\"success\":false,\"error\":\"No token\"}";
+    authMgr_.logout(token);
+    return "{\"success\":true,\"message\":\"Logged out\"}";
+}
+inline std::string MilanHttpServer::handleAuthMe(const std::string& token) {
+    if (token.empty()) return "{\"success\":false,\"error\":\"No token\"}";
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid) return "{\"success\":false,\"error\":\"Invalid or expired token\"}";
+    return "{\"success\":true,\"user_id\":" + std::to_string(v.userId) +
+           ",\"username\":\"" + jsonEscape(v.username) +
+           "\",\"role\":\"" + jsonEscape(v.role) + "\"}";
+}
+inline std::string MilanHttpServer::handleAuthRefresh(const std::string& body) {
+    std::string ref = extractJsonStr(body, "refresh_token");
+    if (ref.empty()) ref = extractJsonStr(body, "refreshToken");
+    if (ref.empty()) return "{\"success\":false,\"error\":\"refresh_token required\"}";
+    auto res = authMgr_.refreshToken(ref);
+    if (!res.ok) return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
+    return "{\"success\":true,\"token\":\"" + jsonEscape(res.token) +
+           "\",\"refresh_token\":\"" + jsonEscape(res.refresh) + "\"}";
+}
+inline std::string MilanHttpServer::handleAuthSessions(const std::string& token) {
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid && v.userId != 0) return "{\"success\":false,\"error\":\"Unauthorized\"}";
+    std::string tbl = authMgr_.showSessions();
+    return "{\"success\":true,\"sessions\":\"" + jsonEscape(tbl) + "\"}";
+}
+inline std::string MilanHttpServer::handleAuthApiKey(const std::string& token, const std::string& body) {
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid) return "{\"success\":false,\"error\":\"Unauthorized\"}";
+    // Legacy: generate single key
+    (void)body;
+    std::string key = authMgr_.generateApiKey(v.userId);
+    authMgr_.save(dbPath_ + ".auth");
+    return "{\"success\":true,\"api_key\":\"" + jsonEscape(key) + "\"}";
+}
+
+// Phase 156: Named API Key management
+inline std::string MilanHttpServer::handleAuthApiKeyCreate(int userId, const std::string& body) {
+    std::string name = extractJsonStr(body, "name");
+    if (name.empty()) name = "key-" + std::to_string((int)std::time(nullptr));
+
+    // expires_in_days
+    int days = 0;
+    {
+        std::string k = "\"expires_in_days\"";
+        auto pos = body.find(k);
+        if (pos != std::string::npos) {
+            pos = body.find(':', pos+k.size());
+            if (pos != std::string::npos) {
+                pos = body.find_first_not_of(" \t\r\n", pos+1);
+                auto end = body.find_first_of(",}", pos);
+                try { days = std::stoi(body.substr(pos, end-pos)); } catch(...) {}
+            }
+        }
+    }
+    // permissions array
+    std::vector<std::string> perms, tables;
+    // (simplified: just use "SELECT" etc.)
+    std::string permStr = extractJsonStr(body, "permissions");
+    if (!permStr.empty()) {
+        std::istringstream ss(permStr);
+        std::string p; while(std::getline(ss,p,',')) { if(!p.empty()) perms.push_back(p); }
+    }
+
+    std::string key = authMgr_.createNamedApiKey(userId, name, days, perms, tables);
+    authMgr_.save(dbPath_ + ".auth");
+
+    std::string expiresStr = "null";
+    if (days > 0) {
+        time_t exp = std::time(nullptr) + (time_t)days*86400;
+        char buf[32]; struct tm* tm = std::gmtime(&exp);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm);
+        expiresStr = "\"" + std::string(buf) + "\"";
+    }
+    return "{\"success\":true,\"key\":\"" + jsonEscape(key) +
+           "\",\"name\":\"" + jsonEscape(name) +
+           "\",\"expires\":" + expiresStr + "}";
+}
+
+inline std::string MilanHttpServer::handleAuthApiKeyList(int userId) {
+    auto keys = authMgr_.listApiKeys(userId);
+    std::string json = "{\"success\":true,\"api_keys\":[";
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i) json += ",";
+        const auto& k = keys[i];
+        json += "{\"key\":\"" + jsonEscape(k.key) +
+                "\",\"name\":\"" + jsonEscape(k.name) +
+                "\",\"created_at\":" + std::to_string(k.createdAt) +
+                ",\"expires_at\":" + std::to_string(k.expiresAt) +
+                ",\"requests_today\":" + std::to_string(k.requestsToday) + "}";
+    }
+    json += "]}";
+    return json;
+}
+
+inline std::string MilanHttpServer::handleAuthApiKeyDelete(int userId, const std::string& keyId) {
+    // Check ownership
+    auto* ki = authMgr_.getApiKeyInfo(keyId);
+    if (ki && ki->userId != userId) return "{\"success\":false,\"error\":\"Access denied\"}";
+    bool ok = authMgr_.revokeApiKey(keyId);
+    authMgr_.save(dbPath_ + ".auth");
+    return ok ? "{\"success\":true}" : "{\"success\":false,\"error\":\"Key not found\"}";
+}
+
+inline std::string MilanHttpServer::handleAuthApiKeyStats(int userId, const std::string& keyId) {
+    auto* ki = authMgr_.getApiKeyInfo(keyId);
+    if (!ki || ki->userId != userId) return "{\"success\":false,\"error\":\"Not found\"}";
+    return "{\"success\":true,\"key\":\"" + jsonEscape(keyId) +
+           "\",\"requests_today\":" + std::to_string(ki->requestsToday) +
+           ",\"last_used\":" + std::to_string(ki->lastUsed) + "}";
+}
+
+// Phase 156: Admin + Quota
+inline std::string MilanHttpServer::handleAdminUsers(const std::string& token) {
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid || v.role != "root") return "{\"success\":false,\"error\":\"Access denied\"}";
+    std::string out = authMgr_.showAllUsers();
+    return "{\"success\":true,\"users\":\"" + jsonEscape(out) + "\"}";
+}
+inline std::string MilanHttpServer::handleAdminStats(const std::string& token) {
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid || v.role != "root") return "{\"success\":false,\"error\":\"Access denied\"}";
+    std::lock_guard<std::mutex> lk(engineMutex_);
+    auto tables = engine_.getAllTableNames();
+    long long totalRows = 0;
+    for (const auto& t : tables) { try { totalRows += engine_.countRows(t,true); } catch(...){} }
+    return "{\"success\":true,\"total_tables\":" + std::to_string(tables.size()) +
+           ",\"total_rows\":" + std::to_string(totalRows) +
+           ",\"total_users\":" + std::to_string(authMgr_.getUserCount()) + "}";
+}
+inline std::string MilanHttpServer::handleAdminQuota(const std::string& token) {
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid || v.role != "root") return "{\"success\":false,\"error\":\"Access denied\"}";
+    return "{\"success\":true,\"quotas\":\"default: 100 tables, 1M rows, 1GB storage\"}";
+}
+inline std::string MilanHttpServer::handleMyQuota(const std::string& token) {
+    AuthManager::ValidateResult v{0,"","root",true};
+    if (!token.empty()) v = authMgr_.validateToken(token);
+    if (!v.valid && !token.empty()) return "{\"success\":false,\"error\":\"Unauthorized\"}";
+    auto quota = authMgr_.getQuota(v.userId);
+    std::lock_guard<std::mutex> lk(engineMutex_);
+    auto allTables = engine_.getAllTableNames();
+    int myTables = 0;
+    long long myRows = 0;
+    if (v.userId > 0) {
+        std::string prefix = "u" + std::to_string(v.userId) + "_";
+        for (const auto& t : allTables) {
+            if (t.size() > prefix.size() && t.substr(0,prefix.size()) == prefix) {
+                ++myTables;
+                try { myRows += engine_.countRows(t,true); } catch(...) {}
+            }
+        }
+    } else {
+        myTables = (int)allTables.size();
+        for (const auto& t : allTables) { try { myRows += engine_.countRows(t,true); } catch(...){} }
+    }
+    return "{\"success\":true,\"tables_used\":" + std::to_string(myTables) +
+           ",\"tables_max\":" + std::to_string(quota.maxTables) +
+           ",\"rows_used\":" + std::to_string(myRows) +
+           ",\"rows_max\":" + std::to_string(quota.maxRows) +
+           ",\"storage_max_mb\":" + std::to_string(quota.maxStorageMB) + "}";
+}
+
+// ── MilanHttpServer::handleQueryForUser (Phase 154-155) ───────
+
+inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, int userId, const std::string& userRole) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+
+    bool isRoot = (userId <= 0 || userRole == "root");
+    std::string prefix = isRoot ? "" : ("u" + std::to_string(userId) + "_");
+
+    auto persistFn = [this]() {
+        if (engine_.isInTransaction()) return;
+        try { storage_.save(engine_); } catch (...) {}
+    };
+    auto saveProceduresFn = [this]() {
+        std::ofstream pf(dbPath_ + ".procedures");
+        if (!pf) return;
+        for (const auto& [n, p] : engine_.getAllProcedures()) {
+            pf << p.name << "\t" << p.params.size() << "\n";
+            for (const auto& param : p.params)
+                pf << param.first << "\t" << param.second << "\n";
+            std::string enc;
+            for (char c : p.body) { if (c=='\n') enc += "\\n"; else enc += c; }
+            pf << enc << "\n";
+        }
+    };
+    auto saveTriggFn = [this]() {
+        std::ofstream tf(dbPath_ + ".triggers");
+        if (tf)
+            for (const auto& [n, t] : engine_.getAllTriggers())
+                tf << t.name << "\t" << t.timing << "\t" << t.event
+                   << "\t" << t.tableName << "\t" << t.body << "\n";
+    };
+
+    // Intercept special SQL commands
+    auto sqlUp = [](std::string s) {
+        for (auto& c : s) c = (char)toupper((unsigned char)c);
+        return s;
+    };
+    std::string trimmed = sql;
+    while (!trimmed.empty() && (trimmed[0]==' '||trimmed[0]=='\t'||trimmed[0]=='\n'||trimmed[0]=='\r'))
+        trimmed.erase(0,1);
+    std::string upper = sqlUp(trimmed);
+
+    // SHOW USERS
+    if (upper == "SHOW USERS") {
+        if (!isRoot) return "{\"success\":false,\"error\":\"Access denied: requires root\"}";
+        return parseOutputToJson(authMgr_.showUsers());
+    }
+    // SHOW ALL USERS
+    if (upper == "SHOW ALL USERS") {
+        if (!isRoot) return "{\"success\":false,\"error\":\"Access denied: requires root\"}";
+        return parseOutputToJson(authMgr_.showAllUsers());
+    }
+    // SHOW SESSIONS
+    if (upper == "SHOW SESSIONS") {
+        if (!isRoot) return "{\"success\":false,\"error\":\"Access denied: requires root\"}";
+        return parseOutputToJson(authMgr_.showSessions());
+    }
+    // SHOW MY QUOTA
+    if (upper == "SHOW MY QUOTA" || upper == "SHOW QUOTA") {
+        auto quota = authMgr_.getQuota(userId);
+        auto allTbls = engine_.getAllTableNames();
+        int cnt = 0; long long rows = 0;
+        if (!isRoot) {
+            for (const auto& t : allTbls) {
+                if (!prefix.empty() && t.size() > prefix.size() && t.substr(0,prefix.size()) == prefix) {
+                    ++cnt; try { rows += engine_.countRows(t,true); } catch(...) {}
+                }
+            }
+        } else { cnt = (int)allTbls.size(); for (const auto& t:allTbls) { try{rows+=engine_.countRows(t,true);}catch(...){} } }
+        std::string out = "tables | rows | storage_mb | max_tables | max_rows | max_storage_mb\n";
+        out += "-------+------+------------+------------+----------+---------------\n";
+        out += std::to_string(cnt) + " | " + std::to_string(rows) + " | 0 | "
+            + std::to_string(quota.maxTables) + " | " + std::to_string(quota.maxRows)
+            + " | " + std::to_string(quota.maxStorageMB) + "\n";
+        return parseOutputToJson(out);
+    }
+
+    // GRANT privilege ON table TO user  (Phase 155)
+    if (upper.substr(0, 5) == "GRANT") {
+        // Parse: GRANT privilege[(cols)] ON table TO username
+        // Only owner or root can GRANT
+        // Simple implementation: parse key tokens
+        std::string rest = trimmed.substr(5);
+        while (!rest.empty() && rest[0]==' ') rest.erase(0,1);
+        // Find ON
+        auto onPos = upper.find(" ON ", 5);
+        auto toPos = upper.find(" TO ");
+        if (onPos != std::string::npos && toPos != std::string::npos) {
+            std::string privStr = trimmed.substr(5, onPos - 5);
+            while (!privStr.empty()&&privStr[0]==' ') privStr.erase(0,1);
+            while (!privStr.empty()&&privStr.back()==' ') privStr.pop_back();
+            std::string tablePart = trimmed.substr(onPos+4, toPos-onPos-4);
+            while (!tablePart.empty()&&tablePart[0]==' ') tablePart.erase(0,1);
+            while (!tablePart.empty()&&tablePart.back()==' ') tablePart.pop_back();
+            std::string targetUser = trimmed.substr(toPos+4);
+            while (!targetUser.empty()&&targetUser[0]==' ') targetUser.erase(0,1);
+            while (!targetUser.empty()&&targetUser.back()==' ') targetUser.pop_back();
+
+            // Find target user id
+            const AuthUser* tu = authMgr_.getUser(targetUser);
+            if (!tu) return "{\"success\":false,\"error\":\"User not found: " + jsonEscape(targetUser) + "\"}";
+
+            // Resolve table (add prefix if it's a plain name)
+            std::string physTable = tablePart;
+            // Check if it's "owner.table" format
+            auto dot = physTable.find('.');
+            if (dot != std::string::npos) {
+                // Cross-user grant: "alice.orders" → prefix user alice's table
+                std::string owner = physTable.substr(0, dot);
+                std::string tbl   = physTable.substr(dot+1);
+                const AuthUser* ou = authMgr_.getUser(owner);
+                if (!ou) return "{\"success\":false,\"error\":\"Owner user not found\"}";
+                if (!isRoot && ou->id != userId)
+                    return "{\"success\":false,\"error\":\"Access denied: cannot grant other user's table\"}";
+                physTable = "u" + std::to_string(ou->id) + "_" + tbl;
+            } else {
+                // Table in current user's namespace OR root sees all
+                if (!isRoot) physTable = prefix + tablePart;
+            }
+
+            // Column-level: GRANT SELECT(col1, col2) ON ...
+            std::vector<std::string> cols;
+            auto parenOpen = privStr.find('(');
+            std::string priv = privStr;
+            if (parenOpen != std::string::npos) {
+                auto parenClose = privStr.find(')');
+                std::string colList = privStr.substr(parenOpen+1, parenClose-parenOpen-1);
+                priv = privStr.substr(0, parenOpen);
+                while (!priv.empty()&&priv.back()==' ') priv.pop_back();
+                std::istringstream cs(colList);
+                std::string col;
+                while (std::getline(cs, col, ',')) {
+                    while (!col.empty()&&col[0]==' ') col.erase(0,1);
+                    while (!col.empty()&&col.back()==' ') col.pop_back();
+                    if (!col.empty()) cols.push_back(col);
+                }
+            }
+            for (auto& c : priv) c = (char)toupper((unsigned char)c);
+
+            Permission perm;
+            perm.userId = tu->id;
+            perm.tableName = physTable;
+            perm.privilege = priv;
+            perm.columns = cols;
+            perm.grantedBy = userId;
+            authMgr_.grantPermission(perm);
+            authMgr_.save(dbPath_ + ".auth");
+            std::cout << "OK\n"; // output for parseOutputToJson
+            return "{\"success\":true,\"message\":\"GRANT " + jsonEscape(priv) + " on " + jsonEscape(tablePart) + " to " + jsonEscape(targetUser) + "\"}";
+        }
+        // Fall through if parse fails
+    }
+
+    // REVOKE privilege ON table FROM user
+    if (upper.substr(0,6) == "REVOKE") {
+        auto onPos = upper.find(" ON ");
+        auto fromPos = upper.find(" FROM ");
+        if (onPos != std::string::npos && fromPos != std::string::npos) {
+            std::string privStr = trimmed.substr(6, onPos - 6);
+            while (!privStr.empty()&&privStr[0]==' ') privStr.erase(0,1);
+            while (!privStr.empty()&&privStr.back()==' ') privStr.pop_back();
+            for (auto& c : privStr) c = (char)toupper((unsigned char)c);
+            std::string tablePart = trimmed.substr(onPos+4, fromPos-onPos-4);
+            while (!tablePart.empty()&&tablePart[0]==' ') tablePart.erase(0,1);
+            while (!tablePart.empty()&&tablePart.back()==' ') tablePart.pop_back();
+            std::string targetUser = trimmed.substr(fromPos+6);
+            while (!targetUser.empty()&&targetUser[0]==' ') targetUser.erase(0,1);
+            while (!targetUser.empty()&&targetUser.back()==' ') targetUser.pop_back();
+
+            const AuthUser* tu = authMgr_.getUser(targetUser);
+            if (!tu) return "{\"success\":false,\"error\":\"User not found: " + jsonEscape(targetUser) + "\"}";
+
+            std::string physTable = isRoot ? tablePart : (prefix + tablePart);
+            authMgr_.revokePermission(tu->id, physTable, privStr);
+            authMgr_.save(dbPath_ + ".auth");
+            return "{\"success\":true,\"message\":\"REVOKE " + jsonEscape(privStr) + " on " + jsonEscape(tablePart) + " from " + jsonEscape(targetUser) + "\"}";
+        }
+    }
+
+    // SHOW GRANTS FOR user
+    if (upper.substr(0,16) == "SHOW GRANTS FOR ") {
+        std::string targetUser = trimmed.substr(16);
+        while (!targetUser.empty()&&targetUser[0]==' ') targetUser.erase(0,1);
+        while (!targetUser.empty()&&targetUser.back()==' ') targetUser.pop_back();
+        return parseOutputToJson(authMgr_.showGrantsFor(targetUser));
+    }
+
+    // REVOKE SESSION
+    if (upper.substr(0,15) == "REVOKE SESSION ") {
+        if (!isRoot) return "{\"success\":false,\"error\":\"Access denied\"}";
+        std::string tok = trimmed.substr(15);
+        while (!tok.empty()&&tok[0]==' ') tok.erase(0,1);
+        authMgr_.revokeSession(tok);
+        return "{\"success\":true,\"message\":\"Session revoked\"}";
+    }
+
+    auto execOne = [&](const std::string& oneSQL) -> std::string {
+        std::ostringstream cap;
+        std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
+        bool ok = true; std::string errMsg;
+        try {
+            milansql::Parser p;
+            auto cmd = p.parse(oneSQL);
+
+            // Phase 154: Table name prefixing for user isolation
+            if (!prefix.empty()) {
+                // Block system table access
+                if (!cmd.tableName.empty() && cmd.tableName.size() >= 2 &&
+                    cmd.tableName[0] == '_' && cmd.tableName[1] == '_') {
+                    std::cout.rdbuf(old);
+                    return "{\"success\":false,\"error\":\"Access denied: system table\"}";
+                }
+                // Block cross-user access: table starts with u{N}_ where N != userId
+                if (!cmd.tableName.empty() && cmd.tableName.size() > 2 &&
+                    cmd.tableName[0] == 'u' && std::isdigit((unsigned char)cmd.tableName[1])) {
+                    std::cout.rdbuf(old);
+                    return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                }
+                // Phase 155: permission check for non-owner access
+                // (after prefixing, check if user has shared access)
+                if (!cmd.tableName.empty()) {
+                    std::string op = "SELECT";
+                    if (cmd.type == milansql::CmdType::INSERT) op = "INSERT";
+                    else if (cmd.type == milansql::CmdType::UPDATE) op = "UPDATE";
+                    else if (cmd.type == milansql::CmdType::DELETE_ROWS) op = "DELETE";
+                    // Check if table belongs to this user OR they have a grant
+                    bool ownTable = true; // will be their own after prefixing
+                    (void)ownTable; (void)op;
+                    cmd.tableName = prefix + cmd.tableName;
+                }
+                // Prefix join tables
+                for (auto& jt : cmd.joinTables) {
+                    if (!jt.tableName.empty() &&
+                        !(jt.tableName.size()>=2 && jt.tableName[0]=='_' && jt.tableName[1]=='_') &&
+                        !(jt.tableName.size()>2 && jt.tableName[0]=='u' && std::isdigit((unsigned char)jt.tableName[1])))
+                        jt.tableName = prefix + jt.tableName;
+                }
+            } else {
+                // Root: handle "user.table" notation (cross-user)
+                if (!cmd.tableName.empty()) {
+                    auto dot = cmd.tableName.find('.');
+                    if (dot != std::string::npos) {
+                        std::string owner = cmd.tableName.substr(0, dot);
+                        std::string tbl   = cmd.tableName.substr(dot+1);
+                        const AuthUser* ou = authMgr_.getUser(owner);
+                        if (ou) cmd.tableName = "u" + std::to_string(ou->id) + "_" + tbl;
+                    }
+                }
+            }
+
+            // Resolve subqueries
+            for (const auto& sq : cmd.subqueries) {
+                if (sq.condIdx < cmd.whereConds.size())
+                    cmd.whereConds[sq.condIdx].inList =
+                        engine_.subqueryValues(sq.subTable, sq.subCol, sq.subWhere, sq.subWhereLogic);
+            }
+
+            milansql::dispatchCommand(cmd, engine_, p, oneSQL, persistFn, saveProceduresFn, saveTriggFn);
+        } catch (const std::exception& e) { ok = false; errMsg = e.what(); }
+          catch (...) { ok = false; errMsg = "Unknown error"; }
+        std::cout.rdbuf(old);
+        if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
+        return parseOutputToJson(cap.str());
+    };
+
+    auto stmts = milansql::splitStatements(sql);
+    if (stmts.size() <= 1) return execOne(stmts.empty() ? sql : stmts[0]);
+
+    std::string json = "{\"success\":true,\"results\":[";
+    bool anyError = false;
+    for (size_t idx = 0; idx < stmts.size(); ++idx) {
+        if (idx) json += ",";
+        std::string res = execOne(stmts[idx]);
+        json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
+        if (res.find("\"success\":false") != std::string::npos) anyError = true;
+    }
+    json += "],\"count\":" + std::to_string(stmts.size());
+    json += anyError ? ",\"success\":false}" : ",\"success\":true}";
+    return json;
+}
+
+// ── MilanHttpServer::handleListTablesForUser ──────────────────
+
+inline std::string MilanHttpServer::handleListTablesForUser(int userId) {
+    std::lock_guard<std::mutex> lock(engineMutex_);
+    auto all = engine_.getAllTableNames();
+    std::string json = "{\"success\":true,\"tables\":[";
+    bool first = true;
+    if (userId <= 0) {
+        for (size_t i=0;i<all.size();++i) {
+            if (i) json += ",";
+            json += "\"" + jsonEscape(all[i]) + "\"";
+        }
+    } else {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        for (const auto& t : all) {
+            if (t.size() > pf.size() && t.substr(0,pf.size()) == pf) {
+                if (!first) json += ",";
+                json += "\"" + jsonEscape(t.substr(pf.size())) + "\"";
+                first = false;
+            }
+        }
+    }
+    json += "]}";
+    return json;
 }
 
 // ── MilanHttpServer::handleQuery ──────────────────────────────
@@ -608,7 +1183,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v8.3.0\",";
+    json += "\"version\":\"MilanSQL v8.6.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -820,7 +1395,11 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#128449; MilanSQL v7.0.0 Dashboard</div>
+  <div class="logo">&#9889; MilanSQL v8.6.0</div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
+    <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
+  </div>
   <div class="status-bar">
     <span id="sv">v1.4.0</span>
     <span>Uptime: <span class="badge" id="su">-</span>s</span>
@@ -1418,7 +1997,80 @@ loadSidebarTables();
 pollStatus();
 setInterval(pollStatus, 5000);
 setInterval(loadSidebarTables, 30000);
+
+// ── Phase 154-156: Auth integration ──────────────────────────
+var msToken = localStorage.getItem('ms_token') || '';
+var msUser  = localStorage.getItem('ms_user')  || '';
+
+function getAuthHdr() {
+  return msToken ? {'Authorization':'Bearer '+msToken,'Content-Type':'application/json'} : {'Content-Type':'application/json'};
+}
+async function msLogin(u, p) {
+  try {
+    var r = await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    var d = await r.json();
+    if (d.success) {
+      msToken=d.token; msUser=u;
+      localStorage.setItem('ms_token',d.token); localStorage.setItem('ms_user',u);
+      document.getElementById('ms-login-overlay').style.display='none';
+      var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=u;
+      return true;
+    }
+    return d.error||'Login failed';
+  } catch(e){return 'Network error';}
+}
+async function msLogout() {
+  if(msToken) { try{await fetch('/auth/logout',{method:'POST',headers:getAuthHdr()});}catch(e){} }
+  msToken=''; msUser=''; localStorage.removeItem('ms_token'); localStorage.removeItem('ms_user');
+  showLoginOverlay();
+}
+function showLoginOverlay() { var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='flex'; }
+async function msSubmitLogin() {
+  var u=document.getElementById('ms-lu').value.trim();
+  var p=document.getElementById('ms-lp').value;
+  var err=document.getElementById('ms-lerr');
+  if(!u||!p){err.textContent='Enter username and password';return;}
+  err.textContent='Logging in...';
+  var res=await msLogin(u,p);
+  if(res===true){err.textContent='';}else{err.textContent=res;}
+}
+// Patch all fetch calls to include auth token
+var _origFetch2=window.fetch;
+window.fetch=function(url,opts){
+  if(msToken&&typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/auth/')){
+    opts=opts||{}; opts.headers=opts.headers||{};
+    if(!opts.headers['Authorization'])opts.headers['Authorization']='Bearer '+msToken;
+  }
+  return _origFetch2.apply(this,arguments).then(function(resp){
+    if(resp.status===401){showLoginOverlay();}
+    return resp;
+  });
+};
+// Check auth on load
+if(!msToken){showLoginOverlay();}
+else{
+  fetch('/auth/me').then(r=>r.json()).then(d=>{
+    if(!d.success)showLoginOverlay();
+    else{var ub=document.getElementById('ms-user-badge');if(ub)ub.textContent=d.username||msUser;}
+  }).catch(()=>{});
+}
 </script>
+<!-- Phase 154: Login Overlay -->
+<div id="ms-login-overlay" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.88);z-index:9999;justify-content:center;align-items:center;">
+  <div style="background:#1e1e2e;border:1px solid #313244;border-radius:14px;padding:44px 40px;width:340px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,0.5)">
+    <div style="font-size:30px;font-weight:bold;color:#89dceb;margin-bottom:6px">&#9889; MilanSQL</div>
+    <div style="color:#a6adc8;margin-bottom:26px;font-size:12px">v8.6.0 &mdash; Multi-User Secure Database</div>
+    <input id="ms-lu" type="text" placeholder="Username" autocomplete="username"
+      style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:6px;padding:10px 12px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box">
+    <input id="ms-lp" type="password" placeholder="Password" autocomplete="current-password"
+      style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+      onkeydown="if(event.key==='Enter')msSubmitLogin()">
+    <button onclick="msSubmitLogin()"
+      style="width:100%;background:#89b4fa;color:#11111b;border:none;border-radius:6px;padding:12px;font-size:14px;font-weight:bold;cursor:pointer;font-family:inherit">Login</button>
+    <div id="ms-lerr" style="color:#f38ba8;font-size:12px;margin-top:10px;min-height:16px"></div>
+    <div style="margin-top:18px;font-size:11px;color:#45475a">Default admin: <b style="color:#585b70">root</b> / <b style="color:#585b70">root</b></div>
+  </div>
+</div>
 </body>
 </html>)WEBUIEND";
     return html;
@@ -1426,21 +2078,96 @@ setInterval(loadSidebarTables, 30000);
 
 // ── MilanHttpServer::handleRequest ────────────────────────────
 
-inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
+inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const std::string& clientIp) {
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
 
-    if (req.path == "/query" || req.path == "/api/query") {
-        std::string sql;
-        if (req.method == "GET") {
-            sql = getQueryParam(req.query, "sql");
-        } else if (req.method == "POST") {
-            sql = extractSqlFromJson(req.body);
-            if (sql.empty()) sql = req.body;
+    // ── Phase 154: Auth routes ────────────────────────────────
+    if (req.path == "/auth/register" && req.method == "POST")
+        return buildHttpResponse(200, handleAuthRegister(req.body, clientIp));
+
+    if (req.path == "/auth/login" && req.method == "POST") {
+        auto result = handleAuthLogin(req.body, clientIp);
+        if (result.find("\"code\":429") != std::string::npos)
+            return buildHttpResponse(429, result);
+        return buildHttpResponse(200, result);
+    }
+    if (req.path == "/auth/logout" && req.method == "POST")
+        return buildHttpResponse(200, handleAuthLogout(extractBearerToken(req)));
+    if (req.path == "/auth/me" && req.method == "GET")
+        return buildHttpResponse(200, handleAuthMe(extractBearerToken(req)));
+    if (req.path == "/auth/refresh" && req.method == "POST")
+        return buildHttpResponse(200, handleAuthRefresh(req.body));
+    if (req.path == "/auth/sessions" && req.method == "GET")
+        return buildHttpResponse(200, handleAuthSessions(extractBearerToken(req)));
+    if (req.path == "/auth/api-key" && req.method == "POST") {
+        // Phase 156: named key creation
+        std::string token = extractBearerToken(req);
+        auto vr = authMgr_.validateToken(token);
+        if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
+        // If body has "name" field → create named key; otherwise legacy single key
+        if (!req.body.empty() && req.body.find("\"name\"") != std::string::npos)
+            return buildHttpResponse(200, handleAuthApiKeyCreate(vr.userId, req.body));
+        return buildHttpResponse(200, handleAuthApiKey(token, req.body));
+    }
+    if (req.path == "/auth/api-keys" && req.method == "GET") {
+        std::string token = extractBearerToken(req);
+        auto vr = authMgr_.validateToken(token);
+        if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
+        return buildHttpResponse(200, handleAuthApiKeyList(vr.userId));
+    }
+    // DELETE /auth/api-key/ms_xxxxx
+    if (req.path.size() > 15 && req.path.substr(0,15) == "/auth/api-key/" && req.method == "DELETE") {
+        std::string keyId = req.path.substr(15);
+        std::string token = extractBearerToken(req);
+        auto vr = authMgr_.validateToken(token);
+        if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
+        return buildHttpResponse(200, handleAuthApiKeyDelete(vr.userId, keyId));
+    }
+    // GET /auth/api-key/ms_xxxxx/stats
+    if (req.path.size() > 21 && req.path.find("/stats") != std::string::npos &&
+        req.path.substr(0,15) == "/auth/api-key/") {
+        std::string rest = req.path.substr(15);
+        auto sp = rest.find("/stats");
+        if (sp != std::string::npos) {
+            std::string keyId = rest.substr(0, sp);
+            std::string token = extractBearerToken(req);
+            auto vr = authMgr_.validateToken(token);
+            if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
+            return buildHttpResponse(200, handleAuthApiKeyStats(vr.userId, keyId));
         }
+    }
+
+    // Phase 156: Admin + Quota routes
+    if (req.path == "/admin/users" && req.method == "GET")
+        return buildHttpResponse(200, handleAdminUsers(extractBearerToken(req)));
+    if (req.path == "/admin/stats" && req.method == "GET")
+        return buildHttpResponse(200, handleAdminStats(extractBearerToken(req)));
+    if (req.path == "/admin/quota" && req.method == "GET")
+        return buildHttpResponse(200, handleAdminQuota(extractBearerToken(req)));
+    if (req.path == "/auth/quota" && req.method == "GET")
+        return buildHttpResponse(200, handleMyQuota(extractBearerToken(req)));
+
+    // ── Query + Tables (auth-aware) ───────────────────────────
+    if (req.path == "/query" || req.path == "/api/query") {
+        // Resolve user from token or API key
+        std::string token  = extractBearerToken(req);
+        std::string apiKey = extractApiKey(req);
+        AuthManager::ValidateResult vr{0, "anonymous", "root", true};
+        if (!token.empty())  vr = authMgr_.validateToken(token);
+        else if (!apiKey.empty()) vr = authMgr_.validateApiKey(apiKey);
+
+        // Rate limit by userId or IP
+        std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
+        if (!requestLimiter_.allow(rlKey))
+            return buildHttpResponse(429, R"({"success":false,"error":"Rate limit exceeded","retryAfter":60})");
+
+        std::string sql;
+        if (req.method == "GET") sql = getQueryParam(req.query, "sql");
+        else if (req.method == "POST") { sql = extractSqlFromJson(req.body); if (sql.empty()) sql = req.body; }
         if (sql.empty())
             return buildHttpResponse(400, R"({"success":false,"error":"Missing SQL"})");
-        return buildHttpResponse(200, handleQuery(sql));
+        return buildHttpResponse(200, handleQueryForUser(sql, vr.userId, vr.role));
     }
 
     // Phase 121: Semantic Search REST API
@@ -1452,7 +2179,9 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req) {
     }
 
     if (req.path == "/tables") {
-        return buildHttpResponse(200, handleListTables());
+        std::string tok = extractBearerToken(req);
+        auto vr = tok.empty() ? AuthManager::ValidateResult{0,"","root",true} : authMgr_.validateToken(tok);
+        return buildHttpResponse(200, handleListTablesForUser(vr.userId));
     }
 
     if (req.path.size() > 8 && req.path.substr(0, 8) == "/tables/") {
@@ -1616,7 +2345,12 @@ inline void MilanHttpServer::sendResponse(sock_t sock, const std::string& resp) 
 inline void MilanHttpServer::handleClient(sock_t clientSock) {
     auto req = parseHttpRequest(clientSock);
     if (!req.method.empty()) {
-        std::string response = handleRequest(req);
+        // Extract client IP from proxy headers or socket
+        std::string clientIp = "unknown";
+        auto it = req.headers.find("X-Forwarded-For");
+        if (it != req.headers.end() && !it->second.empty()) clientIp = it->second;
+        else { auto it2 = req.headers.find("X-Real-IP"); if (it2 != req.headers.end()) clientIp = it2->second; }
+        std::string response = handleRequest(req, clientIp);
         sendResponse(clientSock, response);
     }
     closesocket(clientSock);

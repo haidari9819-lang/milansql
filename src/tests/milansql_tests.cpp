@@ -29,6 +29,10 @@
 #include "transaction/distributed_tx.hpp"
 #include "lock/distributed_lock.hpp"
 
+// Phase 154-156: Auth system
+#include "auth/auth_manager.hpp"
+#include "auth/rate_limiter.hpp"
+
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
 static int failed = 0;
@@ -4611,6 +4615,407 @@ static void testGroup64() {
     check(r4.rows.size() >= 1, "Engine responsive after edge case tests");
 }
 
+// ============================================================
+// Group 65: Phase 154 — Auth System (SHA-256, JWT, AuthManager)
+// ============================================================
+
+static void testGroup65() {
+    std::cout << "\n--- Group 65: Phase 154 Multi-User Auth + JWT ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // 1. SHA256 empty string
+    { auto h = AuthManager::sha256Hex_pub("");
+      check(h == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "SHA256('') = NIST known vector"); }
+
+    // 2. SHA256 non-empty deterministic
+    { auto h1 = AuthManager::sha256Hex_pub("abc");
+      auto h2 = AuthManager::sha256Hex_pub("abc");
+      check(h1 == h2 && h1.size() == 64, "SHA256('abc') is deterministic and 64 chars"); }
+
+    // 3. SHA256 output length
+    { check(AuthManager::sha256Hex_pub("MilanSQL").size() == 64, "SHA256 output = 64 hex chars"); }
+
+    // 4. Base64URL roundtrip
+    { std::string orig = "Hello World 123!@#";
+      auto enc = AuthManager::base64urlEncode_pub(orig);
+      auto dec = AuthManager::base64urlDecode_pub(enc);
+      check(dec == orig, "Base64URL encode/decode roundtrip"); }
+
+    // 5. Base64URL no = padding
+    { auto enc = AuthManager::base64urlEncode_pub("test");
+      check(enc.find('=') == std::string::npos, "Base64URL has no padding chars"); }
+
+    // 6. AuthManager init creates root user
+    { AuthManager am; am.init("test_secret_1234567890");
+      check(am.getUserCount() >= 1, "AuthManager init creates at least root user"); }
+
+    // 7. Register new user succeeds
+    { AuthManager am; am.init("test_secret");
+      auto r = am.registerUser("alice", "AlicePass123");
+      check(r.ok && !r.token.empty(), "Register alice → token returned"); }
+
+    // 8. Duplicate register fails
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("alice", "Pass1");
+      auto r = am.registerUser("alice", "Pass2");
+      check(!r.ok, "Duplicate username → registration fails"); }
+
+    // 9. Login correct password returns token
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("bob", "BobPass42");
+      auto r = am.login("bob", "BobPass42");
+      check(r.ok && !r.token.empty() && r.userId > 0, "Login correct password → token + userId"); }
+
+    // 10. Login wrong password fails
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("carol", "CorrectPass");
+      auto r = am.login("carol", "WrongPass");
+      check(!r.ok, "Login wrong password → fails"); }
+
+    // 11. Login nonexistent user fails
+    { AuthManager am; am.init("test_secret");
+      auto r = am.login("nobody", "pass");
+      check(!r.ok, "Login nonexistent user → fails"); }
+
+    // 12. Validate valid token
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("dave", "DavePass");
+      auto lr = am.login("dave", "DavePass");
+      auto vr = am.validateToken(lr.token);
+      check(vr.valid && vr.username == "dave", "Validate valid token → ok"); }
+
+    // 13. Validate tampered token fails
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("eve", "EvePass");
+      auto lr = am.login("eve", "EvePass");
+      auto vr = am.validateToken(lr.token + "X");
+      check(!vr.valid, "Validate tampered token → fails"); }
+
+    // 14. Validate empty token fails
+    { AuthManager am; am.init("test_secret");
+      check(!am.validateToken("").valid, "Validate empty token → fails"); }
+
+    // 15. Logout invalidates token
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("frank", "FrankPass");
+      auto lr = am.login("frank", "FrankPass");
+      am.logout(lr.token);
+      check(!am.validateToken(lr.token).valid, "After logout → token invalid"); }
+
+    // 16. Generate API key starts with ms_
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("grace", "GracePass");
+      auto lr = am.login("grace", "GracePass");
+      auto key = am.generateApiKey(lr.userId);
+      check(!key.empty() && key.substr(0,3) == "ms_", "API key starts with 'ms_'"); }
+
+    // 17. Validate API key succeeds
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("henry", "HenryPass");
+      auto lr = am.login("henry", "HenryPass");
+      auto key = am.generateApiKey(lr.userId);
+      auto vr = am.validateApiKey(key);
+      check(vr.valid && vr.username == "henry", "Validate API key → valid"); }
+
+    // 18. Invalid API key fails
+    { AuthManager am; am.init("test_secret");
+      check(!am.validateApiKey("ms_invalid_key_xyz").valid, "Invalid API key → fails"); }
+
+    // 19. SHOW USERS contains root
+    { AuthManager am; am.init("test_secret");
+      check(am.showUsers().find("root") != std::string::npos, "SHOW USERS contains 'root'"); }
+
+    // 20. SHOW USERS contains registered user
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("ivan", "IvanPass");
+      check(am.showUsers().find("ivan") != std::string::npos, "SHOW USERS contains registered 'ivan'"); }
+
+    // 21. Refresh token issues new token
+    { AuthManager am; am.init("test_secret");
+      am.registerUser("judy", "JudyPass");
+      auto lr = am.login("judy", "JudyPass");
+      auto rr = am.refreshToken(lr.refresh);
+      check(rr.ok && !rr.token.empty(), "Refresh token → new token"); }
+
+    // 22. Refresh with invalid token fails
+    { AuthManager am; am.init("test_secret");
+      check(!am.refreshToken("invalid_refresh").ok, "Refresh invalid token → fails"); }
+
+    // 23. Root user has role root
+    { AuthManager am; am.init("test_secret");
+      auto lr = am.login("root", "root");
+      check(lr.ok, "Root user can login");
+      if (lr.ok) { auto vr = am.validateToken(lr.token); check(vr.role == "root", "Root token has role 'root'"); }
+      else { ++failed; } }
+
+    // 24. Save/load roundtrip
+    { AuthManager am1; am1.init("persist_secret");
+      am1.registerUser("karl", "KarlPass");
+      std::string tmp = std::tmpnam(nullptr);
+      am1.save(tmp);
+      AuthManager am2; am2.init("persist_secret");
+      am2.load(tmp);
+      auto lr = am2.login("karl", "KarlPass");
+      check(lr.ok, "User survives save/load roundtrip");
+      std::remove(tmp.c_str()); }
+
+    // 25. RateLimiter: under capacity passes
+    { RateLimiter rl(5, 100.0);  // large refill so we only test capacity
+      bool allOk = true;
+      for (int i=0;i<5;i++) if (!rl.allow("u1")) allOk = false;
+      check(allOk, "RateLimiter: 5 requests within capacity all pass"); }
+
+    // 26. RateLimiter: over capacity blocked
+    { RateLimiter rl(3, 0.001); // tiny refill
+      rl.allow("u2"); rl.allow("u2"); rl.allow("u2");
+      check(!rl.allow("u2"), "RateLimiter: 4th request blocked"); }
+}
+
+// ============================================================
+// Group 66: Phase 155 — GRANT/REVOKE + Column Security
+// ============================================================
+
+static void testGroup66() {
+    std::cout << "\n--- Group 66: Phase 155 GRANT/REVOKE + Permission System ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // 1. Root has all permissions by default
+    { AuthManager am; am.init("secret");
+      am.registerUser("alice", "pass");
+      auto lr = am.login("root", "root");
+      auto vr = am.validateToken(lr.token);
+      check(am.hasPermission(vr.userId, "orders", "SELECT"), "Root has SELECT permission on any table"); }
+
+    // 2. New user has no permissions on other tables
+    { AuthManager am; am.init("secret");
+      am.registerUser("alice", "pass");
+      auto lr = am.login("alice", "pass");
+      check(!am.hasPermission(lr.userId, "u1_orders", "DELETE"), "Alice has no DELETE on root's table"); }
+
+    // 3. GRANT SELECT to user
+    { AuthManager am; am.init("secret");
+      am.registerUser("alice", "pass");
+      auto lr = am.login("alice", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="shared_table"; p.privilege="SELECT"; p.grantedBy=1;
+      am.grantPermission(p);
+      check(am.hasPermission(lr.userId, "shared_table", "SELECT"), "After GRANT SELECT → has SELECT"); }
+
+    // 4. GRANT SELECT does not give INSERT
+    { AuthManager am; am.init("secret");
+      am.registerUser("bob", "pass");
+      auto lr = am.login("bob", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="shared_t"; p.privilege="SELECT"; p.grantedBy=1;
+      am.grantPermission(p);
+      check(!am.hasPermission(lr.userId, "shared_t", "INSERT"), "SELECT grant does not give INSERT"); }
+
+    // 5. GRANT ALL gives SELECT
+    { AuthManager am; am.init("secret");
+      am.registerUser("carol", "pass");
+      auto lr = am.login("carol", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="full_table"; p.privilege="ALL"; p.grantedBy=1;
+      am.grantPermission(p);
+      check(am.hasPermission(lr.userId, "full_table", "SELECT"), "GRANT ALL → SELECT permitted"); }
+
+    // 6. GRANT ALL gives DELETE
+    { AuthManager am; am.init("secret");
+      am.registerUser("dave", "pass");
+      auto lr = am.login("dave", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="full_t2"; p.privilege="ALL"; p.grantedBy=1;
+      am.grantPermission(p);
+      check(am.hasPermission(lr.userId, "full_t2", "DELETE"), "GRANT ALL → DELETE permitted"); }
+
+    // 7. REVOKE removes permission
+    { AuthManager am; am.init("secret");
+      am.registerUser("eve", "pass");
+      auto lr = am.login("eve", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="t_eve"; p.privilege="SELECT"; p.grantedBy=1;
+      am.grantPermission(p);
+      am.revokePermission(lr.userId, "t_eve", "SELECT");
+      check(!am.hasPermission(lr.userId, "t_eve", "SELECT"), "After REVOKE → permission removed"); }
+
+    // 8. Column-level grant: allowed columns populated
+    { AuthManager am; am.init("secret");
+      am.registerUser("frank", "pass");
+      auto lr = am.login("frank", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="users_t"; p.privilege="SELECT";
+      p.columns={"name","email"}; p.grantedBy=1;
+      am.grantPermission(p);
+      auto cols = am.getAllowedColumns(lr.userId, "users_t");
+      check(cols.size()==2 && cols[0]=="name" && cols[1]=="email", "Column-level grant: allowed cols = name,email"); }
+
+    // 9. Root has no column restrictions
+    { AuthManager am; am.init("secret");
+      auto cols = am.getAllowedColumns(1, "any_table"); // root id=1
+      check(cols.empty(), "Root has no column restrictions (empty = all)"); }
+
+    // 10. SHOW GRANTS FOR returns output
+    { AuthManager am; am.init("secret");
+      am.registerUser("grace", "pass");
+      auto lr = am.login("grace", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="products"; p.privilege="SELECT"; p.grantedBy=1;
+      am.grantPermission(p);
+      auto out = am.showGrantsFor("grace");
+      check(out.find("SELECT") != std::string::npos && out.find("products") != std::string::npos,
+            "SHOW GRANTS FOR grace → contains SELECT + products"); }
+
+    // 11. SHOW GRANTS FOR unknown user
+    { AuthManager am; am.init("secret");
+      auto out = am.showGrantsFor("nobody");
+      check(out.find("not found") != std::string::npos, "SHOW GRANTS FOR unknown user → not found"); }
+
+    // 12. Multiple GRANTs on different tables
+    { AuthManager am; am.init("secret");
+      am.registerUser("henry", "pass");
+      auto lr = am.login("henry", "pass");
+      Permission p1; p1.userId=lr.userId; p1.tableName="t1"; p1.privilege="SELECT"; p1.grantedBy=1;
+      Permission p2; p2.userId=lr.userId; p2.tableName="t2"; p2.privilege="INSERT"; p2.grantedBy=1;
+      am.grantPermission(p1); am.grantPermission(p2);
+      check(am.hasPermission(lr.userId,"t1","SELECT") && am.hasPermission(lr.userId,"t2","INSERT"),
+            "Multiple grants on different tables work"); }
+
+    // 13. Permissions persist through save/load
+    { AuthManager am1; am1.init("secret");
+      am1.registerUser("ivan", "pass");
+      auto lr = am1.login("ivan", "pass");
+      Permission p; p.userId=lr.userId; p.tableName="persist_t"; p.privilege="SELECT"; p.grantedBy=1;
+      am1.grantPermission(p);
+      std::string tmp = std::tmpnam(nullptr);
+      am1.save(tmp);
+      AuthManager am2; am2.init("secret");
+      am2.load(tmp);
+      check(am2.hasPermission(lr.userId, "persist_t", "SELECT"), "Permission survives save/load");
+      std::remove(tmp.c_str()); }
+}
+
+// ============================================================
+// Group 67: Phase 156 — API Key V2 + Tenant Quotas
+// ============================================================
+
+static void testGroup67() {
+    std::cout << "\n--- Group 67: Phase 156 API Key V2 + Tenant Isolation ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // 1. Create named API key
+    { AuthManager am; am.init("secret");
+      am.registerUser("alice", "pass");
+      auto lr = am.login("alice", "pass");
+      std::string key = am.createNamedApiKey(lr.userId, "my-app", 30);
+      check(!key.empty() && key.substr(0,3)=="ms_", "Named API key starts with 'ms_'"); }
+
+    // 2. Named key validates
+    { AuthManager am; am.init("secret");
+      am.registerUser("bob", "pass");
+      auto lr = am.login("bob", "pass");
+      std::string key = am.createNamedApiKey(lr.userId, "app1", 30);
+      auto vr = am.validateApiKey(key);
+      check(vr.valid && vr.username=="bob", "Named API key validates for bob"); }
+
+    // 3. Revoked named key fails
+    { AuthManager am; am.init("secret");
+      am.registerUser("carol", "pass");
+      auto lr = am.login("carol", "pass");
+      std::string key = am.createNamedApiKey(lr.userId, "app2", 30);
+      am.revokeApiKey(key);
+      check(!am.validateApiKey(key).valid, "Revoked named key → invalid"); }
+
+    // 4. List API keys for user
+    { AuthManager am; am.init("secret");
+      am.registerUser("dave", "pass");
+      auto lr = am.login("dave", "pass");
+      am.createNamedApiKey(lr.userId, "key1", 30);
+      am.createNamedApiKey(lr.userId, "key2", 60);
+      auto keys = am.listApiKeys(lr.userId);
+      check(keys.size() == 2, "listApiKeys returns 2 keys for dave"); }
+
+    // 5. Revoked key not in list
+    { AuthManager am; am.init("secret");
+      am.registerUser("eve", "pass");
+      auto lr = am.login("eve", "pass");
+      std::string k1 = am.createNamedApiKey(lr.userId, "k1", 30);
+      am.createNamedApiKey(lr.userId, "k2", 30);
+      am.revokeApiKey(k1);
+      auto keys = am.listApiKeys(lr.userId);
+      check(keys.size() == 1, "Revoked key not in listApiKeys"); }
+
+    // 6. API key with no-expiry (days=0)
+    { AuthManager am; am.init("secret");
+      am.registerUser("frank", "pass");
+      auto lr = am.login("frank", "pass");
+      std::string key = am.createNamedApiKey(lr.userId, "permanent", 0);
+      auto ki = am.getApiKeyInfo(key);
+      check(ki && ki->expiresAt == 0, "No-expiry key has expiresAt=0"); }
+
+    // 7. API key request count tracking
+    { AuthManager am; am.init("secret");
+      am.registerUser("grace", "pass");
+      auto lr = am.login("grace", "pass");
+      std::string key = am.createNamedApiKey(lr.userId, "tracker", 30);
+      am.validateApiKey(key);
+      am.validateApiKey(key);
+      am.validateApiKey(key);
+      auto ki = am.getApiKeyInfo(key);
+      check(ki && ki->requestsToday >= 3, "API key tracks requestsToday"); }
+
+    // 8. API keys with permissions stored
+    { AuthManager am; am.init("secret");
+      am.registerUser("henry", "pass");
+      auto lr = am.login("henry", "pass");
+      std::string key = am.createNamedApiKey(lr.userId, "readonly", 30, {"SELECT"}, {"orders"});
+      auto ki = am.getApiKeyInfo(key);
+      check(ki && ki->permissions.size()==1 && ki->permissions[0]=="SELECT",
+            "API key with permissions: SELECT stored"); }
+
+    // 9. Named key save/load
+    { AuthManager am1; am1.init("secret");
+      am1.registerUser("ivan", "pass");
+      auto lr = am1.login("ivan", "pass");
+      std::string key = am1.createNamedApiKey(lr.userId, "persist-key", 30);
+      std::string tmp = std::tmpnam(nullptr);
+      am1.save(tmp);
+      AuthManager am2; am2.init("secret");
+      am2.load(tmp);
+      check(am2.validateApiKey(key).valid, "Named API key survives save/load");
+      std::remove(tmp.c_str()); }
+
+    // 10. Tenant quota default values
+    { AuthManager am; am.init("secret");
+      am.registerUser("judy", "pass");
+      auto lr = am.login("judy", "pass");
+      auto q = am.getQuota(lr.userId);
+      check(q.maxTables == 100 && q.maxRows == 1000000 && q.maxStorageMB == 1024,
+            "Default tenant quota: 100 tables, 1M rows, 1GB"); }
+
+    // 11. Set custom quota
+    { AuthManager am; am.init("secret");
+      am.registerUser("karl", "pass");
+      auto lr = am.login("karl", "pass");
+      TenantQuota q; q.userId=lr.userId; q.maxTables=50; q.maxRows=500000; q.maxStorageMB=512;
+      am.setQuota(q);
+      auto got = am.getQuota(lr.userId);
+      check(got.maxTables==50 && got.maxRows==500000, "Custom tenant quota applied"); }
+
+    // 12. SHOW ALL USERS contains registered user
+    { AuthManager am; am.init("secret");
+      am.registerUser("laura", "pass");
+      check(am.showAllUsers().find("laura") != std::string::npos,
+            "SHOW ALL USERS contains 'laura'"); }
+
+    // 13. SHOW ALL USERS contains root
+    { AuthManager am; am.init("secret");
+      check(am.showAllUsers().find("root") != std::string::npos,
+            "SHOW ALL USERS contains 'root'"); }
+}
+
 // MAIN
 // ============================================================
 
@@ -4798,6 +5203,15 @@ int main() {
     }
     try { testGroup64(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 64 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup65(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 65 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup66(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 66 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup67(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 67 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

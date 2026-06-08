@@ -251,9 +251,29 @@ static std::string buildHttpResponse(int statusCode, const std::string& body,
            "X-Content-Type-Options: nosniff\r\n"
            "X-XSS-Protection: 1; mode=block\r\n"
            "Referrer-Policy: strict-origin-when-cross-origin\r\n"
+           "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'\r\n"
+           "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+           "Permissions-Policy: geolocation=(), camera=(), microphone=()\r\n"
            + extraHeaders +
            "Connection: close\r\n"
            "\r\n" + body;
+}
+
+// Strip internal filesystem paths from error messages (information disclosure prevention)
+static std::string sanitizeError(const std::string& msg) {
+    std::string r = msg;
+    // Remove POSIX absolute paths embedded in the message (e.g. /opt/milansql/...)
+    for (size_t i = 0; i < r.size(); ) {
+        if (r[i] == '/' && (i == 0 || r[i-1] == ' ' || r[i-1] == ':' || r[i-1] == '"')) {
+            size_t end = i + 1;
+            while (end < r.size() && r[end] != ' ' && r[end] != '"' && r[end] != '\'') ++end;
+            r = r.substr(0, i) + "<path>" + r.substr(end);
+            i += 6;
+        } else {
+            ++i;
+        }
+    }
+    return r;
 }
 
 // ── Output parser: convert captured table output to JSON ──────
@@ -865,7 +885,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "8.7.0");
+            return makeScalar("@@version", "8.9.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
@@ -1101,7 +1121,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             }
 
             milansql::dispatchCommand(cmd, engine_, p, oneSQL, persistFn, saveProceduresFn, saveTriggFn);
-        } catch (const std::exception& e) { ok = false; errMsg = e.what(); }
+        } catch (const std::exception& e) { ok = false; errMsg = sanitizeError(e.what()); }
           catch (...) { ok = false; errMsg = "Unknown error"; }
         std::cout.rdbuf(old);
         if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
@@ -1303,7 +1323,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v8.7.0\",";
+    json += "\"version\":\"MilanSQL v8.9.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1515,7 +1535,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v8.7.0</div>
+  <div class="logo">&#9889; MilanSQL v8.9.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -1726,7 +1746,7 @@ td.null-val{color:#484f58;font-style:italic}
   <span class="badge blue" id="conn-badge">0 connections</span>
   <span class="badge blue" id="test-badge">426 tests</span>
   <div class="topbar-right">
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v8.7.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v8.9.0</span>
   </div>
 </div>
 
@@ -1756,7 +1776,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v8.7.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v8.9.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1829,7 +1849,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v8.7.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v8.9.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2227,7 +2247,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v8.8.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v8.9.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2283,6 +2303,11 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
 
+    // ── Path traversal guard ──────────────────────────────────────
+    // Block any path containing ".." to prevent directory traversal attacks
+    if (req.path.find("..") != std::string::npos)
+        return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");
+
     // ── Favicon: ⚡ lightning bolt SVG (no 404 in browser console) ──
     if (req.path == "/favicon.ico" || req.path == "/favicon.svg") {
         static const std::string FAVICON_SVG =
@@ -2299,7 +2324,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict\r\n";
+                                 "; HttpOnly; Secure; Path=/; Max-Age=86400; SameSite=Strict\r\n";
             return buildHttpResponse(200, result, "application/json", cookie);
         }
         return buildHttpResponse(200, result);
@@ -2314,7 +2339,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict\r\n";
+                                 "; HttpOnly; Secure; Path=/; Max-Age=86400; SameSite=Strict\r\n";
             return buildHttpResponse(200, result, "application/json", cookie);
         }
         return buildHttpResponse(200, result);
@@ -2322,7 +2347,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.path == "/auth/logout" && req.method == "POST") {
         auto result = handleAuthLogout(extractBearerToken(req));
         static const std::string clearCookie =
-            "Set-Cookie: milansql_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict\r\n";
+            "Set-Cookie: milansql_token=; HttpOnly; Secure; Path=/; Max-Age=0; SameSite=Strict\r\n";
         return buildHttpResponse(200, result, "application/json", clearCookie);
     }
     if (req.path == "/auth/me" && req.method == "GET")
@@ -2398,6 +2423,19 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         else if (req.method == "POST") { sql = extractSqlFromJson(req.body); if (sql.empty()) sql = req.body; }
         if (sql.empty())
             return buildHttpResponse(400, R"({"success":false,"error":"Missing SQL"})");
+        // Input sanitization: length limit + null-byte + control-char removal
+        if (sql.size() > 10000)
+            return buildHttpResponse(400, R"({"success":false,"error":"SQL too long (max 10000 chars)"})");
+        {
+            std::string clean;
+            clean.reserve(sql.size());
+            for (unsigned char c : sql) {
+                if (c == '\0') continue;                // null bytes
+                if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') continue; // control chars
+                clean += static_cast<char>(c);
+            }
+            sql = std::move(clean);
+        }
         return buildHttpResponse(200, handleQueryForUser(sql, vr.userId, vr.role));
     }
 

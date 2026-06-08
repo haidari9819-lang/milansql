@@ -7288,7 +7288,7 @@ public:
         // Phase 157: System info functions (instance-level, know currentUser_)
         std::string fnUp = fn;
         for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (fnUp == "VERSION") return "MilanSQL v8.7.0";
+        if (fnUp == "VERSION") return "MilanSQL v8.9.0";
         if (fnUp == "DATABASE") return "public";
         if (fnUp == "USER" || fnUp == "CURRENT_USER" || fnUp == "SESSION_USER" || fnUp == "SYSTEM_USER")
             return currentUser_.empty() ? "root" : currentUser_;

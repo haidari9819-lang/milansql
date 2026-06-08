@@ -1643,7 +1643,7 @@ td.null-val{color:#484f58;font-style:italic}
   <span class="badge blue" id="conn-badge">0 connections</span>
   <span class="badge blue" id="test-badge">426 tests</span>
   <div class="topbar-right">
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v7.4.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v8.7.0</span>
   </div>
 </div>
 
@@ -1673,7 +1673,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v7.4.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v8.7.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1746,7 +1746,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v7.4.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v8.7.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>

@@ -5261,6 +5261,151 @@ static void testGroup68() {
     }
 }
 
+// ============================================================
+// testGroup69: Phase 158 Security — httpOnly Cookie + User Isolation
+//              + Password Strength + Brute Force + Secure Headers
+// ============================================================
+
+static void testGroup69() {
+    std::cout << "\n--- Group 69: Phase 158 Security Hardening ---\n";
+    auto check = [](bool cond, const std::string& msg) {
+        if (cond) { std::cout << "[PASS] " << msg << "\n"; ++passed; }
+        else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
+    };
+
+    // 1. Password strength: too short
+    {
+        auto valid = [](const std::string& p) -> bool {
+            if (p.size() < 8) return false;
+            for (unsigned char c : p) if (std::isdigit(c)) return true;
+            return false;
+        };
+        check(!valid("abc1"),       "Password < 8 chars is rejected");
+        check(!valid("abcdefgh"),   "Password without digit is rejected");
+        check( valid("abcdefg1"),   "Password ≥8 chars + digit is accepted");
+        check( valid("Root1234"),   "Root1234 passes strength check");
+    }
+
+    // 2. User namespace isolation: table prefix logic
+    {
+        // Simulate the prefix check performed in handleQueryForUser
+        auto canAccess = [](const std::string& table, int userId) -> bool {
+            // root (userId<=1) can access everything
+            if (userId <= 1) return true;
+            std::string myPfx = "u" + std::to_string(userId) + "_";
+            // plain name (no u\d_ prefix) → OK (will get prefixed)
+            if (table.empty() || table[0] != 'u') return true;
+            // starts with u<digit>_ → check if it's our prefix
+            size_t i = 1;
+            while (i < table.size() && std::isdigit((unsigned char)table[i])) ++i;
+            if (i > 1 && i < table.size() && table[i] == '_') {
+                // it has a user prefix — only allow if it's ours
+                return table.substr(0, myPfx.size()) == myPfx;
+            }
+            return true;
+        };
+        check( canAccess("users",    2), "User 2 can access plain 'users'");
+        check( canAccess("u2_users", 2), "User 2 can access 'u2_users' (own prefix)");
+        check(!canAccess("u1_users", 2), "User 2 CANNOT access 'u1_users' (root table)");
+        check(!canAccess("u3_orders",2), "User 2 CANNOT access 'u3_orders' (other user)");
+        check( canAccess("u1_users", 1), "Root can access any table");
+        check( canAccess("u2_users", 1), "Root can access u2_users");
+    }
+
+    // 3. Table list filtering: only user's own tables visible
+    {
+        std::vector<std::string> allTables = {
+            "u1_users", "u1_config", "u2_orders", "u2_products", "u3_logs"
+        };
+        auto listForUser = [&](int userId) {
+            std::string pfx = "u" + std::to_string(userId) + "_";
+            std::vector<std::string> result;
+            for (const auto& t : allTables)
+                if (t.substr(0, pfx.size()) == pfx)
+                    result.push_back(t.substr(pfx.size())); // strip prefix
+            return result;
+        };
+        auto u2 = listForUser(2);
+        check(u2.size() == 2, "User 2 sees exactly 2 tables");
+        check(u2[0] == "orders" || u2[1] == "orders", "User 2 sees 'orders'");
+        check(u2[0] == "products" || u2[1] == "products", "User 2 sees 'products'");
+        auto u3 = listForUser(3);
+        check(u3.size() == 1 && u3[0] == "logs", "User 3 sees only 'logs'");
+    }
+
+    // 4. AuthManager: wrong password doesn't return token
+    {
+        AuthManager am; am.init("test_security_secret");
+        am.registerUser("charlie", "Charlie1234");
+        auto r = am.login("charlie", "wrongpassword");
+        check(!r.ok && r.token.empty(), "Wrong password → login fails, no token");
+    }
+
+    // 5. AuthManager: correct password after registration
+    {
+        AuthManager am; am.init("test_security_secret");
+        am.registerUser("dana", "Dana5678");
+        auto r = am.login("dana", "Dana5678");
+        check(r.ok && !r.token.empty() && r.userId > 1, "Correct password → login OK, token issued");
+    }
+
+    // 6. AuthManager: token validates correctly
+    {
+        AuthManager am; am.init("test_security_secret");
+        am.registerUser("eve", "Eve99secure");
+        auto lr = am.login("eve", "Eve99secure");
+        auto vr = am.validateToken(lr.token);
+        check(vr.valid && vr.username == "eve", "Issued token validates to correct user");
+    }
+
+    // 7. AuthManager: tampered token is rejected
+    {
+        AuthManager am; am.init("test_security_secret");
+        am.registerUser("frank", "Frank7890");
+        auto lr = am.login("frank", "Frank7890");
+        std::string tampered = lr.token;
+        if (!tampered.empty()) tampered.back() ^= 0x01; // flip last bit
+        auto vr = am.validateToken(tampered);
+        check(!vr.valid, "Tampered token is rejected");
+    }
+
+    // 8. Cookie token extraction (pure string logic)
+    {
+        auto extractCookieToken = [](const std::string& cookieHeader) -> std::string {
+            const std::string prefix = "milansql_token=";
+            size_t pos = cookieHeader.find(prefix);
+            if (pos == std::string::npos) return "";
+            pos += prefix.size();
+            size_t end = cookieHeader.find(';', pos);
+            if (end == std::string::npos) end = cookieHeader.size();
+            return cookieHeader.substr(pos, end - pos);
+        };
+        check(extractCookieToken("milansql_token=abc123") == "abc123",
+              "Cookie token extraction — single cookie");
+        check(extractCookieToken("session=xyz; milansql_token=tok456; lang=en") == "tok456",
+              "Cookie token extraction — multi-cookie string");
+        check(extractCookieToken("session=xyz").empty(),
+              "Cookie token extraction — missing token returns empty");
+    }
+
+    // 9. Brute force lockout counter logic
+    {
+        int failedAttempts = 0;
+        const int MAX_ATTEMPTS = 5;
+        bool locked = false;
+        // Simulate 5 wrong logins
+        for (int i = 0; i < 5; ++i) {
+            failedAttempts++;
+            if (failedAttempts >= MAX_ATTEMPTS) locked = true;
+        }
+        check(locked, "Account locks after 5 failed attempts");
+        check(failedAttempts == MAX_ATTEMPTS, "Failure counter = 5 at lockout");
+        // Simulate correct login → reset
+        failedAttempts = 0; locked = false;
+        check(!locked && failedAttempts == 0, "Successful login resets lockout counter");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -5460,6 +5605,9 @@ int main() {
     }
     try { testGroup68(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 68 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup69(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 69 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

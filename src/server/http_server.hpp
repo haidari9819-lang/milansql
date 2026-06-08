@@ -215,17 +215,28 @@ static std::string getQueryParam(const std::string& query, const std::string& ke
 }
 
 static std::string buildHttpResponse(int statusCode, const std::string& body,
-                                     const std::string& contentType = "application/json") {
+                                     const std::string& contentType = "application/json",
+                                     const std::string& extraHeaders = "") {
     std::string statusText = statusCode == 200 ? "OK"
+                           : statusCode == 201 ? "Created"
                            : statusCode == 400 ? "Bad Request"
+                           : statusCode == 401 ? "Unauthorized"
+                           : statusCode == 403 ? "Forbidden"
                            : statusCode == 404 ? "Not Found"
+                           : statusCode == 423 ? "Locked"
+                           : statusCode == 429 ? "Too Many Requests"
                            : "Internal Server Error";
     return "HTTP/1.1 " + std::to_string(statusCode) + " " + statusText + "\r\n"
            "Content-Type: " + contentType + "; charset=utf-8\r\n"
            "Content-Length: " + std::to_string(body.size()) + "\r\n"
            "Access-Control-Allow-Origin: *\r\n"
-           "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-           "Access-Control-Allow-Headers: Content-Type\r\n"
+           "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
+           "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+           "X-Frame-Options: DENY\r\n"
+           "X-Content-Type-Options: nosniff\r\n"
+           "X-XSS-Protection: 1; mode=block\r\n"
+           "Referrer-Policy: strict-origin-when-cross-origin\r\n"
+           + extraHeaders +
            "Connection: close\r\n"
            "\r\n" + body;
 }
@@ -367,6 +378,11 @@ private:
     RateLimiter loginLimiter_{10, 10.0/60.0};    // 10/min per IP
     RateLimiter requestLimiter_{100, 100.0/60.0}; // 100/min per user/IP
 
+    // Brute-force lockout: 5 failures → 15 min account lock
+    struct LockoutInfo { int failedAttempts = 0; std::chrono::steady_clock::time_point lockedUntil{}; };
+    std::map<std::string, LockoutInfo> loginLockouts_;
+    std::mutex lockoutMutex_;
+
     void handleClient(sock_t clientSock);
     std::string handleRequest(const HttpRequest& req, const std::string& clientIp = "");
     std::string handleQuery(const std::string& sql);
@@ -500,10 +516,25 @@ inline void MilanHttpServer::initEngine() {
 // ── Auth helpers ─────────────────────────────────────────────
 
 inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
+    // 1) Authorization: Bearer header (API / in-memory token)
     auto it = req.headers.find("Authorization");
-    if (it == req.headers.end()) return "";
-    const auto& v = it->second;
-    if (v.size() > 7 && v.substr(0,7) == "Bearer ") return v.substr(7);
+    if (it != req.headers.end()) {
+        const auto& v = it->second;
+        if (v.size() > 7 && v.substr(0,7) == "Bearer ") return v.substr(7);
+    }
+    // 2) httpOnly Cookie fallback (survives page refresh)
+    auto cit = req.headers.find("Cookie");
+    if (cit != req.headers.end()) {
+        const std::string& cookies = cit->second;
+        const std::string prefix = "milansql_token=";
+        size_t pos = cookies.find(prefix);
+        if (pos != std::string::npos) {
+            pos += prefix.size();
+            size_t end = cookies.find(';', pos);
+            if (end == std::string::npos) end = cookies.size();
+            return cookies.substr(pos, end - pos);
+        }
+    }
     return "";
 }
 inline std::string MilanHttpServer::extractApiKey(const HttpRequest& req) {
@@ -534,6 +565,15 @@ inline std::string MilanHttpServer::handleAuthRegister(const std::string& body, 
     std::string email    = extractJsonStr(body, "email");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
+    // Password strength: min 8 chars, min 1 digit
+    if (password.size() < 8)
+        return "{\"success\":false,\"error\":\"Password must be at least 8 characters\"}";
+    {
+        bool hasDigit = false;
+        for (unsigned char c : password) if (std::isdigit(c)) { hasDigit = true; break; }
+        if (!hasDigit)
+            return "{\"success\":false,\"error\":\"Password must contain at least one number\"}";
+    }
     auto res = authMgr_.registerUser(username, password, email);
     if (!res.ok) return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
     authMgr_.save(dbPath_ + ".auth");
@@ -549,8 +589,33 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
     std::string password = extractJsonStr(body, "password");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
+    // Brute-force lockout check (per username)
+    {
+        std::lock_guard<std::mutex> lk(lockoutMutex_);
+        auto lit = loginLockouts_.find(username);
+        if (lit != loginLockouts_.end() && lit->second.failedAttempts >= 5) {
+            auto now = std::chrono::steady_clock::now();
+            if (now < lit->second.lockedUntil)
+                return "{\"success\":false,\"error\":\"Account locked after too many failed attempts. Try again in 15 minutes.\",\"code\":423}";
+            // Lockout period expired — reset
+            lit->second.failedAttempts = 0;
+        }
+    }
     auto res = authMgr_.login(username, password);
-    if (!res.ok) return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
+    if (!res.ok) {
+        // Increment failure counter
+        std::lock_guard<std::mutex> lk(lockoutMutex_);
+        auto& info = loginLockouts_[username];
+        info.failedAttempts++;
+        if (info.failedAttempts >= 5)
+            info.lockedUntil = std::chrono::steady_clock::now() + std::chrono::minutes(15);
+        return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
+    }
+    // Success — reset failure counter
+    {
+        std::lock_guard<std::mutex> lk(lockoutMutex_);
+        loginLockouts_.erase(username);
+    }
     authMgr_.save(dbPath_ + ".auth");
     return "{\"success\":true,\"token\":\"" + jsonEscape(res.token) +
            "\",\"refresh_token\":\"" + jsonEscape(res.refresh) +
@@ -813,8 +878,10 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         if (!isRoot) return "{\"success\":false,\"error\":\"Access denied: requires root\"}";
         return parseOutputToJson(authMgr_.showAllUsers());
     }
-    // SHOW SESSIONS
-    if (upper == "SHOW SESSIONS") {
+    // SHOW SESSIONS  /  SELECT * FROM __sessions__
+    if (upper == "SHOW SESSIONS" ||
+        upper == "SELECT * FROM __SESSIONS__" ||
+        upper == "SELECT * FROM __SESSIONS__;" ) {
         if (!isRoot) return "{\"success\":false,\"error\":\"Access denied: requires root\"}";
         return parseOutputToJson(authMgr_.showSessions());
     }
@@ -2038,29 +2105,33 @@ setInterval(pollStatus, 5000);
 setInterval(loadSidebarTables, 30000);
 
 // ── Phase 154-156: Auth integration ──────────────────────────
-var msToken = localStorage.getItem('ms_token') || '';
-var msUser  = localStorage.getItem('ms_user')  || '';
+// Token lives in httpOnly cookie (survives refresh) + in-memory for Bearer header
+var msToken = '';  // in-memory only; restored via /auth/me on page load
+var msUser  = '';
 
 function getAuthHdr() {
-  return msToken ? {'Authorization':'Bearer '+msToken,'Content-Type':'application/json'} : {'Content-Type':'application/json'};
+  var h = {'Content-Type':'application/json'};
+  if (msToken) h['Authorization'] = 'Bearer ' + msToken;
+  return h;
 }
 async function msLogin(u, p) {
   try {
-    var r = await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    var r = await fetch('/auth/login',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     var d = await r.json();
     if (d.success) {
-      msToken=d.token; msUser=u;
-      localStorage.setItem('ms_token',d.token); localStorage.setItem('ms_user',u);
+      msToken=d.token; msUser=d.username||u;
+      // No localStorage — token is in httpOnly cookie set by server
       hidLoginPage();
-      var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=u;
+      var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=msUser;
       return true;
     }
     return d.error||'Login failed';
   } catch(e){return 'Network error';}
 }
 async function msLogout() {
-  if(msToken) { try{await fetch('/auth/logout',{method:'POST',headers:getAuthHdr()});}catch(e){} }
-  msToken=''; msUser=''; localStorage.removeItem('ms_token'); localStorage.removeItem('ms_user');
+  try { await fetch('/auth/logout',{method:'POST',credentials:'include',headers:getAuthHdr()}); } catch(e){}
+  msToken=''; msUser='';
+  // Server clears cookie via Set-Cookie: milansql_token=; Max-Age=0
   showLoginPage();
 }
 async function msSubmitLogin() {
@@ -2072,15 +2143,19 @@ async function msSubmitLogin() {
   var res=await msLogin(u,p);
   if(res===true){err.textContent='';}else{err.style.color='#f38ba8';err.textContent=res;}
 }
-// Patch all fetch calls to include auth token
+// Patch all fetch calls to include auth token + cookie credentials
 var _origFetch2=window.fetch;
 window.fetch=function(url,opts){
-  if(msToken&&typeof url==='string'&&url.startsWith('/')&&!url.startsWith('/auth/')){
-    opts=opts||{}; opts.headers=opts.headers||{};
-    if(!opts.headers['Authorization'])opts.headers['Authorization']='Bearer '+msToken;
+  if(typeof url==='string'&&url.startsWith('/')){
+    opts=opts||{};
+    opts.credentials=opts.credentials||'include'; // always send httpOnly cookie
+    if(msToken&&!url.startsWith('/auth/')){
+      opts.headers=opts.headers||{};
+      if(!opts.headers['Authorization'])opts.headers['Authorization']='Bearer '+msToken;
+    }
   }
   return _origFetch2.apply(this,arguments).then(function(resp){
-    if(resp.status===401){showLoginPage();}
+    if(resp.status===401){msToken='';msUser='';showLoginPage();}
     return resp;
   });
 };
@@ -2123,15 +2198,12 @@ async function msSubmitRegister(){
     }
   }catch(e){err.style.color='#f38ba8';err.textContent='Network error';}
 }
-// Start: show login page immediately if no token (no flash!)
-if(!msToken){
-  showLoginPage();
-} else {
-  fetch('/auth/me',{headers:getAuthHdr()}).then(r=>r.json()).then(d=>{
-    if(!d.success){ msToken=''; msUser=''; localStorage.removeItem('ms_token'); localStorage.removeItem('ms_user'); showLoginPage(); }
-    else{ hidLoginPage(); var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=d.username||msUser; }
+// Start: try cookie-based auto-login (survives page refresh), then show login if not authenticated
+fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/json'}})
+  .then(r=>r.json()).then(d=>{
+    if(d.success){ msUser=d.username||msUser; hidLoginPage(); var ub=document.getElementById('ms-user-badge'); if(ub) ub.textContent=msUser; }
+    else{ showLoginPage(); }
   }).catch(()=>{ showLoginPage(); });
-}
 </script>
 <!-- Phase 158: Full-screen Login Page (starts visible, hidden after auth) -->
 <div id="ms-login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:#11111b;z-index:9999;justify-content:center;align-items:center;">
@@ -2140,7 +2212,7 @@ if(!msToken){
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v8.7.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v8.8.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2207,17 +2279,37 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     // ── Phase 154: Auth routes ────────────────────────────────
-    if (req.path == "/auth/register" && req.method == "POST")
-        return buildHttpResponse(200, handleAuthRegister(req.body, clientIp));
+    if (req.path == "/auth/register" && req.method == "POST") {
+        auto result = handleAuthRegister(req.body, clientIp);
+        if (result.find("\"success\":true") != std::string::npos) {
+            std::string token = extractJsonStr(result, "token");
+            std::string cookie = "Set-Cookie: milansql_token=" + token +
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict\r\n";
+            return buildHttpResponse(200, result, "application/json", cookie);
+        }
+        return buildHttpResponse(200, result);
+    }
 
     if (req.path == "/auth/login" && req.method == "POST") {
         auto result = handleAuthLogin(req.body, clientIp);
         if (result.find("\"code\":429") != std::string::npos)
             return buildHttpResponse(429, result);
+        if (result.find("\"code\":423") != std::string::npos)
+            return buildHttpResponse(423, result);
+        if (result.find("\"success\":true") != std::string::npos) {
+            std::string token = extractJsonStr(result, "token");
+            std::string cookie = "Set-Cookie: milansql_token=" + token +
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict\r\n";
+            return buildHttpResponse(200, result, "application/json", cookie);
+        }
         return buildHttpResponse(200, result);
     }
-    if (req.path == "/auth/logout" && req.method == "POST")
-        return buildHttpResponse(200, handleAuthLogout(extractBearerToken(req)));
+    if (req.path == "/auth/logout" && req.method == "POST") {
+        auto result = handleAuthLogout(extractBearerToken(req));
+        static const std::string clearCookie =
+            "Set-Cookie: milansql_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict\r\n";
+        return buildHttpResponse(200, result, "application/json", clearCookie);
+    }
     if (req.path == "/auth/me" && req.method == "GET")
         return buildHttpResponse(200, handleAuthMe(extractBearerToken(req)));
     if (req.path == "/auth/refresh" && req.method == "POST")

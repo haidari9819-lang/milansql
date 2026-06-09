@@ -5970,6 +5970,86 @@ static void testGroup72() {
     }
 }
 
+// testGroup73: v9.3.0 — INSERT quoted VALUES → correct column headers
+// ============================================================
+
+static void testGroup73() {
+    auto exec = [](milansql::Engine& eng, const std::string& sql) -> std::string {
+        milansql::Parser p;
+        std::ostringstream cap;
+        std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
+        bool ok = true; std::string err;
+        try {
+            auto cmd = p.parse(sql);
+            milansql::dispatchCommand(cmd, eng, p, sql, [](){}, [](){}, [](){});
+        } catch (const std::exception& e) { ok = false; err = e.what(); }
+          catch (...) { ok = false; err = "unknown"; }
+        std::cout.rdbuf(old);
+        if (!ok) return std::string("ERROR:") + err;
+        return cap.str().empty() ? "ok" : cap.str();
+    };
+
+    // 1-4. Column headers after INSERT with quoted VALUES
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t (id INT, name TEXT, stadt TEXT)");
+        exec(eng, "INSERT INTO t VALUES (NULL, 'Alice', 'Berlin')");
+        std::string r = exec(eng, "SELECT * FROM t");
+
+        check(r.find("id")    != std::string::npos, "QuotedVals #1: 'id' column header present");
+        check(r.find("name")  != std::string::npos, "QuotedVals #2: 'name' column header present");
+        check(r.find("stadt") != std::string::npos, "QuotedVals #3: 'stadt' column header present");
+        check(r.find("'Alice'") == std::string::npos, "QuotedVals #4: quoted 'Alice' not raw in output");
+    }
+
+    // 5-7. Data values are shown without surrounding single quotes
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE persons (id INT, vorname TEXT, nachname TEXT)");
+        exec(eng, "INSERT INTO persons VALUES (1, 'Hans', 'Mueller')");
+        std::string r = exec(eng, "SELECT * FROM persons");
+
+        check(r.find("Hans")    != std::string::npos, "QuotedVals #5: value 'Hans' displayed as Hans");
+        check(r.find("Mueller") != std::string::npos, "QuotedVals #6: value 'Mueller' displayed as Mueller");
+        check(r.find("'Hans'")  == std::string::npos, "QuotedVals #7: no raw quoted 'Hans' in output");
+    }
+
+    // 8-10. Multi-row INSERT with quoted strings — columns stay schema-based
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE prod (sku INT, label TEXT)");
+        exec(eng, "INSERT INTO prod VALUES (1, 'Apple'), (2, 'Banana'), (3, 'Cherry')");
+        std::string r = exec(eng, "SELECT * FROM prod");
+
+        check(r.find("sku")   != std::string::npos, "QuotedVals #8: 'sku' column header in multi-row result");
+        check(r.find("label") != std::string::npos, "QuotedVals #9: 'label' column header in multi-row result");
+        check(r.find("Apple") != std::string::npos, "QuotedVals #10: data value Apple present in result");
+    }
+
+    // 11-13. NULL as first value with quoted strings following
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE items (id INT, tag TEXT, cat TEXT)");
+        exec(eng, "INSERT INTO items VALUES (NULL, 'foo', 'bar')");
+        std::string r = exec(eng, "SELECT * FROM items");
+
+        check(r.find("id")  != std::string::npos, "QuotedVals #11: 'id' column header with NULL first value");
+        check(r.find("tag") != std::string::npos, "QuotedVals #12: 'tag' column header with NULL first value");
+        check(r.find("foo") != std::string::npos, "QuotedVals #13: data value foo present");
+    }
+
+    // 14-15. INSERT via named column list with quoted values
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE emp (empno INT, ename TEXT, dept TEXT)");
+        exec(eng, "INSERT INTO emp (ename, dept, empno) VALUES ('Clark', 'Sales', 7)");
+        std::string r = exec(eng, "SELECT * FROM emp");
+
+        check(r.find("empno") != std::string::npos, "QuotedVals #14: 'empno' column header after named-col insert");
+        check(r.find("Clark") != std::string::npos, "QuotedVals #15: value Clark present after named-col insert");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -6181,6 +6261,9 @@ int main() {
     }
     try { testGroup72(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 72 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup73(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 73 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

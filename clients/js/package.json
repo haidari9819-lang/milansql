@@ -1,0 +1,21 @@
+{
+  "name": "milansql",
+  "version": "1.0.0",
+  "description": "JavaScript client for MilanSQL — the open source, self-hosted database for developers",
+  "main": "milansql.js",
+  "module": "milansql.js",
+  "exports": {
+    ".": {
+      "import": "./milansql.js",
+      "require": "./milansql.js"
+    }
+  },
+  "keywords": ["database", "sql", "milansql", "rest-api", "self-hosted"],
+  "author": "Mirwais Haidari",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/haidari9819-lang/milansql"
+  },
+  "homepage": "https://milansql.de"
+}

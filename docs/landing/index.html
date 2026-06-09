@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL — The Open Source Database for Developers</title>
+<meta name="description" content="Self-hosted. AI-native. Privacy-first. 892 tests. 0 dependencies. Made in Germany.">
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--green:#3fb950;--blue:#58a6ff;--purple:#bc8cff;--yellow:#f0a500;--orange:#f78166}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.6}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* NAV */
+nav{position:sticky;top:0;z-index:100;background:rgba(13,17,23,0.95);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between}
+.nav-brand{font-size:1.1rem;font-weight:700;color:var(--text);display:flex;align-items:center;gap:8px}
+.nav-brand span{color:var(--yellow)}
+.nav-links{display:flex;gap:24px;align-items:center}
+.nav-links a{color:var(--muted);font-size:0.9rem;transition:color .2s}
+.nav-links a:hover{color:var(--text);text-decoration:none}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 18px;border-radius:6px;font-size:0.875rem;font-weight:600;cursor:pointer;transition:all .2s;border:none;font-family:inherit}
+.btn-primary{background:var(--green);color:#0d1117}
+.btn-primary:hover{background:#56d364;text-decoration:none;color:#0d1117}
+.btn-secondary{background:transparent;color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover{background:var(--bg3);text-decoration:none}
+
+/* SECTIONS */
+section{padding:80px 24px;max-width:1100px;margin:0 auto}
+.section-label{font-size:0.75rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--green);font-weight:600;margin-bottom:12px}
+h1{font-size:clamp(2.2rem,5vw,3.5rem);font-weight:800;line-height:1.1;letter-spacing:-1px}
+h2{font-size:clamp(1.5rem,3vw,2.2rem);font-weight:700;letter-spacing:-0.5px}
+h3{font-size:1.1rem;font-weight:600;margin-bottom:8px}
+.muted{color:var(--muted)}
+
+/* HERO */
+#hero{padding:100px 24px 80px;max-width:1100px;margin:0 auto;text-align:center}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.3);color:var(--green);padding:4px 14px;border-radius:20px;font-size:0.8rem;font-weight:600;margin-bottom:24px}
+#hero h1{margin-bottom:20px}
+#hero h1 span{color:var(--yellow)}
+.hero-sub{font-size:1.2rem;color:var(--muted);max-width:560px;margin:0 auto 36px}
+.hero-btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:56px}
+.hero-stats{display:flex;gap:32px;justify-content:center;flex-wrap:wrap}
+.stat{text-align:center}
+.stat-num{font-size:1.5rem;font-weight:700;color:var(--text)}
+.stat-lbl{font-size:0.78rem;color:var(--muted)}
+
+/* TERMINAL */
+.terminal{background:#0d1117;border:1px solid var(--border);border-radius:10px;overflow:hidden;max-width:680px;margin:0 auto;text-align:left}
+.terminal-bar{background:var(--bg2);padding:10px 16px;display:flex;align-items:center;gap:8px}
+.dot{width:12px;height:12px;border-radius:50%}
+.dot-r{background:#ff5f57}.dot-y{background:#febc2e}.dot-g{background:#28c840}
+.terminal-body{padding:20px 24px;font-family:'SF Mono','Fira Code',monospace;font-size:0.85rem;line-height:1.8}
+.t-comment{color:var(--muted)}
+.t-cmd{color:var(--text)}
+.t-out{color:var(--green)}
+.t-kw{color:var(--blue)}
+.t-str{color:var(--purple)}
+.t-num{color:var(--orange)}
+
+/* FEATURES */
+#features{padding:80px 24px}
+.features-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px;margin-top:48px;max-width:1100px;margin-left:auto;margin-right:auto}
+.feature-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:28px;transition:border-color .2s}
+.feature-card:hover{border-color:var(--blue)}
+.feature-icon{font-size:2rem;margin-bottom:16px}
+.feature-card p{color:var(--muted);font-size:0.9rem;line-height:1.7}
+
+/* PRICING */
+#pricing{padding:80px 24px;text-align:center}
+.pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;max-width:720px;margin:48px auto 0}
+.price-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:32px;text-align:left}
+.price-card.featured{border-color:var(--blue);position:relative}
+.price-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--blue);color:#0d1117;font-size:0.72rem;font-weight:700;padding:3px 12px;border-radius:20px;white-space:nowrap}
+.price-name{font-size:1rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.price-amount{font-size:2.5rem;font-weight:800;color:var(--text);line-height:1}
+.price-period{color:var(--muted);font-size:0.85rem;margin-bottom:24px}
+.price-features{list-style:none;display:flex;flex-direction:column;gap:10px}
+.price-features li{display:flex;align-items:center;gap:10px;font-size:0.9rem;color:var(--muted)}
+.price-features li::before{content:"→";color:var(--green);font-weight:700;flex-shrink:0}
+.price-features li.disabled{color:#484f58}
+.price-features li.disabled::before{color:#484f58}
+
+/* CODE */
+#code{padding:80px 24px}
+.code-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;max-width:1100px;margin:48px auto 0}
+@media(max-width:700px){.code-grid{grid-template-columns:1fr}}
+pre{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:20px;overflow-x:auto;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:0.82rem;line-height:1.7}
+.code-label{font-size:0.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.c-comment{color:var(--muted)}
+.c-kw{color:var(--blue)}
+.c-str{color:var(--purple)}
+.c-fn{color:var(--green)}
+.c-var{color:var(--orange)}
+
+/* CTA */
+#cta{padding:100px 24px;text-align:center;background:linear-gradient(180deg,var(--bg) 0%,rgba(88,166,255,0.05) 50%,var(--bg) 100%)}
+#cta h2{margin-bottom:16px}
+#cta p{color:var(--muted);margin-bottom:36px;font-size:1.1rem}
+
+/* FOOTER */
+footer{border-top:1px solid var(--border);padding:32px 24px;max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
+.footer-brand{font-size:0.9rem;font-weight:700;color:var(--text)}
+.footer-links{display:flex;gap:20px}
+.footer-links a{color:var(--muted);font-size:0.85rem}
+.footer-links a:hover{color:var(--text);text-decoration:none}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <div class="nav-brand"><span>&#9889;</span> MilanSQL</div>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#pricing">Pricing</a>
+    <a href="#code">Docs</a>
+    <a href="/webui" class="btn btn-secondary" style="padding:6px 14px">Dashboard</a>
+    <a href="/webui#register" class="btn btn-primary" style="padding:6px 14px">Get Started</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section id="hero">
+  <div class="hero-badge">&#x2728; Open Source · v9.8.0 · Made in Germany &#x1F1E9;&#x1F1EA;</div>
+  <h1>The Open Source Database<br><span>for Developers</span></h1>
+  <p class="hero-sub">Self-hosted. AI-native. Privacy-first.<br>Your data stays yours — forever.</p>
+  <div class="hero-btns">
+    <a href="/webui#register" class="btn btn-primary" style="font-size:1rem;padding:12px 28px">Start for Free &#x2192;</a>
+    <a href="/webui" class="btn btn-secondary" style="font-size:1rem;padding:12px 28px">Live Demo &#x2192;</a>
+  </div>
+  <div class="terminal">
+    <div class="terminal-bar"><div class="dot dot-r"></div><div class="dot dot-y"></div><div class="dot dot-g"></div><span style="margin-left:8px;font-size:0.78rem;color:var(--muted)">milansql ~ query</span></div>
+    <div class="terminal-body">
+      <div class="t-comment">-- Connect with any MySQL client</div>
+      <div class="t-cmd">$ mysql -h milansql.de -P 4407 -u alice -p</div>
+      <div class="t-out" style="margin-top:8px">Welcome to MilanSQL v9.8.0</div>
+      <div class="t-out">User: alice (id: 8) · Role: user</div>
+      <div style="margin-top:8px"><span class="t-kw">SELECT</span> * <span class="t-kw">FROM</span> produkte <span class="t-kw">WHERE</span> preis &gt; <span style="color:var(--orange)">100</span>;</div>
+      <div class="t-out">+----+---------+-------+-----------+</div>
+      <div class="t-out">| id | name    | preis | kategorie |</div>
+      <div class="t-out">+----+---------+-------+-----------+</div>
+      <div class="t-out">|  1 | Laptop  |  1200 | IT        |</div>
+      <div class="t-out">|  3 | Monitor |   450 | IT        |</div>
+      <div class="t-out">+----+---------+-------+-----------+</div>
+      <div class="t-out">2 rows in set (0.02 ms)</div>
+    </div>
+  </div>
+  <div class="hero-stats" style="margin-top:48px">
+    <div class="stat"><div class="stat-num">892</div><div class="stat-lbl">Passing Tests</div></div>
+    <div class="stat"><div class="stat-num">0</div><div class="stat-lbl">Dependencies</div></div>
+    <div class="stat"><div class="stat-num">86k</div><div class="stat-lbl">INSERTs/sec</div></div>
+    <div class="stat"><div class="stat-num">0.02ms</div><div class="stat-lbl">Indexed Read</div></div>
+    <div class="stat"><div class="stat-num">C++17</div><div class="stat-lbl">Pure Native</div></div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section id="features" style="max-width:1100px;margin:0 auto">
+  <div style="text-align:center;margin-bottom:0">
+    <div class="section-label">Features</div>
+    <h2>Everything you need.<br>Nothing you don't.</h2>
+  </div>
+  <div class="features-grid">
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F512;</div>
+      <h3>Row-Level Security</h3>
+      <p>Every user sees only their own data. Tables are cryptographically isolated with HMAC-SHA256 prefixes. Zero cross-user leakage — by design, not by accident.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x26A1;</div>
+      <h3>Blazing Fast</h3>
+      <p>86,220 INSERTs/sec. 0.02ms indexed reads. Pure C++17 with zero external dependencies. Runs on a €5 VPS with 28KB memory overhead per 1000 requests.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F916;</div>
+      <h3>AI-Native</h3>
+      <p>pgvector built-in. Semantic search and cosine similarity out of the box. JSONB support. Ready for your LLM applications and RAG pipelines.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F310;</div>
+      <h3>Multi-Protocol</h3>
+      <p>REST API, MySQL Wire Protocol, PostgreSQL Wire Protocol, WebSocket, GraphQL. Connect with any existing tool — no driver changes required.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F4CB;</div>
+      <h3>Full SQL Support</h3>
+      <p>JOINs, CTEs, Window Functions, Subqueries, Transactions, Stored Procedures, Triggers, Views, Materialized Views — the full SQL standard.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">&#x1F1E9;&#x1F1EA;</div>
+      <h3>Privacy First</h3>
+      <p>Self-hosted in Germany. Your data never leaves your server. GDPR-compliant by architecture. Open source — audit the code yourself.</p>
+    </div>
+  </div>
+</section>
+
+<!-- PRICING -->
+<section id="pricing">
+  <div class="section-label">Pricing</div>
+  <h2>Simple, transparent pricing</h2>
+  <p class="muted" style="margin-top:12px">Start for free. Upgrade when you grow.</p>
+  <div class="pricing-grid">
+    <div class="price-card">
+      <div class="price-name">Free</div>
+      <div class="price-amount">€0</div>
+      <div class="price-period">forever</div>
+      <ul class="price-features">
+        <li>1 Database</li>
+        <li>100MB Storage</li>
+        <li>REST + MySQL API</li>
+        <li>Row-Level Security</li>
+        <li>Community Support</li>
+      </ul>
+      <a href="/webui#register" class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:24px">Get Started</a>
+    </div>
+    <div class="price-card featured">
+      <div class="price-badge">Coming Soon</div>
+      <div class="price-name">Pro</div>
+      <div class="price-amount">€9</div>
+      <div class="price-period">per month</div>
+      <ul class="price-features">
+        <li>10 Databases</li>
+        <li>10GB Storage</li>
+        <li>All APIs + GraphQL</li>
+        <li>Daily Backups</li>
+        <li>Priority Support</li>
+      </ul>
+      <button class="btn btn-secondary" style="width:100%;justify-content:center;margin-top:24px;cursor:not-allowed;opacity:0.5">Notify Me</button>
+    </div>
+  </div>
+</section>
+
+<!-- CODE EXAMPLE -->
+<section id="code" style="max-width:1100px;margin:0 auto">
+  <div class="section-label">Quickstart</div>
+  <h2>Connect in seconds</h2>
+  <div class="code-grid">
+    <div>
+      <div class="code-label">REST API</div>
+      <pre><span class="c-comment"># Login</span>
+curl -X POST https://milansql.de/auth/login \
+  -H <span class="c-str">"Content-Type: application/json"</span> \
+  -d <span class="c-str">'{"username":"you","password":"pw"}'</span>
+
+<span class="c-comment"># Query</span>
+curl -X POST https://milansql.de/query \
+  -H <span class="c-str">"Authorization: Bearer TOKEN"</span> \
+  -d <span class="c-str">'{"sql":"SELECT * FROM products"}'</span></pre>
+    </div>
+    <div>
+      <div class="code-label">JavaScript SDK</div>
+      <pre><span class="c-kw">import</span> MilanSQL <span class="c-kw">from</span> <span class="c-str">'milansql'</span>;
+
+<span class="c-kw">const</span> <span class="c-var">db</span> = <span class="c-kw">new</span> <span class="c-fn">MilanSQL</span>(
+  <span class="c-str">'https://milansql.de'</span>, token
+);
+
+<span class="c-kw">const</span> { rows } = <span class="c-kw">await</span> db
+  .<span class="c-fn">from</span>(<span class="c-str">'products'</span>)
+  .<span class="c-fn">select</span>(<span class="c-str">'name, price'</span>)
+  .<span class="c-fn">eq</span>(<span class="c-str">'category'</span>, <span class="c-str">'IT'</span>)
+  .<span class="c-fn">order</span>(<span class="c-str">'price'</span>, { ascending: <span class="c-kw">false</span> })
+  .<span class="c-fn">limit</span>(<span class="c-var">10</span>)
+  .<span class="c-fn">execute</span>();</pre>
+    </div>
+    <div>
+      <div class="code-label">MySQL Client</div>
+      <pre><span class="c-comment">-- Any MySQL-compatible client</span>
+mysql -h milansql.de -P <span class="c-var">4407</span> \
+  -u alice -p
+
+<span class="c-kw">CREATE TABLE</span> products (
+  id   <span class="c-kw">INT PRIMARY KEY AUTO_INCREMENT</span>,
+  name <span class="c-kw">TEXT</span>,
+  price <span class="c-kw">INT</span>
+);
+
+<span class="c-kw">INSERT INTO</span> products
+  <span class="c-kw">VALUES</span> (<span class="c-kw">NULL</span>, <span class="c-str">'Laptop'</span>, <span class="c-var">1200</span>);</pre>
+    </div>
+    <div>
+      <div class="code-label">Semantic Search (AI)</div>
+      <pre><span class="c-comment">-- Store embeddings</span>
+<span class="c-kw">CREATE TABLE</span> docs (
+  id      <span class="c-kw">INT</span>,
+  content <span class="c-kw">TEXT</span>,
+  vec     <span class="c-kw">VECTOR(3)</span>
+);
+
+<span class="c-comment">-- Cosine similarity search</span>
+<span class="c-kw">SELECT</span> content,
+  vec &lt;-&gt; <span class="c-str">'[1,0,0]'</span> <span class="c-kw">AS</span> dist
+<span class="c-kw">FROM</span> docs
+<span class="c-kw">ORDER BY</span> dist <span class="c-kw">LIMIT</span> <span class="c-var">5</span>;</pre>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section id="cta">
+  <div class="section-label">Get Started</div>
+  <h2>Start building today</h2>
+  <p>Free forever. No credit card required. Deploy in 30 seconds.</p>
+  <a href="/webui#register" class="btn btn-primary" style="font-size:1.05rem;padding:14px 32px">Create Free Account &#x2192;</a>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-brand">&#x26A1; MilanSQL v9.8.0 — Open Source Database</div>
+  <div class="footer-links">
+    <a href="/webui">Dashboard</a>
+    <a href="https://github.com/haidari9819-lang/milansql" target="_blank">GitHub</a>
+    <a href="/health">Status</a>
+  </div>
+  <div style="font-size:0.8rem;color:var(--muted)">Made with &#x2764; in Germany &#x1F1E9;&#x1F1EA;</div>
+</footer>
+
+</body>
+</html>

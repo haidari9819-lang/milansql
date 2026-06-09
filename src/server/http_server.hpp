@@ -937,12 +937,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "9.7.0");
+            return makeScalar("@@version", "9.8.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.7.0\",\"MilanSQL Database Engine\"]]}";
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.8.0\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -1418,7 +1418,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v9.7.0\",";
+    json += "\"version\":\"MilanSQL v9.8.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1630,7 +1630,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v9.7.0</div>
+  <div class="logo">&#9889; MilanSQL v9.8.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -1860,7 +1860,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.7.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.8.0</span>
   </div>
 </div>
 
@@ -1896,7 +1896,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#484f58;font-size:9px">●</span><span style="font-size:11px;color:#484f58">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v9.7.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v9.8.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1980,7 +1980,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.7.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.8.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2659,7 +2659,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.7.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.8.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2919,7 +2919,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"9.7.0\","
+            "\"version\":\"9.8.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"
@@ -2952,12 +2952,38 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
                "\r\n" + html;
     }
 
-    if (req.path == "/dashboard" || req.path == "/") {
-        return "HTTP/1.1 302 Found\r\n"
-               "Location: /webui\r\n"
-               "Content-Length: 0\r\n"
-               "Connection: close\r\n"
-               "\r\n";
+    // Phase 163: Landing Page at /
+    if (req.path == "/") {
+        // Try to serve docs/landing/index.html from working directory
+        std::ifstream lf("docs/landing/index.html");
+        if (lf.good()) {
+            std::string html((std::istreambuf_iterator<char>(lf)),
+                              std::istreambuf_iterator<char>());
+            return "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: text/html; charset=utf-8\r\n"
+                   "Content-Length: " + std::to_string(html.size()) + "\r\n"
+                   "Cache-Control: public, max-age=300\r\n"
+                   "Connection: close\r\n\r\n" + html;
+        }
+        // Fallback: redirect to admin UI
+        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    }
+    if (req.path == "/dashboard") {
+        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    }
+    // Phase 164: JS SDK at /sdk/milansql.js
+    if (req.path == "/sdk/milansql.js") {
+        std::ifstream sf("clients/js/milansql.js");
+        if (sf.good()) {
+            std::string js((std::istreambuf_iterator<char>(sf)),
+                            std::istreambuf_iterator<char>());
+            return "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: application/javascript; charset=utf-8\r\n"
+                   "Content-Length: " + std::to_string(js.size()) + "\r\n"
+                   "Cache-Control: public, max-age=3600\r\n"
+                   "Connection: close\r\n\r\n" + js;
+        }
+        return buildHttpResponse(404, R"({"error":"SDK not found"})");
     }
 
     if (req.path == "/ws-playground") {

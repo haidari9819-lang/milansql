@@ -552,7 +552,7 @@ inline void MilanHttpServer::initEngine() {
 
 inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
     // 1) Authorization: Bearer header (API / in-memory token)
-    auto it = req.headers.find("Authorization");
+    auto it = req.headers.find("authorization");
     if (it != req.headers.end()) {
         const auto& v = it->second;
         if (v.size() > 7 && v.substr(0,7) == "Bearer ") {
@@ -561,7 +561,7 @@ inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
         }
     }
     // 2) httpOnly Cookie fallback (survives page refresh)
-    auto cit = req.headers.find("Cookie");
+    auto cit = req.headers.find("cookie");
     if (cit != req.headers.end()) {
         const std::string& cookies = cit->second;
         std::cerr << "[DEBUG] Cookie header: " << cookies.substr(0, std::min(cookies.size(), size_t(80))) << "\n";
@@ -582,7 +582,7 @@ inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
     return "";
 }
 inline std::string MilanHttpServer::extractApiKey(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
+    auto it = req.headers.find("authorization");
     if (it == req.headers.end()) return "";
     const auto& v = it->second;
     if (v.size() > 7 && v.substr(0,7) == "ApiKey ") return v.substr(7);
@@ -2952,9 +2952,9 @@ inline void MilanHttpServer::handleClient(sock_t clientSock) {
     if (!req.method.empty()) {
         // Extract client IP from proxy headers or socket
         std::string clientIp = "unknown";
-        auto it = req.headers.find("X-Forwarded-For");
+        auto it = req.headers.find("x-forwarded-for");
         if (it != req.headers.end() && !it->second.empty()) clientIp = it->second;
-        else { auto it2 = req.headers.find("X-Real-IP"); if (it2 != req.headers.end()) clientIp = it2->second; }
+        else { auto it2 = req.headers.find("x-real-ip"); if (it2 != req.headers.end()) clientIp = it2->second; }
         std::string response = handleRequest(req, clientIp);
         sendResponse(clientSock, response);
     }

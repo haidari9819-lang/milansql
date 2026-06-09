@@ -2824,7 +2824,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"8.3.0\","
+            "\"version\":\"9.3.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"

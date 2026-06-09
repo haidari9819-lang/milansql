@@ -552,13 +552,15 @@ inline void MilanHttpServer::initEngine() {
 
 inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
     // 1) Authorization: Bearer header (API / in-memory token)
-    auto it = req.headers.find("Authorization");
+    auto it = req.headers.find("authorization");
     if (it != req.headers.end()) {
         const auto& v = it->second;
-        if (v.size() > 7 && v.substr(0,7) == "Bearer ") return v.substr(7);
+        if (v.size() > 7 && v.substr(0,7) == "Bearer ") {
+            return v.substr(7);
+        }
     }
     // 2) httpOnly Cookie fallback (survives page refresh)
-    auto cit = req.headers.find("Cookie");
+    auto cit = req.headers.find("cookie");
     if (cit != req.headers.end()) {
         const std::string& cookies = cit->second;
         const std::string prefix = "milansql_token=";
@@ -567,13 +569,15 @@ inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
             pos += prefix.size();
             size_t end = cookies.find(';', pos);
             if (end == std::string::npos) end = cookies.size();
-            return cookies.substr(pos, end - pos);
+            std::string tok = cookies.substr(pos, end - pos);
+            return tok;
         }
+    } else {
     }
     return "";
 }
 inline std::string MilanHttpServer::extractApiKey(const HttpRequest& req) {
-    auto it = req.headers.find("Authorization");
+    auto it = req.headers.find("authorization");
     if (it == req.headers.end()) return "";
     const auto& v = it->second;
     if (v.size() > 7 && v.substr(0,7) == "ApiKey ") return v.substr(7);
@@ -887,12 +891,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "9.2.0");
+            return makeScalar("@@version", "9.4.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.2.0\",\"MilanSQL Database Engine\"]]}";
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.4.0\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -1368,7 +1372,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v9.3.0\",";
+    json += "\"version\":\"MilanSQL v9.4.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1580,7 +1584,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v9.3.0</div>
+  <div class="logo">&#9889; MilanSQL v9.4.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -1620,7 +1624,7 @@ const B=window.location.origin;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 async function loadSidebar(){
   try{
-    const[tr,sr,str]=await Promise.all([fetch(B+'/tables'),fetch(B+'/schemas'),fetch(B+'/status')]);
+    const[tr,sr,str]=await Promise.all([fetch(B+'/tables',{credentials:'include'}),fetch(B+'/schemas',{credentials:'include'}),fetch(B+'/status',{credentials:'include'})]);
     const td=await tr.json(),sd=await sr.json(),std=await str.json();
     const tl=document.getElementById('tbl-list');
     tl.innerHTML=(td.tables&&td.tables.length)?td.tables.map(t=>`<div class="tbl-item" onclick="qt('${esc(t)}')" title="SELECT * FROM ${esc(t)}">${esc(t)}</div>`).join(''):'<div class="empty">No tables</div>';
@@ -1636,7 +1640,7 @@ async function run(){
   document.getElementById('et').textContent='';
   const t0=Date.now();
   try{
-    const r=await fetch(B+'/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
+    const r=await fetch(B+'/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
     const d=await r.json();
     document.getElementById('et').textContent=(Date.now()-t0)+'ms';
     if(!d.success){o.innerHTML=`<div class="err">&#10005; ${esc(d.error||'Unknown error')}</div>`;return;}
@@ -1808,7 +1812,7 @@ td.null-val{color:#484f58;font-style:italic}
   <span class="badge blue" id="conn-badge">0 connections</span>
   <span class="badge blue" id="test-badge">850 tests</span>
   <div class="topbar-right">
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.3.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.4.0</span>
   </div>
 </div>
 
@@ -1838,7 +1842,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v9.3.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v9.4.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1921,7 +1925,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.3.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.4.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -1993,7 +1997,7 @@ function updateEditorDecor() {
 
 // ── Autocomplete ──────────────────────────────────────────────
 var acTableNames = [];
-fetch('/tables').then(function(r){return r.json();}).then(function(d){
+fetch('/tables',{credentials:'include'}).then(function(r){return r.json();}).then(function(d){
   var tables = Array.isArray(d) ? d : (d.tables||[]);
   acTableNames = tables.map(function(t){ return typeof t==='string'?t:(t.name||''); }).filter(Boolean);
 }).catch(function(){});
@@ -2084,6 +2088,7 @@ async function runQuery(sql) {
   try {
     var resp = await fetch('/api/query', {
       method: 'POST',
+      credentials: 'include',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({sql: q})
     });
@@ -2301,7 +2306,7 @@ document.addEventListener('click', function(e) {
 // Table sidebar
 async function loadSidebarTables() {
   try {
-    var r = await fetch('/tables');
+    var r = await fetch('/tables', {credentials:'include'});
     var data = await r.json();
     var tables = Array.isArray(data) ? data : (data.tables || []);
     var el = document.getElementById('sidebar-tables');
@@ -2323,7 +2328,7 @@ function selectFromTable(name) {
 // Table Browser
 async function loadBrowserTables() {
   try {
-    var r = await fetch('/tables');
+    var r = await fetch('/tables', {credentials:'include'});
     var data = await r.json();
     var tables = Array.isArray(data) ? data : (data.tables || []);
     var listEl = document.getElementById('browser-tbl-list');
@@ -2340,8 +2345,8 @@ async function browseTable(name, btn) {
   var detail = document.getElementById('browser-tbl-detail');
   detail.innerHTML = '<div style="color:#8b949e;font-size:0.8rem">Loading...</div>';
   try {
-    var descR = await fetch('/api/query', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DESCRIBE ' + name})});
-    var dataR = await fetch('/api/query', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SELECT * FROM ' + name + ' LIMIT 50'})});
+    var descR = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DESCRIBE ' + name})});
+    var dataR = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SELECT * FROM ' + name + ' LIMIT 50'})});
     var desc = await descR.json();
     var data = await dataR.json();
     var html = '<h3 style="margin-bottom:12px">&#x1F4CB; ' + escHtml(name) + '</h3>';
@@ -2378,7 +2383,7 @@ async function browseTable(name, btn) {
 // Monitoring
 async function loadMonitoring() {
   try {
-    var r = await fetch('/status');
+    var r = await fetch('/status', {credentials:'include'});
     var d = await r.json();
     function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
     set('m-tables',  d.tables   != null ? d.tables   : '--');
@@ -2430,7 +2435,7 @@ function clearHistory() {
 // Status bar polling
 async function pollStatus() {
   try {
-    var r = await fetch('/status');
+    var r = await fetch('/status', {credentials:'include'});
     var d = await r.json();
     var healthy = d.status === 'healthy' || d.status === 'ok' || !d.status;
     var hb = document.getElementById('health-badge');
@@ -2568,7 +2573,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.3.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.4.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2824,7 +2829,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"8.3.0\","
+            "\"version\":\"9.4.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"
@@ -2937,9 +2942,9 @@ inline void MilanHttpServer::handleClient(sock_t clientSock) {
     if (!req.method.empty()) {
         // Extract client IP from proxy headers or socket
         std::string clientIp = "unknown";
-        auto it = req.headers.find("X-Forwarded-For");
+        auto it = req.headers.find("x-forwarded-for");
         if (it != req.headers.end() && !it->second.empty()) clientIp = it->second;
-        else { auto it2 = req.headers.find("X-Real-IP"); if (it2 != req.headers.end()) clientIp = it2->second; }
+        else { auto it2 = req.headers.find("x-real-ip"); if (it2 != req.headers.end()) clientIp = it2->second; }
         std::string response = handleRequest(req, clientIp);
         sendResponse(clientSock, response);
     }

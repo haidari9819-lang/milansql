@@ -6978,10 +6978,19 @@ private:
     static std::vector<std::string> tokenize(const std::string& s) {
         std::vector<std::string> tokens;
         std::string cur;
+        bool inStr = false;
+        char strChar = 0;
         for (char c : s) {
-            if (c == ' ' || c == '\t' || c == '\r') {
+            if (inStr) {
+                cur += c;
+                if (c == strChar) inStr = false;
+            } else if (c == '\'' || c == '"') {
+                inStr = true; strChar = c; cur += c;
+            } else if (c == ' ' || c == '\t' || c == '\r') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
-            } else { cur += c; }
+            } else {
+                cur += c;
+            }
         }
         if (!cur.empty()) tokens.push_back(cur);
         return tokens;

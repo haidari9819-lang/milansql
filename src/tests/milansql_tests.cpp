@@ -5037,8 +5037,8 @@ static void testGroup68() {
     };
 
     // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
-    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.6.0",
-          "version() returns MilanSQL v9.6.0");
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.7.0",
+          "version() returns MilanSQL v9.7.0");
     check(engine.evalFuncPublic("DATABASE", {}) == "public",
           "database() returns 'public'");
     check(engine.evalFuncPublic("USER", {}) == "root",
@@ -5965,8 +5965,8 @@ static void testGroup72() {
     // 15. Version v9.2.0
     {
         milansql::Engine eng;
-        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.6.0",
-              "Isolation #15: version() returns MilanSQL v9.6.0");
+        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.7.0",
+              "Isolation #15: version() returns MilanSQL v9.7.0");
     }
 }
 
@@ -6050,7 +6050,7 @@ static void testGroup73() {
     }
 }
 
-// testGroup74: v9.6.0 — INSERT quoted VALUES with spaces + umlauts
+// testGroup74: v9.7.0 — INSERT quoted VALUES with spaces + umlauts
 // ============================================================
 
 static void testGroup74() {

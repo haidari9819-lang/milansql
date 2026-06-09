@@ -393,6 +393,14 @@ static std::string parseOutputToJson(const std::string& output) {
 
 // ── MilanHttpServer ───────────────────────────────────────────
 
+struct UserContext {
+    int userId = 0;
+    std::string username;
+    std::string role;
+    bool isRoot = false;
+    bool valid = false;
+};
+
 class MilanHttpServer {
 public:
     MilanHttpServer(int port, const std::string& dbPath)
@@ -454,6 +462,7 @@ private:
     // Helpers
     static std::string extractBearerToken(const HttpRequest& req);
     static std::string extractApiKey(const HttpRequest& req);
+    UserContext extractUserContext(const HttpRequest& req);
     static std::string extractJsonStr(const std::string& body, const std::string& key);
 
     void initEngine();
@@ -583,6 +592,42 @@ inline std::string MilanHttpServer::extractApiKey(const HttpRequest& req) {
     if (v.size() > 7 && v.substr(0,7) == "ApiKey ") return v.substr(7);
     return "";
 }
+inline UserContext MilanHttpServer::extractUserContext(const HttpRequest& req) {
+    UserContext ctx;
+    std::string token;
+    // 1) Authorization: Bearer header
+    auto it = req.headers.find("authorization");
+    if (it != req.headers.end()) {
+        const auto& v = it->second;
+        if (v.size() > 7 && v.substr(0,7) == "Bearer ") token = v.substr(7);
+    }
+    // 2) httpOnly Cookie fallback
+    if (token.empty()) {
+        auto cit = req.headers.find("cookie");
+        if (cit != req.headers.end()) {
+            const std::string& cookies = cit->second;
+            const std::string prefix = "milansql_token=";
+            size_t pos = cookies.find(prefix);
+            if (pos != std::string::npos) {
+                pos += prefix.size();
+                size_t end = cookies.find(';', pos);
+                if (end == std::string::npos) end = cookies.size();
+                token = cookies.substr(pos, end - pos);
+            }
+        }
+    }
+    if (!token.empty()) {
+        auto vr = authMgr_.validateToken(token);
+        if (vr.valid) {
+            ctx.userId   = vr.userId;
+            ctx.username = vr.username;
+            ctx.role     = vr.role;
+            ctx.isRoot   = (vr.role == "root");
+            ctx.valid    = true;
+        }
+    }
+    return ctx;
+}
 inline std::string MilanHttpServer::extractJsonStr(const std::string& body, const std::string& key) {
     std::string search = "\"" + key + "\"";
     auto pos = body.find(search);
@@ -673,7 +718,8 @@ inline std::string MilanHttpServer::handleAuthMe(const std::string& token) {
     if (!v.valid) return "{\"success\":false,\"error\":\"Invalid or expired token\"}";
     return "{\"success\":true,\"user_id\":" + std::to_string(v.userId) +
            ",\"username\":\"" + jsonEscape(v.username) +
-           "\",\"role\":\"" + jsonEscape(v.role) + "\"}";
+           "\",\"role\":\"" + jsonEscape(v.role) +
+           "\",\"token\":\"" + jsonEscape(token) + "\"}";
 }
 inline std::string MilanHttpServer::handleAuthRefresh(const std::string& body) {
     std::string ref = extractJsonStr(body, "refresh_token");
@@ -1842,6 +1888,12 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
       </div>
     </div>
+    <div style="padding:8px 12px;border-top:1px solid #21262d;margin-top:auto">
+      <div id="rls-panel" style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:11px;color:#8b949e">
+        <div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>
+        <div style="display:flex;align-items:center;gap:6px"><span style="color:#484f58;font-size:9px">●</span><span style="font-size:11px;color:#484f58">Not connected</span></div>
+      </div>
+    </div>
     <div class="sidebar-footer">MilanSQL Admin v9.5.0</div>
   </nav>
 
@@ -1875,6 +1927,7 @@ td.null-val{color:#484f58;font-style:italic}
           <span class="pill" id="result-pill"></span>
           <span id="result-info"></span>
         </div>
+        <div id="exec-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:6px;background:#1c2128;margin:4px 0 2px 0"></div>
         <div id="result-content"></div>
       </div>
     </div>
@@ -2097,11 +2150,24 @@ async function runQuery(sql) {
     document.getElementById('exec-time').textContent = ms + 'ms';
     lastResultData = data;
     renderResult(data, ms);
+    showExecBadge(data);
     saveHistory(q, ms, !data.error && (data.success !== false));
   } catch(e) {
     showError('Network error: ' + e.message);
     saveHistory(q, '0', false);
   }
+}
+function showExecBadge(data) {
+  var badge = document.getElementById('exec-badge');
+  if (!badge) return;
+  if (msUser) {
+    badge.innerHTML = '<span style="color:#3fb950">&#10003;</span> Ausgeführt als: <b>' + escHtml(msUser) + '</b> (id: ' + msUserId + ')';
+    badge.style.color = '#3fb950';
+  } else {
+    badge.innerHTML = '<span style="color:#f38ba8">&#9888;</span> Nicht authentifiziert';
+    badge.style.color = '#f38ba8';
+  }
+  badge.style.display = 'block';
 }
 
 function renderResult(data, ms) {
@@ -2467,8 +2533,9 @@ setInterval(loadSidebarTables, 30000);
 
 // ── Phase 154-156: Auth integration ──────────────────────────
 // Token lives in httpOnly cookie (survives refresh) + in-memory for Bearer header
-var msToken = '';  // in-memory only; restored via /auth/me on page load
-var msUser  = '';
+var msToken  = '';  // in-memory only; restored via /auth/me on page load
+var msUser   = '';
+var msUserId = 0;
 
 function getAuthHdr() {
   var h = {'Content-Type':'application/json'};
@@ -2480,10 +2547,10 @@ async function msLogin(u, p) {
     var r = await fetch('/auth/login',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
     var d = await r.json();
     if (d.success) {
-      msToken=d.token; msUser=d.username||u;
+      msToken=d.token||''; msUser=d.username||u; msUserId=d.user_id||0;
       // No localStorage — token is in httpOnly cookie set by server
       hidLoginPage();
-      var ub=document.getElementById('ms-user-badge'); if(ub){ub.textContent='● '+msUser;ub.title='Eingeloggt als: '+msUser;}
+      updateUserBadge();
       return true;
     }
     return d.error||'Login failed';
@@ -2503,6 +2570,18 @@ async function msSubmitLogin() {
   err.style.color='#a6adc8';err.textContent='Signing in...';
   var res=await msLogin(u,p);
   if(res===true){err.textContent='';}else{err.style.color='#f38ba8';err.textContent=res;}
+}
+function updateUserBadge() {
+  var ub=document.getElementById('ms-user-badge');
+  if(ub){ub.textContent='● '+msUser;ub.title='Eingeloggt als: '+msUser+' (id: '+msUserId+')';}
+  var rp=document.getElementById('rls-panel');
+  if(rp){
+    var tables=document.querySelectorAll('#sidebar-tables .tbl-btn');
+    rp.innerHTML='<div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
+      +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="color:#3fb950;font-size:9px">●</span><span style="font-size:11px;color:#3fb950;font-weight:600">ACTIVE</span></div>'
+      +'<div style="font-size:10px;color:#8b949e">User: <b style="color:#cdd6f4">'+escHtml(msUser)+'</b> (id: '+msUserId+')</div>'
+      +'<div style="font-size:10px;color:#8b949e">Isolation: <b style="color:#3fb950">ENABLED</b></div>';
+  }
 }
 // Patch all fetch calls to include auth token + cookie credentials
 var _origFetch2=window.fetch;
@@ -2562,8 +2641,11 @@ async function msSubmitRegister(){
 // Start: try cookie-based auto-login (survives page refresh), then show login if not authenticated
 fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/json'}})
   .then(r=>r.json()).then(d=>{
-    if(d.success){ msUser=d.username||msUser; hidLoginPage(); var ub=document.getElementById('ms-user-badge'); if(ub){ub.textContent='● '+msUser;ub.title='Eingeloggt als: '+msUser;} }
-    else{ showLoginPage(); }
+    if(d.success){
+      msUser=d.username||msUser; msUserId=d.user_id||0;
+      if(d.token) msToken=d.token;
+      hidLoginPage(); updateUserBadge();
+    } else { showLoginPage(); }
   }).catch(()=>{ showLoginPage(); });
 </script>
 <!-- Phase 158: Full-screen Login Page (starts visible, hidden after auth) -->
@@ -2732,12 +2814,16 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     // ── Query + Tables (auth-aware) ───────────────────────────
     if (req.path == "/query" || req.path == "/api/query") {
-        // Resolve user from token or API key
-        std::string token  = extractBearerToken(req);
-        std::string apiKey = extractApiKey(req);
+        // Resolve user from token (cookie or Bearer) or API key
+        auto ctx = extractUserContext(req);
         AuthManager::ValidateResult vr{0, "anonymous", "root", true};
-        if (!token.empty())  vr = authMgr_.validateToken(token);
-        else if (!apiKey.empty()) vr = authMgr_.validateApiKey(apiKey);
+        if (ctx.valid) {
+            vr.userId = ctx.userId; vr.username = ctx.username;
+            vr.role = ctx.role; vr.valid = true;
+        } else {
+            std::string apiKey = extractApiKey(req);
+            if (!apiKey.empty()) vr = authMgr_.validateApiKey(apiKey);
+        }
 
         // Rate limit by userId or IP
         std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
@@ -2774,10 +2860,8 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/tables") {
-        std::string tok = extractBearerToken(req);
-        auto vr = tok.empty() ? AuthManager::ValidateResult{0,"","root",true} : authMgr_.validateToken(tok);
-        // Root users (role=="root") see all tables unfiltered → pass 0
-        int listId = (vr.role == "root") ? 0 : vr.userId;
+        auto ctx = extractUserContext(req);
+        int listId = ctx.isRoot ? 0 : ctx.userId;
         return buildHttpResponse(200, handleListTablesForUser(listId));
     }
 

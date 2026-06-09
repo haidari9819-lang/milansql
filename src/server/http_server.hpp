@@ -2776,7 +2776,9 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.path == "/tables") {
         std::string tok = extractBearerToken(req);
         auto vr = tok.empty() ? AuthManager::ValidateResult{0,"","root",true} : authMgr_.validateToken(tok);
-        return buildHttpResponse(200, handleListTablesForUser(vr.userId));
+        // Root users (role=="root") see all tables unfiltered → pass 0
+        int listId = (vr.role == "root") ? 0 : vr.userId;
+        return buildHttpResponse(200, handleListTablesForUser(listId));
     }
 
     if (req.path.size() > 8 && req.path.substr(0, 8) == "/tables/") {

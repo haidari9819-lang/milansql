@@ -556,7 +556,6 @@ inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
     if (it != req.headers.end()) {
         const auto& v = it->second;
         if (v.size() > 7 && v.substr(0,7) == "Bearer ") {
-            std::cerr << "[DEBUG] Token from Bearer header: " << v.substr(7,16) << "...\n";
             return v.substr(7);
         }
     }
@@ -564,7 +563,6 @@ inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
     auto cit = req.headers.find("cookie");
     if (cit != req.headers.end()) {
         const std::string& cookies = cit->second;
-        std::cerr << "[DEBUG] Cookie header: " << cookies.substr(0, std::min(cookies.size(), size_t(80))) << "\n";
         const std::string prefix = "milansql_token=";
         size_t pos = cookies.find(prefix);
         if (pos != std::string::npos) {
@@ -572,12 +570,9 @@ inline std::string MilanHttpServer::extractBearerToken(const HttpRequest& req) {
             size_t end = cookies.find(';', pos);
             if (end == std::string::npos) end = cookies.size();
             std::string tok = cookies.substr(pos, end - pos);
-            std::cerr << "[DEBUG] Token from Cookie: " << tok.substr(0, std::min(tok.size(), size_t(16))) << "...\n";
             return tok;
         }
-        std::cerr << "[DEBUG] Cookie present but no milansql_token found\n";
     } else {
-        std::cerr << "[DEBUG] No Cookie header at all\n";
     }
     return "";
 }
@@ -2781,11 +2776,6 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.path == "/tables") {
         std::string tok = extractBearerToken(req);
         auto vr = tok.empty() ? AuthManager::ValidateResult{0,"","root",true} : authMgr_.validateToken(tok);
-        std::cerr << "[DEBUG] /tables: tok_empty=" << (tok.empty()?"YES":"NO")
-                  << " userId=" << vr.userId
-                  << " username=" << vr.username
-                  << " role=" << vr.role
-                  << " valid=" << (vr.valid?"YES":"NO") << "\n";
         return buildHttpResponse(200, handleListTablesForUser(vr.userId));
     }
 

@@ -5037,8 +5037,8 @@ static void testGroup68() {
     };
 
     // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
-    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.2.0",
-          "version() returns MilanSQL v9.2.0");
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.4.0",
+          "version() returns MilanSQL v9.4.0");
     check(engine.evalFuncPublic("DATABASE", {}) == "public",
           "database() returns 'public'");
     check(engine.evalFuncPublic("USER", {}) == "root",
@@ -5965,8 +5965,8 @@ static void testGroup72() {
     // 15. Version v9.2.0
     {
         milansql::Engine eng;
-        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.2.0",
-              "Isolation #15: version() returns MilanSQL v9.2.0");
+        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.4.0",
+              "Isolation #15: version() returns MilanSQL v9.4.0");
     }
 }
 
@@ -6047,6 +6047,78 @@ static void testGroup73() {
 
         check(r.find("empno") != std::string::npos, "QuotedVals #14: 'empno' column header after named-col insert");
         check(r.find("Clark") != std::string::npos, "QuotedVals #15: value Clark present after named-col insert");
+    }
+}
+
+// testGroup74: v9.4.0 — INSERT quoted VALUES with spaces + umlauts
+// ============================================================
+
+static void testGroup74() {
+    auto exec = [](milansql::Engine& eng, const std::string& sql) -> std::string {
+        milansql::Parser p;
+        std::ostringstream cap;
+        std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
+        bool ok = true; std::string err;
+        try {
+            auto cmd = p.parse(sql);
+            milansql::dispatchCommand(cmd, eng, p, sql, [](){}, [](){}, [](){});
+        } catch (const std::exception& e) { ok = false; err = e.what(); }
+          catch (...) { ok = false; err = "unknown"; }
+        std::cout.rdbuf(old);
+        if (!ok) return std::string("ERROR:") + err;
+        return cap.str().empty() ? "ok" : cap.str();
+    };
+
+    // 1-5. Values with spaces inside quoted strings
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t (id INT, name TEXT, info TEXT)");
+        exec(eng, "INSERT INTO t VALUES (1, 'Alice Smith', 'Nur fuer mich!')");
+        std::string r = exec(eng, "SELECT * FROM t");
+
+        check(r.find("id")   != std::string::npos, "QuotedVals2 #1: schema col 'id' present");
+        check(r.find("name") != std::string::npos, "QuotedVals2 #2: schema col 'name' present");
+        check(r.find("info") != std::string::npos, "QuotedVals2 #3: schema col 'info' present");
+        check(r.find("Alice Smith")     != std::string::npos, "QuotedVals2 #4: value 'Alice Smith' shown unquoted");
+        check(r.find("'Alice Smith'")   == std::string::npos, "QuotedVals2 #5: no raw quoted 'Alice Smith'");
+    }
+
+    // 6-9. NULL as first value + quoted string with spaces
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE items (id INT, tag TEXT)");
+        exec(eng, "INSERT INTO items VALUES (NULL, 'Text hier')");
+        std::string r = exec(eng, "SELECT * FROM items");
+
+        check(r.find("id")         != std::string::npos, "QuotedVals2 #6: schema col 'id' present");
+        check(r.find("tag")        != std::string::npos, "QuotedVals2 #7: schema col 'tag' present");
+        check(r.find("Text hier")  != std::string::npos, "QuotedVals2 #8: value 'Text hier' shown");
+        check(r.find("'Text hier'")== std::string::npos, "QuotedVals2 #9: no raw quoted 'Text hier'");
+    }
+
+    // 10-12. WHERE with quoted value containing space
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE persons (id INT, name TEXT)");
+        exec(eng, "INSERT INTO persons VALUES (1, 'Anna Mueller')");
+        exec(eng, "INSERT INTO persons VALUES (2, 'Bob Schmidt')");
+        std::string r = exec(eng, "SELECT * FROM persons WHERE name = 'Anna Mueller'");
+
+        check(r.find("Anna Mueller") != std::string::npos, "QuotedVals2 #10: WHERE with space-value returns row");
+        check(r.find("Bob Schmidt")  == std::string::npos, "QuotedVals2 #11: other row not returned");
+        check(r.find("name")         != std::string::npos, "QuotedVals2 #12: schema col 'name' in WHERE result");
+    }
+
+    // 13-15. Multi-row INSERT with quoted values having spaces
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE prod (sku INT, label TEXT)");
+        exec(eng, "INSERT INTO prod VALUES (1, 'Red Apple'), (2, 'Green Banana'), (3, 'Blue Cherry')");
+        std::string r = exec(eng, "SELECT * FROM prod");
+
+        check(r.find("sku")          != std::string::npos, "QuotedVals2 #13: schema col 'sku' present");
+        check(r.find("label")        != std::string::npos, "QuotedVals2 #14: schema col 'label' present");
+        check(r.find("Red Apple")    != std::string::npos, "QuotedVals2 #15: value 'Red Apple' present");
     }
 }
 
@@ -6264,6 +6336,9 @@ int main() {
     }
     try { testGroup73(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 73 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup74(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 74 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

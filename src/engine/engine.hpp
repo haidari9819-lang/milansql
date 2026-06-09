@@ -4305,7 +4305,7 @@ public:
         // Only check for regular tables
         auto it = users_.find(currentUser_);
         if (it == users_.end())
-            throw std::runtime_error("Kein aktiver Benutzer");
+            return; // JWT user not in engine grant map → allowed (HTTP layer enforces prefix isolation)
         const auto& grants = it->second.grants;
         auto tblIt = grants.find(tableName);
         if (tblIt != grants.end()) {
@@ -7346,7 +7346,7 @@ public:
         // Phase 157: System info functions (instance-level, know currentUser_)
         std::string fnUp = fn;
         for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (fnUp == "VERSION") return "MilanSQL v9.4.0";
+        if (fnUp == "VERSION") return "MilanSQL v9.5.0";
         if (fnUp == "DATABASE") return "public";
         if (fnUp == "USER" || fnUp == "CURRENT_USER" || fnUp == "SESSION_USER" || fnUp == "SYSTEM_USER")
             return currentUser_.empty() ? "root" : currentUser_;

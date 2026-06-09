@@ -891,12 +891,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "9.4.0");
+            return makeScalar("@@version", "9.5.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.4.0\",\"MilanSQL Database Engine\"]]}";
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.5.0\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -1372,7 +1372,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v9.4.0\",";
+    json += "\"version\":\"MilanSQL v9.5.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1584,7 +1584,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v9.4.0</div>
+  <div class="logo">&#9889; MilanSQL v9.5.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -1812,7 +1812,7 @@ td.null-val{color:#484f58;font-style:italic}
   <span class="badge blue" id="conn-badge">0 connections</span>
   <span class="badge blue" id="test-badge">850 tests</span>
   <div class="topbar-right">
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.4.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.5.0</span>
   </div>
 </div>
 
@@ -1842,7 +1842,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v9.4.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v9.5.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1925,7 +1925,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.4.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.5.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2573,7 +2573,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.4.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.5.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2829,7 +2829,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"9.4.0\","
+            "\"version\":\"9.5.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"

@@ -3802,6 +3802,60 @@ public:
     const std::string& getCurrentUser() const { return currentUser_; }
     void setCurrentUserDirect(const std::string& name) { currentUser_ = name; }
 
+    // ── Phase 162: User-ID based identity (numeric, for crypto isolation) ──
+    void setCurrentUser(int userId, bool isRoot) {
+        currentUserId_ = userId;
+        isRootUser_    = isRoot;
+    }
+    int  getCurrentUserId() const { return currentUserId_; }
+    bool isRootUser()       const { return isRootUser_; }
+
+    // ── Phase 162: Namespace registry (__user_namespaces__) ─────────
+    void ensureNamespaceTable() {
+        const std::string ns = "__user_namespaces__";
+        if (tables_.count(ns)) return;
+        // CREATE TABLE __user_namespaces__ (user_id INT, real_name TEXT, enc_name TEXT)
+        tables_.emplace(ns, Table(ns, std::vector<Column>{
+            Column{"user_id",   "INT"},
+            Column{"real_name", "TEXT"},
+            Column{"enc_name",  "TEXT"}
+        }));
+    }
+
+    void registerUserNamespace(int userId, const std::string& realName, const std::string& encName) {
+        ensureNamespaceTable();
+        tables_["__user_namespaces__"].insert(
+            Row({ std::to_string(userId), realName, encName }));
+    }
+
+    void unregisterUserNamespace(int userId, const std::string& realName) {
+        if (!tables_.count("__user_namespaces__")) return;
+        auto& rows = tables_["__user_namespaces__"].mutableRows();
+        std::string uid = std::to_string(userId);
+        rows.erase(
+            std::remove_if(rows.begin(), rows.end(),
+                [&](const Row& r) {
+                    return r.values.size() >= 2 &&
+                           r.values[0] == uid &&
+                           r.values[1] == realName;
+                }),
+            rows.end());
+    }
+
+    // Returns vector of {real_name, enc_name} pairs for a given userId (0 = all)
+    std::vector<std::pair<std::string,std::string>> getUserNamespaces(int userId) {
+        std::vector<std::pair<std::string,std::string>> result;
+        if (!tables_.count("__user_namespaces__")) return result;
+        const auto& rows = tables_["__user_namespaces__"].rows();
+        std::string uid = std::to_string(userId);
+        for (const auto& r : rows) {
+            if (r.values.size() < 3) continue;
+            if (userId == 0 || r.values[0] == uid)
+                result.emplace_back(r.values[1], r.values[2]);
+        }
+        return result;
+    }
+
     // ── Phase 78: Table Inheritance ──────────────────────────────
     bool tableHasParent(const std::string& tbl) const {
         return tableParent_.count(resolveTableName(tbl)) > 0;
@@ -7224,6 +7278,10 @@ public:
     std::map<std::string, UserDef> users_;
     std::string currentUser_ = "root";
 
+    // Phase 162: Numeric user identity for crypto isolation
+    int  currentUserId_ = 0;
+    bool isRootUser_    = true;
+
     // Phase 75: Row-Level Security
     std::map<std::string, std::vector<RlsPolicy>> rlsPolicies_;
     std::set<std::string> rlsEnabled_;
@@ -7288,7 +7346,7 @@ public:
         // Phase 157: System info functions (instance-level, know currentUser_)
         std::string fnUp = fn;
         for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (fnUp == "VERSION") return "MilanSQL v8.9.0";
+        if (fnUp == "VERSION") return "MilanSQL v9.1.0";
         if (fnUp == "DATABASE") return "public";
         if (fnUp == "USER" || fnUp == "CURRENT_USER" || fnUp == "SESSION_USER" || fnUp == "SYSTEM_USER")
             return currentUser_.empty() ? "root" : currentUser_;

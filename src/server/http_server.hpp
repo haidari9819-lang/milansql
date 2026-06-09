@@ -885,12 +885,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "8.9.0");
+            return makeScalar("@@version", "9.1.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"8.7.0\",\"MilanSQL Database Engine\"]]}";
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.1.0\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -1323,7 +1323,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v8.9.0\",";
+    json += "\"version\":\"MilanSQL v9.1.0\",";
     json += "\"uptime\":"    + std::to_string(elapsed) + ",";
     json += "\"tables\":"    + std::to_string(tables.size()) + ",";
     json += "\"rows\":"      + std::to_string(totalRows) + ",";
@@ -1535,7 +1535,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v8.9.0</div>
+  <div class="logo">&#9889; MilanSQL v9.1.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -1672,8 +1672,19 @@ body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFo
 #editor-area{padding:12px;display:flex;flex-direction:column;gap:8px;flex-shrink:0}
 .editor-toolbar{display:flex;gap:8px;align-items:center}
 .editor-toolbar .exec-time{margin-left:auto;font-size:0.75rem;color:#8b949e}
-#sql-editor{width:100%;height:140px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#e6edf3;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4}
-#sql-editor:focus{border-color:#388bfd}
+/* New: editor with line numbers + syntax highlight */
+#editor-container{display:flex;border:1px solid #30363d;border-radius:6px;overflow:hidden;background:#161b22;transition:border-color .15s}
+#editor-container:focus-within{border-color:#388bfd}
+#line-numbers{background:#0d1117;color:#484f58;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;line-height:1.6;padding:12px 8px;text-align:right;user-select:none;min-width:40px;overflow:hidden;white-space:pre;flex-shrink:0;border-right:1px solid #21262d}
+#editor-wrap{position:relative;flex:1;overflow:hidden}
+#highlight-backdrop{position:absolute;top:0;left:0;right:0;bottom:0;padding:12px;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow:hidden;pointer-events:none;color:transparent}
+#sql-editor{position:relative;width:100%;height:140px;background:transparent;border:none;color:#e6edf3;caret-color:#e6edf3;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4;z-index:1;overflow:auto}
+/* Autocomplete dropdown */
+#autocomplete{display:none;position:absolute;background:#1c2128;border:1px solid #30363d;border-radius:6px;z-index:9999;max-height:200px;overflow-y:auto;min-width:160px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+.ac-item{padding:6px 12px;font-size:0.82rem;font-family:'JetBrains Mono',monospace;color:#e6edf3;cursor:pointer;white-space:nowrap}
+.ac-item:hover,.ac-item.ac-selected{background:#388bfd;color:#fff}
+/* Error line highlight */
+.error-line-badge{display:inline-block;background:#da3633;color:#fff;border-radius:4px;padding:2px 8px;font-size:0.75rem;margin-bottom:4px}
 
 /* BUTTONS */
 .btn{padding:6px 14px;border-radius:6px;border:none;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s}
@@ -1691,7 +1702,10 @@ body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFo
 .result-header .pill.info{border-color:#1f6feb;color:#58a6ff}
 #result-table-wrap{overflow:auto;border:1px solid #21262d;border-radius:6px}
 table{width:100%;border-collapse:collapse;font-size:0.82rem}
-th{background:#161b22;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #21262d;font-weight:500;white-space:nowrap;position:sticky;top:0}
+th{background:#161b22;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #21262d;font-weight:500;white-space:nowrap;position:sticky;top:0;cursor:pointer;user-select:none}
+th:hover{color:#e6edf3}
+th.sort-asc::after{content:' \25B2';font-size:0.7rem}
+th.sort-desc::after{content:' \25BC';font-size:0.7rem}
 td{padding:7px 12px;border-bottom:1px solid #161b22;color:#e6edf3;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
 tr:hover td{background:#1c2128}
 td.num{color:#58a6ff;font-family:monospace}
@@ -1729,7 +1743,10 @@ td.null-val{color:#484f58;font-style:italic}
 .hist-item{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 14px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
 .hist-item:hover{border-color:#388bfd}
 .hist-item .hist-sql{font-family:monospace;font-size:0.82rem;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hist-item .hist-meta{font-size:0.72rem;color:#8b949e;margin-top:4px}
+.hist-item .hist-meta{font-size:0.72rem;color:#8b949e;margin-top:4px;display:flex;gap:8px;align-items:center}
+.hist-badge{display:inline-block;border-radius:10px;padding:1px 7px;font-size:0.7rem;font-weight:600}
+.hist-badge.ok{background:#1a3a1a;color:#3fb950;border:1px solid #238636}
+.hist-badge.err{background:#2a1010;color:#f85149;border:1px solid #da3633}
 
 /* SCROLLBAR */
 ::-webkit-scrollbar{width:6px;height:6px}
@@ -1744,9 +1761,9 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="brand"><span>&#x26A1;</span> MilanSQL</div>
   <span class="badge" id="health-badge">checking...</span>
   <span class="badge blue" id="conn-badge">0 connections</span>
-  <span class="badge blue" id="test-badge">426 tests</span>
+  <span class="badge blue" id="test-badge">850 tests</span>
   <div class="topbar-right">
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v8.9.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.1.0</span>
   </div>
 </div>
 
@@ -1776,7 +1793,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v8.9.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v9.1.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1790,9 +1807,19 @@ td.null-val{color:#484f58;font-style:italic}
           <button class="btn btn-blue" onclick="explainQuery()">&#x26A1; EXPLAIN</button>
           <button class="btn btn-gray" onclick="formatSQL()">Format</button>
           <button class="btn btn-gray" onclick="clearEditor()">&#x2715; Clear</button>
+          <button class="btn btn-gray" onclick="copyCSV()" title="Copy results as CSV">&#x1F4CB; CSV</button>
           <span class="exec-time" id="exec-time"></span>
         </div>
-        <textarea id="sql-editor" placeholder="-- Enter SQL here (Ctrl+Enter to run)&#10;SELECT * FROM employees LIMIT 10;">SELECT version();</textarea>
+        <div style="position:relative">
+          <div id="editor-container">
+            <div id="line-numbers">1</div>
+            <div id="editor-wrap">
+              <div id="highlight-backdrop" aria-hidden="true"></div>
+              <textarea id="sql-editor" spellcheck="false" placeholder="-- Enter SQL here (Ctrl+Enter to run)">SELECT version();</textarea>
+            </div>
+          </div>
+          <div id="autocomplete"></div>
+        </div>
       </div>
       <div id="results-area">
         <div class="result-header" id="result-header" style="display:none">
@@ -1849,11 +1876,147 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v8.9.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.1.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
-// Page navigation
+// ── Syntax Highlighting ───────────────────────────────────────
+var SQL_KEYWORDS = ['SELECT','FROM','WHERE','JOIN','LEFT JOIN','RIGHT JOIN','INNER JOIN','FULL JOIN','CROSS JOIN',
+  'INSERT','UPDATE','DELETE','CREATE','DROP','ALTER','TABLE','INDEX','DATABASE','SCHEMA',
+  'GROUP BY','ORDER BY','HAVING','LIMIT','OFFSET','BEGIN','COMMIT','ROLLBACK','SAVEPOINT',
+  'AND','OR','NOT','NULL','IS','IN','LIKE','BETWEEN','EXISTS','CASE','WHEN','THEN','ELSE','END',
+  'PRIMARY KEY','FOREIGN KEY','AUTO_INCREMENT','UNIQUE','DEFAULT','REFERENCES','CONSTRAINT',
+  'INTO','SET','VALUES','ON','AS','DISTINCT','ALL','UNION','INTERSECT','EXCEPT',
+  'GRANT','REVOKE','SHOW','DESCRIBE','EXPLAIN','USE','TRUNCATE','WITH','LATERAL','RECURSIVE'];
+var SQL_FUNCS = ['COUNT','SUM','AVG','MIN','MAX','COALESCE','NULLIF','IFNULL','IF',
+  'CAST','CONVERT','UPPER','LOWER','SUBSTR','SUBSTRING','LENGTH','TRIM','LTRIM','RTRIM',
+  'REPLACE','CONCAT','CONCAT_WS','GROUP_CONCAT','NOW','DATE','YEAR','MONTH','DAY',
+  'ROUND','FLOOR','CEIL','CEILING','ABS','MOD','POWER','SQRT','RAND',
+  'ROW_NUMBER','RANK','DENSE_RANK','LEAD','LAG','FIRST_VALUE','LAST_VALUE','NTH_VALUE',
+  'OVER','PARTITION BY','STRING_AGG','ARRAY_AGG','JSONB_AGG','JSONB_BUILD_OBJECT',
+  'VERSION','DATABASE','USER','SCHEMA'];
+
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+function highlightSQL(text) {
+  // Escape HTML first
+  var s = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Comments (-- and /* */) — replace with placeholder to protect from further substitution
+  var comments = [];
+  s = s.replace(/\/\*[\s\S]*?\*\//g, function(m){ comments.push('<span style="color:#8b949e">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
+  s = s.replace(/--[^\n]*/g, function(m){ comments.push('<span style="color:#8b949e">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
+  // Strings
+  var strings = [];
+  s = s.replace(/'(?:[^'\\]|\\.)*'/g, function(m){ strings.push('<span style="color:#a5d6ff">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
+  s = s.replace(/"(?:[^"\\]|\\.)*"/g, function(m){ strings.push('<span style="color:#a5d6ff">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
+  // Numbers
+  s = s.replace(/\b(\d+(?:\.\d+)?)\b/g,'<span style="color:#f8c555">$1</span>');
+  // Functions (before keywords so they match first)
+  var fnPat = '\\b(' + SQL_FUNCS.map(escRe).join('|') + ')\\s*(?=\\()';
+  s = s.replace(new RegExp(fnPat,'gi'), function(m){ return '<span style="color:#d2a8ff">'+m+'</span>'; });
+  // Keywords (longest first to match GROUP BY before GROUP)
+  var kwSorted = SQL_KEYWORDS.slice().sort(function(a,b){return b.length-a.length;});
+  kwSorted.forEach(function(kw){
+    s = s.replace(new RegExp('\\b'+escRe(kw)+'\\b','gi'), function(m){ return '<span style="color:#ff7b72">'+m+'</span>'; });
+  });
+  // Restore strings and comments
+  s = s.replace(/\x00S(\d+)\x00/g, function(_,i){ return strings[+i]; });
+  s = s.replace(/\x00C(\d+)\x00/g, function(_,i){ return comments[+i]; });
+  return s;
+}
+
+// ── Editor: Line Numbers + Highlight sync ────────────────────
+var acItems = [];
+var acIndex = -1;
+var acVisible = false;
+
+function updateEditorDecor() {
+  var ed = document.getElementById('sql-editor');
+  var backdrop = document.getElementById('highlight-backdrop');
+  var lineNums = document.getElementById('line-numbers');
+  if (!ed || !backdrop) return;
+  var val = ed.value;
+  backdrop.innerHTML = highlightSQL(val) + '\n'; // extra \n prevents scroll flicker
+  var lines = val.split('\n').length;
+  var nums = '';
+  for (var i = 1; i <= lines; i++) nums += i + '\n';
+  lineNums.textContent = nums;
+  // Sync scroll
+  backdrop.scrollTop = ed.scrollTop;
+  backdrop.scrollLeft = ed.scrollLeft;
+  lineNums.scrollTop = ed.scrollTop;
+}
+
+// ── Autocomplete ──────────────────────────────────────────────
+var acTableNames = [];
+fetch('/tables').then(function(r){return r.json();}).then(function(d){
+  var tables = Array.isArray(d) ? d : (d.tables||[]);
+  acTableNames = tables.map(function(t){ return typeof t==='string'?t:(t.name||''); }).filter(Boolean);
+}).catch(function(){});
+
+function getWordBeforeCursor(ta) {
+  var pos = ta.selectionStart;
+  var text = ta.value.substring(0, pos);
+  var m = text.match(/[\w]+$/);
+  return m ? m[0] : '';
+}
+
+function showAutocomplete(ta) {
+  var word = getWordBeforeCursor(ta);
+  if (!word || word.length < 1) { closeAutocomplete(); return; }
+  var ul = word.toUpperCase();
+  var candidates = SQL_KEYWORDS.concat(SQL_FUNCS).concat(acTableNames).filter(function(k){
+    return k.toUpperCase().startsWith(ul) && k.toUpperCase() !== ul;
+  });
+  // Deduplicate
+  candidates = candidates.filter(function(v,i,a){ return a.indexOf(v)===i; });
+  if (!candidates.length) { closeAutocomplete(); return; }
+  var ac = document.getElementById('autocomplete');
+  ac.innerHTML = candidates.slice(0,20).map(function(c,i){
+    return '<div class="ac-item" data-idx="'+i+'" onclick="applyAC(\''+escAttr(c)+'\')">' + escHtml(c) + '</div>';
+  }).join('');
+  acItems = candidates.slice(0,20);
+  acIndex = -1;
+  acVisible = true;
+  // Position below editor
+  var wrap = document.getElementById('editor-wrap');
+  var rect = wrap.getBoundingClientRect();
+  ac.style.display = 'block';
+  ac.style.left = '44px';
+  ac.style.top = (rect.bottom - rect.top + 8) + 'px';
+}
+
+function closeAutocomplete() {
+  acVisible = false; acIndex = -1; acItems = [];
+  document.getElementById('autocomplete').style.display = 'none';
+}
+
+function applyAC(word) {
+  var ta = document.getElementById('sql-editor');
+  var pos = ta.selectionStart;
+  var text = ta.value;
+  var before = text.substring(0, pos);
+  var after = text.substring(pos);
+  var m = before.match(/[\w]+$/);
+  var start = m ? pos - m[0].length : pos;
+  ta.value = text.substring(0, start) + word + after;
+  ta.selectionStart = ta.selectionEnd = start + word.length;
+  closeAutocomplete();
+  updateEditorDecor();
+  ta.focus();
+}
+
+function moveAC(dir) {
+  if (!acVisible) return false;
+  var items = document.querySelectorAll('.ac-item');
+  if (!items.length) return false;
+  if (acIndex >= 0) items[acIndex].classList.remove('ac-selected');
+  acIndex = (acIndex + dir + items.length) % items.length;
+  items[acIndex].classList.add('ac-selected');
+  items[acIndex].scrollIntoView({block:'nearest'});
+  return true;
+}
+
+// ── Page navigation ───────────────────────────────────────────
 function showPage(name, el) {
   document.querySelectorAll('.page').forEach(function(p){p.classList.remove('active');});
   document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active');});
@@ -1864,13 +2027,15 @@ function showPage(name, el) {
   if (name === 'monitoring') loadMonitoring();
 }
 
-// SQL Execution
+// ── SQL Execution ──────────────────────────────────────────────
+var lastResultData = null;
 async function runQuery(sql) {
   var q = sql || document.getElementById('sql-editor').value.trim();
   if (!q) return;
   var t0 = performance.now();
   document.getElementById('result-content').innerHTML = '<div style="color:#8b949e;padding:8px;font-size:0.8rem">Running...</div>';
   document.getElementById('result-header').style.display = 'none';
+  clearErrorHighlight();
   try {
     var resp = await fetch('/api/query', {
       method: 'POST',
@@ -1880,10 +2045,12 @@ async function runQuery(sql) {
     var data = await resp.json();
     var ms = (performance.now() - t0).toFixed(1);
     document.getElementById('exec-time').textContent = ms + 'ms';
+    lastResultData = data;
     renderResult(data, ms);
-    saveHistory(q, ms);
+    saveHistory(q, ms, !data.error && (data.success !== false));
   } catch(e) {
     showError('Network error: ' + e.message);
+    saveHistory(q, '0', false);
   }
 }
 
@@ -1898,7 +2065,15 @@ function renderResult(data, ms) {
   if (err) {
     pill.className = 'pill error'; pill.textContent = 'Error';
     info.textContent = '';
-    content.innerHTML = '<div class="error-box">&#x26A0; ' + escHtml(err) + '</div>';
+    // Try to extract line number from error message
+    var lineMatch = err.match(/line\s+(\d+)/i) || err.match(/at\s+line\s+(\d+)/i);
+    var lineHtml = '';
+    if (lineMatch) {
+      var ln = parseInt(lineMatch[1]);
+      highlightErrorLine(ln);
+      lineHtml = '<div class="error-line-badge">Zeile '+ln+'</div>';
+    }
+    content.innerHTML = lineHtml + '<div class="error-box">&#x26A0; ' + escHtml(err) + '</div>';
     return;
   }
 
@@ -1914,10 +2089,19 @@ function renderResult(data, ms) {
   }
 
   pill.className = 'pill'; pill.textContent = rows.length + ' rows';
-  info.textContent = 'returned \u00b7 ' + ms + 'ms';
+  info.textContent = rows.length + ' rows returned \u00b7 ' + ms + 'ms';
 
-  var html = '<div id="result-table-wrap"><table><thead><tr>';
-  cols.forEach(function(c){ html += '<th>' + escHtml(typeof c === 'string' ? c : (c.name || String(c))) + '</th>'; });
+  renderTable(cols, rows, content);
+}
+
+var sortState = {col:-1, asc:true};
+function renderTable(cols, rows, container) {
+  var html = '<div id="result-table-wrap"><table id="result-table"><thead><tr>';
+  cols.forEach(function(c,i){
+    var name = escHtml(typeof c === 'string' ? c : (c.name || String(c)));
+    var cls = sortState.col===i ? (sortState.asc?'sort-asc':'sort-desc') : '';
+    html += '<th class="'+cls+'" onclick="sortTable('+i+')">'+name+'</th>';
+  });
   html += '</tr></thead><tbody>';
   rows.forEach(function(row) {
     html += '<tr>';
@@ -1934,7 +2118,42 @@ function renderResult(data, ms) {
     html += '</tr>';
   });
   html += '</tbody></table></div>';
-  content.innerHTML = html;
+  container.innerHTML = html;
+}
+
+function sortTable(colIdx) {
+  if (!lastResultData) return;
+  var rows = (lastResultData.rows || []).slice();
+  var cols = lastResultData.columns || [];
+  if (sortState.col === colIdx) {
+    sortState.asc = !sortState.asc;
+  } else {
+    sortState.col = colIdx; sortState.asc = true;
+  }
+  rows.sort(function(a, b) {
+    var va = Array.isArray(a) ? a[colIdx] : (a.values||Object.values(a))[colIdx];
+    var vb = Array.isArray(b) ? b[colIdx] : (b.values||Object.values(b))[colIdx];
+    if (va === null || va === undefined) va = '';
+    if (vb === null || vb === undefined) vb = '';
+    var na = parseFloat(va), nb = parseFloat(vb);
+    var cmp = (!isNaN(na)&&!isNaN(nb)) ? na-nb : String(va).localeCompare(String(vb));
+    return sortState.asc ? cmp : -cmp;
+  });
+  renderTable(cols, rows, document.getElementById('result-content'));
+}
+
+function highlightErrorLine(lineNum) {
+  var ed = document.getElementById('sql-editor');
+  var lines = ed.value.split('\n');
+  if (lineNum < 1 || lineNum > lines.length) return;
+  var start = lines.slice(0, lineNum-1).join('\n').length + (lineNum > 1 ? 1 : 0);
+  var end = start + lines[lineNum-1].length;
+  ed.focus();
+  ed.setSelectionRange(start, end);
+}
+
+function clearErrorHighlight() {
+  // Nothing to do — selection cleared on next click
 }
 
 function showError(msg) {
@@ -1960,28 +2179,78 @@ function formatSQL() {
   var s = ed.value;
   kws.forEach(function(k){ s = s.replace(new RegExp('\\b' + k + '\\b','gi'), k); });
   ed.value = s;
+  updateEditorDecor();
 }
 
 function clearEditor() {
-  document.getElementById('sql-editor').value = '';
+  var ed = document.getElementById('sql-editor');
+  ed.value = '';
+  updateEditorDecor();
   document.getElementById('result-header').style.display = 'none';
   document.getElementById('result-content').innerHTML = '';
   document.getElementById('exec-time').textContent = '';
+  lastResultData = null;
+}
+
+function copyCSV() {
+  if (!lastResultData) return;
+  var rows = lastResultData.rows || [];
+  var cols = lastResultData.columns || [];
+  if (!cols.length) return;
+  var csvCols = cols.map(function(c){ return typeof c==='string'?c:(c.name||String(c)); });
+  var lines = [csvCols.join(',')];
+  rows.forEach(function(row){
+    var vals = Array.isArray(row) ? row : (row.values||Object.values(row));
+    lines.push(vals.map(function(v){
+      var s = v===null||v===undefined?'':String(v);
+      return s.includes(',') || s.includes('"') || s.includes('\n') ? '"'+s.replace(/"/g,'""')+'"' : s;
+    }).join(','));
+  });
+  var csv = lines.join('\n');
+  navigator.clipboard.writeText(csv).then(function(){
+    var btn = document.querySelector('[onclick="copyCSV()"]');
+    if(btn){ var old=btn.textContent; btn.textContent='Copied!'; setTimeout(function(){btn.textContent=old;},1500); }
+  }).catch(function(){});
 }
 
 // Keyboard shortcuts
 document.getElementById('sql-editor').addEventListener('keydown', function(e) {
-  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); runQuery(); }
-  if (e.ctrlKey && e.key === 'e')     { e.preventDefault(); explainQuery(); }
-  if (e.ctrlKey && e.key === 'l')     { e.preventDefault(); clearEditor(); }
-  if (e.ctrlKey && e.key === 'h')     { e.preventDefault(); showPage('history', document.querySelector('[data-page=history]')); }
-  if (e.key === 'Tab') {
+  if (acVisible) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveAC(1); return; }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); moveAC(-1); return; }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      if (acIndex >= 0 && acItems[acIndex]) { e.preventDefault(); applyAC(acItems[acIndex]); return; }
+    }
+    if (e.key === 'Escape')    { e.preventDefault(); closeAutocomplete(); return; }
+  }
+  if (e.ctrlKey && e.key === ' ') { e.preventDefault(); showAutocomplete(e.target); return; }
+  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); runQuery(); return; }
+  if (e.ctrlKey && e.key === 'e')     { e.preventDefault(); explainQuery(); return; }
+  if (e.ctrlKey && e.key === 'l')     { e.preventDefault(); clearEditor(); return; }
+  if (e.ctrlKey && e.key === 'h')     { e.preventDefault(); showPage('history', document.querySelector('[data-page=history]')); return; }
+  if (e.key === 'Tab' && !e.ctrlKey) {
     e.preventDefault();
     var ta = e.target;
     var s = ta.selectionStart;
     ta.value = ta.value.substring(0,s) + '    ' + ta.value.substring(ta.selectionEnd);
     ta.selectionStart = ta.selectionEnd = s + 4;
+    updateEditorDecor();
+    return;
   }
+});
+
+document.getElementById('sql-editor').addEventListener('input', function() {
+  updateEditorDecor();
+  closeAutocomplete();
+});
+document.getElementById('sql-editor').addEventListener('scroll', function() {
+  var bd = document.getElementById('highlight-backdrop');
+  var ln = document.getElementById('line-numbers');
+  if(bd){ bd.scrollTop = this.scrollTop; bd.scrollLeft = this.scrollLeft; }
+  if(ln) ln.scrollTop = this.scrollTop;
+});
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#autocomplete') && e.target.id !== 'sql-editor') closeAutocomplete();
 });
 
 // Table sidebar
@@ -2001,6 +2270,7 @@ async function loadSidebarTables() {
 
 function selectFromTable(name) {
   document.getElementById('sql-editor').value = 'SELECT * FROM ' + name + ' LIMIT 100;';
+  updateEditorDecor();
   showPage('editor', document.querySelector('[data-page=editor]'));
   runQuery();
 }
@@ -2076,10 +2346,11 @@ async function loadMonitoring() {
 }
 
 // History
-function saveHistory(sql, ms) {
+function saveHistory(sql, ms, ok) {
   var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
-  hist.unshift({sql: sql, ms: ms, ts: new Date().toLocaleTimeString()});
-  if (hist.length > 50) hist.pop();
+  var ts = new Date();
+  hist.unshift({sql: sql, ms: ms, ts: ts.toLocaleString(), ok: ok !== false});
+  if (hist.length > 20) hist = hist.slice(0, 20);
   localStorage.setItem('mq_hist', JSON.stringify(hist));
 }
 
@@ -2088,9 +2359,12 @@ function renderHistory() {
   var el = document.getElementById('history-list');
   if (!hist.length) { el.innerHTML = '<div style="color:#484f58;font-size:0.85rem;padding:8px">No history yet.</div>'; return; }
   el.innerHTML = hist.map(function(h,i) {
+    var badge = h.ok !== false
+      ? '<span class="hist-badge ok">OK</span>'
+      : '<span class="hist-badge err">Error</span>';
     return '<div class="hist-item" onclick="loadHistItem(' + i + ')">' +
       '<div class="hist-sql">' + escHtml(h.sql) + '</div>' +
-      '<div class="hist-meta">' + h.ts + ' \u00b7 ' + h.ms + 'ms</div>' +
+      '<div class="hist-meta">' + badge + '<span>' + escHtml(h.ts||'') + '</span><span>' + escHtml(String(h.ms||'0')) + 'ms</span></div>' +
       '</div>';
   }).join('');
 }
@@ -2099,6 +2373,7 @@ function loadHistItem(i) {
   var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
   if (!hist[i]) return;
   document.getElementById('sql-editor').value = hist[i].sql;
+  updateEditorDecor();
   showPage('editor', document.querySelector('[data-page=editor]'));
 }
 
@@ -2134,6 +2409,7 @@ function escHtml(s) {
 function escAttr(s) { return String(s).replace(/'/g,"\\'"); }
 
 // Init
+updateEditorDecor();
 loadSidebarTables();
 pollStatus();
 setInterval(pollStatus, 5000);
@@ -2247,7 +2523,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v8.9.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.1.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2425,7 +2701,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             return buildHttpResponse(400, R"({"success":false,"error":"Missing SQL"})");
         // Input sanitization: length limit + null-byte + control-char removal
         if (sql.size() > 10000)
-            return buildHttpResponse(400, R"({"success":false,"error":"SQL too long (max 10000 chars)"})");
+            return buildHttpResponse(400, std::string("{\"success\":false,\"error\":\"SQL too long (max 10000 chars)\"}"));
         {
             std::string clean;
             clean.reserve(sql.size());

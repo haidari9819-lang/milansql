@@ -5037,8 +5037,8 @@ static void testGroup68() {
     };
 
     // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
-    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.1.0",
-          "version() returns MilanSQL v9.1.0");
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.2.0",
+          "version() returns MilanSQL v9.2.0");
     check(engine.evalFuncPublic("DATABASE", {}) == "public",
           "database() returns 'public'");
     check(engine.evalFuncPublic("USER", {}) == "root",
@@ -5873,6 +5873,103 @@ static void testGroup71() {
     }
 }
 
+// ============================================================
+// testGroup72: v9.2.0 — User Isolation Fix
+// Per-prefix isolation, setCurrentUser context, namespace registry
+// ============================================================
+static void testGroup72() {
+    auto exec = [](milansql::Engine& eng, const std::string& sql) -> std::string {
+        milansql::Parser p;
+        std::ostringstream cap;
+        std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
+        bool ok = true; std::string err;
+        try {
+            auto cmd = p.parse(sql);
+            milansql::dispatchCommand(cmd, eng, p, sql, [](){}, [](){}, [](){});
+        } catch (const std::exception& e) { ok = false; err = e.what(); }
+          catch (...) { ok = false; err = "unknown"; }
+        std::cout.rdbuf(old);
+        if (!ok) return std::string("ERROR:") + err;
+        return cap.str().empty() ? "ok" : cap.str();
+    };
+
+    // 1-4. Prefix-based isolation: u1_ and u2_ tables are independent
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE u1_geheimnis (id INT, secret TEXT)");
+        exec(eng, "INSERT INTO u1_geheimnis VALUES (1, 'alice_secret')");
+        exec(eng, "CREATE TABLE u2_geheimnis (id INT, secret TEXT)");
+        exec(eng, "INSERT INTO u2_geheimnis VALUES (2, 'bob_secret')");
+
+        auto r1 = exec(eng, "SELECT * FROM u1_geheimnis");
+        check(r1.find("alice_secret") != std::string::npos, "Isolation #1: user1 sees own data");
+        check(r1.find("bob_secret")   == std::string::npos, "Isolation #2: user1 NOT see user2 data");
+
+        auto r2 = exec(eng, "SELECT * FROM u2_geheimnis");
+        check(r2.find("bob_secret")   != std::string::npos, "Isolation #3: user2 sees own data");
+        check(r2.find("alice_secret") == std::string::npos, "Isolation #4: user2 NOT see user1 data");
+    }
+
+    // 5-8. setCurrentUser context tracking
+    {
+        milansql::Engine eng;
+        eng.setCurrentUser(5, false);
+        check(eng.getCurrentUserId() == 5, "Isolation #5: setCurrentUser(5,false) → getId=5");
+        check(!eng.isRootUser(),            "Isolation #6: isRootUser=false for non-root");
+        eng.setCurrentUser(0, true);
+        check(eng.isRootUser(),             "Isolation #7: reset to root");
+        check(eng.getCurrentUserId() == 0,  "Isolation #8: userId=0 after root reset");
+    }
+
+    // 9-11. Namespace registry per user
+    {
+        milansql::Engine eng;
+        eng.registerUserNamespace(1, "orders", "u1_abc123");
+        eng.registerUserNamespace(2, "orders", "u2_def456");
+        auto ns1 = eng.getUserNamespaces(1);
+        auto ns2 = eng.getUserNamespaces(2);
+        check(!ns1.empty() && ns1[0].second == "u1_abc123", "Isolation #9: user1 namespace correct");
+        check(!ns2.empty() && ns2[0].second == "u2_def456", "Isolation #10: user2 namespace correct");
+        check((ns1.empty() || ns2.empty()) || ns1[0].second != ns2[0].second,
+              "Isolation #11: namespaces are distinct");
+    }
+
+    // 12. Cross-user access returns error
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE u3_private (id INT)");
+        exec(eng, "INSERT INTO u3_private VALUES (99)");
+        auto r = exec(eng, "SELECT * FROM u4_private");
+        check(r.find("ERROR:") != std::string::npos ||
+              r.find("nicht gefunden") != std::string::npos ||
+              r.find("not found") != std::string::npos,
+              "Isolation #12: user4 cannot read user3 table");
+    }
+
+    // 13-14. DROP TABLE isolation
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE u5_data (x INT)");
+        exec(eng, "CREATE TABLE u6_data (x INT)");
+        exec(eng, "DROP TABLE u5_data");
+        auto tables = eng.getAllTableNames();
+        bool u5gone = true, u6present = false;
+        for (const auto& t : tables) {
+            if (t == "u5_data") u5gone = false;
+            if (t == "u6_data") u6present = true;
+        }
+        check(u5gone,    "Isolation #13: DROP TABLE removes only u5 table");
+        check(u6present, "Isolation #14: u6_data survives u5 DROP");
+    }
+
+    // 15. Version v9.2.0
+    {
+        milansql::Engine eng;
+        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.2.0",
+              "Isolation #15: version() returns MilanSQL v9.2.0");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -6081,6 +6178,9 @@ int main() {
     }
     try { testGroup71(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 71 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup72(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 72 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -36,6 +36,7 @@
 #include <vector>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
@@ -420,7 +421,7 @@ private:
     // Phase 154-156: Auth + Rate Limiting
     AuthManager authMgr_;
     RateLimiter loginLimiter_{10, 10.0/60.0};    // 10/min per IP
-    RateLimiter requestLimiter_{100, 100.0/60.0}; // 100/min per user/IP
+    RateLimiter requestLimiter_;                   // tiered: per user/IP
 
     // Brute-force lockout: 5 failures → 15 min account lock
     struct LockoutInfo { int failedAttempts = 0; std::chrono::steady_clock::time_point lockedUntil{}; };
@@ -2951,10 +2952,17 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             if (!apiKey.empty()) vr = authMgr_.validateApiKey(apiKey);
         }
 
-        // Rate limit by userId or IP
+        // Rate limit by userId or IP (tiered)
         std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
-        if (!requestLimiter_.allow(rlKey))
-            return buildHttpResponse(429, R"({"success":false,"error":"Rate limit exceeded","retryAfter":60})");
+        if (vr.userId > 0 && requestLimiter_.getTier(rlKey) == RateTier::ANONYMOUS) {
+            requestLimiter_.setTier(rlKey, vr.role == "root" ? RateTier::ADMIN : RateTier::FREE);
+        }
+        if (!requestLimiter_.allow(rlKey)) {
+            double retry = requestLimiter_.retryAfterSeconds(rlKey);
+            return buildHttpResponse(429,
+                "{\"success\":false,\"error\":\"Rate limit exceeded\",\"retryAfter\":"
+                + std::to_string((int)std::ceil(retry)) + "}");
+        }
 
         std::string sql;
         if (req.method == "GET") sql = getQueryParam(req.query, "sql");

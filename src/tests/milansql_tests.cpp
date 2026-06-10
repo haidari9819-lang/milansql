@@ -6214,6 +6214,102 @@ static void testGroup75() {
     }
 }
 
+// ── Group 76: CREATE TABLE IF NOT EXISTS ──────────────────
+static void testGroup76() {
+    auto exec = [](milansql::Engine& eng, const std::string& sql) -> milansql::QueryResult {
+        milansql::Parser p;
+        try {
+            return milansql::dispatch(p.parse(sql), eng);
+        } catch (const std::exception& e) {
+            milansql::QueryResult qr; qr.error = e.what(); return qr;
+        } catch (...) {
+            milansql::QueryResult qr; qr.error = "unknown"; return qr;
+        }
+    };
+
+    // 1. Basic IF NOT EXISTS creates table
+    {
+        milansql::Engine eng;
+        auto r = exec(eng, "CREATE TABLE IF NOT EXISTS t76a (id INT, name TEXT)");
+        check(r.error.empty(), "IF NOT EXISTS #1: basic create succeeds");
+    }
+
+    // 2. Table name is correct, not "IF"
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE IF NOT EXISTS t76b (id INT)");
+        auto r = exec(eng, "SELECT * FROM t76b");
+        check(r.error.empty(), "IF NOT EXISTS #2: table name is t76b, not IF");
+    }
+
+    // 3. Duplicate create with IF NOT EXISTS — no error
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t76c (id INT)");
+        auto r = exec(eng, "CREATE TABLE IF NOT EXISTS t76c (id INT)");
+        check(r.error.empty(), "IF NOT EXISTS #3: duplicate create no error");
+    }
+
+    // 4. Duplicate create WITHOUT IF NOT EXISTS — error expected
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t76d (id INT)");
+        auto r = exec(eng, "CREATE TABLE t76d (id INT)");
+        check(!r.error.empty(), "IF NOT EXISTS #4: duplicate without IF NOT EXISTS errors");
+    }
+
+    // 5. SHOW TABLES after IF NOT EXISTS — must NOT show "IF"
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE IF NOT EXISTS t76e (id INT, val TEXT)");
+        auto r = exec(eng, "SHOW TABLES");
+        bool hasIF = false, hasT76e = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) {
+                std::string uv = v;
+                for (auto& c : uv) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (uv == "IF") hasIF = true;
+                if (uv == "T76E" || v.find("t76e") != std::string::npos || v.find("T76E") != std::string::npos) hasT76e = true;
+            }
+        check(!hasIF, "IF NOT EXISTS #5: SHOW TABLES does not contain 'IF'");
+        check(hasT76e, "IF NOT EXISTS #6: SHOW TABLES contains 't76e'");
+    }
+
+    // 7. INSERT into IF NOT EXISTS table works
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE IF NOT EXISTS t76f (id INT, name TEXT)");
+        auto r = exec(eng, "INSERT INTO t76f VALUES (1, 'hello')");
+        check(r.error.empty(), "IF NOT EXISTS #7: INSERT after IF NOT EXISTS works");
+    }
+
+    // 8. Columns are parsed correctly with IF NOT EXISTS
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE IF NOT EXISTS t76g (id INT, name TEXT, age INT)");
+        exec(eng, "INSERT INTO t76g VALUES (1, 'Alice', 30)");
+        auto r = exec(eng, "SELECT name, age FROM t76g WHERE id = 1");
+        check(r.error.empty(), "IF NOT EXISTS #8: columns parsed correctly");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) if (v == "Alice") found = true;
+        check(found, "IF NOT EXISTS #9: data correct after IF NOT EXISTS create");
+    }
+
+    // 10. Second IF NOT EXISTS on existing table preserves data
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE IF NOT EXISTS t76h (id INT, val TEXT)");
+        exec(eng, "INSERT INTO t76h VALUES (1, 'keep')");
+        exec(eng, "CREATE TABLE IF NOT EXISTS t76h (id INT, val TEXT)");
+        auto r = exec(eng, "SELECT * FROM t76h");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) if (v == "keep") found = true;
+        check(found, "IF NOT EXISTS #10: data preserved after duplicate IF NOT EXISTS");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -6434,6 +6530,9 @@ int main() {
     }
     try { testGroup75(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 75 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup76(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 76 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

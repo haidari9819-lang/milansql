@@ -2196,6 +2196,10 @@ inline bool dispatchCommand(
         if (cmd.tableName.empty() || cmd.columns.empty()) {
             std::cout << "  Fehler: CREATE TABLE name (col TYP, ...)\n"; break;
         }
+        if (cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+            std::cout << "  Tabelle '" << cmd.tableName << "' existiert bereits (IF NOT EXISTS).\n\n";
+            break;
+        }
         engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys,
                            cmd.tableInherits); // Phase 78: INHERITS
         // Auto-create BTREE index for PRIMARY KEY column

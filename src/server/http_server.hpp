@@ -406,60 +406,6 @@ struct UserContext {
     bool valid = false;
 };
 
-// ── Thread Pool with Work Queue ─────────────────────────────
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t numThreads) : stop_(false) {
-        for (size_t i = 0; i < numThreads; ++i)
-            workers_.emplace_back([this] { workerLoop(); });
-    }
-    ~ThreadPool() {
-        { std::lock_guard<std::mutex> lk(mtx_); stop_ = true; }
-        cv_.notify_all();
-        for (auto& w : workers_) if (w.joinable()) w.join();
-    }
-
-    // Submit a task. Returns false if queue is full (backpressure).
-    bool submit(std::function<void()> task) {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (stop_) return false;
-            if (queue_.size() >= maxQueueSize_) return false;  // backpressure
-            queue_.push(std::move(task));
-        }
-        cv_.notify_one();
-        return true;
-    }
-
-    size_t queueSize() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return queue_.size();
-    }
-    size_t poolSize() const { return workers_.size(); }
-
-    static constexpr size_t maxQueueSize_ = 4096;
-
-private:
-    void workerLoop() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lk(mtx_);
-                cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty()) return;
-                task = std::move(queue_.front());
-                queue_.pop();
-            }
-            task();
-        }
-    }
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> queue_;
-    mutable std::mutex mtx_;
-    std::condition_variable cv_;
-    bool stop_;
-};
-
 class MilanHttpServer {
 public:
     MilanHttpServer(int port, const std::string& dbPath)
@@ -476,7 +422,7 @@ private:
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
     std::atomic<long long> queryCounter_{0};   // Phase 166: live query counter
 
-    // Phase 167: Thread Pool (256 workers, 4096 queue)
+    // Phase 167: Thread Pool (reuses ThreadPool from server.hpp)
     std::unique_ptr<ThreadPool> threadPool_;
 
     // Phase 154-156: Auth + Rate Limiting
@@ -3283,7 +3229,7 @@ inline void MilanHttpServer::run() {
 
     // Phase 167: Thread Pool — 256 workers, 4096 queue depth
     constexpr size_t POOL_SIZE = 256;
-    threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE);
+    threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE, 4096);
 
     std::cout << "MilanSQL HTTP Server auf Port " << port_
               << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024)\n" << std::flush;
@@ -3295,7 +3241,7 @@ inline void MilanHttpServer::run() {
         if (client == INVALID_SOCK) break;
 
         // Submit to thread pool; if queue full → 503 Service Unavailable
-        bool submitted = threadPool_->submit([this, client]() {
+        bool submitted = threadPool_->enqueue([this, client]() {
             handleClient(client);
         });
         if (!submitted) {

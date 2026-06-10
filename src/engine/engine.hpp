@@ -1306,7 +1306,27 @@ public:
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         Table& t = getTable(tbl);       // wirft wenn Tabelle fehlt
+        // Apply defaults first (fills "" sentinels from named-column INSERT, appends missing cols)
+        // Must run BEFORE quote-stripping so that '' (empty string) is not confused with "" sentinel
         applyDefaults(t, vals);         // fehlende Werte mit DEFAULT/NULL füllen
+        // Phase 165: strip surrounding quotes from string values before storage
+        // 'Maus' → Maus, 'Hello World' → Hello World, 'It''s fine' → It's fine, '' → ""
+        for (auto& v : vals) {
+            if (v.size() >= 2 &&
+                ((v.front()=='\'' && v.back()=='\'') ||
+                 (v.front()=='"'  && v.back()=='"'))) {
+                v = v.substr(1, v.size() - 2);
+                // unescape doubled quotes: '' → ' and "" → "
+                std::string unesc;
+                unesc.reserve(v.size());
+                for (size_t qi = 0; qi < v.size(); ++qi) {
+                    unesc += v[qi];
+                    if ((v[qi]=='\'' || v[qi]=='"') && qi+1<v.size() && v[qi+1]==v[qi])
+                        ++qi; // skip duplicate
+                }
+                v = std::move(unesc);
+            }
+        }
         applyAutoInc(t, vals);          // AUTO_INCREMENT-Spalten befüllen
         applyGeneratedCols(t, vals);    // Phase 68: Generated Columns berechnen
         checkInsertFK(tbl, vals);       // FOREIGN KEY prüfen
@@ -1489,7 +1509,8 @@ public:
         // Index nur bei einzelner "="-Bedingung
         if (conds.size() == 1 && conds[0].op == "=" && src.hasIndex(conds[0].col)) {
             usedIndex = true;
-            for (size_t ri : src.indexSearch(conds[0].col, conds[0].val))
+            const std::string idxSearchVal = milansql::dateutils::stripQuotes(conds[0].val);
+            for (size_t ri : src.indexSearch(conds[0].col, idxSearchVal))
                 if (ri < src.rows().size() && src.rows()[ri].xmax == 0)  // Phase 71
                     result.insert(src.rows()[ri]);
             // Phase 75: RLS
@@ -7346,7 +7367,7 @@ public:
         // Phase 157: System info functions (instance-level, know currentUser_)
         std::string fnUp = fn;
         for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (fnUp == "VERSION") return "MilanSQL v9.8.0";
+        if (fnUp == "VERSION") return "MilanSQL v9.9.0";
         if (fnUp == "DATABASE") return "public";
         if (fnUp == "USER" || fnUp == "CURRENT_USER" || fnUp == "SESSION_USER" || fnUp == "SYSTEM_USER")
             return currentUser_.empty() ? "root" : currentUser_;

@@ -415,6 +415,7 @@ private:
     milansql::MilanBinaryStorage storage_;
     std::mutex engineMutex_;
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
+    std::atomic<long long> queryCounter_{0};   // Phase 166: live query counter
 
     // Phase 154-156: Auth + Rate Limiting
     AuthManager authMgr_;
@@ -937,12 +938,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "9.8.0");
+            return makeScalar("@@version", "9.9.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.8.0\",\"MilanSQL Database Engine\"]]}";
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.9.0\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -1415,18 +1416,25 @@ inline std::string MilanHttpServer::handleStatus() {
         try { totalRows += (long long)engine_.countRows(tname, true); } catch (...) {}
     }
 
+    // Phase 166: format uptime as "Xh Ym Zs"
+    long long h = elapsed / 3600, m = (elapsed % 3600) / 60, s = elapsed % 60;
+    std::string uptimeFmt = std::to_string(h) + "h " + std::to_string(m) + "m " + std::to_string(s) + "s";
+    long long qc = queryCounter_.load();
+
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v9.8.0\",";
-    json += "\"uptime\":"    + std::to_string(elapsed) + ",";
-    json += "\"tables\":"    + std::to_string(tables.size()) + ",";
-    json += "\"rows\":"      + std::to_string(totalRows) + ",";
-    json += "\"queries\":0,";
+    json += "\"version\":\"MilanSQL v9.9.0\",";
+    json += "\"uptime\":"       + std::to_string(elapsed) + ",";
+    json += "\"uptime_fmt\":\"" + uptimeFmt + "\",";
+    json += "\"tables\":"       + std::to_string(tables.size()) + ",";
+    json += "\"rows\":"         + std::to_string(totalRows) + ",";
+    json += "\"queries\":"      + std::to_string(qc) + ",";
+    json += "\"query_count\":"  + std::to_string(qc) + ",";
     json += "\"connections\":0,";
     json += "\"slow_queries\":" + std::to_string(engine_.slowQueryLog.size()) + ",";
-    json += "\"tableCount\":" + std::to_string(tables.size()) + ",";
-    json += "\"schemaCount\":" + std::to_string(schemas.size());
+    json += "\"tableCount\":"   + std::to_string(tables.size()) + ",";
+    json += "\"schemaCount\":"  + std::to_string(schemas.size());
     json += "}";
     return json;
 }
@@ -1630,7 +1638,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v9.8.0</div>
+  <div class="logo">&#9889; MilanSQL v9.9.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -1860,7 +1868,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.8.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.9.0</span>
   </div>
 </div>
 
@@ -1896,7 +1904,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#484f58;font-size:9px">●</span><span style="font-size:11px;color:#484f58">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v9.8.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v9.9.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -1948,17 +1956,32 @@ td.null-val{color:#484f58;font-style:italic}
 
     <!-- MONITORING PAGE -->
     <div class="page" id="page-monitoring">
-      <div class="mon-grid" id="mon-grid">
-        <div class="stat-card"><div class="label">Tables</div><div class="value" id="m-tables">--</div></div>
-        <div class="stat-card"><div class="label">Total Rows</div><div class="value" id="m-rows">--</div></div>
-        <div class="stat-card"><div class="label">Queries Run</div><div class="value" id="m-queries">--</div></div>
-        <div class="stat-card"><div class="label">Uptime</div><div class="value" id="m-uptime">--</div></div>
-        <div class="stat-card"><div class="label">Slow Queries</div><div class="value" id="m-slow">--</div></div>
-        <div class="stat-card"><div class="label">Active Connections</div><div class="value" id="m-conns">--</div></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #21262d">
+        <span style="font-size:0.85rem;color:#8b949e">Live Server Metrics</span>
+        <span style="font-size:0.75rem;color:#484f58">Auto-refresh: <span id="m-countdown" style="color:#3fb950;font-weight:600">5s</span></span>
       </div>
-      <div class="slow-queries-section">
-        <h3>Recent Slow Queries</h3>
-        <div id="slow-queries-list" style="font-size:0.8rem;color:#8b949e">Run SHOW SLOW QUERIES to see data.</div>
+      <div class="mon-grid" id="mon-grid">
+        <div class="stat-card"><div class="label">&#x1F4C1; Tables</div><div class="value" id="m-tables">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F4CA; Total Rows</div><div class="value" id="m-rows">--</div></div>
+        <div class="stat-card"><div class="label">&#x26A1; Queries Run</div><div class="value" id="m-queries">--</div></div>
+        <div class="stat-card"><div class="label">&#x23F1; Uptime</div><div class="value" id="m-uptime" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F40C; Slow Queries</div><div class="value" id="m-slow">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F4BB; Version</div><div class="value" id="m-version" style="font-size:0.85rem">--</div></div>
+      </div>
+      <div style="padding:16px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span style="font-size:0.85rem;font-weight:600;color:#e6edf3">Query History (last 10)</span>
+          <span id="m-last-update" style="font-size:0.7rem;color:#484f58;margin-left:auto"></span>
+        </div>
+        <canvas id="m-chart" height="60" style="width:100%;background:#0d1117;border-radius:6px;border:1px solid #21262d"></canvas>
+        <div style="display:flex;justify-content:space-between;margin-top:4px">
+          <span style="font-size:0.65rem;color:#484f58">10 samples · 5s interval</span>
+          <span style="font-size:0.65rem;color:#484f58">queries/poll</span>
+        </div>
+      </div>
+      <div style="padding:0 16px 16px">
+        <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Recent Slow Queries</div>
+        <div id="slow-queries-list" style="font-size:0.8rem;color:#8b949e;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;min-height:40px">Loading...</div>
       </div>
     </div>
 
@@ -1980,7 +2003,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.8.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.9.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2128,7 +2151,8 @@ function showPage(name, el) {
   if (el) el.classList.add('active');
   if (name === 'browser') loadBrowserTables();
   if (name === 'history') renderHistory();
-  if (name === 'monitoring') loadMonitoring();
+  if (name === 'monitoring') { monLastQ = 0; monQueryHistory = []; loadMonitoring(); }
+  else stopMonitoring();
 }
 
 // ── SQL Execution ──────────────────────────────────────────────
@@ -2448,19 +2472,117 @@ async function browseTable(name, btn) {
   } catch(e) { detail.innerHTML = '<div class="error-box">' + escHtml(e.message) + '</div>'; }
 }
 
-// Monitoring
-async function loadMonitoring() {
+// Monitoring — Phase 166
+var monTimer = null, monCountdown = 5, monQueryHistory = [], monLastQ = 0;
+
+function stopMonitoring() {
+  if (monTimer) { clearInterval(monTimer); monTimer = null; }
+}
+
+async function fetchMonitoring() {
   try {
     var r = await fetch('/status', {credentials:'include'});
     var d = await r.json();
     function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
     set('m-tables',  d.tables   != null ? d.tables   : '--');
     set('m-rows',    d.rows     != null ? d.rows     : '--');
-    set('m-queries', d.queries  != null ? d.queries  : (d.query_count != null ? d.query_count : '--'));
-    set('m-uptime',  d.uptime   != null ? (d.uptime + 's') : '--');
+    var qc = d.queries != null ? d.queries : (d.query_count != null ? d.query_count : 0);
+    set('m-queries', qc);
+    set('m-uptime',  d.uptime_fmt != null ? d.uptime_fmt : (d.uptime != null ? d.uptime + 's' : '--'));
     set('m-slow',    d.slow_queries != null ? d.slow_queries : '0');
-    set('m-conns',   d.connections != null ? d.connections : (d.active_connections != null ? d.active_connections : '0'));
-  } catch(e) {}
+    set('m-version', d.version || 'MilanSQL');
+    var now = new Date();
+    set('m-last-update', 'Updated: ' + now.toLocaleTimeString());
+    // Track query delta for chart
+    var delta = qc - monLastQ; if (monLastQ === 0) delta = 0;
+    monLastQ = qc;
+    monQueryHistory.push(delta);
+    if (monQueryHistory.length > 10) monQueryHistory.shift();
+    drawMonChart();
+    // Slow queries
+    loadSlowQueriesMon();
+  } catch(e) {
+    var el = document.getElementById('m-last-update');
+    if(el) el.textContent = 'Error fetching status';
+  }
+}
+
+function drawMonChart() {
+  var canvas = document.getElementById('m-chart');
+  if (!canvas || !canvas.getContext) return;
+  canvas.width = canvas.offsetWidth || 400;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height || 60;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, W, H);
+  var data = monQueryHistory;
+  if (!data.length) { ctx.fillStyle='#484f58'; ctx.font='10px monospace'; ctx.fillText('No data yet',8,H/2+4); return; }
+  var maxV = Math.max(1, Math.max.apply(null, data));
+  var barW = Math.floor((W - 20) / 10);
+  var pad = 4;
+  for (var i = 0; i < data.length; i++) {
+    var barH = Math.max(2, Math.floor((data[i] / maxV) * (H - 16)));
+    var x = pad + i * (barW + 2);
+    var y = H - 8 - barH;
+    var age = data.length - 1 - i;
+    var alpha = 0.4 + 0.6 * (i / Math.max(1, data.length - 1));
+    ctx.fillStyle = 'rgba(63,185,80,' + alpha + ')';
+    ctx.fillRect(x, y, barW, barH);
+    ctx.fillStyle = '#484f58';
+    ctx.font = '8px monospace';
+    ctx.fillText(data[i], x, H - 1);
+  }
+  ctx.fillStyle = '#484f58';
+  ctx.font = '9px monospace';
+  ctx.fillText('max:'+maxV, W-40, 10);
+}
+
+async function loadSlowQueriesMon() {
+  try {
+    var r = await fetch('/query', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sql:'SHOW SLOW QUERIES'}), credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('slow-queries-list');
+    if (!el) return;
+    if (!d.success || !d.rows || !d.rows.length) {
+      el.textContent = 'No slow queries recorded.'; return;
+    }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:0.75rem">';
+    html += '<tr style="color:#636e7b;border-bottom:1px solid #21262d">';
+    (d.columns||[]).forEach(function(c){ html += '<th style="text-align:left;padding:3px 6px">'+escHtml(c.name||c)+'</th>'; });
+    html += '</tr>';
+    d.rows.slice(0,8).forEach(function(row){
+      html += '<tr style="border-bottom:1px solid #161b22">';
+      (row.values||row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#e6edf3">'+escHtml(String(v||''))+'</td>'; });
+      html += '</tr>';
+    });
+    html += '</table>';
+    el.innerHTML = html;
+  } catch(e) {
+    var el = document.getElementById('slow-queries-list');
+    if(el) el.textContent = 'Run SHOW SLOW QUERIES to see data.';
+  }
+}
+
+function startMonCountdown() {
+  monCountdown = 5;
+  var cdEl = document.getElementById('m-countdown');
+  if (cdEl) cdEl.textContent = monCountdown + 's';
+  if (monTimer) clearInterval(monTimer);
+  monTimer = setInterval(function() {
+    monCountdown--;
+    if (cdEl) cdEl.textContent = Math.max(0, monCountdown) + 's';
+    if (monCountdown <= 0) {
+      monCountdown = 5;
+      fetchMonitoring();
+    }
+  }, 1000);
+}
+
+async function loadMonitoring() {
+  await fetchMonitoring();
+  startMonCountdown();
 }
 
 // History
@@ -2659,7 +2781,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="font-size:36px;line-height:1">&#9889;</div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.8.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.9.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">
@@ -2852,6 +2974,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             }
             sql = std::move(clean);
         }
+        ++queryCounter_;  // Phase 166: track query count
         return buildHttpResponse(200, handleQueryForUser(sql, vr.userId, vr.role));
     }
 
@@ -2919,7 +3042,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"9.8.0\","
+            "\"version\":\"9.9.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"

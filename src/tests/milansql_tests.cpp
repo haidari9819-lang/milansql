@@ -5037,8 +5037,8 @@ static void testGroup68() {
     };
 
     // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
-    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.8.0",
-          "version() returns MilanSQL v9.8.0");
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.9.0",
+          "version() returns MilanSQL v9.9.0");
     check(engine.evalFuncPublic("DATABASE", {}) == "public",
           "database() returns 'public'");
     check(engine.evalFuncPublic("USER", {}) == "root",
@@ -5965,8 +5965,8 @@ static void testGroup72() {
     // 15. Version v9.2.0
     {
         milansql::Engine eng;
-        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.8.0",
-              "Isolation #15: version() returns MilanSQL v9.8.0");
+        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.9.0",
+              "Isolation #15: version() returns MilanSQL v9.9.0");
     }
 }
 
@@ -6050,7 +6050,7 @@ static void testGroup73() {
     }
 }
 
-// testGroup74: v9.8.0 — INSERT quoted VALUES with spaces + umlauts
+// testGroup74: v9.9.0 — INSERT quoted VALUES with spaces + umlauts
 // ============================================================
 
 static void testGroup74() {
@@ -6119,6 +6119,98 @@ static void testGroup74() {
         check(r.find("sku")          != std::string::npos, "QuotedVals2 #13: schema col 'sku' present");
         check(r.find("label")        != std::string::npos, "QuotedVals2 #14: schema col 'label' present");
         check(r.find("Red Apple")    != std::string::npos, "QuotedVals2 #15: value 'Red Apple' present");
+    }
+}
+
+// testGroup75: v9.9.0 — Phase 165 INSERT quoted strings final fix
+// ============================================================
+
+static void testGroup75() {
+    auto exec = [](milansql::Engine& eng, const std::string& sql) -> milansql::QueryResult {
+        milansql::Parser p;
+        try {
+            return milansql::dispatch(p.parse(sql), eng);
+        } catch (const std::exception& e) {
+            milansql::QueryResult qr; qr.error = e.what(); return qr;
+        } catch (...) {
+            milansql::QueryResult qr; qr.error = "unknown"; return qr;
+        }
+    };
+
+    // 1-3. Basic quoted string stored without quotes
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t75a (id INT, name TEXT)");
+        exec(eng, "INSERT INTO t75a VALUES (1, 'Maus')");
+        auto r = exec(eng, "SELECT * FROM t75a");
+        check(r.error.empty(), "Phase165 #1: INSERT 'Maus' no error");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) if (v == "Maus") found = true;
+        check(found, "Phase165 #2: 'Maus' stored without quotes");
+        bool noRaw = true;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) if (v == "'Maus'") noRaw = false;
+        check(noRaw, "Phase165 #3: raw 'Maus' not in output");
+    }
+
+    // 4-6. Empty string '' stored as empty, not NULL
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t75b (id INT, s TEXT)");
+        exec(eng, "INSERT INTO t75b VALUES (1, '')");
+        auto r = exec(eng, "SELECT * FROM t75b WHERE s = ''");
+        check(r.error.empty(), "Phase165 #4: INSERT '' no error");
+        check(!r.rows.empty(), "Phase165 #5: '' stored and found by WHERE s = ''");
+        auto rAll = exec(eng, "SELECT * FROM t75b");
+        bool notNull = false;
+        for (const auto& row : rAll.rows)
+            for (const auto& v : row.values) if (v != "NULL" && v != "1") notNull = true;
+        check(notNull, "Phase165 #6: '' not converted to NULL");
+    }
+
+    // 7-9. Escaped quote '' inside value → stored as single quote '
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t75c (id INT, msg TEXT)");
+        exec(eng, "INSERT INTO t75c VALUES (1, 'It''s fine')");
+        auto r = exec(eng, "SELECT * FROM t75c");
+        check(r.error.empty(), "Phase165 #7: INSERT with escaped quote no error");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) if (v == "It's fine") found = true;
+        check(found, "Phase165 #8: escaped '' stored as single quote");
+        bool noDouble = true;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values) if (v == "It''s fine") noDouble = false;
+        check(noDouble, "Phase165 #9: doubled '' not present in output");
+    }
+
+    // 10-12. WHERE with quoted value → finds unquoted stored value
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t75d (id INT, city TEXT)");
+        exec(eng, "INSERT INTO t75d VALUES (1, 'Berlin')");
+        exec(eng, "INSERT INTO t75d VALUES (2, 'Munich')");
+        auto r = exec(eng, "SELECT * FROM t75d WHERE city = 'Berlin'");
+        check(r.error.empty(), "Phase165 #10: WHERE city='Berlin' no error");
+        check(!r.rows.empty(), "Phase165 #11: WHERE city='Berlin' finds row");
+        check(r.rows.size() == 1, "Phase165 #12: only 1 row returned for Berlin");
+    }
+
+    // 13-15. Multi-word value with spaces
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE t75e (id INT, descr TEXT)");
+        exec(eng, "INSERT INTO t75e VALUES (1, 'Hello World')");
+        auto r = exec(eng, "SELECT * FROM t75e WHERE descr = 'Hello World'");
+        check(r.error.empty(), "Phase165 #13: space-value WHERE no error");
+        check(!r.rows.empty(), "Phase165 #14: space-value WHERE finds row");
+        auto rAll = exec(eng, "SELECT * FROM t75e");
+        bool ok = false;
+        for (const auto& row : rAll.rows)
+            for (const auto& v : row.values) if (v == "Hello World") ok = true;
+        check(ok, "Phase165 #15: 'Hello World' stored without quotes");
     }
 }
 
@@ -6339,6 +6431,9 @@ int main() {
     }
     try { testGroup74(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 74 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup75(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 75 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -6310,6 +6310,979 @@ static void testGroup76() {
     }
 }
 
+// ── Group 77: 100 Systematic SQL Stress Tests ────────────────
+static void testGroup77() {
+    auto exec = [](milansql::Engine& eng, const std::string& sql) -> milansql::QueryResult {
+        milansql::Parser p;
+        try {
+            return milansql::dispatch(p.parse(sql), eng);
+        } catch (const std::exception& e) {
+            milansql::QueryResult qr; qr.error = e.what(); return qr;
+        } catch (...) {
+            milansql::QueryResult qr; qr.error = "unknown"; return qr;
+        }
+    };
+    // Helper: check if any row contains a value
+    auto hasVal = [](const milansql::QueryResult& r, const std::string& v) -> bool {
+        for (const auto& row : r.rows)
+            for (const auto& c : row.values) if (c == v) return true;
+        return false;
+    };
+    // Helper: get first row, nth column value
+    auto cell = [](const milansql::QueryResult& r, size_t row, size_t col) -> std::string {
+        if (row < r.rows.size() && col < r.rows[row].values.size())
+            return r.rows[row].values[col];
+        return "<<MISSING>>";
+    };
+    // Helper: strip surrounding single quotes
+    auto stripQ = [](const std::string& s) -> std::string {
+        if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'')
+            return s.substr(1, s.size() - 2);
+        return s;
+    };
+
+    // ════════════════════════════════════════════════════════════
+    // KATEGORIE 1 — INSERT Edge Cases (20 Tests)
+    // ════════════════════════════════════════════════════════════
+
+    // 1. Leerer String INSERT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1 (id INT, val TEXT)");
+        auto r = exec(eng, "INSERT INTO k1 VALUES (1, '')");
+        check(r.error.empty(), "Stress #1: INSERT empty string no error");
+    }
+    // 2. Leerer String wird gefunden
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1b (id INT, val TEXT)");
+        exec(eng, "INSERT INTO k1b VALUES (1, '')");
+        auto r = exec(eng, "SELECT * FROM k1b");
+        check(r.rows.size() == 1, "Stress #2: empty string row exists");
+    }
+    // 3. NULL INSERT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1c (id INT, val TEXT)");
+        auto r = exec(eng, "INSERT INTO k1c VALUES (1, NULL)");
+        check(r.error.empty(), "Stress #3: INSERT NULL no error");
+    }
+    // 4. NULL wird als NULL gespeichert
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1d (id INT, val TEXT)");
+        exec(eng, "INSERT INTO k1d VALUES (1, NULL)");
+        auto r = exec(eng, "SELECT * FROM k1d");
+        check(hasVal(r, "NULL"), "Stress #4: NULL stored as NULL");
+    }
+    // 5. Sonderzeichen: Umlaut Straße
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1e (id INT, name TEXT)");
+        auto r = exec(eng, "INSERT INTO k1e VALUES (1, 'Straße')");
+        check(r.error.empty(), "Stress #5: INSERT Straße no error");
+    }
+    // 6. Unicode: café gespeichert
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1f (id INT, name TEXT)");
+        exec(eng, "INSERT INTO k1f VALUES (1, 'café')");
+        auto r = exec(eng, "SELECT * FROM k1f");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "café" || stripQ(v) == "café") found = true;
+        check(found, "Stress #6: café stored correctly");
+    }
+    // 7. Sehr langer String (10000 Zeichen)
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1g (id INT, data TEXT)");
+        std::string longStr(10000, 'X');
+        auto r = exec(eng, "INSERT INTO k1g VALUES (1, '" + longStr + "')");
+        check(r.error.empty(), "Stress #7: INSERT 10000-char string no error");
+    }
+    // 8. Langer String SELECT zurück
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1h (id INT, data TEXT)");
+        std::string longStr(10000, 'Y');
+        exec(eng, "INSERT INTO k1h VALUES (1, '" + longStr + "')");
+        auto r = exec(eng, "SELECT * FROM k1h");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v.size() >= 10000) found = true;
+        check(found, "Stress #8: 10000-char string retrieved");
+    }
+    // 9. Escaped Quotes: It''s fine
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1i (id INT, msg TEXT)");
+        exec(eng, "INSERT INTO k1i VALUES (1, 'It''s fine')");
+        auto r = exec(eng, "SELECT * FROM k1i");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "It's fine" || stripQ(v) == "It's fine") found = true;
+        check(found, "Stress #9: escaped quote stored as single quote");
+    }
+    // 10. Komma im Text: 'Berlin, Deutschland'
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1j (id INT, city TEXT)");
+        exec(eng, "INSERT INTO k1j VALUES (1, 'Berlin, Deutschland')");
+        auto r = exec(eng, "SELECT * FROM k1j");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "Berlin, Deutschland" || stripQ(v) == "Berlin, Deutschland") found = true;
+        check(found, "Stress #10: comma in text preserved");
+    }
+    // 11. Zahl als Text
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1k (id INT, val TEXT)");
+        exec(eng, "INSERT INTO k1k VALUES (1, '42')");
+        auto r = exec(eng, "SELECT * FROM k1k");
+        check(hasVal(r, "42"), "Stress #11: number as text stored");
+    }
+    // 12. Negative Zahl
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1l (id INT, val INT)");
+        auto r = exec(eng, "INSERT INTO k1l VALUES (1, -99)");
+        check(r.error.empty(), "Stress #12: INSERT negative number no error");
+    }
+    // 13. Negative Zahl korrekt gespeichert
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1m (id INT, val INT)");
+        exec(eng, "INSERT INTO k1m VALUES (1, -99)");
+        auto r = exec(eng, "SELECT * FROM k1m");
+        check(hasVal(r, "-99"), "Stress #13: -99 stored correctly");
+    }
+    // 14. Dezimalzahl (FLOAT)
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1n (id INT, price FLOAT)");
+        exec(eng, "INSERT INTO k1n VALUES (1, 3.14)");
+        auto r = exec(eng, "SELECT * FROM k1n");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v.find("3.14") != std::string::npos) found = true;
+        check(found, "Stress #14: decimal 3.14 stored");
+    }
+    // 15. Mehrere Zeilen INSERT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1o (id INT, name TEXT)");
+        exec(eng, "INSERT INTO k1o VALUES (1, 'A')");
+        exec(eng, "INSERT INTO k1o VALUES (2, 'B')");
+        exec(eng, "INSERT INTO k1o VALUES (3, 'C')");
+        auto r = exec(eng, "SELECT * FROM k1o");
+        check(r.rows.size() == 3, "Stress #15: 3 rows inserted");
+    }
+    // 16. Multi-Value INSERT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1p (id INT, name TEXT)");
+        auto r = exec(eng, "INSERT INTO k1p VALUES (1, 'X'), (2, 'Y'), (3, 'Z')");
+        auto s = exec(eng, "SELECT * FROM k1p");
+        check(r.error.empty() && s.rows.size() == 3, "Stress #16: multi-value INSERT → 3 rows");
+    }
+    // 17. Text mit Leerzeichen
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1q (id INT, val TEXT)");
+        exec(eng, "INSERT INTO k1q VALUES (1, 'hello world')");
+        auto r = exec(eng, "SELECT * FROM k1q");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "hello world" || stripQ(v) == "hello world") found = true;
+        check(found, "Stress #17: multi-word text stored");
+    }
+    // 18. INSERT mit lowercase Keywords
+    {
+        milansql::Engine eng;
+        exec(eng, "create table k1r (id int, val text)");
+        auto r = exec(eng, "insert into k1r values (1, 'lower')");
+        check(r.error.empty(), "Stress #18: lowercase SQL keywords work");
+    }
+    // 19. SELECT auf leere Tabelle
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1s (id INT, name TEXT)");
+        auto r = exec(eng, "SELECT * FROM k1s");
+        check(r.error.empty() && r.rows.empty(), "Stress #19: SELECT on empty table → 0 rows");
+    }
+    // 20. INSERT mit mehreren Spaltentypen
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k1t (id INT, name TEXT, score FLOAT, active INT)");
+        exec(eng, "INSERT INTO k1t VALUES (1, 'Test', 99.5, 1)");
+        auto r = exec(eng, "SELECT * FROM k1t");
+        check(r.rows.size() == 1, "Stress #20: multi-type INSERT → 1 row");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // KATEGORIE 2 — WHERE Bedingungen (20 Tests)
+    // ════════════════════════════════════════════════════════════
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE k2 (id INT, name TEXT, score INT, city TEXT)");
+        exec(eng, "INSERT INTO k2 VALUES (1, 'Alice', 90, 'Berlin')");
+        exec(eng, "INSERT INTO k2 VALUES (2, 'Bob', 75, 'Munich')");
+        exec(eng, "INSERT INTO k2 VALUES (3, 'Charlie', 60, 'Berlin')");
+        exec(eng, "INSERT INTO k2 VALUES (4, 'Diana', 85, 'Hamburg')");
+        exec(eng, "INSERT INTO k2 VALUES (5, 'Eve', 50, 'Munich')");
+        exec(eng, "INSERT INTO k2 VALUES (6, 'Frank', NULL, 'Berlin')");
+
+        // 21. WHERE = (Gleichheit)
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE id = 1");
+            check(r.rows.size() == 1 && hasVal(r, "Alice"), "Stress #21: WHERE id=1 → Alice");
+        }
+        // 22. WHERE != (Ungleichheit)
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE id != 1");
+            check(r.rows.size() >= 4, "Stress #22: WHERE id!=1 → >=4 rows");
+        }
+        // 23. WHERE < (kleiner)
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score < 70");
+            bool ok = !r.rows.empty();
+            for (const auto& row : r.rows)
+                for (size_t i = 0; i < row.values.size(); ++i)
+                    if (row.values[i] == "90" || row.values[i] == "85" || row.values[i] == "75") ok = false;
+            check(ok, "Stress #23: WHERE score<70 → only scores <70");
+        }
+        // 24. WHERE > (größer)
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score > 80");
+            check(!r.rows.empty(), "Stress #24: WHERE score>80 finds rows");
+        }
+        // 25. WHERE <= (kleiner gleich)
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score <= 60");
+            check(!r.rows.empty(), "Stress #25: WHERE score<=60 finds rows");
+        }
+        // 26. WHERE >= (größer gleich)
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score >= 90");
+            check(r.rows.size() >= 1, "Stress #26: WHERE score>=90 → Alice");
+        }
+        // 27. WHERE LIKE pattern% (via engine API)
+        {
+            milansql::WhereCondition wc;
+            wc.col = "name"; wc.op = "LIKE"; wc.val = "A%";
+            auto tbl = eng.selectWhere("k2", {wc}, "AND").table;
+            bool found = false;
+            for (const auto& row : tbl.rows())
+                if (row.xmax == 0)
+                    for (const auto& v : row.values) if (v == "Alice") found = true;
+            check(found, "Stress #27: LIKE 'A%' → Alice");
+        }
+        // 28. WHERE LIKE %pattern (via engine API)
+        {
+            milansql::WhereCondition wc;
+            wc.col = "name"; wc.op = "LIKE"; wc.val = "%lie";
+            auto tbl = eng.selectWhere("k2", {wc}, "AND").table;
+            bool found = false;
+            for (const auto& row : tbl.rows())
+                if (row.xmax == 0)
+                    for (const auto& v : row.values) if (v == "Charlie") found = true;
+            check(found, "Stress #28: LIKE '%lie' → Charlie");
+        }
+        // 29. WHERE IN Liste
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE id IN (1, 3, 5)");
+            check(r.rows.size() == 3, "Stress #29: IN (1,3,5) → 3 rows");
+        }
+        // 30. WHERE BETWEEN
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score BETWEEN 60 AND 80");
+            check(!r.rows.empty(), "Stress #30: BETWEEN 60 AND 80 finds rows");
+        }
+        // 31. WHERE AND
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE city = 'Berlin' AND score > 70");
+            check(r.rows.size() >= 1 && hasVal(r, "Alice"), "Stress #31: AND combined → Alice");
+        }
+        // 32. WHERE OR
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE city = 'Hamburg' OR city = 'Munich'");
+            check(r.rows.size() >= 2, "Stress #32: OR → Hamburg+Munich rows");
+        }
+        // 33. WHERE mit quoted string
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE city = 'Berlin'");
+            check(r.rows.size() >= 2, "Stress #33: WHERE city='Berlin' → >=2 rows");
+        }
+        // 34. WHERE IS NULL
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score IS NULL");
+            check(!r.rows.empty() && hasVal(r, "Frank"), "Stress #34: IS NULL → Frank");
+        }
+        // 35. WHERE IS NOT NULL
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score IS NOT NULL");
+            check(r.rows.size() >= 5, "Stress #35: IS NOT NULL → >=5 rows");
+        }
+        // 36. WHERE NOT IN
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE id NOT IN (1, 2)");
+            check(r.rows.size() >= 3, "Stress #36: NOT IN (1,2) → >=3 rows");
+        }
+        // 37. WHERE mit LIKE %pattern% (via engine API)
+        {
+            milansql::WhereCondition wc;
+            wc.col = "name"; wc.op = "LIKE"; wc.val = "%li%";
+            auto tbl = eng.selectWhere("k2", {wc}, "AND").table;
+            bool found = false;
+            for (const auto& row : tbl.rows())
+                if (row.xmax == 0)
+                    for (const auto& v : row.values)
+                        if (v == "Alice" || v == "Charlie") found = true;
+            check(found, "Stress #37: LIKE '%li%' → Alice/Charlie");
+        }
+        // 38. WHERE mit score = exakt
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score = 75");
+            check(r.rows.size() == 1 && hasVal(r, "Bob"), "Stress #38: score=75 → Bob");
+        }
+        // 39. WHERE keine Treffer
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE name = 'Nobody'");
+            check(r.error.empty() && r.rows.empty(), "Stress #39: WHERE no match → 0 rows");
+        }
+        // 40. WHERE NOT BETWEEN
+        {
+            auto r = exec(eng, "SELECT * FROM k2 WHERE score NOT BETWEEN 70 AND 100");
+            check(!r.rows.empty(), "Stress #40: NOT BETWEEN 70-100 finds rows");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // KATEGORIE 3 — JOINs (15 Tests)
+    // ════════════════════════════════════════════════════════════
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE users77 (id INT, name TEXT)");
+        exec(eng, "CREATE TABLE orders77 (id INT, user_id INT, product TEXT)");
+        exec(eng, "INSERT INTO users77 VALUES (1, 'Alice')");
+        exec(eng, "INSERT INTO users77 VALUES (2, 'Bob')");
+        exec(eng, "INSERT INTO users77 VALUES (3, 'Charlie')");
+        exec(eng, "INSERT INTO orders77 VALUES (10, 1, 'Laptop')");
+        exec(eng, "INSERT INTO orders77 VALUES (11, 1, 'Mouse')");
+        exec(eng, "INSERT INTO orders77 VALUES (12, 2, 'Keyboard')");
+
+        // 41. INNER JOIN basic
+        {
+            auto r = exec(eng, "SELECT * FROM users77 INNER JOIN orders77 ON users77.id = orders77.user_id");
+            check(r.error.empty(), "Stress #41: INNER JOIN no error");
+            check(r.rows.size() == 3, "Stress #42: INNER JOIN → 3 rows (Alice×2, Bob×1)");
+        }
+        // 43. LEFT JOIN — Charlie hat keine Orders
+        {
+            auto r = exec(eng, "SELECT * FROM users77 LEFT JOIN orders77 ON users77.id = orders77.user_id");
+            check(r.rows.size() == 4, "Stress #43: LEFT JOIN → 4 rows (incl Charlie)");
+            bool hasNull = false;
+            for (const auto& row : r.rows)
+                if (hasVal(milansql::QueryResult{{}, {row}, {}}, "Charlie")) {
+                    for (const auto& v : row.values) if (v == "NULL") hasNull = true;
+                }
+            check(hasNull, "Stress #44: LEFT JOIN Charlie has NULL order columns");
+        }
+        // 45. RIGHT JOIN
+        {
+            auto r = exec(eng, "SELECT * FROM orders77 RIGHT JOIN users77 ON users77.id = orders77.user_id");
+            check(r.error.empty(), "Stress #45: RIGHT JOIN no error");
+            check(r.rows.size() >= 3, "Stress #46: RIGHT JOIN → >=3 rows");
+        }
+        // 47. INNER JOIN — Laptop present in results
+        {
+            auto r = exec(eng, "SELECT * FROM users77 INNER JOIN orders77 ON users77.id = orders77.user_id");
+            bool laptop = false;
+            for (const auto& row : r.rows)
+                for (const auto& v : row.values)
+                    if (v == "Laptop" || stripQ(v) == "Laptop") laptop = true;
+            check(laptop, "Stress #47: JOIN results contain Laptop");
+        }
+        // 48. JOIN auf leere Tabelle
+        {
+            exec(eng, "CREATE TABLE empty77 (id INT, val TEXT)");
+            auto r = exec(eng, "SELECT * FROM users77 INNER JOIN empty77 ON users77.id = empty77.id");
+            check(r.error.empty() && r.rows.empty(), "Stress #48: JOIN on empty table → 0 rows");
+        }
+        // 49. LEFT JOIN auf leere Tabelle
+        {
+            auto r = exec(eng, "SELECT * FROM users77 LEFT JOIN empty77 ON users77.id = empty77.id");
+            check(r.rows.size() == 3, "Stress #49: LEFT JOIN empty → all left rows");
+        }
+        // 50. Self-JOIN
+        {
+            exec(eng, "CREATE TABLE emp77 (id INT, name TEXT, mgr_id INT)");
+            exec(eng, "INSERT INTO emp77 VALUES (1, 'Boss', NULL)");
+            exec(eng, "INSERT INTO emp77 VALUES (2, 'Worker', 1)");
+            auto r = exec(eng, "SELECT * FROM emp77 AS a INNER JOIN emp77 AS b ON a.id = b.mgr_id");
+            check(r.error.empty(), "Stress #50: Self-JOIN no error");
+        }
+        // 51. Mehrfache JOINs
+        {
+            exec(eng, "CREATE TABLE cats77 (id INT, name TEXT)");
+            exec(eng, "INSERT INTO cats77 VALUES (100, 'Electronics')");
+            exec(eng, "INSERT INTO cats77 VALUES (200, 'Office')");
+            exec(eng, "CREATE TABLE prods77 (id INT, cat_id INT, pname TEXT)");
+            exec(eng, "INSERT INTO prods77 VALUES (1, 100, 'Phone')");
+            exec(eng, "INSERT INTO prods77 VALUES (2, 200, 'Pen')");
+            auto r = exec(eng, "SELECT * FROM prods77 INNER JOIN cats77 ON prods77.cat_id = cats77.id");
+            check(r.rows.size() == 2, "Stress #51: 2-table JOIN → 2 rows");
+        }
+        // 52. INNER JOIN keine Matches
+        {
+            exec(eng, "CREATE TABLE noMatch77a (id INT, val TEXT)");
+            exec(eng, "CREATE TABLE noMatch77b (id INT, val TEXT)");
+            exec(eng, "INSERT INTO noMatch77a VALUES (1, 'A')");
+            exec(eng, "INSERT INTO noMatch77b VALUES (99, 'Z')");
+            auto r = exec(eng, "SELECT * FROM noMatch77a INNER JOIN noMatch77b ON noMatch77a.id = noMatch77b.id");
+            check(r.rows.empty(), "Stress #52: INNER JOIN no matches → 0 rows");
+        }
+        // 53. JOIN result hat korrekte Spaltenanzahl
+        {
+            auto r = exec(eng, "SELECT * FROM users77 INNER JOIN orders77 ON users77.id = orders77.user_id");
+            if (!r.rows.empty())
+                check(r.rows[0].values.size() >= 4, "Stress #53: JOIN row has >=4 columns");
+            else
+                check(false, "Stress #53: JOIN should return rows");
+        }
+        // 54. LEFT JOIN alle links
+        {
+            auto r = exec(eng, "SELECT * FROM users77 LEFT JOIN orders77 ON users77.id = orders77.user_id");
+            bool aliceFound = false, bobFound = false, charlieFound = false;
+            for (const auto& row : r.rows)
+                for (const auto& v : row.values) {
+                    auto sv = stripQ(v);
+                    if (sv == "Alice") aliceFound = true;
+                    if (sv == "Bob") bobFound = true;
+                    if (sv == "Charlie") charlieFound = true;
+                }
+            check(aliceFound && bobFound && charlieFound, "Stress #54: LEFT JOIN has all left users");
+        }
+        // 55. JOIN mit Duplikat-IDs
+        {
+            auto r = exec(eng, "SELECT * FROM users77 INNER JOIN orders77 ON users77.id = orders77.user_id");
+            int aliceCount = 0;
+            for (const auto& row : r.rows)
+                for (const auto& v : row.values)
+                    if (stripQ(v) == "Alice") ++aliceCount;
+            check(aliceCount == 2, "Stress #55: Alice appears 2x (2 orders)");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // KATEGORIE 4 — Aggregate (15 Tests)
+    // ════════════════════════════════════════════════════════════
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE agg77 (id INT, dept TEXT, salary INT)");
+        exec(eng, "INSERT INTO agg77 VALUES (1, 'IT', 5000)");
+        exec(eng, "INSERT INTO agg77 VALUES (2, 'IT', 6000)");
+        exec(eng, "INSERT INTO agg77 VALUES (3, 'HR', 4000)");
+        exec(eng, "INSERT INTO agg77 VALUES (4, 'HR', 4500)");
+        exec(eng, "INSERT INTO agg77 VALUES (5, 'Sales', 7000)");
+
+        // 56. COUNT(*)
+        {
+            auto r = exec(eng, "SELECT COUNT(*) FROM agg77");
+            check(r.error.empty() && !r.rows.empty() && cell(r, 0, 0) == "5",
+                  "Stress #56: COUNT(*) = 5");
+        }
+        // 57. SUM
+        {
+            auto r = exec(eng, "SELECT SUM(salary) FROM agg77");
+            check(!r.rows.empty() && cell(r, 0, 0) == "26500",
+                  "Stress #57: SUM(salary) = 26500");
+        }
+        // 58. AVG
+        {
+            auto r = exec(eng, "SELECT AVG(salary) FROM agg77");
+            auto v = cell(r, 0, 0);
+            check(!r.rows.empty() && (v == "5300" || v == "5300.0" || v == "5300.00"),
+                  "Stress #58: AVG(salary) = 5300");
+        }
+        // 59. MIN
+        {
+            auto r = exec(eng, "SELECT MIN(salary) FROM agg77");
+            check(!r.rows.empty() && cell(r, 0, 0) == "4000",
+                  "Stress #59: MIN(salary) = 4000");
+        }
+        // 60. MAX
+        {
+            auto r = exec(eng, "SELECT MAX(salary) FROM agg77");
+            check(!r.rows.empty() && cell(r, 0, 0) == "7000",
+                  "Stress #60: MAX(salary) = 7000");
+        }
+        // 61. GROUP BY
+        {
+            auto r = exec(eng, "SELECT dept, COUNT(*) FROM agg77 GROUP BY dept");
+            check(r.error.empty() && r.rows.size() == 3,
+                  "Stress #61: GROUP BY dept → 3 groups");
+        }
+        // 62. GROUP BY SUM
+        {
+            auto r = exec(eng, "SELECT dept, SUM(salary) FROM agg77 GROUP BY dept");
+            bool itOk = r.rows.size() == 3;
+            bool itSum = false;
+            for (const auto& row : r.rows)
+                if ((stripQ(row.values[0]) == "IT") && row.values[1] == "11000") itSum = true;
+            check(itOk && itSum, "Stress #62: GROUP BY SUM → 3 groups, IT=11000");
+        }
+        // 63. HAVING
+        {
+            auto r = exec(eng, "SELECT dept, COUNT(*) FROM agg77 GROUP BY dept HAVING COUNT(*) >= 2");
+            check(r.rows.size() == 2, "Stress #63: HAVING COUNT>=2 → IT+HR");
+        }
+        // 64. Aggregate auf leerer Tabelle
+        {
+            exec(eng, "CREATE TABLE emptyAgg (id INT, val INT)");
+            auto r = exec(eng, "SELECT COUNT(*) FROM emptyAgg");
+            check(!r.rows.empty() && cell(r, 0, 0) == "0",
+                  "Stress #64: COUNT(*) on empty = 0");
+        }
+        // 65. SUM auf leerer Tabelle
+        {
+            auto r = exec(eng, "SELECT SUM(val) FROM emptyAgg");
+            auto v = cell(r, 0, 0);
+            check(!r.rows.empty() && (v == "0" || v == "NULL"), "Stress #65: SUM on empty = 0 or NULL");
+        }
+        // 66. MIN auf leerer Tabelle
+        {
+            auto r = exec(eng, "SELECT MIN(val) FROM emptyAgg");
+            auto v = cell(r, 0, 0);
+            check(!r.rows.empty() && (v == "NULL" || v == "0"), "Stress #66: MIN on empty = NULL or 0");
+        }
+        // 67. Distinct values via SELECT DISTINCT + count rows
+        {
+            exec(eng, "CREATE TABLE cdist77 (id INT, color TEXT)");
+            exec(eng, "INSERT INTO cdist77 VALUES (1, 'red')");
+            exec(eng, "INSERT INTO cdist77 VALUES (2, 'blue')");
+            exec(eng, "INSERT INTO cdist77 VALUES (3, 'red')");
+            exec(eng, "INSERT INTO cdist77 VALUES (4, 'green')");
+            // COUNT all = 4
+            auto r = exec(eng, "SELECT COUNT(*) FROM cdist77");
+            check(!r.rows.empty() && cell(r, 0, 0) == "4",
+                  "Stress #67: COUNT(*) = 4 (with duplicates)");
+        }
+        // 68. GROUP BY HAVING mit SUM
+        {
+            auto r = exec(eng, "SELECT dept, SUM(salary) FROM agg77 GROUP BY dept HAVING SUM(salary) > 8000");
+            check(!r.rows.empty(), "Stress #68: HAVING SUM>8000 finds groups");
+        }
+        // 69. MAX mit GROUP BY
+        {
+            auto r = exec(eng, "SELECT dept, MAX(salary) FROM agg77 GROUP BY dept");
+            check(r.rows.size() == 3, "Stress #69: MAX per group → 3 rows");
+        }
+        // 70. GROUP BY as DISTINCT equivalent
+        {
+            auto r = exec(eng, "SELECT dept, COUNT(*) FROM agg77 GROUP BY dept");
+            check(r.rows.size() == 3, "Stress #70: GROUP BY dept → 3 unique depts");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // KATEGORIE 5 — UPDATE/DELETE (15 Tests)
+    // ════════════════════════════════════════════════════════════
+
+    // 71. UPDATE mit WHERE
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77 (id INT, name TEXT, score INT)");
+        exec(eng, "INSERT INTO upd77 VALUES (1, 'Alice', 80)");
+        exec(eng, "INSERT INTO upd77 VALUES (2, 'Bob', 70)");
+        auto r = exec(eng, "UPDATE upd77 SET score = 95 WHERE id = 1");
+        auto s = exec(eng, "SELECT * FROM upd77 WHERE id = 1");
+        check(r.error.empty() && hasVal(s, "95"), "Stress #71: UPDATE WHERE → score=95");
+    }
+    // 72. UPDATE ohne WHERE → alle Zeilen
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77b (id INT, status TEXT)");
+        exec(eng, "INSERT INTO upd77b VALUES (1, 'old')");
+        exec(eng, "INSERT INTO upd77b VALUES (2, 'old')");
+        exec(eng, "INSERT INTO upd77b VALUES (3, 'old')");
+        auto r = exec(eng, "UPDATE upd77b SET status = 'new'");
+        auto s = exec(eng, "SELECT * FROM upd77b");
+        int newCount = 0;
+        for (const auto& row : s.rows)
+            for (const auto& v : row.values)
+                if (v == "new" || stripQ(v) == "new") ++newCount;
+        check(r.error.empty() && newCount == 3, "Stress #72: UPDATE all → 3 rows = new");
+    }
+    // 73. DELETE mit WHERE
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE del77 (id INT, name TEXT)");
+        exec(eng, "INSERT INTO del77 VALUES (1, 'Keep')");
+        exec(eng, "INSERT INTO del77 VALUES (2, 'Remove')");
+        exec(eng, "INSERT INTO del77 VALUES (3, 'Keep2')");
+        exec(eng, "DELETE FROM del77 WHERE id = 2");
+        auto r = exec(eng, "SELECT * FROM del77");
+        bool noRemove = r.rows.size() == 2;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "Remove" || stripQ(v) == "Remove") noRemove = false;
+        check(noRemove, "Stress #73: DELETE WHERE → 2 rows, Remove gone");
+    }
+    // 74. DELETE alle Zeilen
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE del77b (id INT)");
+        exec(eng, "INSERT INTO del77b VALUES (1)");
+        exec(eng, "INSERT INTO del77b VALUES (2)");
+        exec(eng, "DELETE FROM del77b");
+        auto r = exec(eng, "SELECT * FROM del77b");
+        check(r.rows.empty(), "Stress #74: DELETE all → 0 rows");
+    }
+    // 75. UPDATE mit quoted string
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77c (id INT, city TEXT)");
+        exec(eng, "INSERT INTO upd77c VALUES (1, 'Berlin')");
+        exec(eng, "UPDATE upd77c SET city = 'Munich' WHERE id = 1");
+        auto r = exec(eng, "SELECT * FROM upd77c");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "Munich" || stripQ(v) == "Munich") found = true;
+        check(found, "Stress #75: UPDATE to 'Munich' works");
+    }
+    // 76. UPDATE ändert nur betroffene Zeile
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77d (id INT, val TEXT)");
+        exec(eng, "INSERT INTO upd77d VALUES (1, 'A')");
+        exec(eng, "INSERT INTO upd77d VALUES (2, 'B')");
+        exec(eng, "UPDATE upd77d SET val = 'X' WHERE id = 1");
+        auto r = exec(eng, "SELECT * FROM upd77d WHERE id = 2");
+        bool bStill = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "B" || stripQ(v) == "B") bStill = true;
+        check(bStill, "Stress #76: UPDATE id=1 doesn't touch id=2");
+    }
+    // 77. DELETE nicht existierende Zeile → keine Änderung
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE del77c (id INT, val TEXT)");
+        exec(eng, "INSERT INTO del77c VALUES (1, 'Keep')");
+        exec(eng, "DELETE FROM del77c WHERE id = 999");
+        auto r = exec(eng, "SELECT * FROM del77c");
+        check(r.rows.size() == 1, "Stress #77: DELETE nonexistent → 1 row remains");
+    }
+    // 78. UPDATE mehrere Spalten
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77e (id INT, name TEXT, age INT)");
+        exec(eng, "INSERT INTO upd77e VALUES (1, 'Old', 20)");
+        auto r = exec(eng, "UPDATE upd77e SET name = 'New', age = 30 WHERE id = 1");
+        auto s = exec(eng, "SELECT * FROM upd77e WHERE id = 1");
+        bool nameOk = false, ageOk = false;
+        for (const auto& row : s.rows)
+            for (const auto& v : row.values) {
+                if (v == "New" || stripQ(v) == "New") nameOk = true;
+                if (v == "30") ageOk = true;
+            }
+        check(r.error.empty() && nameOk && ageOk, "Stress #78: multi-column UPDATE both changed");
+    }
+    // 79. DELETE dann INSERT → ID wiederverwenden
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE del77d (id INT, val TEXT)");
+        exec(eng, "INSERT INTO del77d VALUES (1, 'First')");
+        exec(eng, "DELETE FROM del77d WHERE id = 1");
+        exec(eng, "INSERT INTO del77d VALUES (1, 'Second')");
+        auto r = exec(eng, "SELECT * FROM del77d");
+        check(r.rows.size() == 1 && hasVal(r, "Second"), "Stress #79: re-insert after DELETE works");
+    }
+    // 80. UPDATE mit negativem Wert
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77f (id INT, balance INT)");
+        exec(eng, "INSERT INTO upd77f VALUES (1, 100)");
+        auto r = exec(eng, "UPDATE upd77f SET balance = -50 WHERE id = 1");
+        auto s = exec(eng, "SELECT * FROM upd77f WHERE id = 1");
+        check(r.error.empty() && hasVal(s, "-50"), "Stress #80: UPDATE to -50 works");
+    }
+    // 81. Mehrere DELETEs nacheinander
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE del77e (id INT, val TEXT)");
+        exec(eng, "INSERT INTO del77e VALUES (1, 'A')");
+        exec(eng, "INSERT INTO del77e VALUES (2, 'B')");
+        exec(eng, "INSERT INTO del77e VALUES (3, 'C')");
+        exec(eng, "DELETE FROM del77e WHERE id = 1");
+        exec(eng, "DELETE FROM del77e WHERE id = 3");
+        auto r = exec(eng, "SELECT * FROM del77e");
+        check(r.rows.size() == 1 && hasVal(r, "B"), "Stress #81: 2 deletes → only B left");
+    }
+    // 82. UPDATE dann SELECT COUNT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77g (id INT, active INT)");
+        exec(eng, "INSERT INTO upd77g VALUES (1, 1)");
+        exec(eng, "INSERT INTO upd77g VALUES (2, 0)");
+        exec(eng, "INSERT INTO upd77g VALUES (3, 1)");
+        exec(eng, "UPDATE upd77g SET active = 0 WHERE id = 1");
+        auto r = exec(eng, "SELECT COUNT(*) FROM upd77g WHERE active = 0");
+        check(!r.rows.empty(), "Stress #82: COUNT after UPDATE returns result");
+    }
+    // 83. INSERT nach DELETE COUNT korrekt
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE idl77 (id INT)");
+        exec(eng, "INSERT INTO idl77 VALUES (1)");
+        exec(eng, "INSERT INTO idl77 VALUES (2)");
+        exec(eng, "DELETE FROM idl77 WHERE id = 1");
+        exec(eng, "INSERT INTO idl77 VALUES (3)");
+        auto r = exec(eng, "SELECT COUNT(*) FROM idl77");
+        check(!r.rows.empty() && cell(r, 0, 0) == "2",
+              "Stress #83: DELETE+INSERT → COUNT=2");
+    }
+    // 84. UPDATE WHERE keine Treffer → keine Änderung
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE upd77h (id INT, val TEXT)");
+        exec(eng, "INSERT INTO upd77h VALUES (1, 'Keep')");
+        exec(eng, "UPDATE upd77h SET val = 'Changed' WHERE id = 999");
+        auto r = exec(eng, "SELECT * FROM upd77h");
+        bool kept = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "Keep" || stripQ(v) == "Keep") kept = true;
+        check(kept, "Stress #84: UPDATE nonexistent WHERE → data unchanged");
+    }
+    // 85. DELETE + SELECT auf leere Tabelle
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE del77f (id INT, val TEXT)");
+        exec(eng, "INSERT INTO del77f VALUES (1, 'Only')");
+        exec(eng, "DELETE FROM del77f WHERE id = 1");
+        auto r = exec(eng, "SELECT * FROM del77f");
+        check(r.rows.empty(), "Stress #85: DELETE last row → empty table");
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // KATEGORIE 6 — Transactions (15 Tests)
+    // ════════════════════════════════════════════════════════════
+
+    // 86. BEGIN/COMMIT basic
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77a (id INT, val TEXT)");
+        auto r1 = exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77a VALUES (1, 'committed')");
+        auto r2 = exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77a");
+        check(r1.error.empty() && r2.error.empty() && r.rows.size() == 1,
+              "Stress #86: BEGIN/COMMIT → row visible");
+    }
+    // 87. BEGIN/ROLLBACK → Zeile weg
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77b (id INT, val TEXT)");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77b VALUES (1, 'vanish')");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77b");
+        check(r.rows.empty(), "Stress #87: ROLLBACK → inserted row gone");
+    }
+    // 88. COMMIT erhält Daten
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77c (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77c VALUES (1, 'before')");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77c VALUES (2, 'during')");
+        exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77c");
+        check(r.rows.size() == 2, "Stress #88: COMMIT keeps both rows");
+    }
+    // 89. ROLLBACK nach UPDATE → alter Wert bleibt
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77d (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77d VALUES (1, 'original')");
+        exec(eng, "BEGIN");
+        exec(eng, "UPDATE tx77d SET val = 'changed' WHERE id = 1");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77d");
+        bool orig = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "original" || stripQ(v) == "original") orig = true;
+        check(orig, "Stress #89: ROLLBACK restores original value");
+    }
+    // 90. DELETE in Transaction dann ROLLBACK → Zeile noch da
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77e (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77e VALUES (1, 'survivor')");
+        exec(eng, "BEGIN");
+        exec(eng, "DELETE FROM tx77e WHERE id = 1");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77e");
+        bool found = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "survivor" || stripQ(v) == "survivor") found = true;
+        check(found, "Stress #90: ROLLBACK restores deleted row");
+    }
+    // 91. Mehrere INSERTs in einer Transaction + COMMIT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77f (id INT, val TEXT)");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77f VALUES (1, 'A')");
+        exec(eng, "INSERT INTO tx77f VALUES (2, 'B')");
+        exec(eng, "INSERT INTO tx77f VALUES (3, 'C')");
+        exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77f");
+        check(r.rows.size() == 3, "Stress #91: 3 inserts in TX committed");
+    }
+    // 92. Mehrere INSERTs in Transaction + ROLLBACK → alle weg
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77g (id INT, val TEXT)");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77g VALUES (1, 'A')");
+        exec(eng, "INSERT INTO tx77g VALUES (2, 'B')");
+        exec(eng, "INSERT INTO tx77g VALUES (3, 'C')");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77g");
+        check(r.rows.empty(), "Stress #92: 3 inserts rolled back → 0 rows");
+    }
+    // 93. UPDATE in Transaction + COMMIT → neuer Wert bleibt
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77h (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77h VALUES (1, 'old')");
+        exec(eng, "BEGIN");
+        exec(eng, "UPDATE tx77h SET val = 'new' WHERE id = 1");
+        exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77h");
+        bool ok = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "new" || stripQ(v) == "new") ok = true;
+        check(ok, "Stress #93: UPDATE in TX + COMMIT persists");
+    }
+    // 94. DELETE in Transaction + COMMIT → Zeile weg
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77i (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77i VALUES (1, 'gone')");
+        exec(eng, "INSERT INTO tx77i VALUES (2, 'stay')");
+        exec(eng, "BEGIN");
+        exec(eng, "DELETE FROM tx77i WHERE id = 1");
+        exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77i");
+        check(r.rows.size() == 1, "Stress #94: DELETE in TX + COMMIT → 1 row");
+    }
+    // 95. Daten vor Transaction bleiben nach ROLLBACK
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77j (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77j VALUES (1, 'pre')");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77j VALUES (2, 'inTx')");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77j");
+        bool pre = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "pre" || stripQ(v) == "pre") pre = true;
+        check(r.rows.size() == 1 && pre, "Stress #95: pre-TX row preserved after ROLLBACK");
+    }
+    // 96. Leere Transaction: BEGIN → COMMIT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77k (id INT)");
+        exec(eng, "INSERT INTO tx77k VALUES (1)");
+        auto r1 = exec(eng, "BEGIN");
+        auto r2 = exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77k");
+        check(r1.error.empty() && r2.error.empty() && r.rows.size() == 1,
+              "Stress #96: empty TX → data unchanged");
+    }
+    // 97. Leere Transaction: BEGIN → ROLLBACK
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77l (id INT)");
+        exec(eng, "INSERT INTO tx77l VALUES (1)");
+        exec(eng, "BEGIN");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77l");
+        check(r.rows.size() == 1, "Stress #97: empty ROLLBACK preserves data");
+    }
+    // 98. INSERT + UPDATE in gleicher Transaction + COMMIT
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77m (id INT, val TEXT)");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77m VALUES (1, 'init')");
+        exec(eng, "UPDATE tx77m SET val = 'modified' WHERE id = 1");
+        exec(eng, "COMMIT");
+        auto r = exec(eng, "SELECT * FROM tx77m");
+        bool ok = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "modified" || stripQ(v) == "modified") ok = true;
+        check(ok, "Stress #98: INSERT+UPDATE in TX → modified value");
+    }
+    // 99. INSERT + DELETE in gleicher Transaction + ROLLBACK
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77n (id INT, val TEXT)");
+        exec(eng, "INSERT INTO tx77n VALUES (1, 'safe')");
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77n VALUES (2, 'temp')");
+        exec(eng, "DELETE FROM tx77n WHERE id = 1");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77n");
+        bool safe = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "safe" || stripQ(v) == "safe") safe = true;
+        check(r.rows.size() == 1 && safe, "Stress #99: ROLLBACK restores original, removes temp");
+    }
+    // 100. Sequenz: TX1 COMMIT → TX2 ROLLBACK → korrekt
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE tx77o (id INT, val TEXT)");
+        // TX1: commit
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77o VALUES (1, 'kept')");
+        exec(eng, "COMMIT");
+        // TX2: rollback
+        exec(eng, "BEGIN");
+        exec(eng, "INSERT INTO tx77o VALUES (2, 'lost')");
+        exec(eng, "ROLLBACK");
+        auto r = exec(eng, "SELECT * FROM tx77o");
+        bool kept = false;
+        for (const auto& row : r.rows)
+            for (const auto& v : row.values)
+                if (v == "kept" || stripQ(v) == "kept") kept = true;
+        check(r.rows.size() == 1 && kept, "Stress #100: TX1 commit + TX2 rollback → only TX1 survives");
+    }
+
+    // cleanup temp WAL files
+    std::remove("/tmp/test_milansql_tx.wal");
+}
+
 // MAIN
 // ============================================================
 
@@ -6533,6 +7506,9 @@ int main() {
     }
     try { testGroup76(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 76 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup77(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 77 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <algorithm>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
@@ -406,60 +407,6 @@ struct UserContext {
     bool valid = false;
 };
 
-// ── Thread Pool with Work Queue ─────────────────────────────
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t numThreads) : stop_(false) {
-        for (size_t i = 0; i < numThreads; ++i)
-            workers_.emplace_back([this] { workerLoop(); });
-    }
-    ~ThreadPool() {
-        { std::lock_guard<std::mutex> lk(mtx_); stop_ = true; }
-        cv_.notify_all();
-        for (auto& w : workers_) if (w.joinable()) w.join();
-    }
-
-    // Submit a task. Returns false if queue is full (backpressure).
-    bool submit(std::function<void()> task) {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (stop_) return false;
-            if (queue_.size() >= maxQueueSize_) return false;  // backpressure
-            queue_.push(std::move(task));
-        }
-        cv_.notify_one();
-        return true;
-    }
-
-    size_t queueSize() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return queue_.size();
-    }
-    size_t poolSize() const { return workers_.size(); }
-
-    static constexpr size_t maxQueueSize_ = 4096;
-
-private:
-    void workerLoop() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lk(mtx_);
-                cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty()) return;
-                task = std::move(queue_.front());
-                queue_.pop();
-            }
-            task();
-        }
-    }
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> queue_;
-    mutable std::mutex mtx_;
-    std::condition_variable cv_;
-    bool stop_;
-};
-
 class MilanHttpServer {
 public:
     MilanHttpServer(int port, const std::string& dbPath)
@@ -521,6 +468,7 @@ private:
     std::string handleAdminStats(const std::string& token);
     std::string handleAdminQuota(const std::string& token);
     std::string handleMyQuota(const std::string& token);
+    std::string handleBackup(const std::string& token);  // Phase 167: SQL dump backup
 
     // Helpers
     static std::string extractBearerToken(const HttpRequest& req);
@@ -934,6 +882,118 @@ inline std::string MilanHttpServer::handleMyQuota(const std::string& token) {
            ",\"rows_used\":" + std::to_string(myRows) +
            ",\"rows_max\":" + std::to_string(quota.maxRows) +
            ",\"storage_max_mb\":" + std::to_string(quota.maxStorageMB) + "}";
+}
+
+// ── Phase 167: Backup — full SQL dump ─────────────────────────
+inline std::string MilanHttpServer::handleBackup(const std::string& token) {
+    // Auth: any valid user (own tables), root/ADMIN (all tables)
+    AuthManager::ValidateResult v{0, "anonymous", "root", true};
+    if (!token.empty()) {
+        v = authMgr_.validateToken(token);
+        if (!v.valid)
+            return "-- ERROR: Access denied. Valid token required.\n";
+    }
+    bool isRoot = (v.role == "root");
+    std::string userPrefix = (v.userId > 0) ? "u" + std::to_string(v.userId) + "_" : "";
+
+    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::ostringstream out;
+    out << "-- MilanSQL Backup";
+    if (!isRoot && v.userId > 0)
+        out << " (user: " << v.username << ")";
+    out << "\n";
+    out << "-- Generated: " << [](){
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        char buf[64]; std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+        return std::string(buf);
+    }() << "\n";
+    out << "-- ================================================\n\n";
+
+    auto tableNames = engine_.getAllTableNamesInternal();
+    std::sort(tableNames.begin(), tableNames.end());
+
+    int tableCount = 0;
+    for (const auto& fullName : tableNames) {
+        // Skip internal/info_schema tables
+        if (fullName.find("information_schema.") == 0) continue;
+        if (fullName.find("_sys_") == 0) continue;
+
+        // Non-root users: only their own tables (u{id}_*)
+        if (!isRoot && v.userId > 0) {
+            // Check bare name or schema-prefixed name for user prefix
+            std::string bareName = fullName;
+            auto dot = fullName.find('.');
+            if (dot != std::string::npos) bareName = fullName.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+        }
+
+        try {
+            ++tableCount;
+            const auto& tbl = engine_.selectAll(fullName);
+            const auto& cols = tbl.columns();
+            const auto& fks = tbl.getForeignKeys();
+
+            // CREATE TABLE
+            out << "CREATE TABLE " << fullName << " (\n";
+            for (size_t i = 0; i < cols.size(); ++i) {
+                out << "  " << cols[i].name << " " << cols[i].type;
+                if (cols[i].isPrimaryKey)   out << " PRIMARY KEY";
+                if (cols[i].autoIncrement)  out << " AUTO_INCREMENT";
+                if (cols[i].notNull && !cols[i].isPrimaryKey) out << " NOT NULL";
+                if (cols[i].isUnique && !cols[i].isPrimaryKey) out << " UNIQUE";
+                if (cols[i].hasDefault)     out << " DEFAULT " << cols[i].defaultValue;
+                if (i + 1 < cols.size() || !fks.empty()) out << ",";
+                out << "\n";
+            }
+            for (size_t i = 0; i < fks.size(); ++i) {
+                out << "  FOREIGN KEY (" << fks[i].fromCol << ") REFERENCES "
+                    << fks[i].refTable << "(" << fks[i].refCol << ")";
+                if (fks[i].onDelete != "RESTRICT")
+                    out << " ON DELETE " << fks[i].onDelete;
+                if (i + 1 < fks.size()) out << ",";
+                out << "\n";
+            }
+            out << ");\n\n";
+
+            // INSERT rows (skip dead MVCC rows)
+            const auto& rows = tbl.rows();
+            for (const auto& row : rows) {
+                if (row.xmax != 0) continue;  // skip deleted rows
+                out << "INSERT INTO " << fullName << " VALUES (";
+                for (size_t c = 0; c < row.values.size(); ++c) {
+                    if (c > 0) out << ", ";
+                    const auto& val = row.values[c];
+                    if (val == "NULL") {
+                        out << "NULL";
+                    } else if (c < cols.size() &&
+                               (cols[c].type.find("INT") != std::string::npos ||
+                                cols[c].type.find("FLOAT") != std::string::npos ||
+                                cols[c].type.find("DOUBLE") != std::string::npos ||
+                                cols[c].type.find("DECIMAL") != std::string::npos ||
+                                cols[c].type.find("NUMERIC") != std::string::npos ||
+                                cols[c].type == "BOOLEAN" || cols[c].type == "BOOL")) {
+                        out << val;
+                    } else {
+                        // String value — escape single quotes
+                        out << "'";
+                        for (char ch : val) {
+                            if (ch == '\'') out << "''";
+                            else out << ch;
+                        }
+                        out << "'";
+                    }
+                }
+                out << ");\n";
+            }
+            if (!rows.empty()) out << "\n";
+        } catch (...) {
+            out << "-- ERROR dumping table: " << fullName << "\n\n";
+        }
+    }
+
+    out << "-- End of backup (" << tableCount << " tables)\n";
+    return out.str();
 }
 
 // ── MilanHttpServer::handleQueryForUser (Phase 154-155) ───────
@@ -2999,6 +3059,17 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(200, handleAdminQuota(extractBearerToken(req)));
     if (req.path == "/auth/quota" && req.method == "GET")
         return buildHttpResponse(200, handleMyQuota(extractBearerToken(req)));
+
+    // Phase 167: Backup — full SQL dump (auth required)
+    if (req.path == "/backup" && req.method == "GET") {
+        std::string backupToken = extractBearerToken(req);
+        if (backupToken.empty())
+            return buildHttpResponse(401, R"({"success":false,"error":"Authorization required. Use: curl -H 'Authorization: Bearer TOKEN' /backup"})");
+        auto backupResult = handleBackup(backupToken);
+        if (backupResult.find("-- ERROR: Access denied") == 0)
+            return buildHttpResponse(403, R"({"success":false,"error":"Access denied. Valid token required."})");
+        return buildHttpResponse(200, backupResult, "application/sql");
+    }
 
     // ── Query + Tables (auth-aware) ───────────────────────────
     if (req.path == "/query" || req.path == "/api/query") {

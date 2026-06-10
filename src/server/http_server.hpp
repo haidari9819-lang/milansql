@@ -28,12 +28,16 @@
 
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <sstream>
 #include <iostream>
 #include <fstream>
 #include <map>
 #include <vector>
+#include <queue>
+#include <functional>
+#include <memory>
 #include <chrono>
 #include <cctype>
 #include <cmath>
@@ -402,6 +406,60 @@ struct UserContext {
     bool valid = false;
 };
 
+// ── Thread Pool with Work Queue ─────────────────────────────
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t numThreads) : stop_(false) {
+        for (size_t i = 0; i < numThreads; ++i)
+            workers_.emplace_back([this] { workerLoop(); });
+    }
+    ~ThreadPool() {
+        { std::lock_guard<std::mutex> lk(mtx_); stop_ = true; }
+        cv_.notify_all();
+        for (auto& w : workers_) if (w.joinable()) w.join();
+    }
+
+    // Submit a task. Returns false if queue is full (backpressure).
+    bool submit(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (stop_) return false;
+            if (queue_.size() >= maxQueueSize_) return false;  // backpressure
+            queue_.push(std::move(task));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    size_t queueSize() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return queue_.size();
+    }
+    size_t poolSize() const { return workers_.size(); }
+
+    static constexpr size_t maxQueueSize_ = 4096;
+
+private:
+    void workerLoop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_.wait(lk, [this] { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+            task();
+        }
+    }
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> queue_;
+    mutable std::mutex mtx_;
+    std::condition_variable cv_;
+    bool stop_;
+};
+
 class MilanHttpServer {
 public:
     MilanHttpServer(int port, const std::string& dbPath)
@@ -417,6 +475,9 @@ private:
     std::mutex engineMutex_;
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
     std::atomic<long long> queryCounter_{0};   // Phase 166: live query counter
+
+    // Phase 167: Thread Pool (256 workers, 4096 queue)
+    std::unique_ptr<ThreadPool> threadPool_;
 
     // Phase 154-156: Auth + Rate Limiting
     AuthManager authMgr_;
@@ -3218,16 +3279,37 @@ inline void MilanHttpServer::run() {
     addr.sin_port        = htons((unsigned short)port_);
 
     bind(srv, (sockaddr*)&addr, sizeof(addr));
-    listen(srv, SOMAXCONN);
+    listen(srv, 1024);  // backlog: 1024 pending connections
 
-    std::cout << "MilanSQL HTTP Server auf Port " << port_ << " ...\n" << std::flush;
+    // Phase 167: Thread Pool — 256 workers, 4096 queue depth
+    constexpr size_t POOL_SIZE = 256;
+    threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE);
+
+    std::cout << "MilanSQL HTTP Server auf Port " << port_
+              << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024)\n" << std::flush;
 
     while (true) {
         sockaddr_in clientAddr{};
         socklen_t len = sizeof(clientAddr);
         sock_t client = accept(srv, (sockaddr*)&clientAddr, &len);
         if (client == INVALID_SOCK) break;
-        std::thread(&MilanHttpServer::handleClient, this, client).detach();
+
+        // Submit to thread pool; if queue full → 503 Service Unavailable
+        bool submitted = threadPool_->submit([this, client]() {
+            handleClient(client);
+        });
+        if (!submitted) {
+            // Backpressure: queue full → reject gracefully
+            const char* busy =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\n"
+                "Retry-After: 1\r\n"
+                "Content-Length: 60\r\n"
+                "Connection: close\r\n\r\n"
+                "{\"success\":false,\"error\":\"Server busy, retry in 1s\"}";
+            send(client, busy, (int)strlen(busy), 0);
+            closesocket(client);
+        }
     }
 
     closesocket(srv);

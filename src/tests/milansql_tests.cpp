@@ -7324,15 +7324,14 @@ static void testGroup78() {
         check(allOk, "RateTier #6: FREE allows 200 requests");
         check(!rl.allow("free1"), "RateTier #7: FREE blocks at 201");
     }
-    // 8. ADMIN: allows 100000 without blocking
+    // 8. ADMIN: truly unlimited — 500k requests without blocking
     {
         RateLimiter rl;
         rl.setTier("admin1", RateTier::ADMIN);
         bool allOk = true;
-        // Run 200k requests — ADMIN capacity is 100k burst
-        for (int i = 0; i < 100000; ++i)
+        for (int i = 0; i < 500000; ++i)
             if (!rl.allow("admin1")) { allOk = false; break; }
-        check(allOk, "RateTier #8: ADMIN allows 100k requests");
+        check(allOk, "RateTier #8: ADMIN allows 500k requests (unlimited)");
     }
     // 9. Different keys have independent buckets
     {

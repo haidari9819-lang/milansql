@@ -476,7 +476,7 @@ private:
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
     std::atomic<long long> queryCounter_{0};   // Phase 166: live query counter
 
-    // Phase 167: Thread Pool (256 workers, 4096 queue)
+    // Phase 167: Thread Pool (reuses ThreadPool from server.hpp)
     std::unique_ptr<ThreadPool> threadPool_;
 
     // Phase 154-156: Auth + Rate Limiting
@@ -3283,7 +3283,7 @@ inline void MilanHttpServer::run() {
 
     // Phase 167: Thread Pool — 256 workers, 4096 queue depth
     constexpr size_t POOL_SIZE = 256;
-    threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE);
+    threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE, 4096);
 
     std::cout << "MilanSQL HTTP Server auf Port " << port_
               << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024)\n" << std::flush;
@@ -3295,7 +3295,7 @@ inline void MilanHttpServer::run() {
         if (client == INVALID_SOCK) break;
 
         // Submit to thread pool; if queue full → 503 Service Unavailable
-        bool submitted = threadPool_->submit([this, client]() {
+        bool submitted = threadPool_->enqueue([this, client]() {
             handleClient(client);
         });
         if (!submitted) {

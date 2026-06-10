@@ -7283,6 +7283,129 @@ static void testGroup77() {
     std::remove("/tmp/test_milansql_tx.wal");
 }
 
+// ── Group 78: Tiered Rate Limiter Tests ──────────────────────
+static void testGroup78() {
+    // 1. Default tiered limiter: unknown key = ANONYMOUS
+    {
+        RateLimiter rl;  // tiered mode
+        check(rl.getTier("unknown") == RateTier::ANONYMOUS,
+              "RateTier #1: unknown key = ANONYMOUS");
+    }
+    // 2. setTier to FREE
+    {
+        RateLimiter rl;
+        rl.setTier("user1", RateTier::FREE);
+        check(rl.getTier("user1") == RateTier::FREE,
+              "RateTier #2: setTier FREE works");
+    }
+    // 3. setTier to ADMIN
+    {
+        RateLimiter rl;
+        rl.setTier("root", RateTier::ADMIN);
+        check(rl.getTier("root") == RateTier::ADMIN,
+              "RateTier #3: setTier ADMIN works");
+    }
+    // 4. ANONYMOUS: blocked after 60 requests
+    {
+        RateLimiter rl;
+        bool allOk = true;
+        for (int i = 0; i < 60; ++i)
+            if (!rl.allow("anon1")) allOk = false;
+        check(allOk, "RateTier #4: ANONYMOUS allows 60 requests");
+        check(!rl.allow("anon1"), "RateTier #5: ANONYMOUS blocks at 61");
+    }
+    // 6. FREE: allows 200, blocks at 201
+    {
+        RateLimiter rl;
+        rl.setTier("free1", RateTier::FREE);
+        bool allOk = true;
+        for (int i = 0; i < 200; ++i)
+            if (!rl.allow("free1")) allOk = false;
+        check(allOk, "RateTier #6: FREE allows 200 requests");
+        check(!rl.allow("free1"), "RateTier #7: FREE blocks at 201");
+    }
+    // 8. ADMIN: allows 100000 without blocking
+    {
+        RateLimiter rl;
+        rl.setTier("admin1", RateTier::ADMIN);
+        bool allOk = true;
+        // Run 200k requests — ADMIN capacity is 100k burst
+        for (int i = 0; i < 100000; ++i)
+            if (!rl.allow("admin1")) { allOk = false; break; }
+        check(allOk, "RateTier #8: ADMIN allows 100k requests");
+    }
+    // 9. Different keys have independent buckets
+    {
+        RateLimiter rl;
+        rl.setTier("a", RateTier::FREE);   // 200 capacity
+        rl.setTier("b", RateTier::FREE);
+        for (int i = 0; i < 200; ++i) rl.allow("a");
+        check(!rl.allow("a"), "RateTier #9: key a exhausted");
+        check(rl.allow("b"),  "RateTier #10: key b still has tokens");
+    }
+    // 11. Tier upgrade: ANONYMOUS → ADMIN mid-stream
+    {
+        RateLimiter rl;
+        // Exhaust ANONYMOUS bucket (60 tokens)
+        for (int i = 0; i < 60; ++i) rl.allow("upgrade");
+        check(!rl.allow("upgrade"), "RateTier #11: exhausted as ANONYMOUS");
+        // Upgrade to ADMIN — setTier resets bucket
+        rl.setTier("upgrade", RateTier::ADMIN);
+        check(rl.allow("upgrade"), "RateTier #12: after upgrade to ADMIN, allows again");
+    }
+    // 13. PRO tier: allows 5000
+    {
+        RateLimiter rl;
+        rl.setTier("pro1", RateTier::PRO);
+        bool allOk = true;
+        for (int i = 0; i < 5000; ++i)
+            if (!rl.allow("pro1")) { allOk = false; break; }
+        check(allOk, "RateTier #13: PRO allows 5000 requests");
+        check(!rl.allow("pro1"), "RateTier #14: PRO blocks at 5001");
+    }
+    // 15. API_KEY tier: allows 10000
+    {
+        RateLimiter rl;
+        rl.setTier("apikey1", RateTier::API_KEY);
+        bool allOk = true;
+        for (int i = 0; i < 10000; ++i)
+            if (!rl.allow("apikey1")) { allOk = false; break; }
+        check(allOk, "RateTier #15: API_KEY allows 10000 requests");
+    }
+    // 16. Legacy (non-tiered) mode still works
+    {
+        RateLimiter rl(5, 100.0);
+        bool allOk = true;
+        for (int i = 0; i < 5; ++i)
+            if (!rl.allow("legacy")) allOk = false;
+        check(allOk, "RateTier #16: legacy mode allows capacity");
+        check(!rl.allow("legacy"), "RateTier #17: legacy mode blocks over capacity");
+    }
+    // 18. remaining() reflects tokens left
+    {
+        RateLimiter rl;
+        rl.setTier("rem1", RateTier::FREE); // 200 capacity
+        rl.allow("rem1");
+        double rem = rl.remaining("rem1");
+        check(rem >= 198.0 && rem <= 200.0, "RateTier #18: remaining ~199 after 1 allow");
+    }
+    // 19. retryAfterSeconds returns positive
+    {
+        RateLimiter rl;
+        double retry = rl.retryAfterSeconds("anykey");
+        check(retry > 0.0, "RateTier #19: retryAfterSeconds > 0");
+    }
+    // 20. requestCount increments
+    {
+        RateLimiter rl;
+        rl.setTier("cnt1", RateTier::FREE);
+        rl.allow("cnt1");
+        rl.allow("cnt1");
+        rl.allow("cnt1");
+        check(rl.requestCount("cnt1") == 3, "RateTier #20: requestCount = 3");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -7509,6 +7632,9 @@ int main() {
     }
     try { testGroup77(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 77 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup78(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 78 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

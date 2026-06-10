@@ -3015,8 +3015,12 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
         // Rate limit by userId or IP (tiered)
         std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
-        if (vr.userId > 0 && requestLimiter_.getTier(rlKey) == RateTier::ANONYMOUS) {
-            requestLimiter_.setTier(rlKey, vr.role == "root" ? RateTier::ADMIN : RateTier::FREE);
+        // Assign tier based on role — check every request so first request gets correct tier
+        RateTier desiredTier = RateTier::ANONYMOUS;
+        if (vr.role == "root")       desiredTier = RateTier::ADMIN;
+        else if (vr.userId > 0)      desiredTier = RateTier::FREE;
+        if (requestLimiter_.getTier(rlKey) != desiredTier) {
+            requestLimiter_.setTier(rlKey, desiredTier);
         }
         if (!requestLimiter_.allow(rlKey)) {
             double retry = requestLimiter_.retryAfterSeconds(rlKey);

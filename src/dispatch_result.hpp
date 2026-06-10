@@ -428,6 +428,10 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     // For INSERT/CREATE/etc. in tests, delegate to engine directly
     case milansql::CommandType::CREATE_TABLE:
         try {
+            if (cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+                // Silently succeed — table already exists
+                break;
+            }
             engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
         } catch (const std::exception& e) {
             qr.error = e.what();

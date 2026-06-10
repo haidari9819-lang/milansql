@@ -517,7 +517,8 @@ struct ParsedCommand {
 
     // Phase 57: Backup / Restore
     std::string backupFile;         // Dateipfad für BACKUP/RESTORE
-    bool        ifExists = false;   // für DROP TABLE IF EXISTS
+    bool        ifExists = false;      // für DROP TABLE IF EXISTS
+    bool        ifNotExists = false;   // für CREATE TABLE IF NOT EXISTS
 
     // Phase 58: Benchmark
     int         benchmarkIter = 0;  // Anzahl Iterationen
@@ -2421,7 +2422,16 @@ public:
         } else if (kw0 == "CREATE" && kw1 == "TABLE") {
             cmd.type = CommandType::CREATE_TABLE;
             if (tokens.size() >= 3) {
-                cmd.tableName = tokens[2];
+                size_t nameIdx = 2;
+                // IF NOT EXISTS erkennen
+                if (tokens.size() >= 6 &&
+                    toUpper(tokens[2]) == "IF" &&
+                    toUpper(tokens[3]) == "NOT" &&
+                    toUpper(tokens[4]) == "EXISTS") {
+                    cmd.ifNotExists = true;
+                    nameIdx = 5;
+                }
+                cmd.tableName = tokens[nameIdx];
                 for (const auto& colDef : splitTrim(parenContent, ',')) {
                     auto parts = tokenize(colDef);
                     if (parts.size() < 2) continue;

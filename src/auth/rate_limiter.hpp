@@ -64,6 +64,16 @@ public:
 
     bool allow(const std::string& key) {
         std::lock_guard<std::mutex> lk(mutex_);
+
+        // ADMIN tier: always allow, no token accounting
+        if (tieredMode_) {
+            auto tierIt = keyTiers_.find(key);
+            if (tierIt != keyTiers_.end() && tierIt->second == RateTier::ADMIN) {
+                buckets_[key].count++;
+                return true;
+            }
+        }
+
         auto now = std::chrono::steady_clock::now();
 
         int cap;

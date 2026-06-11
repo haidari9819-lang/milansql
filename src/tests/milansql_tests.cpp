@@ -7405,6 +7405,391 @@ static void testGroup78() {
     }
 }
 
+// ── testGroup79: Prepared Statements / SQL Injection (20 Tests) ──
+// Phase C: Parameter Binding Security Tests (1037 → 1057)
+
+// Inline the bind functions for testing (they're static in http_server.hpp)
+namespace bind_test {
+    static std::vector<std::string> extractParamsFromJson(const std::string& json) {
+        std::vector<std::string> params;
+        auto pos = json.find("\"params\"");
+        if (pos == std::string::npos) return params;
+        pos = json.find('[', pos);
+        if (pos == std::string::npos) return params;
+        ++pos;
+        while (pos < json.size()) {
+            while (pos < json.size() && (json[pos]==' '||json[pos]=='\t'||json[pos]=='\n'||json[pos]=='\r')) ++pos;
+            if (pos >= json.size() || json[pos] == ']') break;
+            if (json[pos] == '"') {
+                ++pos;
+                std::string val;
+                while (pos < json.size() && json[pos] != '"') {
+                    if (json[pos]=='\\' && pos+1<json.size()) {
+                        char next=json[pos+1];
+                        if(next=='"') val+='"'; else if(next=='\\') val+='\\';
+                        else if(next=='n') val+='\n'; else if(next=='t') val+='\t';
+                        else val+=next;
+                        pos+=2;
+                    } else { val+=json[pos++]; }
+                }
+                if (pos<json.size()) ++pos;
+                params.push_back(val);
+            } else if (json[pos]=='n'&&pos+3<json.size()&&json.substr(pos,4)=="null") {
+                params.push_back("NULL"); pos+=4;
+            } else if (json[pos]=='t'&&pos+3<json.size()&&json.substr(pos,4)=="true") {
+                params.push_back("TRUE"); pos+=4;
+            } else if (json[pos]=='f'&&pos+4<json.size()&&json.substr(pos,5)=="false") {
+                params.push_back("FALSE"); pos+=5;
+            } else if (json[pos]=='-'||(json[pos]>='0'&&json[pos]<='9')) {
+                std::string num;
+                while (pos<json.size()&&json[pos]!=','&&json[pos]!=']'&&json[pos]!=' '&&json[pos]!='\n')
+                    num+=json[pos++];
+                params.push_back(num);
+            } else { ++pos; continue; }
+            while (pos<json.size()&&(json[pos]==' '||json[pos]==','||json[pos]=='\t'||json[pos]=='\n'||json[pos]=='\r')) ++pos;
+        }
+        return params;
+    }
+
+    static std::string bindParams(const std::string& sql, const std::vector<std::string>& params) {
+        if (params.empty()) return sql;
+        std::string result;
+        result.reserve(sql.size()+params.size()*16);
+        size_t paramIdx=0;
+        bool inString=false; char strChar=0;
+        for (size_t i=0;i<sql.size();++i) {
+            char c=sql[i];
+            if (!inString&&(c=='\''||c=='"')) { inString=true; strChar=c; result+=c; }
+            else if (inString&&c==strChar) {
+                if (c=='\''&&i+1<sql.size()&&sql[i+1]=='\'') { result+="''"; ++i; }
+                else { inString=false; result+=c; }
+            } else if (!inString&&c=='?'&&paramIdx<params.size()) {
+                const auto& val=params[paramIdx++];
+                if (val=="NULL") { result+="NULL"; }
+                else { result+='\''; for(char v:val){if(v=='\'')result+="''";else result+=v;} result+='\''; }
+            } else { result+=c; }
+        }
+        return result;
+    }
+}
+
+static void testGroup79() {
+    std::cout << "\n── testGroup79: Prepared Statements / SQL Injection ──\n";
+    using namespace bind_test;
+
+    // ── 1. Basic extractParamsFromJson ───────────────────────
+    {
+        auto p = extractParamsFromJson(R"({"sql":"SELECT ?","params":["alice"]})");
+        check(p.size() == 1 && p[0] == "alice", "PrepStmt #1: extract single string param");
+    }
+    {
+        auto p = extractParamsFromJson(R"({"sql":"?","params":["a",42,null,true,false]})");
+        check(p.size() == 5 && p[0] == "a" && p[1] == "42" && p[2] == "NULL"
+              && p[3] == "TRUE" && p[4] == "FALSE", "PrepStmt #2: mixed param types");
+    }
+    {
+        auto p = extractParamsFromJson(R"({"sql":"SELECT 1"})");
+        check(p.empty(), "PrepStmt #3: no params → empty vector");
+    }
+
+    // ── 2. Basic bindParams ─────────────────────────────────
+    {
+        auto r = bindParams("SELECT * FROM t WHERE name = ?", {"alice"});
+        check(r == "SELECT * FROM t WHERE name = 'alice'", "PrepStmt #4: simple string bind");
+    }
+    {
+        auto r = bindParams("SELECT * FROM t WHERE id = ? AND name = ?", {"42", "bob"});
+        check(r == "SELECT * FROM t WHERE id = '42' AND name = 'bob'",
+              "PrepStmt #5: two params bind");
+    }
+    {
+        auto r = bindParams("INSERT INTO t VALUES (?, ?, ?)", {"NULL", "hello", "123"});
+        check(r == "INSERT INTO t VALUES (NULL, 'hello', '123')",
+              "PrepStmt #6: NULL + string + number bind");
+    }
+
+    // ── 3. SQL INJECTION ATTACKS ────────────────────────────
+    // Each attack string must land as a harmless quoted literal.
+
+    // Classic OR injection
+    {
+        auto r = bindParams("SELECT * FROM users WHERE name = ?", {"' OR '1'='1"});
+        check(r == "SELECT * FROM users WHERE name = ''' OR ''1''=''1'",
+              "PrepStmt #7: ' OR '1'='1 escaped to literal");
+    }
+    // DROP TABLE injection
+    {
+        auto r = bindParams("SELECT * FROM users WHERE name = ?", {"'; DROP TABLE users; --"});
+        check(r.find("DROP TABLE") != std::string::npos &&
+              r.find("''") != std::string::npos &&
+              r[r.size()-1] == '\'',
+              "PrepStmt #8: DROP TABLE injection safely quoted");
+    }
+    // UNION SELECT injection
+    {
+        auto r = bindParams("SELECT * FROM users WHERE id = ?", {"1 UNION SELECT * FROM __users__"});
+        // The entire attack is inside quotes — parser sees it as one string literal
+        check(r == "SELECT * FROM users WHERE id = '1 UNION SELECT * FROM __users__'",
+              "PrepStmt #9: UNION SELECT safely quoted as string");
+    }
+    // Semicolon + second statement
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"1; DELETE FROM t"});
+        check(r == "SELECT * FROM t WHERE x = '1; DELETE FROM t'",
+              "PrepStmt #10: semicolon injection safely quoted");
+    }
+    // Comment injection (-- and /*)
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"admin'--"});
+        check(r == "SELECT * FROM t WHERE x = 'admin''--'",
+              "PrepStmt #11: comment injection (--) safely quoted");
+    }
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"admin'/*"});
+        check(r == "SELECT * FROM t WHERE x = 'admin''/*'",
+              "PrepStmt #12: comment injection (/*) safely quoted");
+    }
+    // Backslash escape attempt
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"a\\'; DROP TABLE t;--"});
+        check(r.find("DROP TABLE") != std::string::npos && r[r.size()-1] == '\'',
+              "PrepStmt #13: backslash escape attempt safely quoted");
+    }
+    // Nested quote attack
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"a''''b"});
+        check(r == "SELECT * FROM t WHERE x = 'a''''''''b'",
+              "PrepStmt #14: nested quotes escaped (each ' → '')");
+    }
+
+    // ── 4. ? inside string literal NOT replaced ─────────────
+    {
+        auto r = bindParams("SELECT '?' FROM t WHERE x = ?", {"val"});
+        check(r == "SELECT '?' FROM t WHERE x = 'val'",
+              "PrepStmt #15: ? inside string literal not replaced");
+    }
+    {
+        auto r = bindParams("SELECT \"?\" FROM t WHERE x = ?", {"v"});
+        check(r == "SELECT \"?\" FROM t WHERE x = 'v'",
+              "PrepStmt #16: ? inside double-quoted identifier not replaced");
+    }
+
+    // ── 5. End-to-end: injection via engine ─────────────────
+    // Actually insert attack strings and verify they're stored as data
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+        auto cmd = p.parse("CREATE TABLE inj_test (id INT, val TEXT)");
+        eng.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+
+        // Simulate bound parameter INSERT
+        std::string attack1 = "'; DROP TABLE inj_test; --";
+        std::string safeSql1 = bindParams("INSERT INTO inj_test VALUES (?, ?)",
+                                          {"1", attack1});
+        auto r1 = milansql::dispatch(p.parse(safeSql1), eng);
+        check(r1.error.empty(), "PrepStmt #17: injection INSERT succeeds without error");
+
+        // Verify the attack string is stored as data, not executed
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM inj_test WHERE id = 1"), eng);
+        check(sel.rows.size() == 1 && sel.rows[0].values[1].find("DROP TABLE") != std::string::npos,
+              "PrepStmt #18: attack string stored as literal data, table still exists");
+    }
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+        auto cmd = p.parse("CREATE TABLE inj2 (id INT, name TEXT)");
+        eng.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+
+        // UNION injection via bound params
+        std::string attack = "1 UNION SELECT * FROM inj2 --";
+        std::string safeSql = bindParams("INSERT INTO inj2 VALUES (?, ?)",
+                                         {"1", attack});
+        milansql::dispatch(p.parse(safeSql), eng);
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM inj2"), eng);
+        check(sel.rows.size() == 1 && sel.rows[0].values[1].find("UNION") != std::string::npos,
+              "PrepStmt #19: UNION attack stored as string, not executed");
+    }
+
+    // ── 6. No params = no change ────────────────────────────
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = '?'", {});
+        check(r == "SELECT * FROM t WHERE x = '?'",
+              "PrepStmt #20: empty params → SQL unchanged");
+    }
+}
+
+// ── testGroup80: Injection Hardening Edge Cases (20 Tests) ───
+// Phase C Härtung: NULL-Bytes, Backslash, Unicode, numerischer
+// Kontext, gemischte Typen (1057 → 1077)
+
+static void testGroup80() {
+    std::cout << "\n── testGroup80: Injection Hardening Edge Cases ──\n";
+    using namespace bind_test;
+
+    // ── 1. NULL-Byte Injection ──────────────────────────────
+    // \x00 inside a param must not break quoting or truncate the string
+    {
+        std::string attack = std::string("alice\x00' OR '1'='1", 18);
+        auto r = bindParams("SELECT * FROM t WHERE name = ?", {attack});
+        // The null byte is inside quotes, quotes are escaped
+        check(r.front() != '\'' || r.find("SELECT") == 0,
+              "NullByte #1: null byte param doesn't break SQL structure");
+        // Must start with SELECT, end with closing quote
+        check(r.substr(0, 6) == "SELECT" && r.back() == '\'',
+              "NullByte #2: query starts with SELECT, ends with quote");
+    }
+    {
+        // NULL-byte before closing quote attempt
+        std::string attack = std::string("x\x00", 2);
+        auto r = bindParams("SELECT ? FROM t", {attack});
+        check(r.find("SELECT '") == 0, "NullByte #3: null byte param still wrapped in quotes");
+    }
+    {
+        // End-to-end: NULL-byte injected into engine
+        milansql::Engine eng;
+        milansql::Parser p;
+        eng.createTable("nb_test",
+            {milansql::Column("id","INT"), milansql::Column("val","TEXT")}, {});
+        std::string attack = std::string("safe\x00'; DROP TABLE nb_test;--", 25);
+        std::string sql = bindParams("INSERT INTO nb_test VALUES (?, ?)", {"1", attack});
+        milansql::dispatch(p.parse(sql), eng);
+        // Table must still exist
+        check(eng.tableExists("nb_test"), "NullByte #4: table survives null-byte injection");
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM nb_test"), eng);
+        check(sel.rows.size() == 1, "NullByte #5: exactly 1 row inserted (not executed as SQL)");
+    }
+
+    // ── 2. Backslash-Quote Interaction ──────────────────────
+    // MySQL-style: \' should NOT escape the quote in our system
+    // (we use SQL-standard '' escaping, not backslash escaping)
+    {
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"\\"});
+        // A single backslash becomes: '\'  (backslash is not special)
+        check(r == "SELECT * FROM t WHERE x = '\\'",
+              "Backslash #6: single \\ → '\\' (not special)");
+    }
+    {
+        // Backslash before quote: \'  — attacker hopes this escapes the closing '
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"\\'"});
+        // Must become: '\'' — the ' is doubled, backslash stays
+        check(r == "SELECT * FROM t WHERE x = '\\'''",
+              "Backslash #7: \\' → '\\''' (quote doubled, not escaped by backslash)");
+    }
+    {
+        // Double backslash: \\ — backslash is NOT special in our escaping
+        auto r = bindParams("SELECT * FROM t WHERE x = ?", {"\\\\"});
+        check(r == "SELECT * FROM t WHERE x = '\\\\'",
+              "Backslash #8: \\\\ → '\\\\' (backslash not special, preserved as-is)");
+    }
+    {
+        // End-to-end: backslash injection
+        milansql::Engine eng;
+        milansql::Parser p;
+        eng.createTable("bs_test",
+            {milansql::Column("id","INT"), milansql::Column("val","TEXT")}, {});
+        std::string sql = bindParams("INSERT INTO bs_test VALUES (?, ?)",
+                                     {"1", "\\'; DROP TABLE bs_test;--"});
+        try { milansql::dispatch(p.parse(sql), eng); } catch (...) {}
+        check(eng.tableExists("bs_test"),
+              "Backslash #9: table survives backslash-quote injection");
+    }
+
+    // ── 3. Unicode / Multibyte ──────────────────────────────
+    {
+        // UTF-8 multibyte chars that contain 0x27 (') byte — actually
+        // valid UTF-8 never contains 0x27 except as ASCII ', but test
+        // that multi-byte sequences pass through safely
+        auto r = bindParams("SELECT * FROM t WHERE name = ?", {"Ünïcödé"});
+        check(r == "SELECT * FROM t WHERE name = 'Ünïcödé'",
+              "Unicode #10: UTF-8 multibyte preserved in quotes");
+    }
+    {
+        // High-byte chars (umlauts, accents) — must not break quoting
+        auto r = bindParams("INSERT INTO t VALUES (?)", {"Stra\xc3\x9fe caf\xc3\xa9"});
+        check(r.find("INSERT") == 0 && r.substr(r.size()-2) == "')",
+              "Unicode #11: high-byte UTF-8 preserved, quoting intact");
+    }
+    {
+        // CJK + quote inside
+        auto r = bindParams("SELECT ? AS v", {"日本語'テスト"});
+        check(r == "SELECT '日本語''テスト' AS v",
+              "Unicode #12: CJK with embedded quote escaped");
+    }
+
+    // ── 4. Numerischer Kontext ──────────────────────────────
+    // WHERE id = ? with non-numeric param — bound as string, won't match int
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+        eng.createTable("num_test",
+            {milansql::Column("id","INT"), milansql::Column("name","TEXT")}, {});
+        milansql::dispatch(p.parse("INSERT INTO num_test VALUES (1, 'alice')"), eng);
+        milansql::dispatch(p.parse("INSERT INTO num_test VALUES (2, 'bob')"), eng);
+
+        // Attack: "1 OR 1=1" as param for numeric column
+        std::string sql = bindParams("SELECT * FROM num_test WHERE id = ?",
+                                     {"1 OR 1=1"});
+        check(sql == "SELECT * FROM num_test WHERE id = '1 OR 1=1'",
+              "NumCtx #13: '1 OR 1=1' bound as quoted string, not raw SQL");
+
+        // Execute it — should match 0 rows (no id equals the string "1 OR 1=1")
+        auto sel = milansql::dispatch(p.parse(sql), eng);
+        check(sel.rows.empty(),
+              "NumCtx #14: '1 OR 1=1' matches 0 rows (not both rows!)");
+    }
+    {
+        // Negative number edge case
+        auto r = bindParams("SELECT * FROM t WHERE id = ?", {"-1"});
+        check(r == "SELECT * FROM t WHERE id = '-1'",
+              "NumCtx #15: negative number still quoted as string");
+    }
+    {
+        // Float with trailing SQL
+        auto r = bindParams("SELECT * FROM t WHERE val > ?", {"3.14; DELETE FROM t"});
+        check(r == "SELECT * FROM t WHERE val > '3.14; DELETE FROM t'",
+              "NumCtx #16: float + SQL injection safely quoted");
+    }
+
+    // ── 5. Gemischte Typen / Edge Cases ─────────────────────
+    {
+        // More params than ? placeholders — extras silently ignored
+        auto r = bindParams("SELECT ?", {"a", "b", "c"});
+        check(r == "SELECT 'a'", "Mixed #17: extra params silently ignored");
+    }
+    {
+        // Fewer params than ? — remaining ? left as-is
+        auto r = bindParams("SELECT ?, ?, ?", {"only_one"});
+        check(r == "SELECT 'only_one', ?, ?",
+              "Mixed #18: unbound ? left as-is (engine will error)");
+    }
+    {
+        // JSON extraction round-trip: param with JSON special chars
+        auto p = extractParamsFromJson(
+            R"({"sql":"?","params":["he said \"hello\"","line1\nline2","\t\ttabs"]})");
+        check(p.size() == 3 &&
+              p[0] == "he said \"hello\"" && p[1] == "line1\nline2" && p[2] == "\t\ttabs",
+              "Mixed #19: JSON escaped chars correctly unescaped in params");
+    }
+    {
+        // Mega-combo: multiple injections in one query
+        milansql::Engine eng;
+        milansql::Parser p;
+        eng.createTable("combo",
+            {milansql::Column("a","TEXT"), milansql::Column("b","TEXT"),
+             milansql::Column("c","TEXT")}, {});
+        std::string sql = bindParams(
+            "INSERT INTO combo VALUES (?, ?, ?)",
+            {"' OR 1=1 --", "'; DROP TABLE combo;--", "1 UNION SELECT * FROM combo"});
+        milansql::dispatch(p.parse(sql), eng);
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM combo"), eng);
+        check(eng.tableExists("combo") && sel.rows.size() == 1 &&
+              sel.rows[0].values[0].find("OR 1=1") != std::string::npos &&
+              sel.rows[0].values[1].find("DROP TABLE") != std::string::npos &&
+              sel.rows[0].values[2].find("UNION SELECT") != std::string::npos,
+              "Mixed #20: triple injection stored as harmless data, table intact");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -7634,6 +8019,12 @@ int main() {
     }
     try { testGroup78(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 78 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup79(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 79 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup80(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 80 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

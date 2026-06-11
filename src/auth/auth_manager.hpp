@@ -18,6 +18,7 @@
 #include <random>
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 
 // ── SHA-256 (pure C++, NIST FIPS 180-4) ─────────────────────
 
@@ -271,8 +272,8 @@ public:
 
     void init(const std::string& jwtSecret = "") {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (!jwtSecret.empty()) jwtSecret_ = jwtSecret;
-        else jwtSecret_ = generateRandom(32);
+        if (!jwtSecret.empty()) jwtSecret_ = jwtSecret;  // tests / explicit
+        else resolveJwtSecret();  // production: env → file → legacy → generate
 
         // Create root user if none exist
         if (users_.empty()) {
@@ -626,8 +627,8 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         std::ofstream f(path);
         if (!f) return;
-        f << "# MilanSQL Auth v2\n";
-        f << "[secret]\n" << jwtSecret_ << "\n";
+        f << "# MilanSQL Auth v3\n";
+        // JWT secret no longer stored here — see /etc/milansql/jwt.secret
         f << "[users]\n";
         for (const auto& [id, u] : users_) {
             f << u.id << "\t" << u.username << "\t" << u.email << "\t"
@@ -660,7 +661,7 @@ public:
         while (std::getline(f, line)) {
             if (line.empty() || line[0]=='#') continue;
             if (line[0]=='[') { section=line; continue; }
-            if (section=="[secret]") { jwtSecret_=line; continue; }
+            if (section=="[secret]") { legacySecret_=line; continue; }  // migration path
             if (section=="[users]") {
                 auto parts = splitTab(line);
                 if (parts.size() < 7) continue;
@@ -822,6 +823,8 @@ private:
     std::vector<Permission> permissions_;
     std::map<int, TenantQuota> quotas_;
     std::string jwtSecret_;
+    std::string legacySecret_;   // read from [secret] in auth file during migration
+    std::string jwtSecretPath_;  // resolved path to jwt.secret file
     int nextId_ = 1;
     mutable std::mutex mutex_;
 
@@ -844,6 +847,64 @@ private:
         }
         return out;
     }
+    // ── JWT Secret Resolution ─────────────────────────────────
+    // Priority: 1) env MILANSQL_JWT_SECRET  2) file jwt.secret  3) legacy from auth-file  4) generate
+    void resolveJwtSecret() {
+        // 1. Environment variable
+        const char* envSecret = std::getenv("MILANSQL_JWT_SECRET");
+        if (envSecret && std::string(envSecret).size() > 0) {
+            jwtSecret_ = envSecret;
+            return;
+        }
+
+        // Determine secret file path
+#ifdef _WIN32
+        jwtSecretPath_ = "jwt.secret";  // local fallback on Windows
+#else
+        jwtSecretPath_ = "/etc/milansql/jwt.secret";
+#endif
+
+        // 2. Read from secret file
+        {
+            std::ifstream f(jwtSecretPath_);
+            if (f) {
+                std::string s;
+                if (std::getline(f, s) && !s.empty()) {
+                    jwtSecret_ = s;
+                    return;
+                }
+            }
+        }
+
+        // 3. Migrate legacy secret from auth-file
+        if (!legacySecret_.empty()) {
+            jwtSecret_ = legacySecret_;
+            writeJwtSecretFile(jwtSecret_);
+            return;
+        }
+
+        // 4. Generate new secret
+        jwtSecret_ = generateRandom(32);
+        writeJwtSecretFile(jwtSecret_);
+    }
+
+    void writeJwtSecretFile(const std::string& secret) {
+        if (jwtSecretPath_.empty()) return;
+#ifndef _WIN32
+        // Ensure directory exists
+        std::system("mkdir -p /etc/milansql 2>/dev/null");
+#endif
+        std::ofstream f(jwtSecretPath_);
+        if (f) {
+            f << secret << "\n";
+            f.close();
+#ifndef _WIN32
+            // chmod 600 — owner read/write only
+            std::system(("chmod 600 " + jwtSecretPath_).c_str());
+#endif
+        }
+    }
+
     // Returns {matches, needsMigration}
     static std::pair<bool,bool> checkPasswordEx(const std::string& password,
                                                  const std::string& storedHash) {

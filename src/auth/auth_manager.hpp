@@ -126,6 +126,36 @@ static std::string hmacSha256Hex(const std::string& key, const std::string& msg)
     return SHA256Impl::hexStr(hmacSha256Bytes(key, msg));
 }
 
+// ── PBKDF2-HMAC-SHA256 (RFC 8018) ────────────────────────────
+// Uses existing hmacSha256Bytes. Output: 32 bytes (one SHA-256 block).
+static constexpr int PBKDF2_ITERATIONS = 250000;  // tuned for ~300-500ms on production server
+
+static std::vector<uint8_t> pbkdf2HmacSha256(const std::string& password,
+                                               const std::string& salt,
+                                               int iterations) {
+    // For 32-byte output we only need block_index = 1
+    // U1 = HMAC(password, salt || INT32_BE(1))
+    std::string saltBlock = salt;
+    saltBlock += '\0'; saltBlock += '\0'; saltBlock += '\0'; saltBlock += '\1';
+
+    auto U = hmacSha256Bytes(password, saltBlock);
+    auto result = U;  // T = U1
+
+    for (int i = 1; i < iterations; ++i) {
+        std::string prev(U.begin(), U.end());
+        U = hmacSha256Bytes(password, prev);
+        for (size_t j = 0; j < 32; ++j) result[j] ^= U[j];
+    }
+    return result;
+}
+
+// Hash a password with PBKDF2. Format: "pbkdf2$<iterations>$<salt_hex>$<hash_hex>"
+static std::string hashPasswordPbkdf2(const std::string& password, const std::string& saltHex) {
+    // Convert hex salt to raw bytes for PBKDF2 input
+    auto dk = pbkdf2HmacSha256(password, saltHex, PBKDF2_ITERATIONS);
+    return "pbkdf2$" + std::to_string(PBKDF2_ITERATIONS) + "$" + saltHex + "$" + SHA256Impl::hexStr(dk);
+}
+
 // ── Base64URL ─────────────────────────────────────────────────
 
 static std::string base64urlEncode(const std::string& input) {
@@ -253,7 +283,7 @@ public:
             root.isActive = true;
             root.createdAt = nowStr();
             std::string salt = generateRandom(32);
-            root.passwordHash = salt + ":" + SHA256Impl::hashHex(salt + "root");
+            root.passwordHash = hashPasswordPbkdf2("root", salt);
             users_[root.id] = root;
             nameIndex_["root"] = root.id;
         }
@@ -277,7 +307,7 @@ public:
         u.isActive = true;
         u.createdAt = nowStr();
         std::string salt = generateRandom(32);
-        u.passwordHash = salt + ":" + SHA256Impl::hashHex(salt + password);
+        u.passwordHash = hashPasswordPbkdf2(password, salt);
         users_[u.id] = u;
         nameIndex_[username] = u.id;
 
@@ -291,8 +321,13 @@ public:
         if (it == nameIndex_.end()) return {false,"","",0,"Invalid username or password"};
         auto& u = users_[it->second];
         if (!u.isActive) return {false,"","",0,"Account disabled"};
-        if (!checkPassword(password, u.passwordHash))
-            return {false,"","",0,"Invalid username or password"};
+        auto [ok, needsMigration] = checkPasswordEx(password, u.passwordHash);
+        if (!ok) return {false,"","",0,"Invalid username or password"};
+        // Transparent migration: rehash legacy SHA-256 to PBKDF2
+        if (needsMigration) {
+            std::string salt = generateRandom(32);
+            u.passwordHash = hashPasswordPbkdf2(password, salt);
+        }
         u.lastLogin = nowStr();
         auto [tok, ref] = makeTokens(u.id, u.username, u.role);
         return {true, tok, ref, u.id, ""};
@@ -664,6 +699,9 @@ public:
 
     // Public wrappers for testing
     static std::string sha256Hex_pub(const std::string& s) { return SHA256Impl::hashHex(s); }
+    static std::pair<bool,bool> checkPasswordExPublic(const std::string& pw, const std::string& h) {
+        return checkPasswordEx(pw, h);
+    }
     static std::string base64urlEncode_pub(const std::string& s) { return base64urlEncode(s); }
     static std::string base64urlDecode_pub(const std::string& s) { return base64urlDecode(s); }
 
@@ -768,12 +806,33 @@ private:
         }
         return out;
     }
-    static bool checkPassword(const std::string& password, const std::string& storedHash) {
+    // Returns {matches, needsMigration}
+    static std::pair<bool,bool> checkPasswordEx(const std::string& password,
+                                                 const std::string& storedHash) {
+        if (storedHash.substr(0, 7) == "pbkdf2$") {
+            // PBKDF2 format: "pbkdf2$<iterations>$<salt>$<hash>"
+            size_t d1 = storedHash.find('$');         // after "pbkdf2"
+            size_t d2 = storedHash.find('$', d1+1);   // after iterations
+            size_t d3 = storedHash.find('$', d2+1);   // after salt
+            if (d2 == std::string::npos || d3 == std::string::npos)
+                return {false, false};
+            int iters = std::stoi(storedHash.substr(d1+1, d2-d1-1));
+            std::string salt = storedHash.substr(d2+1, d3-d2-1);
+            std::string expected = storedHash.substr(d3+1);
+            auto dk = pbkdf2HmacSha256(password, salt, iters);
+            return {SHA256Impl::hexStr(dk) == expected, false};
+        }
+        // Legacy format: "salt:sha256hash"
         size_t colon = storedHash.find(':');
-        if (colon == std::string::npos) return false;
+        if (colon == std::string::npos) return {false, false};
         std::string salt = storedHash.substr(0, colon);
         std::string expected = storedHash.substr(colon+1);
-        return SHA256Impl::hashHex(salt + password) == expected;
+        bool ok = SHA256Impl::hashHex(salt + password) == expected;
+        return {ok, ok};  // if matched, needs migration to PBKDF2
+    }
+    // Legacy compat wrapper
+    static bool checkPassword(const std::string& password, const std::string& storedHash) {
+        return checkPasswordEx(password, storedHash).first;
     }
     std::pair<std::string,std::string> makeTokens(int uid, const std::string& uname, const std::string& role) {
         std::string tok = encodeJWT(uid, uname, role);

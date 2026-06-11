@@ -3271,6 +3271,57 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "Set-Cookie: milansql_token=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax\r\n";
         return buildHttpResponse(200, result, "application/json", clearCookie);
     }
+    if (req.path == "/auth/change-password" && req.method == "POST") {
+        std::string token = extractBearerToken(req);
+        auto vr = authMgr_.validateToken(token);
+        if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
+        // Parse old_password, new_password from body
+        auto getField = [&](const std::string& field) -> std::string {
+            auto pos = req.body.find("\"" + field + "\"");
+            if (pos == std::string::npos) return "";
+            pos = req.body.find(':', pos);
+            if (pos == std::string::npos) return "";
+            pos = req.body.find('"', pos + 1);
+            if (pos == std::string::npos) return "";
+            auto end = req.body.find('"', pos + 1);
+            return (end != std::string::npos) ? req.body.substr(pos + 1, end - pos - 1) : "";
+        };
+        std::string oldPw = getField("old_password");
+        std::string newPw = getField("new_password");
+        if (oldPw.empty() || newPw.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"old_password and new_password required"})");
+        auto result = authMgr_.changePassword(vr.userId, oldPw, newPw);
+        if (!result.ok)
+            return buildHttpResponse(400, R"({"success":false,"error":")" + result.error + R"("})");
+        return buildHttpResponse(200, R"({"success":true,"message":"Password changed"})");
+    }
+    if (req.path == "/auth/admin/set-password" && req.method == "POST") {
+        std::string token = extractBearerToken(req);
+        auto vr = authMgr_.validateToken(token);
+        if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
+        auto getField = [&](const std::string& field) -> std::string {
+            auto pos = req.body.find("\"" + field + "\"");
+            if (pos == std::string::npos) return "";
+            pos = req.body.find(':', pos);
+            if (pos == std::string::npos) return "";
+            pos = req.body.find('"', pos + 1);
+            if (pos == std::string::npos) return "";
+            auto end = req.body.find('"', pos + 1);
+            return (end != std::string::npos) ? req.body.substr(pos + 1, end - pos - 1) : "";
+        };
+        std::string targetUser = getField("username");
+        std::string newPw = getField("new_password");
+        if (targetUser.empty() || newPw.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"username and new_password required"})");
+        // Look up target user ID
+        int targetId = authMgr_.getUserIdByName(targetUser);
+        if (targetId < 0)
+            return buildHttpResponse(404, R"({"success":false,"error":"User not found"})");
+        auto result = authMgr_.adminSetPassword(vr.userId, targetId, newPw);
+        if (!result.ok)
+            return buildHttpResponse(403, R"({"success":false,"error":")" + result.error + R"("})");
+        return buildHttpResponse(200, R"({"success":true,"message":"Password updated for )" + targetUser + R"("})");
+    }
     if (req.path == "/auth/me" && req.method == "GET")
         return buildHttpResponse(200, handleAuthMe(extractBearerToken(req)));
     if (req.path == "/auth/refresh" && req.method == "POST")

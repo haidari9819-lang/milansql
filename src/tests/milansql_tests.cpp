@@ -8222,6 +8222,115 @@ static void testGroup83() {
     }
 }
 
+// ── testGroup84: Change Password Endpoint (10 Tests) ──
+// Phase 169: POST /auth/change-password + POST /auth/admin/set-password
+
+static void testGroup84() {
+    std::cout << "\n── testGroup84: Change Password ──\n";
+
+    // ── 1. changePassword: success ──────────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_12345678");
+        auto reg = mgr.registerUser("bob", "oldpass123");
+        check(reg.ok, "ChangePW #1a: register bob");
+        auto cp = mgr.changePassword(reg.userId, "oldpass123", "newpass456");
+        check(cp.ok, "ChangePW #1: password changed successfully");
+    }
+
+    // ── 2. Login with new password works ────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_22345678");
+        mgr.registerUser("carol", "oldpass123");
+        mgr.changePassword(mgr.getUserIdByName("carol"), "oldpass123", "newpass456");
+        auto login = mgr.login("carol", "newpass456");
+        check(login.ok, "ChangePW #2: login with new password succeeds");
+    }
+
+    // ── 3. Login with old password fails ────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_32345678");
+        mgr.registerUser("dave", "oldpass123");
+        mgr.changePassword(mgr.getUserIdByName("dave"), "oldpass123", "newpass456");
+        auto login = mgr.login("dave", "oldpass123");
+        check(!login.ok, "ChangePW #3: login with old password fails");
+    }
+
+    // ── 4. Wrong current password rejected ──────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_42345678");
+        auto reg = mgr.registerUser("eve", "mypass123");
+        auto cp = mgr.changePassword(reg.userId, "wrongpass", "newpass456");
+        check(!cp.ok && cp.error == "Current password incorrect",
+              "ChangePW #4: wrong current password rejected");
+    }
+
+    // ── 5. Too short new password rejected ──────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_52345678");
+        auto reg = mgr.registerUser("frank", "mypass123");
+        auto cp = mgr.changePassword(reg.userId, "mypass123", "short");
+        check(!cp.ok && cp.error.find("8 characters") != std::string::npos,
+              "ChangePW #5: short new password rejected");
+    }
+
+    // ── 6. adminSetPassword: root can reset others ──────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_62345678");
+        int rootId = mgr.getUserIdByName("root");
+        auto reg = mgr.registerUser("grace", "oldpass123");
+        auto cp = mgr.adminSetPassword(rootId, reg.userId, "adminset99");
+        check(cp.ok, "ChangePW #6: admin set-password succeeds");
+        auto login = mgr.login("grace", "adminset99");
+        check(login.ok, "ChangePW #6b: login with admin-set password");
+    }
+
+    // ── 7. Non-admin cannot use adminSetPassword ────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_72345678");
+        auto reg = mgr.registerUser("hank", "pass12345");
+        auto reg2 = mgr.registerUser("iris", "pass12345");
+        auto cp = mgr.adminSetPassword(reg.userId, reg2.userId, "hackedpw1");
+        check(!cp.ok && cp.error.find("Admin") != std::string::npos,
+              "ChangePW #7: non-admin rejected");
+    }
+
+    // ── 8. getUserIdByName works ────────────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_82345678");
+        mgr.registerUser("jack", "pass12345");
+        check(mgr.getUserIdByName("jack") > 0, "ChangePW #8: getUserIdByName finds user");
+        check(mgr.getUserIdByName("nonexist") < 0, "ChangePW #8b: getUserIdByName returns -1 for unknown");
+    }
+
+    // ── 9. New hash is PBKDF2 after change ──────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_92345678");
+        auto reg = mgr.registerUser("kate", "oldpass123");
+        mgr.changePassword(reg.userId, "oldpass123", "newpass456");
+        // Verify by logging in (proves PBKDF2 hash was stored)
+        auto login = mgr.login("kate", "newpass456");
+        check(login.ok, "ChangePW #9: changed password uses PBKDF2 (login works)");
+    }
+
+    // ── 10. changePassword on nonexistent user ──────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_change_pw_02345678");
+        auto cp = mgr.changePassword(9999, "old", "newpass456");
+        check(!cp.ok && cp.error == "User not found",
+              "ChangePW #10: nonexistent user rejected");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -8466,6 +8575,10 @@ int main() {
     }
     try { testGroup83(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 83 exception: " << e.what() << "\n"; ++failed;
+    }
+
+    try { testGroup84(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 84 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

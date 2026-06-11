@@ -820,7 +820,9 @@ private:
             std::string salt = storedHash.substr(d2+1, d3-d2-1);
             std::string expected = storedHash.substr(d3+1);
             auto dk = pbkdf2HmacSha256(password, salt, iters);
-            return {SHA256Impl::hexStr(dk) == expected, false};
+            bool matches = SHA256Impl::hexStr(dk) == expected;
+            // Migrate if stored iterations differ from current target
+            return {matches, matches && iters != PBKDF2_ITERATIONS};
         }
         // Legacy format: "salt:sha256hash"
         size_t colon = storedHash.find(':');

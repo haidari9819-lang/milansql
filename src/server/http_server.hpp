@@ -218,6 +218,126 @@ static std::string extractSqlFromJson(const std::string& json) {
     return sql;
 }
 
+// ── Phase C: Extract "params" array from JSON body ───────────
+// Returns vector of string values from {"params":["a","b",123,null,...]}
+static std::vector<std::string> extractParamsFromJson(const std::string& json) {
+    std::vector<std::string> params;
+    auto pos = json.find("\"params\"");
+    if (pos == std::string::npos) return params;
+    pos = json.find('[', pos);
+    if (pos == std::string::npos) return params;
+    ++pos; // skip '['
+
+    while (pos < json.size()) {
+        // skip whitespace
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' ||
+               json[pos] == '\n' || json[pos] == '\r')) ++pos;
+        if (pos >= json.size() || json[pos] == ']') break;
+
+        if (json[pos] == '"') {
+            // String value — parse with JSON unescaping
+            ++pos;
+            std::string val;
+            while (pos < json.size() && json[pos] != '"') {
+                if (json[pos] == '\\' && pos + 1 < json.size()) {
+                    char next = json[pos + 1];
+                    if      (next == '"')  val += '"';
+                    else if (next == '\\') val += '\\';
+                    else if (next == 'n')  val += '\n';
+                    else if (next == 'r')  val += '\r';
+                    else if (next == 't')  val += '\t';
+                    else if (next == '/')  val += '/';
+                    else val += next;
+                    pos += 2;
+                } else {
+                    val += json[pos++];
+                }
+            }
+            if (pos < json.size()) ++pos; // skip closing '"'
+            params.push_back(val);
+        } else if (json[pos] == 'n' && pos + 3 < json.size() &&
+                   json.substr(pos, 4) == "null") {
+            params.push_back("NULL");
+            pos += 4;
+        } else if (json[pos] == 't' && pos + 3 < json.size() &&
+                   json.substr(pos, 4) == "true") {
+            params.push_back("TRUE");
+            pos += 4;
+        } else if (json[pos] == 'f' && pos + 4 < json.size() &&
+                   json.substr(pos, 5) == "false") {
+            params.push_back("FALSE");
+            pos += 5;
+        } else if (json[pos] == '-' || (json[pos] >= '0' && json[pos] <= '9')) {
+            // Number
+            std::string num;
+            while (pos < json.size() && json[pos] != ',' && json[pos] != ']' &&
+                   json[pos] != ' ' && json[pos] != '\n') {
+                num += json[pos++];
+            }
+            params.push_back(num);
+        } else {
+            ++pos; // skip unexpected chars
+            continue;
+        }
+        // skip comma
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ',' ||
+               json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) ++pos;
+    }
+    return params;
+}
+
+// ── Phase C: Safe parameter binding ──────────────────────────
+// Replaces ? placeholders with safely escaped literal values.
+// Parameters are NEVER parsed as SQL — they become quoted string
+// literals or numeric literals only.
+static std::string bindParams(const std::string& sql,
+                              const std::vector<std::string>& params) {
+    if (params.empty()) return sql;
+    std::string result;
+    result.reserve(sql.size() + params.size() * 16);
+    size_t paramIdx = 0;
+    bool inString = false;
+    char strChar = 0;
+
+    for (size_t i = 0; i < sql.size(); ++i) {
+        char c = sql[i];
+
+        // Track string literals — don't replace ? inside strings
+        if (!inString && (c == '\'' || c == '"')) {
+            inString = true;
+            strChar = c;
+            result += c;
+        } else if (inString && c == strChar) {
+            // Check for escaped quote ('')
+            if (c == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
+                result += "''";
+                ++i;
+            } else {
+                inString = false;
+                result += c;
+            }
+        } else if (!inString && c == '?' && paramIdx < params.size()) {
+            // Replace ? with safe literal
+            const auto& val = params[paramIdx++];
+            if (val == "NULL") {
+                result += "NULL";
+            } else {
+                // Always quote as string — SQL engine will cast as needed.
+                // This ensures the value can NEVER be interpreted as SQL syntax.
+                result += '\'';
+                for (char v : val) {
+                    if (v == '\'') result += "''";  // escape single quote
+                    else result += v;
+                }
+                result += '\'';
+            }
+        } else {
+            result += c;
+        }
+    }
+    return result;
+}
+
 static std::string getQueryParam(const std::string& query, const std::string& key) {
     std::string search = key + "=";
     size_t pos = 0;
@@ -3101,10 +3221,22 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         }
 
         std::string sql;
+        std::vector<std::string> params;
         if (req.method == "GET") sql = getQueryParam(req.query, "sql");
-        else if (req.method == "POST") { sql = extractSqlFromJson(req.body); if (sql.empty()) sql = req.body; }
+        else if (req.method == "POST") {
+            sql = extractSqlFromJson(req.body);
+            if (sql.empty()) sql = req.body;
+            params = extractParamsFromJson(req.body);
+        }
         if (sql.empty())
             return buildHttpResponse(400, R"({"success":false,"error":"Missing SQL"})");
+
+        // Phase C: Bind parameters BEFORE any parsing/sanitization.
+        // This ensures params are treated as pure values, never as SQL syntax.
+        if (!params.empty()) {
+            sql = bindParams(sql, params);
+        }
+
         // Input sanitization: length limit + null-byte + control-char removal
         if (sql.size() > 10000)
             return buildHttpResponse(400, std::string("{\"success\":false,\"error\":\"SQL too long (max 10000 chars)\"}"));

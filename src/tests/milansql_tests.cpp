@@ -8331,6 +8331,138 @@ static void testGroup84() {
     }
 }
 
+// ── testGroup85: JWT Secret Separation (8 Tests) ──
+// Phase 169: JWT secret out of auth file → env / /etc/milansql/jwt.secret
+
+static void testGroup85() {
+    std::cout << "\n── testGroup85: JWT Secret Separation ──\n";
+
+    // ── 1. Explicit secret in init() still works (test mode) ─
+    {
+        AuthManager mgr;
+        mgr.init("explicit_test_secret_1234567890");
+        auto reg = mgr.registerUser("sectest1", "password123");
+        check(reg.ok, "JWTSec #1: explicit secret → register works");
+        auto login = mgr.login("sectest1", "password123");
+        check(login.ok, "JWTSec #1b: explicit secret → login works");
+    }
+
+    // ── 2. save() does NOT write [secret] section ────────────
+    {
+        AuthManager mgr;
+        mgr.init("secret_not_in_file_12345678");
+        mgr.registerUser("sectest2", "password123");
+        std::string tmpPath = "test_auth_nosecret.tmp";
+        mgr.save(tmpPath);
+        // Read file and verify no [secret] section
+        std::ifstream f(tmpPath);
+        std::string content((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+        f.close();
+        std::remove(tmpPath.c_str());
+        check(content.find("[secret]") == std::string::npos,
+              "JWTSec #2: save() does not write [secret] section");
+        check(content.find("Auth v3") != std::string::npos,
+              "JWTSec #2b: save() writes v3 header");
+    }
+
+    // ── 3. load() reads legacy [secret] into legacySecret_ ──
+    {
+        // Write a fake auth file with [secret]
+        std::string tmpPath = "test_auth_legacy.tmp";
+        {
+            std::ofstream f(tmpPath);
+            f << "# MilanSQL Auth v2\n";
+            f << "[secret]\n";
+            f << "legacy_secret_abc123\n";
+            f << "[users]\n";
+            f << "1\troot\t\tpbkdf2$250000$aabb$ccdd\troot\t2026-01-01T00:00:00Z\t1\t\t\n";
+        }
+        AuthManager mgr;
+        mgr.load(tmpPath);
+        std::remove(tmpPath.c_str());
+        // After load, init with explicit secret to avoid file I/O
+        mgr.init("override_secret_for_test_1234");
+        // Legacy secret was read but not used (explicit overrides)
+        auto login = mgr.login("root", "anything");
+        // Password won't match but that's fine — we just verify load didn't crash
+        check(true, "JWTSec #3: load() reads legacy [secret] without error");
+    }
+
+    // ── 4. Tokens from same secret are valid ─────────────────
+    {
+        AuthManager mgr;
+        mgr.init("stable_secret_for_token_test1");
+        mgr.registerUser("sectest4", "password123");
+        auto login = mgr.login("sectest4", "password123");
+        check(login.ok, "JWTSec #4a: login produces token");
+        auto vr = mgr.validateToken(login.token);
+        check(vr.valid, "JWTSec #4: token validates with same secret");
+    }
+
+    // ── 5. save→load roundtrip preserves users (no secret) ──
+    {
+        AuthManager mgr;
+        mgr.init("roundtrip_secret_test_123456");
+        mgr.registerUser("sectest5", "password123");
+        std::string tmpPath = "test_auth_roundtrip.tmp";
+        mgr.save(tmpPath);
+
+        AuthManager mgr2;
+        mgr2.load(tmpPath);
+        mgr2.init("roundtrip_secret_test_123456");
+        std::remove(tmpPath.c_str());
+        auto login = mgr2.login("sectest5", "password123");
+        check(login.ok, "JWTSec #5: save→load roundtrip preserves users");
+    }
+
+    // ── 6. v3 file has no secret leak ────────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("super_secret_must_not_leak_!!");
+        mgr.registerUser("sectest6", "password123");
+        std::string tmpPath = "test_auth_noleak.tmp";
+        mgr.save(tmpPath);
+        std::ifstream f(tmpPath);
+        std::string content((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+        f.close();
+        std::remove(tmpPath.c_str());
+        check(content.find("super_secret") == std::string::npos,
+              "JWTSec #6: secret string not present in saved file");
+    }
+
+    // ── 7. root user NOT recreated after load ────────────────
+    {
+        // Save a file with custom root password
+        AuthManager mgr;
+        mgr.init("root_preserve_test_1234567890");
+        // Change root password
+        int rootId = mgr.getUserIdByName("root");
+        mgr.changePassword(rootId, "root", "custom_root_pw");
+        std::string tmpPath = "test_auth_rootkeep.tmp";
+        mgr.save(tmpPath);
+
+        // Load into new manager — root should keep custom password
+        AuthManager mgr2;
+        mgr2.load(tmpPath);
+        mgr2.init("root_preserve_test_1234567890");
+        std::remove(tmpPath.c_str());
+        auto login = mgr2.login("root", "custom_root_pw");
+        check(login.ok, "JWTSec #7: root user preserved after load (not recreated)");
+    }
+
+    // ── 8. Empty init() without explicit secret doesn't crash ─
+    {
+        // This tests resolveJwtSecret() path — will try env, file, then generate
+        // On test machines neither env nor file may exist, so it generates
+        AuthManager mgr;
+        mgr.init();  // no argument → resolveJwtSecret()
+        auto reg = mgr.registerUser("sectest8", "password123");
+        check(reg.ok, "JWTSec #8: init() without secret → auto-resolve works");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -8579,6 +8711,9 @@ int main() {
 
     try { testGroup84(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 84 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup85(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 85 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -680,13 +680,10 @@ inline void MilanHttpServer::initEngine() {
         }
     }
 
-    // Phase 154: Init auth system
-    {
-        const char* envSecret = std::getenv("MILANSQL_JWT_SECRET");
-        std::string secret = envSecret ? envSecret : "";
-        authMgr_.init(secret);
-        authMgr_.load(dbPath_ + ".auth");
-    }
+    // Phase 154/169: Init auth system
+    // Load first (reads legacy secret + users), then init (resolves JWT secret)
+    authMgr_.load(dbPath_ + ".auth");
+    authMgr_.init();  // resolves secret: env → file → legacy → generate
 }
 
 // ── Auth helpers ─────────────────────────────────────────────

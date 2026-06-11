@@ -7989,6 +7989,234 @@ static void testGroup81() {
     }
 }
 
+// ── testGroup82: Idempotent Backup/Restore + Clean Mode (10 Tests) ──
+// Phase 168b: DROP TABLE IF EXISTS in dump, clean restore (1097 → 1107)
+
+static void testGroup82() {
+    std::cout << "\n── testGroup82: Idempotent Backup + Clean Restore ──\n";
+    using namespace restore_test;
+
+    // ── 1. DROP TABLE IF EXISTS in dump is parseable ────────
+    {
+        std::string dump =
+            "DROP TABLE IF EXISTS mytbl;\n"
+            "CREATE TABLE mytbl (id INT, name TEXT);\n"
+            "INSERT INTO mytbl VALUES (1, 'alice');\n";
+        auto stmts = splitSqlStatements(dump);
+        check(stmts.size() == 3 && stmts[0].find("DROP TABLE") == 0,
+              "Idempotent #1: DROP TABLE IF EXISTS splits as own statement");
+    }
+
+    // ── 2. Idempotent dump on non-empty DB ──────────────────
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+
+        // Create initial data
+        eng.createTable("idem1",
+            {milansql::Column("id","INT"), milansql::Column("val","TEXT")}, {});
+        milansql::dispatch(p.parse("INSERT INTO idem1 VALUES (1, 'old')"), eng);
+
+        // Simulate backup dump (with DROP TABLE IF EXISTS, like real backup now produces)
+        std::string dump =
+            "-- MilanSQL Backup\n"
+            "DROP TABLE IF EXISTS idem1;\n"
+            "CREATE TABLE idem1 (\n"
+            "  id INT,\n"
+            "  val TEXT\n"
+            ");\n"
+            "INSERT INTO idem1 VALUES (1, 'new');\n"
+            "INSERT INTO idem1 VALUES (2, 'fresh');\n";
+
+        // Restore onto non-empty DB — should succeed because dump has DROP
+        auto stmts = splitSqlStatements(dump);
+        check(stmts.size() == 4, "Idempotent #2: dump = 1 DROP + 1 CREATE + 2 INSERT");
+
+        int ok = 0;
+        for (const auto& sql : stmts) {
+            try { milansql::dispatch(p.parse(sql), eng); ++ok; } catch (...) {}
+        }
+        check(ok == 4, "Idempotent #3: all 4 statements succeed on non-empty DB");
+
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM idem1"), eng);
+        check(sel.rows.size() == 2 && sel.rows[0].values[1] == "new",
+              "Idempotent #4: old data replaced, new data present");
+    }
+
+    // ── 3. Double-restore: same dump applied twice ──────────
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+
+        std::string dump =
+            "DROP TABLE IF EXISTS dr_test;\n"
+            "CREATE TABLE dr_test (id INT, name TEXT);\n"
+            "INSERT INTO dr_test VALUES (1, 'first');\n";
+
+        // Apply dump twice
+        for (int round = 0; round < 2; ++round) {
+            auto stmts = splitSqlStatements(dump);
+            for (const auto& sql : stmts)
+                milansql::dispatch(p.parse(sql), eng);
+        }
+
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM dr_test"), eng);
+        check(sel.rows.size() == 1 && sel.rows[0].values[1] == "first",
+              "Idempotent #5: double-restore produces exactly 1 row (idempotent)");
+    }
+
+    // ── 4. Clean mode: drop before CREATE (without DROP in dump) ──
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+
+        // Pre-existing data
+        eng.createTable("cl_test",
+            {milansql::Column("id","INT"), milansql::Column("val","TEXT")}, {});
+        milansql::dispatch(p.parse("INSERT INTO cl_test VALUES (1, 'stale')"), eng);
+        milansql::dispatch(p.parse("INSERT INTO cl_test VALUES (2, 'old')"), eng);
+
+        // Dump WITHOUT DROP (old-style or user-created dump)
+        std::string dump =
+            "CREATE TABLE cl_test (\n"
+            "  id INT,\n"
+            "  val TEXT\n"
+            ");\n"
+            "INSERT INTO cl_test VALUES (1, 'restored');\n";
+
+        // Without clean: CREATE TABLE would fail (table exists)
+        auto stmts = splitSqlStatements(dump);
+
+        // Simulate clean mode: drop table before CREATE
+        milansql::Parser restoreP;
+        int ok = 0;
+        for (const auto& sql : stmts) {
+            auto cmd = restoreP.parse(sql);
+            if (cmd.type == milansql::CommandType::CREATE_TABLE && !cmd.tableName.empty()) {
+                // Clean: drop first
+                try { eng.dropTable(cmd.tableName); } catch (...) {}
+            }
+            try { milansql::dispatch(cmd, eng); ++ok; } catch (...) {}
+        }
+        check(ok == 2, "Idempotent #6: clean mode — both statements succeed");
+
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM cl_test"), eng);
+        check(sel.rows.size() == 1 && sel.rows[0].values[1] == "restored",
+              "Idempotent #7: clean mode replaced old data with restored data");
+    }
+
+    // ── 5. Multi-table idempotent restore ───────────────────
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+
+        // Pre-existing tables
+        eng.createTable("mt1",
+            {milansql::Column("id","INT")}, {});
+        eng.createTable("mt2",
+            {milansql::Column("id","INT")}, {});
+        milansql::dispatch(p.parse("INSERT INTO mt1 VALUES (99)"), eng);
+        milansql::dispatch(p.parse("INSERT INTO mt2 VALUES (99)"), eng);
+
+        // Full dump with DROP TABLE IF EXISTS
+        std::string dump =
+            "DROP TABLE IF EXISTS mt1;\n"
+            "CREATE TABLE mt1 (id INT);\n"
+            "INSERT INTO mt1 VALUES (1);\n"
+            "INSERT INTO mt1 VALUES (2);\n"
+            "DROP TABLE IF EXISTS mt2;\n"
+            "CREATE TABLE mt2 (id INT);\n"
+            "INSERT INTO mt2 VALUES (10);\n";
+
+        auto stmts = splitSqlStatements(dump);
+        int ok = 0;
+        for (const auto& sql : stmts) {
+            try { milansql::dispatch(p.parse(sql), eng); ++ok; } catch (...) {}
+        }
+        check(ok == 7, "Idempotent #8: all 7 statements succeed on non-empty DB");
+
+        auto s1 = milansql::dispatch(p.parse("SELECT * FROM mt1"), eng);
+        auto s2 = milansql::dispatch(p.parse("SELECT * FROM mt2"), eng);
+        check(s1.rows.size() == 2 && s2.rows.size() == 1,
+              "Idempotent #9: multi-table restore correct row counts (2 + 1)");
+        check(s1.rows[0].values[0] == "1" && s2.rows[0].values[0] == "10",
+              "Idempotent #10: multi-table restore correct data values");
+    }
+}
+
+// ── testGroup83: PBKDF2 Password Hashing + Migration (10 Tests) ──
+// Phase 168c: SHA-256 → PBKDF2-HMAC-SHA256 migration (1107 → 1117)
+
+static void testGroup83() {
+    std::cout << "\n── testGroup83: PBKDF2 Password Hashing ──\n";
+
+    // ── 1. PBKDF2 function produces correct output ──────────
+    {
+        // Low iteration count for speed; just verify it produces 32 bytes and is deterministic
+        auto dk1 = pbkdf2HmacSha256("password", "salt", 1);
+        auto dk2 = pbkdf2HmacSha256("password", "salt", 1);
+        check(dk1.size() == 32 && dk1 == dk2,
+              "PBKDF2 #1: deterministic 32-byte output");
+    }
+    {
+        // Different password → different hash
+        auto dk1 = pbkdf2HmacSha256("password1", "salt", 1);
+        auto dk2 = pbkdf2HmacSha256("password2", "salt", 1);
+        check(dk1 != dk2, "PBKDF2 #2: different passwords → different hashes");
+    }
+    {
+        // Different salt → different hash
+        auto dk1 = pbkdf2HmacSha256("password", "salt1", 1);
+        auto dk2 = pbkdf2HmacSha256("password", "salt2", 1);
+        check(dk1 != dk2, "PBKDF2 #3: different salts → different hashes");
+    }
+
+    // ── 2. hashPasswordPbkdf2 format ────────────────────────
+    {
+        auto h = hashPasswordPbkdf2("test", "aabbccdd");
+        check(h.substr(0, 7) == "pbkdf2$" && h.find("$600000$") != std::string::npos &&
+              h.find("$aabbccdd$") != std::string::npos,
+              "PBKDF2 #4: hash format = pbkdf2$600000$salt$hash");
+    }
+
+    // ── 3. New registration uses PBKDF2 ─────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_key_for_testing_1234");
+        auto reg = mgr.registerUser("alice", "strongpass123");
+        check(reg.ok, "PBKDF2 #5: registration succeeds");
+        // Login with correct password
+        auto login = mgr.login("alice", "strongpass123");
+        check(login.ok, "PBKDF2 #6: login with PBKDF2 hash succeeds");
+        // Login with wrong password
+        auto bad = mgr.login("alice", "wrongpass");
+        check(!bad.ok, "PBKDF2 #7: wrong password rejected");
+    }
+
+    // ── 4. Legacy SHA-256 migration ─────────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("test_secret_for_migration_12345");
+        // Manually create a user with legacy SHA-256 hash
+        // Format: "salt:sha256hex"
+        std::string salt = "deadbeef1234";
+        std::string legacyHash = salt + ":" + SHA256Impl::hashHex(salt + "oldpass");
+        // Use internal access: register a user, then overwrite their hash
+        auto reg = mgr.registerUser("legacy_user", "temppass");
+        check(reg.ok, "PBKDF2 #8a: setup legacy user");
+        // Overwrite with legacy hash via the auth file round-trip
+        // Instead, test checkPasswordEx directly with legacy format
+        auto [ok1, migrate1] = AuthManager::checkPasswordExPublic("oldpass", legacyHash);
+        check(ok1 && migrate1, "PBKDF2 #8: legacy hash verifies + flagged for migration");
+        auto [ok2, migrate2] = AuthManager::checkPasswordExPublic("wrongpass", legacyHash);
+        check(!ok2 && !migrate2, "PBKDF2 #9: wrong password on legacy hash rejected");
+        // PBKDF2 hash does NOT flag migration
+        auto pbkdf2Hash = hashPasswordPbkdf2("mypass", "aabb1122");
+        auto [ok3, migrate3] = AuthManager::checkPasswordExPublic("mypass", pbkdf2Hash);
+        check(ok3 && !migrate3, "PBKDF2 #10: PBKDF2 hash verifies without migration flag");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -8227,6 +8455,12 @@ int main() {
     }
     try { testGroup81(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 81 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup82(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 82 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup83(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 83 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

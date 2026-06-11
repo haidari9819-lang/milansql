@@ -589,7 +589,7 @@ private:
     std::string handleAdminQuota(const std::string& token);
     std::string handleMyQuota(const std::string& token);
     std::string handleBackup(const std::string& token);  // Phase 167: SQL dump backup
-    std::string handleRestore(const std::string& token, const std::string& dump, bool dryRun);
+    std::string handleRestore(const std::string& token, const std::string& dump, bool dryRun, bool clean = false);
 
     // Helpers
     static std::string extractBearerToken(const HttpRequest& req);
@@ -1055,7 +1055,8 @@ inline std::string MilanHttpServer::handleBackup(const std::string& token) {
             const auto& cols = tbl.columns();
             const auto& fks = tbl.getForeignKeys();
 
-            // CREATE TABLE
+            // DROP + CREATE TABLE (idempotent, like mysqldump)
+            out << "DROP TABLE IF EXISTS " << fullName << ";\n";
             out << "CREATE TABLE " << fullName << " (\n";
             for (size_t i = 0; i < cols.size(); ++i) {
                 out << "  " << cols[i].name << " " << cols[i].type;
@@ -1176,7 +1177,7 @@ static std::vector<std::string> splitSqlStatements(const std::string& dump) {
 
 inline std::string MilanHttpServer::handleRestore(const std::string& token,
                                                    const std::string& dump,
-                                                   bool dryRun) {
+                                                   bool dryRun, bool clean) {
     auto v = authMgr_.validateToken(token);
     if (!v.valid || v.role != "root")
         return R"({"success":false,"error":"Access denied. Root only."})";
@@ -1186,28 +1187,51 @@ inline std::string MilanHttpServer::handleRestore(const std::string& token,
         return R"({"success":false,"error":"No SQL statements found in dump"})";
 
     int ok = 0, fail = 0;
+    int dropped = 0;
     std::string errors;
 
     if (dryRun) {
-        // Dry run: parse only, no lock needed
+        // Dry run: parse only, report what would be dropped
         milansql::Parser parser;
+        std::string wouldDrop;
         for (const auto& sql : stmts) {
-            try { parser.parse(sql); ++ok; }
-            catch (const std::exception& e) {
+            try {
+                auto cmd = parser.parse(sql);
+                if (clean && cmd.type == milansql::CommandType::CREATE_TABLE) {
+                    wouldDrop += cmd.tableName + ", ";
+                    ++dropped;
+                }
+                ++ok;
+            } catch (const std::exception& e) {
                 ++fail;
                 if (errors.size() < 2000)
                     errors += "PARSE ERROR: " + std::string(e.what()).substr(0, 100) + "\\n";
             }
         }
+        if (!wouldDrop.empty()) {
+            // Remove trailing ", "
+            wouldDrop = wouldDrop.substr(0, wouldDrop.size() - 2);
+            if (errors.size() < 2000)
+                errors += "WOULD DROP: " + wouldDrop + "\\n";
+        }
     } else {
         // Execute each statement through handleQueryForUser (root context)
-        // This reuses the full SQL execution path including persist/triggers/etc.
+        milansql::Parser restoreParser;
         for (const auto& sql : stmts) {
             try {
+                // clean mode: auto-drop table before CREATE TABLE
+                if (clean) {
+                    auto cmd = restoreParser.parse(sql);
+                    if (cmd.type == milansql::CommandType::CREATE_TABLE && !cmd.tableName.empty()) {
+                        std::string dropSql = "DROP TABLE IF EXISTS " + cmd.tableName;
+                        handleQueryForUser(dropSql, v.userId, v.role);
+                        ++dropped;
+                    }
+                }
+
                 auto result = handleQueryForUser(sql, v.userId, v.role);
                 if (result.find("\"success\":false") != std::string::npos) {
                     ++fail;
-                    // Extract error message
                     auto epos = result.find("\"error\":\"");
                     if (epos != std::string::npos && errors.size() < 2000) {
                         auto eend = result.find('"', epos + 9);
@@ -1226,9 +1250,11 @@ inline std::string MilanHttpServer::handleRestore(const std::string& token,
     }
 
     std::string result = "{\"success\":true,\"dry_run\":" + std::string(dryRun ? "true" : "false") +
+        ",\"clean\":" + std::string(clean ? "true" : "false") +
         ",\"total\":" + std::to_string(stmts.size()) +
         ",\"ok\":" + std::to_string(ok) +
-        ",\"failed\":" + std::to_string(fail);
+        ",\"failed\":" + std::to_string(fail) +
+        ",\"dropped\":" + std::to_string(dropped);
     if (!errors.empty())
         result += ",\"errors\":\"" + errors + "\"";
     result += "}";
@@ -3315,20 +3341,23 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         std::string restoreToken = extractBearerToken(req);
         if (restoreToken.empty())
             return buildHttpResponse(401, R"({"success":false,"error":"Authorization required"})");
-        // Accept raw SQL body or JSON {"dump":"...","dry_run":true}
+        // Accept raw SQL body or JSON {"dump":"...","dry_run":true,"clean":true}
         std::string dump;
         bool dryRun = false;
+        bool clean = false;
         if (!req.body.empty() && req.body[0] == '{') {
             dump = extractJsonStr(req.body, "dump");
-            // Check for dry_run flag
             if (req.body.find("\"dry_run\"") != std::string::npos &&
                 req.body.find("true") != std::string::npos)
                 dryRun = true;
+            if (req.body.find("\"clean\"") != std::string::npos &&
+                req.body.find("true") != std::string::npos)
+                clean = true;
         }
         if (dump.empty()) dump = req.body;  // raw SQL body
         if (dump.empty())
             return buildHttpResponse(400, R"({"success":false,"error":"Empty dump body"})");
-        return buildHttpResponse(200, handleRestore(restoreToken, dump, dryRun));
+        return buildHttpResponse(200, handleRestore(restoreToken, dump, dryRun, clean));
     }
 
     // ── Query + Tables (auth-aware) ───────────────────────────

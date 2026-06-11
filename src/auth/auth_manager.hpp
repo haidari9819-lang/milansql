@@ -333,6 +333,44 @@ public:
         return {true, tok, ref, u.id, ""};
     }
 
+    // ── Change Password ────────────────────────────────────────
+    struct ChangePasswordResult { bool ok = false; std::string error; };
+
+    ChangePasswordResult changePassword(int userId, const std::string& oldPassword,
+                                        const std::string& newPassword) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = users_.find(userId);
+        if (it == users_.end()) return {false, "User not found"};
+        auto& u = it->second;
+        auto [match, _] = checkPasswordEx(oldPassword, u.passwordHash);
+        if (!match) return {false, "Current password incorrect"};
+        if (newPassword.size() < 8) return {false, "New password must be at least 8 characters"};
+        std::string salt = generateRandom(32);
+        u.passwordHash = hashPasswordPbkdf2(newPassword, salt);
+        return {true, ""};
+    }
+
+    // Admin: force-set password without knowing old one
+    ChangePasswordResult adminSetPassword(int requesterId, int targetUserId,
+                                          const std::string& newPassword) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto reqIt = users_.find(requesterId);
+        if (reqIt == users_.end() || reqIt->second.role != "root")
+            return {false, "Admin privileges required"};
+        auto it = users_.find(targetUserId);
+        if (it == users_.end()) return {false, "Target user not found"};
+        if (newPassword.size() < 8) return {false, "New password must be at least 8 characters"};
+        std::string salt = generateRandom(32);
+        it->second.passwordHash = hashPasswordPbkdf2(newPassword, salt);
+        return {true, ""};
+    }
+
+    int getUserIdByName(const std::string& username) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = nameIndex_.find(username);
+        return (it != nameIndex_.end()) ? it->second : -1;
+    }
+
     bool logout(const std::string& token) {
         std::lock_guard<std::mutex> lk(mutex_);
         auto it = sessions_.find(token);

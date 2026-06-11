@@ -128,7 +128,7 @@ static std::string hmacSha256Hex(const std::string& key, const std::string& msg)
 
 // ── PBKDF2-HMAC-SHA256 (RFC 8018) ────────────────────────────
 // Uses existing hmacSha256Bytes. Output: 32 bytes (one SHA-256 block).
-static constexpr int PBKDF2_ITERATIONS = 600000;  // OWASP 2024 recommendation
+static constexpr int PBKDF2_ITERATIONS = 250000;  // tuned for ~300-500ms on production server
 
 static std::vector<uint8_t> pbkdf2HmacSha256(const std::string& password,
                                                const std::string& salt,

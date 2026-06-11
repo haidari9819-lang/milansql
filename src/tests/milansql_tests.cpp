@@ -8174,9 +8174,9 @@ static void testGroup83() {
     // ── 2. hashPasswordPbkdf2 format ────────────────────────
     {
         auto h = hashPasswordPbkdf2("test", "aabbccdd");
-        check(h.substr(0, 7) == "pbkdf2$" && h.find("$600000$") != std::string::npos &&
+        check(h.substr(0, 7) == "pbkdf2$" && h.find("$250000$") != std::string::npos &&
               h.find("$aabbccdd$") != std::string::npos,
-              "PBKDF2 #4: hash format = pbkdf2$600000$salt$hash");
+              "PBKDF2 #4: hash format = pbkdf2$250000$salt$hash");
     }
 
     // ── 3. New registration uses PBKDF2 ─────────────────────

@@ -8463,6 +8463,114 @@ static void testGroup85() {
     }
 }
 
+// ── testGroup86: Login Rate Limiting (10 Tests) ──
+// Phase 170: Brute-force + DoS protection on /auth/login
+
+static void testGroup86() {
+    std::cout << "\n── testGroup86: Login Rate Limiting ──\n";
+
+    // ── 1. Token bucket: 5 burst allowed ─────────────────────
+    {
+        RateLimiter lim(5, 5.0/900.0);  // 5 burst, 5/15min
+        int allowed = 0;
+        for (int i = 0; i < 10; i++) {
+            if (lim.allow("ip1")) allowed++;
+        }
+        check(allowed == 5, "RateLogin #1: token bucket allows exactly 5 burst");
+    }
+
+    // ── 2. Different IPs get independent limits ──────────────
+    {
+        RateLimiter lim(5, 5.0/900.0);
+        for (int i = 0; i < 5; i++) lim.allow("ip_a");
+        check(!lim.allow("ip_a"), "RateLogin #2a: ip_a exhausted after 5");
+        check(lim.allow("ip_b"), "RateLogin #2b: ip_b still has tokens");
+    }
+
+    // ── 3. Login lockout after 5 failures (per-username) ─────
+    {
+        AuthManager mgr;
+        mgr.init("rate_test_secret_1234567890");
+        mgr.registerUser("victim", "correctpw1");
+        // 5 wrong attempts
+        for (int i = 0; i < 5; i++) {
+            auto r = mgr.login("victim", "wrongpassword");
+            check(!r.ok, "RateLogin #3a: wrong pw rejected");
+        }
+        // 6th attempt with CORRECT password should still work
+        // (lockout is in HTTP handler, not AuthManager)
+        auto r = mgr.login("victim", "correctpw1");
+        check(r.ok, "RateLogin #3: AuthManager itself does not lock out");
+    }
+
+    // ── 4. Slow refill rate (~1 token per 3 min) ────────────
+    {
+        RateLimiter lim(5, 5.0/900.0);
+        // Exhaust all tokens
+        for (int i = 0; i < 5; i++) lim.allow("ip_slow");
+        check(!lim.allow("ip_slow"), "RateLogin #4: exhausted");
+        // Remaining should be < 1
+        check(lim.remaining("ip_slow") < 1.0,
+              "RateLogin #4b: remaining < 1 after exhaustion");
+    }
+
+    // ── 5. retryAfterSeconds reflects slow refill ────────────
+    {
+        RateLimiter lim(5, 5.0/900.0);
+        double retry = lim.retryAfterSeconds("any_ip");
+        // 1 / (5/900) = 180 seconds
+        check(retry > 170.0 && retry < 190.0,
+              "RateLogin #5: retryAfter ~180s for login limiter");
+    }
+
+    // ── 6. ADMIN tier still bypasses general rate limiter ────
+    {
+        RateLimiter lim;  // tiered mode
+        lim.setTier("admin_ip", RateTier::ADMIN);
+        int allowed = 0;
+        for (int i = 0; i < 100; i++) {
+            if (lim.allow("admin_ip")) allowed++;
+        }
+        check(allowed == 100, "RateLogin #6: ADMIN tier unlimited");
+    }
+
+    // ── 7. Login limiter is separate from query limiter ──────
+    {
+        RateLimiter loginLim(5, 5.0/900.0);
+        RateLimiter queryLim(100, 100.0/60.0);
+        // Exhaust login limiter
+        for (int i = 0; i < 5; i++) loginLim.allow("user1");
+        check(!loginLim.allow("user1"), "RateLogin #7a: login exhausted");
+        // Query limiter still works
+        check(queryLim.allow("user1"), "RateLogin #7b: query limiter independent");
+    }
+
+    // ── 8. Multiple IPs: one blocked, others free ────────────
+    {
+        RateLimiter lim(5, 5.0/900.0);
+        for (int i = 0; i < 5; i++) lim.allow("attacker");
+        check(!lim.allow("attacker"), "RateLogin #8a: attacker blocked");
+        check(lim.allow("legit_user_1"), "RateLogin #8b: legit user 1 OK");
+        check(lim.allow("legit_user_2"), "RateLogin #8c: legit user 2 OK");
+    }
+
+    // ── 9. Burst capacity matches configured value ───────────
+    {
+        RateLimiter lim(3, 1.0/60.0);  // 3 burst, 1/min
+        check(lim.allow("x") && lim.allow("x") && lim.allow("x"),
+              "RateLogin #9a: 3 burst allowed");
+        check(!lim.allow("x"), "RateLogin #9b: 4th blocked");
+    }
+
+    // ── 10. requestCount tracks attempts ─────────────────────
+    {
+        RateLimiter lim(5, 5.0/900.0);
+        for (int i = 0; i < 3; i++) lim.allow("counter_ip");
+        check(lim.requestCount("counter_ip") == 3,
+              "RateLogin #10: requestCount tracks allowed attempts");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -8714,6 +8822,9 @@ int main() {
     }
     try { testGroup85(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 85 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup86(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 86 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

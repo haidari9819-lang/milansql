@@ -8144,7 +8144,7 @@ static void testGroup82() {
     }
 }
 
-// ── testGroup83: PBKDF2 Password Hashing + Migration (10 Tests) ──
+// ── testGroup83: PBKDF2 Password Hashing + Migration (11 Tests) ──
 // Phase 168c: SHA-256 → PBKDF2-HMAC-SHA256 migration (1107 → 1117)
 
 static void testGroup83() {
@@ -8210,10 +8210,15 @@ static void testGroup83() {
         check(ok1 && migrate1, "PBKDF2 #8: legacy hash verifies + flagged for migration");
         auto [ok2, migrate2] = AuthManager::checkPasswordExPublic("wrongpass", legacyHash);
         check(!ok2 && !migrate2, "PBKDF2 #9: wrong password on legacy hash rejected");
-        // PBKDF2 hash does NOT flag migration
+        // PBKDF2 hash with current iterations does NOT flag migration
         auto pbkdf2Hash = hashPasswordPbkdf2("mypass", "aabb1122");
         auto [ok3, migrate3] = AuthManager::checkPasswordExPublic("mypass", pbkdf2Hash);
-        check(ok3 && !migrate3, "PBKDF2 #10: PBKDF2 hash verifies without migration flag");
+        check(ok3 && !migrate3, "PBKDF2 #10: current-iter hash verifies without migration flag");
+        // PBKDF2 hash with OLD iterations DOES flag migration
+        auto dk600k = pbkdf2HmacSha256("mypass", "aabb1122", 600000);
+        std::string old600k = "pbkdf2$600000$aabb1122$" + SHA256Impl::hexStr(dk600k);
+        auto [ok4, migrate4] = AuthManager::checkPasswordExPublic("mypass", old600k);
+        check(ok4 && migrate4, "PBKDF2 #11: old 600k hash verifies + flagged for migration");
     }
 }
 

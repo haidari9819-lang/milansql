@@ -548,12 +548,13 @@ private:
 
     // Phase 154-156: Auth + Rate Limiting
     AuthManager authMgr_;
-    RateLimiter loginLimiter_{10, 10.0/60.0};    // 10/min per IP
+    RateLimiter loginLimiter_{5, 5.0/900.0};      // 5 burst, 5 per 15min per IP
     RateLimiter requestLimiter_;                   // tiered: per user/IP
 
-    // Brute-force lockout: 5 failures → 15 min account lock
+    // Brute-force lockout: per-username AND per-IP, 5 failures → 15 min lock
     struct LockoutInfo { int failedAttempts = 0; std::chrono::steady_clock::time_point lockedUntil{}; };
-    std::map<std::string, LockoutInfo> loginLockouts_;
+    std::map<std::string, LockoutInfo> loginLockouts_;   // key = username
+    std::map<std::string, LockoutInfo> ipLockouts_;      // key = client IP
     std::mutex lockoutMutex_;
 
     void handleClient(sock_t clientSock);
@@ -796,38 +797,54 @@ inline std::string MilanHttpServer::handleAuthRegister(const std::string& body, 
 }
 
 inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, const std::string& clientIp) {
+    // Layer 1: Token-bucket rate limit per IP (5 burst, 5/15min)
     if (!loginLimiter_.allow(clientIp))
-        return "{\"success\":false,\"error\":\"Too many login attempts. Try again later.\",\"code\":429}";
+        return "{\"success\":false,\"error\":\"Too many login attempts. Try again later.\",\"retry_after\":900,\"code\":429}";
+    // Layer 2: IP-based lockout (spray attacks across multiple usernames)
+    {
+        std::lock_guard<std::mutex> lk(lockoutMutex_);
+        auto iit = ipLockouts_.find(clientIp);
+        if (iit != ipLockouts_.end() && iit->second.failedAttempts >= 10) {
+            auto now = std::chrono::steady_clock::now();
+            if (now < iit->second.lockedUntil)
+                return "{\"success\":false,\"error\":\"IP blocked after too many failed logins. Try again in 15 minutes.\",\"retry_after\":900,\"code\":429}";
+            iit->second.failedAttempts = 0;
+        }
+    }
     std::string username = extractJsonStr(body, "username");
     std::string password = extractJsonStr(body, "password");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
-    // Brute-force lockout check (per username)
+    // Layer 3: Per-username lockout (brute-force single account)
     {
         std::lock_guard<std::mutex> lk(lockoutMutex_);
         auto lit = loginLockouts_.find(username);
         if (lit != loginLockouts_.end() && lit->second.failedAttempts >= 5) {
             auto now = std::chrono::steady_clock::now();
             if (now < lit->second.lockedUntil)
-                return "{\"success\":false,\"error\":\"Account locked after too many failed attempts. Try again in 15 minutes.\",\"code\":423}";
-            // Lockout period expired — reset
+                return "{\"success\":false,\"error\":\"Account locked after too many failed attempts. Try again in 15 minutes.\",\"retry_after\":900,\"code\":429}";
             lit->second.failedAttempts = 0;
         }
     }
     auto res = authMgr_.login(username, password);
     if (!res.ok) {
-        // Increment failure counter
+        // Increment both per-username and per-IP failure counters
         std::lock_guard<std::mutex> lk(lockoutMutex_);
-        auto& info = loginLockouts_[username];
-        info.failedAttempts++;
-        if (info.failedAttempts >= 5)
-            info.lockedUntil = std::chrono::steady_clock::now() + std::chrono::minutes(15);
+        auto& uInfo = loginLockouts_[username];
+        uInfo.failedAttempts++;
+        if (uInfo.failedAttempts >= 5)
+            uInfo.lockedUntil = std::chrono::steady_clock::now() + std::chrono::minutes(15);
+        auto& ipInfo = ipLockouts_[clientIp];
+        ipInfo.failedAttempts++;
+        if (ipInfo.failedAttempts >= 10)
+            ipInfo.lockedUntil = std::chrono::steady_clock::now() + std::chrono::minutes(15);
         return "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}";
     }
-    // Success — reset failure counter
+    // Success — reset both counters
     {
         std::lock_guard<std::mutex> lk(lockoutMutex_);
         loginLockouts_.erase(username);
+        ipLockouts_.erase(clientIp);
     }
     authMgr_.save(dbPath_ + ".auth");
     return "{\"success\":true,\"token\":\"" + jsonEscape(res.token) +
@@ -3250,10 +3267,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     if (req.path == "/auth/login" && req.method == "POST") {
         auto result = handleAuthLogin(req.body, clientIp);
-        if (result.find("\"code\":429") != std::string::npos)
-            return buildHttpResponse(429, result);
-        if (result.find("\"code\":423") != std::string::npos)
-            return buildHttpResponse(423, result);
+        if (result.find("\"code\":429") != std::string::npos) {
+            std::string headers = "Retry-After: 900\r\n";
+            return buildHttpResponse(429, result, "application/json", headers);
+        }
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +

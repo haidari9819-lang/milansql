@@ -589,6 +589,7 @@ private:
     std::string handleAdminQuota(const std::string& token);
     std::string handleMyQuota(const std::string& token);
     std::string handleBackup(const std::string& token);  // Phase 167: SQL dump backup
+    std::string handleRestore(const std::string& token, const std::string& dump, bool dryRun);
 
     // Helpers
     static std::string extractBearerToken(const HttpRequest& req);
@@ -1114,6 +1115,124 @@ inline std::string MilanHttpServer::handleBackup(const std::string& token) {
 
     out << "-- End of backup (" << tableCount << " tables)\n";
     return out.str();
+}
+
+// ── Phase 168: Restore — import SQL dump ──────────────────────
+
+// Split SQL dump into individual statements.
+// Respects string literals ('...'), escaped quotes (''), and -- comments.
+static std::vector<std::string> splitSqlStatements(const std::string& dump) {
+    std::vector<std::string> stmts;
+    std::string current;
+    bool inString = false;
+
+    for (size_t i = 0; i < dump.size(); ++i) {
+        char c = dump[i];
+
+        // -- line comment (outside strings): skip to end of line
+        if (!inString && c == '-' && i + 1 < dump.size() && dump[i + 1] == '-') {
+            while (i < dump.size() && dump[i] != '\n') ++i;
+            continue;
+        }
+
+        // String literal tracking
+        if (!inString && c == '\'') {
+            inString = true;
+            current += c;
+        } else if (inString && c == '\'') {
+            current += c;
+            // Check for escaped quote ''
+            if (i + 1 < dump.size() && dump[i + 1] == '\'') {
+                current += '\'';
+                ++i;
+            } else {
+                inString = false;
+            }
+        } else if (!inString && c == ';') {
+            // Statement boundary — trim and collect
+            // Trim whitespace
+            size_t start = current.find_first_not_of(" \t\n\r");
+            if (start != std::string::npos) {
+                size_t end = current.find_last_not_of(" \t\n\r");
+                std::string stmt = current.substr(start, end - start + 1);
+                if (!stmt.empty()) stmts.push_back(std::move(stmt));
+            }
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+
+    // Last statement (no trailing ;)
+    size_t start = current.find_first_not_of(" \t\n\r");
+    if (start != std::string::npos) {
+        size_t end = current.find_last_not_of(" \t\n\r");
+        std::string stmt = current.substr(start, end - start + 1);
+        if (!stmt.empty()) stmts.push_back(std::move(stmt));
+    }
+
+    return stmts;
+}
+
+inline std::string MilanHttpServer::handleRestore(const std::string& token,
+                                                   const std::string& dump,
+                                                   bool dryRun) {
+    auto v = authMgr_.validateToken(token);
+    if (!v.valid || v.role != "root")
+        return R"({"success":false,"error":"Access denied. Root only."})";
+
+    auto stmts = splitSqlStatements(dump);
+    if (stmts.empty())
+        return R"({"success":false,"error":"No SQL statements found in dump"})";
+
+    int ok = 0, fail = 0;
+    std::string errors;
+
+    if (dryRun) {
+        // Dry run: parse only, no lock needed
+        milansql::Parser parser;
+        for (const auto& sql : stmts) {
+            try { parser.parse(sql); ++ok; }
+            catch (const std::exception& e) {
+                ++fail;
+                if (errors.size() < 2000)
+                    errors += "PARSE ERROR: " + std::string(e.what()).substr(0, 100) + "\\n";
+            }
+        }
+    } else {
+        // Execute each statement through handleQueryForUser (root context)
+        // This reuses the full SQL execution path including persist/triggers/etc.
+        for (const auto& sql : stmts) {
+            try {
+                auto result = handleQueryForUser(sql, v.userId, v.role);
+                if (result.find("\"success\":false") != std::string::npos) {
+                    ++fail;
+                    // Extract error message
+                    auto epos = result.find("\"error\":\"");
+                    if (epos != std::string::npos && errors.size() < 2000) {
+                        auto eend = result.find('"', epos + 9);
+                        errors += result.substr(epos + 9,
+                            eend != std::string::npos ? eend - epos - 9 : 80) + "\\n";
+                    }
+                } else {
+                    ++ok;
+                }
+            } catch (const std::exception& e) {
+                ++fail;
+                if (errors.size() < 2000)
+                    errors += "ERROR: " + std::string(e.what()).substr(0, 100) + "\\n";
+            }
+        }
+    }
+
+    std::string result = "{\"success\":true,\"dry_run\":" + std::string(dryRun ? "true" : "false") +
+        ",\"total\":" + std::to_string(stmts.size()) +
+        ",\"ok\":" + std::to_string(ok) +
+        ",\"failed\":" + std::to_string(fail);
+    if (!errors.empty())
+        result += ",\"errors\":\"" + errors + "\"";
+    result += "}";
+    return result;
 }
 
 // ── MilanHttpServer::handleQueryForUser (Phase 154-155) ───────
@@ -3189,6 +3308,27 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         if (backupResult.find("-- ERROR: Access denied") == 0)
             return buildHttpResponse(403, R"({"success":false,"error":"Access denied. Valid token required."})");
         return buildHttpResponse(200, backupResult, "application/sql");
+    }
+
+    // Phase 168: Restore — import SQL dump (root only)
+    if (req.path == "/restore" && req.method == "POST") {
+        std::string restoreToken = extractBearerToken(req);
+        if (restoreToken.empty())
+            return buildHttpResponse(401, R"({"success":false,"error":"Authorization required"})");
+        // Accept raw SQL body or JSON {"dump":"...","dry_run":true}
+        std::string dump;
+        bool dryRun = false;
+        if (!req.body.empty() && req.body[0] == '{') {
+            dump = extractJsonStr(req.body, "dump");
+            // Check for dry_run flag
+            if (req.body.find("\"dry_run\"") != std::string::npos &&
+                req.body.find("true") != std::string::npos)
+                dryRun = true;
+        }
+        if (dump.empty()) dump = req.body;  // raw SQL body
+        if (dump.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Empty dump body"})");
+        return buildHttpResponse(200, handleRestore(restoreToken, dump, dryRun));
     }
 
     // ── Query + Tables (auth-aware) ───────────────────────────

@@ -7790,6 +7790,205 @@ static void testGroup80() {
     }
 }
 
+// ── testGroup81: Restore / Statement Splitting + Roundtrip (20 Tests) ──
+// Phase 168: /restore endpoint tests (1077 → 1097)
+
+// Inline splitSqlStatements for testing
+namespace restore_test {
+    static std::vector<std::string> splitSqlStatements(const std::string& dump) {
+        std::vector<std::string> stmts;
+        std::string current;
+        bool inString = false;
+        for (size_t i = 0; i < dump.size(); ++i) {
+            char c = dump[i];
+            if (!inString && c == '-' && i + 1 < dump.size() && dump[i+1] == '-') {
+                while (i < dump.size() && dump[i] != '\n') ++i;
+                continue;
+            }
+            if (!inString && c == '\'') { inString = true; current += c; }
+            else if (inString && c == '\'') {
+                current += c;
+                if (i+1 < dump.size() && dump[i+1] == '\'') { current += '\''; ++i; }
+                else inString = false;
+            } else if (!inString && c == ';') {
+                size_t s = current.find_first_not_of(" \t\n\r");
+                if (s != std::string::npos) {
+                    size_t e = current.find_last_not_of(" \t\n\r");
+                    std::string stmt = current.substr(s, e - s + 1);
+                    if (!stmt.empty()) stmts.push_back(std::move(stmt));
+                }
+                current.clear();
+            } else { current += c; }
+        }
+        size_t s = current.find_first_not_of(" \t\n\r");
+        if (s != std::string::npos) {
+            size_t e = current.find_last_not_of(" \t\n\r");
+            std::string stmt = current.substr(s, e - s + 1);
+            if (!stmt.empty()) stmts.push_back(std::move(stmt));
+        }
+        return stmts;
+    }
+}
+
+static void testGroup81() {
+    std::cout << "\n── testGroup81: Restore / Statement Splitting ──\n";
+    using namespace restore_test;
+
+    // ── 1. Basic splitting ──────────────────────────────────
+    {
+        auto s = splitSqlStatements("SELECT 1; SELECT 2; SELECT 3");
+        check(s.size() == 3 && s[0] == "SELECT 1" && s[2] == "SELECT 3",
+              "Restore #1: basic 3-statement split");
+    }
+    {
+        auto s = splitSqlStatements("SELECT 1;\n\nSELECT 2;\n");
+        check(s.size() == 2, "Restore #2: split with newlines and trailing newline");
+    }
+    {
+        auto s = splitSqlStatements("");
+        check(s.empty(), "Restore #3: empty dump → empty result");
+    }
+
+    // ── 2. Semicolon inside string literal ──────────────────
+    {
+        auto s = splitSqlStatements("INSERT INTO t VALUES ('hello; world')");
+        check(s.size() == 1 && s[0].find("hello; world") != std::string::npos,
+              "Restore #4: semicolon inside string NOT split");
+    }
+    {
+        auto s = splitSqlStatements(
+            "INSERT INTO t VALUES ('a;b;c'); INSERT INTO t VALUES ('d')");
+        check(s.size() == 2 && s[0].find("a;b;c") != std::string::npos,
+              "Restore #5: semicolons in string + real delimiter");
+    }
+    {
+        // Escaped quote with semicolons
+        auto s = splitSqlStatements(
+            "INSERT INTO t VALUES ('it''s; done'); SELECT 1");
+        check(s.size() == 2 && s[0].find("it''s; done") != std::string::npos,
+              "Restore #6: escaped quote ('') with semicolon in string");
+    }
+
+    // ── 3. Comments stripped ────────────────────────────────
+    {
+        auto s = splitSqlStatements(
+            "-- This is a comment\nSELECT 1;\n-- Another comment\nSELECT 2");
+        check(s.size() == 2 && s[0] == "SELECT 1" && s[1] == "SELECT 2",
+              "Restore #7: line comments stripped");
+    }
+    {
+        auto s = splitSqlStatements("-- MilanSQL Backup\n-- Generated: 2026\n\nCREATE TABLE t (id INT)");
+        check(s.size() == 1 && s[0].find("CREATE TABLE") == 0,
+              "Restore #8: backup header comments stripped");
+    }
+
+    // ── 4. Multiline CREATE TABLE ───────────────────────────
+    {
+        std::string ddl =
+            "CREATE TABLE test (\n"
+            "  id INT PRIMARY KEY,\n"
+            "  name TEXT NOT NULL,\n"
+            "  val INT DEFAULT 0\n"
+            ");\n"
+            "INSERT INTO test VALUES (1, 'alice', 42)";
+        auto s = splitSqlStatements(ddl);
+        check(s.size() == 2, "Restore #9: multiline CREATE TABLE stays as one statement");
+        check(s[0].find("CREATE TABLE") == 0 && s[0].find("DEFAULT 0") != std::string::npos,
+              "Restore #10: multiline DDL complete with all columns");
+    }
+
+    // ── 5. Full roundtrip: create → dump → drop → restore ──
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+
+        // Create table + insert data
+        auto cmd1 = p.parse("CREATE TABLE rt_test (id INT, name TEXT, score INT)");
+        eng.createTable(cmd1.tableName, cmd1.columns, cmd1.foreignKeys);
+        milansql::dispatch(p.parse("INSERT INTO rt_test VALUES (1, 'Alice', 95)"), eng);
+        milansql::dispatch(p.parse("INSERT INTO rt_test VALUES (2, 'Bob', 87)"), eng);
+        milansql::dispatch(p.parse("INSERT INTO rt_test VALUES (3, 'Charlie', 91)"), eng);
+
+        // Generate dump manually (simulating /backup output)
+        std::string dump =
+            "-- MilanSQL Backup\n"
+            "CREATE TABLE rt_test (\n"
+            "  id INT,\n"
+            "  name TEXT,\n"
+            "  score INT\n"
+            ");\n"
+            "INSERT INTO rt_test VALUES (1, 'Alice', 95);\n"
+            "INSERT INTO rt_test VALUES (2, 'Bob', 87);\n"
+            "INSERT INTO rt_test VALUES (3, 'Charlie', 91);\n";
+
+        // Drop original table
+        eng.dropTable("rt_test");
+        check(!eng.tableExists("rt_test"), "Restore #11: table dropped for roundtrip");
+
+        // Restore from dump
+        auto stmts = splitSqlStatements(dump);
+        check(stmts.size() == 4, "Restore #12: dump splits into 4 statements (1 DDL + 3 INSERT)");
+
+        for (const auto& sql : stmts) {
+            auto cmd = p.parse(sql);
+            milansql::dispatch(cmd, eng);
+        }
+        check(eng.tableExists("rt_test"), "Restore #13: table recreated after restore");
+
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM rt_test"), eng);
+        check(sel.rows.size() == 3, "Restore #14: all 3 rows restored");
+        check(sel.rows[0].values[1] == "Alice" && sel.rows[2].values[1] == "Charlie",
+              "Restore #15: data integrity preserved after roundtrip");
+    }
+
+    // ── 6. Special characters in roundtrip ──────────────────
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+        eng.createTable("sp_test",
+            {milansql::Column("id","INT"), milansql::Column("val","TEXT")}, {});
+
+        // Insert via dump with tricky strings
+        std::string dump =
+            "INSERT INTO sp_test VALUES (1, 'it''s a test');\n"
+            "INSERT INTO sp_test VALUES (2, 'semi;colon');\n"
+            "INSERT INTO sp_test VALUES (3, 'line1\\nline2');\n";
+
+        auto stmts = splitSqlStatements(dump);
+        check(stmts.size() == 3, "Restore #16: 3 statements with special chars");
+
+        for (const auto& sql : stmts) milansql::dispatch(p.parse(sql), eng);
+        auto sel = milansql::dispatch(p.parse("SELECT * FROM sp_test"), eng);
+        check(sel.rows.size() == 3, "Restore #17: all 3 special-char rows inserted");
+    }
+
+    // ── 7. Multiple tables in one dump ──────────────────────
+    {
+        milansql::Engine eng;
+        milansql::Parser p;
+
+        std::string dump =
+            "CREATE TABLE t1 (id INT, name TEXT);\n"
+            "CREATE TABLE t2 (id INT, val INT);\n"
+            "INSERT INTO t1 VALUES (1, 'a');\n"
+            "INSERT INTO t2 VALUES (1, 100);\n"
+            "INSERT INTO t1 VALUES (2, 'b');\n"
+            "INSERT INTO t2 VALUES (2, 200);\n";
+
+        auto stmts = splitSqlStatements(dump);
+        check(stmts.size() == 6, "Restore #18: 6 statements (2 DDL + 4 INSERT)");
+
+        for (const auto& sql : stmts) milansql::dispatch(p.parse(sql), eng);
+        check(eng.tableExists("t1") && eng.tableExists("t2"),
+              "Restore #19: both tables created from multi-table dump");
+
+        auto s1 = milansql::dispatch(p.parse("SELECT * FROM t1"), eng);
+        auto s2 = milansql::dispatch(p.parse("SELECT * FROM t2"), eng);
+        check(s1.rows.size() == 2 && s2.rows.size() == 2,
+              "Restore #20: both tables have correct row counts");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -8025,6 +8224,9 @@ int main() {
     }
     try { testGroup80(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 80 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup81(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 81 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -879,7 +879,7 @@ inline std::string MilanHttpServer::handleAuthRefresh(const std::string& body) {
 }
 inline std::string MilanHttpServer::handleAuthSessions(const std::string& token) {
     auto v = authMgr_.validateToken(token);
-    if (!v.valid && v.userId != 0) return "{\"success\":false,\"error\":\"Unauthorized\"}";
+    if (!v.valid) return "{\"success\":false,\"error\":\"Unauthorized\"}";
     std::string tbl = authMgr_.showSessions();
     return "{\"success\":true,\"sessions\":\"" + jsonEscape(tbl) + "\"}";
 }
@@ -3337,12 +3337,18 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             return buildHttpResponse(403, R"({"success":false,"error":")" + result.error + R"("})");
         return buildHttpResponse(200, R"({"success":true,"message":"Password updated for )" + targetUser + R"("})");
     }
-    if (req.path == "/auth/me" && req.method == "GET")
-        return buildHttpResponse(200, handleAuthMe(extractBearerToken(req)));
+    if (req.path == "/auth/me" && req.method == "GET") {
+        auto result = handleAuthMe(extractBearerToken(req));
+        int code = (result.find("\"success\":true") != std::string::npos) ? 200 : 401;
+        return buildHttpResponse(code, result);
+    }
     if (req.path == "/auth/refresh" && req.method == "POST")
         return buildHttpResponse(200, handleAuthRefresh(req.body));
-    if (req.path == "/auth/sessions" && req.method == "GET")
-        return buildHttpResponse(200, handleAuthSessions(extractBearerToken(req)));
+    if (req.path == "/auth/sessions" && req.method == "GET") {
+        auto result = handleAuthSessions(extractBearerToken(req));
+        int code = (result.find("\"success\":true") != std::string::npos) ? 200 : 401;
+        return buildHttpResponse(code, result);
+    }
     if (req.path == "/auth/api-key" && req.method == "POST") {
         // Phase 156: named key creation
         std::string token = extractBearerToken(req);

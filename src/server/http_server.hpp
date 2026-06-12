@@ -3308,6 +3308,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         auto result = authMgr_.changePassword(vr.userId, oldPw, newPw);
         if (!result.ok)
             return buildHttpResponse(400, R"({"success":false,"error":")" + result.error + R"("})");
+        authMgr_.save(dbPath_ + ".auth");
         return buildHttpResponse(200, R"({"success":true,"message":"Password changed"})");
     }
     if (req.path == "/auth/admin/set-password" && req.method == "POST") {
@@ -3335,6 +3336,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         auto result = authMgr_.adminSetPassword(vr.userId, targetId, newPw);
         if (!result.ok)
             return buildHttpResponse(403, R"({"success":false,"error":")" + result.error + R"("})");
+        authMgr_.save(dbPath_ + ".auth");
         return buildHttpResponse(200, R"({"success":true,"message":"Password updated for )" + targetUser + R"("})");
     }
     if (req.path == "/auth/me" && req.method == "GET") {

@@ -381,11 +381,13 @@ public:
 
     ValidateResult validateToken(const std::string& token) {
         if (token.empty()) return {};
-        // Check revocation first
+        // Session MUST exist and not be revoked (deny-by-default)
         {
             std::lock_guard<std::mutex> lk(mutex_);
             auto it = sessions_.find(token);
-            if (it != sessions_.end() && it->second.revoked) return {};
+            if (it == sessions_.end()) return {};        // unknown token → reject
+            if (it->second.revoked) return {};           // revoked → reject
+            if (it->second.expiresAt < nowSeconds()) return {};  // expired → reject
         }
         return decodeJWT(token);
     }
@@ -651,6 +653,15 @@ public:
             for (size_t i=0;i<ki.tables.size();i++){if(i)f<<",";f<<ki.tables[i];}
             f << "\n";
         }
+        // Persist active sessions (skip expired/revoked to keep file small)
+        f << "[sessions]\n";
+        int64_t now = nowSeconds();
+        for (const auto& [tok, s] : sessions_) {
+            if (s.revoked || s.expiresAt < now) continue;
+            f << tok << "\t" << s.refreshToken << "\t" << s.userId << "\t"
+              << s.username << "\t" << s.createdAt << "\t" << s.expiresAt << "\t"
+              << s.refreshExpiresAt << "\t" << (s.revoked?1:0) << "\n";
+        }
     }
 
     void load(const std::string& path) {
@@ -711,6 +722,22 @@ public:
                     while (std::getline(ts, tbl, ',')) if (!tbl.empty()) ki.tables.push_back(tbl);
                 }
                 namedKeys_[ki.key] = ki;
+            }
+            if (section=="[sessions]") {
+                auto parts = splitTab(line);
+                if (parts.size() < 8) continue;
+                UserSession s;
+                s.token = parts[0];
+                s.refreshToken = parts[1];
+                s.userId = std::stoi(parts[2]);
+                s.username = parts[3];
+                s.createdAt = std::stoll(parts[4]);
+                s.expiresAt = std::stoll(parts[5]);
+                s.refreshExpiresAt = std::stoll(parts[6]);
+                s.revoked = (parts[7]=="1");
+                // Skip expired sessions on load
+                if (!s.revoked && s.expiresAt > nowSeconds())
+                    sessions_[s.token] = s;
             }
         }
     }

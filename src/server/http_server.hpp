@@ -856,6 +856,7 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
 inline std::string MilanHttpServer::handleAuthLogout(const std::string& token) {
     if (token.empty()) return "{\"success\":false,\"error\":\"No token\"}";
     authMgr_.logout(token);
+    authMgr_.save(dbPath_ + ".auth");  // persist revocation immediately
     return "{\"success\":true,\"message\":\"Logged out\"}";
 }
 inline std::string MilanHttpServer::handleAuthMe(const std::string& token) {

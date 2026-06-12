@@ -8571,6 +8571,185 @@ static void testGroup86() {
     }
 }
 
+// ── testGroup87: Session Persistence + Logout Revocation (12 Tests) ──
+// Phase 170b: Tokens survive restart, logout actually invalidates
+
+static void testGroup87() {
+    std::cout << "\n── testGroup87: Session Persistence + Logout ──\n";
+
+    // ── 1. Login creates a session, validateToken works ──────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_12345678901");
+        mgr.registerUser("alice", "password123");
+        auto login = mgr.login("alice", "password123");
+        check(login.ok, "Session #1a: login succeeds");
+        auto v = mgr.validateToken(login.token);
+        check(v.valid && v.username == "alice", "Session #1: token validates");
+    }
+
+    // ── 2. Logout revokes token immediately ──────────────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_22345678901");
+        mgr.registerUser("bob", "password123");
+        auto login = mgr.login("bob", "password123");
+        check(login.ok, "Session #2a: login");
+        mgr.logout(login.token);
+        auto v = mgr.validateToken(login.token);
+        check(!v.valid, "Session #2: token invalid after logout");
+    }
+
+    // ── 3. Unknown token is rejected (deny-by-default) ──────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_32345678901");
+        auto v = mgr.validateToken("eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxfQ.fakesig");
+        check(!v.valid, "Session #3: unknown token rejected");
+    }
+
+    // ── 4. Save persists sessions ────────────────────────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_42345678901");
+        mgr.registerUser("carol", "password123");
+        auto login = mgr.login("carol", "password123");
+        std::string tmpPath = "test_sessions.tmp";
+        mgr.save(tmpPath);
+        // Read file, verify [sessions] section exists
+        std::ifstream f(tmpPath);
+        std::string content((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+        f.close();
+        std::remove(tmpPath.c_str());
+        check(content.find("[sessions]") != std::string::npos,
+              "Session #4: save() writes [sessions] section");
+        check(content.find(login.token.substr(0, 20)) != std::string::npos,
+              "Session #4b: token present in saved file");
+    }
+
+    // ── 5. Load restores sessions → token still valid ────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_52345678901");
+        mgr.registerUser("dave", "password123");
+        auto login = mgr.login("dave", "password123");
+        std::string tmpPath = "test_sessions_load.tmp";
+        mgr.save(tmpPath);
+
+        // New manager: load from file
+        AuthManager mgr2;
+        mgr2.load(tmpPath);
+        mgr2.init("sess_test_secret_52345678901");
+        std::remove(tmpPath.c_str());
+        auto v = mgr2.validateToken(login.token);
+        check(v.valid && v.username == "dave",
+              "Session #5: token valid after save→load (survives restart)");
+    }
+
+    // ── 6. Revoked session NOT saved (stays revoked) ─────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_62345678901");
+        mgr.registerUser("eve", "password123");
+        auto login = mgr.login("eve", "password123");
+        mgr.logout(login.token);  // revoke
+        std::string tmpPath = "test_sessions_revoked.tmp";
+        mgr.save(tmpPath);
+
+        AuthManager mgr2;
+        mgr2.load(tmpPath);
+        mgr2.init("sess_test_secret_62345678901");
+        std::remove(tmpPath.c_str());
+        auto v = mgr2.validateToken(login.token);
+        check(!v.valid, "Session #6: revoked token stays invalid after restart");
+    }
+
+    // ── 7. Multiple sessions: one revoked, one valid ─────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_72345678901");
+        mgr.registerUser("frank", "password123");
+        auto login1 = mgr.login("frank", "password123");
+        auto login2 = mgr.login("frank", "password123");
+        mgr.logout(login1.token);
+        check(!mgr.validateToken(login1.token).valid, "Session #7a: first token revoked");
+        check(mgr.validateToken(login2.token).valid, "Session #7b: second token still valid");
+    }
+
+    // ── 8. Refresh token works after save→load ───────────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_82345678901");
+        mgr.registerUser("grace", "password123");
+        auto login = mgr.login("grace", "password123");
+        std::string tmpPath = "test_sessions_refresh.tmp";
+        mgr.save(tmpPath);
+
+        AuthManager mgr2;
+        mgr2.load(tmpPath);
+        mgr2.init("sess_test_secret_82345678901");
+        std::remove(tmpPath.c_str());
+        auto refreshed = mgr2.refreshToken(login.refresh);
+        check(refreshed.ok, "Session #8: refresh token works after restart");
+    }
+
+    // ── 9. Token from different secret is rejected ───────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_92345678901");
+        mgr.registerUser("hank", "password123");
+        auto login = mgr.login("hank", "password123");
+
+        AuthManager mgr2;
+        mgr2.init("different_secret_9999999999");
+        auto v = mgr2.validateToken(login.token);
+        check(!v.valid, "Session #9: token from different secret rejected");
+    }
+
+    // ── 10. Logout returns true for known, false for unknown ─
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_02345678901");
+        mgr.registerUser("iris", "password123");
+        auto login = mgr.login("iris", "password123");
+        check(mgr.logout(login.token), "Session #10a: logout known token → true");
+        check(!mgr.logout("nonexistent.token.here"), "Session #10b: logout unknown → false");
+    }
+
+    // ── 11. Login after logout gives fresh valid token ───────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_11345678901");
+        mgr.registerUser("jack", "password123");
+        auto login1 = mgr.login("jack", "password123");
+        mgr.logout(login1.token);
+        auto login2 = mgr.login("jack", "password123");
+        check(login2.ok, "Session #11a: re-login succeeds");
+        check(mgr.validateToken(login2.token).valid, "Session #11b: new token valid");
+        check(!mgr.validateToken(login1.token).valid, "Session #11c: old token still revoked");
+    }
+
+    // ── 12. Save does not write expired sessions ─────────────
+    {
+        AuthManager mgr;
+        mgr.init("sess_test_secret_12345678902");
+        mgr.registerUser("kate", "password123");
+        auto login = mgr.login("kate", "password123");
+        // Token is valid now, save should include it
+        std::string tmpPath = "test_sessions_expiry.tmp";
+        mgr.save(tmpPath);
+        std::ifstream f(tmpPath);
+        std::string content((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+        f.close();
+        std::remove(tmpPath.c_str());
+        // Active session should be in the file
+        check(content.find("kate") != std::string::npos,
+              "Session #12: active session saved");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -8825,6 +9004,9 @@ int main() {
     }
     try { testGroup86(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 86 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup87(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 87 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

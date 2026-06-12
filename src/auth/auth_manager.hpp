@@ -775,10 +775,12 @@ public:
 
     std::string encodeJWT(int userId, const std::string& username, const std::string& role) {
         std::string hdr = base64urlEncode("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+        std::string nonce = generateRandom(8);  // unique per token
         std::string pay = base64urlEncode(
             "{\"user_id\":" + std::to_string(userId) +
             ",\"username\":\"" + username + "\",\"role\":\"" + role +
-            "\",\"exp\":" + std::to_string(nowSeconds() + 86400) + "}");
+            "\",\"exp\":" + std::to_string(nowSeconds() + 86400) +
+            ",\"jti\":\"" + nonce + "\"}");
         std::string data = hdr + "." + pay;
         std::string sig = base64urlEncodeBytes(hmacSha256Bytes(jwtSecret_, data));
         std::string token = data + "." + sig;

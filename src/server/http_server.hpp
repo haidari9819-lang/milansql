@@ -766,9 +766,27 @@ inline std::string MilanHttpServer::extractJsonStr(const std::string& body, cons
     if (pos == std::string::npos) return "";
     pos = body.find_first_not_of(" \t\r\n", pos+1);
     if (pos == std::string::npos || body[pos] != '"') return "";
-    auto end = body.find('"', pos+1);
-    if (end == std::string::npos) return "";
-    return body.substr(pos+1, end-pos-1);
+    // Parse JSON string value: handle escape sequences and find true end quote
+    std::string result;
+    for (size_t i = pos + 1; i < body.size(); ++i) {
+        char c = body[i];
+        if (c == '"') break;  // unescaped quote = end of string
+        if (c == '\\' && i + 1 < body.size()) {
+            char next = body[i + 1];
+            switch (next) {
+                case '"':  result += '"';  ++i; break;
+                case '\\': result += '\\'; ++i; break;
+                case 'n':  result += '\n'; ++i; break;
+                case 'r':  result += '\r'; ++i; break;
+                case 't':  result += '\t'; ++i; break;
+                case '/':  result += '/';  ++i; break;
+                default:   result += c;         break;
+            }
+        } else {
+            result += c;
+        }
+    }
+    return result;
 }
 
 // ── Phase 154: Auth route handlers ───────────────────────────

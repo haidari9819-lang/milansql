@@ -8826,7 +8826,31 @@ static void testGroup88() {
     // ── 10. Mixed: quoted range query (after delete, Döner+Pizza remain) ──
     {
         auto r = run("SELECT * FROM shop_produkte WHERE preis >= '700' AND preis <= '1000'");
-        check(r.rows.size() == 1, "Param #10: preis BETWEEN '700' AND '1000' → 1 row (Döner=799)");
+        check(r.rows.size() == 1, "Param #10: preis >= '700' AND <= '1000' → 1 row (Döner=799)");
+    }
+
+    // ── 11. BETWEEN with quoted params ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis BETWEEN '700' AND '1000'");
+        check(r.rows.size() == 1, "Param #11: BETWEEN '700' AND '1000' → 1 row (Döner=799)");
+    }
+
+    // ── 12. BETWEEN with unquoted (regression) ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis BETWEEN 700 AND 1000");
+        check(r.rows.size() == 1, "Param #12: BETWEEN 700 AND 1000 → 1 row");
+    }
+
+    // ── 13. BETWEEN wider range with quoted params ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis BETWEEN '100' AND '2000'");
+        check(r.rows.size() == 2, "Param #13: BETWEEN '100' AND '2000' → 2 rows (Döner+Pizza remain)");
+    }
+
+    // ── 14. NOT BETWEEN with quoted params ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis NOT BETWEEN '800' AND '2000'");
+        check(r.rows.size() == 1, "Param #14: NOT BETWEEN '800' AND '2000' → 1 row (Döner=799)");
     }
 }
 

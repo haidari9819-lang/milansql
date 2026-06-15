@@ -6239,14 +6239,17 @@ private:
             return c.op == "IN" ? found : !found;
         }
         if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+            const std::string sv  = milansql::dateutils::stripQuotes(val);
+            const std::string slo = milansql::dateutils::stripQuotes(c.betweenLow);
+            const std::string shi = milansql::dateutils::stripQuotes(c.betweenHigh);
             bool inRange = false;
             try {
-                double v  = std::stod(val);
-                double lo = std::stod(c.betweenLow);
-                double hi = std::stod(c.betweenHigh);
+                double v  = std::stod(sv);
+                double lo = std::stod(slo);
+                double hi = std::stod(shi);
                 inRange = (v >= lo && v <= hi);
             } catch (...) {
-                inRange = (val >= c.betweenLow && val <= c.betweenHigh);
+                inRange = (sv >= slo && sv <= shi);
             }
             return c.op == "BETWEEN" ? inRange : !inRange;
         }

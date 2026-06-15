@@ -8872,6 +8872,80 @@ static void testGroup88() {
     }
 }
 
+// ── testGroup89: JOIN Qualified Column Resolution (10 Tests) ──
+
+static void testGroup89() {
+    std::cout << "\n── testGroup89: JOIN Qualified Column Names ──\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto run = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    run("CREATE TABLE produkte (id INT PRIMARY KEY, name TEXT, preis INT)");
+    run("INSERT INTO produkte VALUES (1, 'Döner', 799)");
+    run("INSERT INTO produkte VALUES (2, 'Pizza', 1299)");
+    run("CREATE TABLE bestellungen (id INT PRIMARY KEY, produkt_id INT, menge INT)");
+    run("INSERT INTO bestellungen VALUES (1, 1, 2)");
+    run("INSERT INTO bestellungen VALUES (2, 2, 1)");
+    run("INSERT INTO bestellungen VALUES (3, 1, 5)");
+
+    // ── 1. SELECT * JOIN (baseline) ──
+    {
+        auto r = run("SELECT * FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #1: SELECT * → 3 rows");
+    }
+
+    // ── 2. SELECT with table.col qualification ──
+    {
+        auto r = run("SELECT bestellungen.id, produkte.name FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #2: SELECT bestellungen.id, produkte.name → 3 rows");
+        check(r.columns.size() == 2, "JOIN #2: 2 columns projected");
+    }
+
+    // ── 3. SELECT with bare unambiguous column ──
+    {
+        auto r = run("SELECT menge, name FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #3: SELECT menge, name → 3 rows (unambiguous bare cols)");
+    }
+
+    // ── 4. Mixed: qualified + bare ──
+    {
+        auto r = run("SELECT bestellungen.id, name, menge FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #4: mixed qualified+bare → 3 rows");
+        check(r.columns.size() == 3, "JOIN #4: 3 columns");
+    }
+
+    // ── 5. Ambiguous bare col 'id' → returns -1 (no unique match), must disambiguate ──
+    {
+        // Both tables have 'id' — must use table prefix
+        auto r = run("SELECT bestellungen.id FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #5: disambiguated bestellungen.id → 3 rows");
+    }
+
+    // ── 6. Disambiguated with table prefix ──
+    {
+        auto r = run("SELECT produkte.id, produkte.name FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #6: SELECT produkte.id (disambiguated) → 3 rows");
+    }
+
+    // ── 7. SELECT preis (unambiguous, only in produkte) ──
+    {
+        auto r = run("SELECT preis FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #7: SELECT preis (unambiguous) → 3 rows");
+    }
+
+    // ── 8. Verify correct values ──
+    {
+        auto r = run("SELECT produkte.name, menge FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(!r.rows.empty(), "JOIN #8: has rows");
+        // First row: Döner, menge=2
+        check(r.rows[0].values[0] == "Döner" || r.rows[0].values[0] == "D\xc3\xb6ner",
+              "JOIN #8: first row name=Döner");
+        check(r.rows[0].values[1] == "2", "JOIN #8: first row menge=2");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -9132,6 +9206,9 @@ int main() {
     }
     try { testGroup88(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 88 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup89(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 89 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

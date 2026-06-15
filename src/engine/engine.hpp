@@ -792,8 +792,39 @@ public:
 
     // Öffentlich für Engine::alterTable()
     int colOf(const std::string& col) const {
+        // 1. Exact match
         for (size_t i = 0; i < columns_.size(); ++i)
             if (columns_[i].name == col) return static_cast<int>(i);
+        // 2. Qualified suffix match (e.g. "bestellungen.id" matches "public.bestellungen.id",
+        //    or bare "name" matches "public.shop_produkte.name")
+        auto dot = col.rfind('.');
+        std::string raw = dot != std::string::npos ? col.substr(dot + 1) : col;
+        std::string tblPrefix = dot != std::string::npos ? col.substr(0, dot) : "";
+        int bareMatch = -1;
+        int bareCount = 0;
+        for (size_t i = 0; i < columns_.size(); ++i) {
+            const auto& cn = columns_[i].name;
+            auto p = cn.rfind('.');
+            std::string suf = p != std::string::npos ? cn.substr(p + 1) : cn;
+            if (suf != raw) continue;
+            if (!tblPrefix.empty()) {
+                // Table-qualified: "bestellungen.id" must match table part
+                std::string cnTbl = p != std::string::npos ? cn.substr(0, p) : "";
+                // cnTbl = "public.bestellungen", tblPrefix = "bestellungen"
+                // Check suffix match on table name too
+                if (!cnTbl.empty() && cnTbl != tblPrefix &&
+                    !(cnTbl.size() > tblPrefix.size() &&
+                      cnTbl.substr(cnTbl.size() - tblPrefix.size()) == tblPrefix &&
+                      cnTbl[cnTbl.size() - tblPrefix.size() - 1] == '.'))
+                    continue;
+                return static_cast<int>(i);
+            }
+            // Bare column name: track for ambiguity
+            bareMatch = static_cast<int>(i);
+            ++bareCount;
+        }
+        // Return bare match only if unambiguous
+        if (bareCount == 1) return bareMatch;
         return -1;
     }
 

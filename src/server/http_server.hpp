@@ -2351,6 +2351,15 @@ td.null-val{color:#484f58;font-style:italic}
           </div>
           <div id="autocomplete"></div>
         </div>
+        <div id="example-queries" style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0">
+          <span style="font-size:0.7rem;color:#484f58;align-self:center">Examples:</span>
+          <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- JOIN with expression\nSELECT p.name, p.preis * b.menge AS gesamt\nFROM produkte p\nJOIN bestellungen b ON p.id = b.produkt_id')">JOIN + Calc</button>
+          <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- JOIN with GROUP BY\nSELECT p.name, SUM(b.menge) AS total\nFROM produkte p\nJOIN bestellungen b ON p.id = b.produkt_id\nGROUP BY p.name')">JOIN + GROUP BY</button>
+          <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- Aggregate with BETWEEN\nSELECT COUNT(*) FROM produkte\nWHERE preis BETWEEN 100 AND 1000')">COUNT + BETWEEN</button>
+          <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- Parameterized query (injection-safe)\n-- Use the params field below for ? values\nSELECT * FROM produkte WHERE id = ? AND preis > ?')">Params (?)</button>
+          <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- Window function\nSELECT name, preis,\n  RANK() OVER (ORDER BY preis DESC) AS rang\nFROM produkte')">Window Func</button>
+          <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- Subquery with IN\nSELECT * FROM produkte\nWHERE id IN (SELECT produkt_id FROM bestellungen)')">Subquery IN</button>
+        </div>
       </div>
       <div id="results-area">
         <div class="result-header" id="result-header" style="display:none">
@@ -2752,6 +2761,12 @@ function clearEditor() {
   document.getElementById('result-content').innerHTML = '';
   document.getElementById('exec-time').textContent = '';
   lastResultData = null;
+}
+function setSQL(s) {
+  var ed = document.getElementById('sql-editor');
+  ed.value = s;
+  updateEditorDecor();
+  ed.focus();
 }
 
 function copyCSV() {
@@ -3224,7 +3239,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
         onmouseover="this.style.background='#94d68f'" onmouseout="this.style.background='#a6e3a1'">Sign In</button>
       <div id="ms-lerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
       <div style="margin-top:16px;text-align:center;font-size:11px;color:#45475a">
-        Default: <b style="color:#6c7086">root</b> / <b style="color:#6c7086">root</b>
+        Create an account or sign in to get started
       </div>
     </div>
     <!-- Register Form -->

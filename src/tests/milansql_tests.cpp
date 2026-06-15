@@ -8967,6 +8967,70 @@ static void testGroup89() {
     }
 }
 
+// ── testGroup90: COUNT/SUM/AVG/MIN/MAX with BETWEEN/IN (Phase 167) ──
+
+static void testGroup90() {
+    std::cout << "\n── testGroup90: Aggregates with BETWEEN/IN ──\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto run = [&](const std::string& sql) {
+        return dispatch(parser.parse(sql), engine);
+    };
+
+    run("CREATE TABLE agg_test (id INT PRIMARY KEY, name TEXT, preis INT, kat TEXT)");
+    run("INSERT INTO agg_test VALUES (1, 'Laptop', 1200, 'IT')");
+    run("INSERT INTO agg_test VALUES (2, 'Maus', 25, 'IT')");
+    run("INSERT INTO agg_test VALUES (3, 'Stuhl', 300, 'Moebel')");
+    run("INSERT INTO agg_test VALUES (4, 'Monitor', 450, 'IT')");
+    run("INSERT INTO agg_test VALUES (5, 'Tisch', 800, 'Moebel')");
+
+    // 1. COUNT(*) with BETWEEN
+    {
+        auto r = run("SELECT COUNT(*) FROM agg_test WHERE preis BETWEEN 100 AND 1000");
+        check(r.rows.size() == 1 && r.rows[0].values[0] == "3",
+              "AGG #1: COUNT(*) BETWEEN 100-1000 = 3, got: " +
+              (r.rows.empty() ? "EMPTY" : r.rows[0].values[0]));
+    }
+
+    // 2. SUM with BETWEEN
+    {
+        auto r = run("SELECT SUM(preis) FROM agg_test WHERE preis BETWEEN 100 AND 1000");
+        check(r.rows.size() == 1 && r.rows[0].values[0] == "1550",
+              "AGG #2: SUM BETWEEN = 1550, got: " +
+              (r.rows.empty() ? "EMPTY" : r.rows[0].values[0]));
+    }
+
+    // 3. MIN with BETWEEN
+    {
+        auto r = run("SELECT MIN(preis) FROM agg_test WHERE preis BETWEEN 100 AND 1000");
+        check(r.rows.size() == 1 && r.rows[0].values[0] == "300",
+              "AGG #3: MIN BETWEEN = 300, got: " +
+              (r.rows.empty() ? "EMPTY" : r.rows[0].values[0]));
+    }
+
+    // 4. MAX with BETWEEN
+    {
+        auto r = run("SELECT MAX(preis) FROM agg_test WHERE preis BETWEEN 100 AND 1000");
+        check(r.rows.size() == 1 && r.rows[0].values[0] == "800",
+              "AGG #4: MAX BETWEEN = 800, got: " +
+              (r.rows.empty() ? "EMPTY" : r.rows[0].values[0]));
+    }
+
+    // 5. AVG with IN
+    {
+        auto r = run("SELECT AVG(preis) FROM agg_test WHERE kat IN ('Moebel')");
+        check(r.rows.size() == 1, "AGG #5: AVG with IN -> 1 row");
+    }
+
+    // 6. COUNT(*) without WHERE (regression check)
+    {
+        auto r = run("SELECT COUNT(*) FROM agg_test");
+        check(r.rows.size() == 1 && r.rows[0].values[0] == "5",
+              "AGG #6: COUNT(*) no WHERE = 5, got: " +
+              (r.rows.empty() ? "EMPTY" : r.rows[0].values[0]));
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -9230,6 +9294,9 @@ int main() {
     }
     try { testGroup89(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 89 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup90(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 90 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

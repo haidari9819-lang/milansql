@@ -2440,12 +2440,14 @@ public:
         if (hasExpr) {
             // Per-row update with expression evaluation
             size_t wCI = colIdx(tblRef, wCol);
+            const std::string wValStripped = milansql::dateutils::stripQuotes(wVal);
             std::vector<std::size_t> setCIs;
             for (const auto& col : setCols)
                 setCIs.push_back(colIdx(tblRef, col));
             std::size_t n = 0;
             for (auto& row : tblRef.mutableRows()) {
-                if (wCI < row.values.size() && row.values[wCI] == wVal) {
+                if (wCI < row.values.size() &&
+                    (row.values[wCI] == wVal || row.values[wCI] == wValStripped)) {
                     for (size_t k = 0; k < setCIs.size() && k < setVals.size(); ++k) {
                         if (setCIs[k] < row.values.size()) {
                             std::string resolved = evalSetExpr(setVals[k], tblRef.columns(), row);
@@ -2471,6 +2473,7 @@ public:
         }
 
         size_t wCI = colIdx(tblRef, wCol);
+        const std::string wvs = milansql::dateutils::stripQuotes(wVal);
 
         // Phase 43: collect old rows and compute new rows for BEFORE UPDATE triggers
         std::vector<std::size_t> setCIs2;
@@ -2479,7 +2482,8 @@ public:
 
         std::vector<std::vector<std::string>> oldRows;
         for (const auto& row : tblRef.rows())
-            if (wCI < row.values.size() && row.values[wCI] == wVal)
+            if (wCI < row.values.size() &&
+                (row.values[wCI] == wVal || row.values[wCI] == wvs))
                 oldRows.push_back(row.values);
 
         // Fire BEFORE UPDATE triggers
@@ -2499,7 +2503,8 @@ public:
 
         // Phase 68: recompute generated cols for affected rows
         for (auto& row : tblRef.mutableRows())
-            if (wCI < row.values.size() && row.values[wCI] == wVal)
+            if (wCI < row.values.size() &&
+                (row.values[wCI] == wVal || row.values[wCI] == wvs))
                 applyGeneratedCols(tblRef, row.values);
         if (n) tblRef.rebuildIndexes();
 
@@ -3674,8 +3679,8 @@ public:
                         rhsStr = row.values[i]; break;
                     }
                 try {
-                    double lv = std::stod(lhsStr);
-                    double rv = std::stod(rhsStr);
+                    double lv = std::stod(milansql::dateutils::stripQuotes(lhsStr));
+                    double rv = std::stod(milansql::dateutils::stripQuotes(rhsStr));
                     double res = 0;
                     if (op == "+") res = lv + rv;
                     else if (op == "-") res = lv - rv;

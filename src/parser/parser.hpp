@@ -5882,6 +5882,43 @@ private:
                 ++selStart; // skip just DISTINCT
             }
         }
+        // Phase 167: Detect standalone aggregates (COUNT/SUM/AVG/MIN/MAX) before column parsing
+        bool aggDetected167 = false;
+        if (selStart < fromPos) {
+            std::string aggU = toUpper(ft[selStart]);
+            bool isAggHere = (aggU == "COUNT" || aggU == "SUM" || aggU == "AVG" ||
+                              aggU == "MIN" || aggU == "MAX");
+            if (isAggHere && selStart + 1 < fromPos && ft[selStart + 1] == "(") {
+                // Collect aggregate column inside parens
+                std::string aggColStr;
+                size_t j = selStart + 2;  // skip FUNC and (
+                while (j < fromPos && ft[j] != ")") {
+                    if (!aggColStr.empty()) aggColStr += " ";
+                    aggColStr += ft[j];
+                    ++j;
+                }
+                // Check if this is the ONLY select item (no comma before FROM)
+                size_t afterClose = (j < fromPos) ? j + 1 : j;  // skip )
+                // Skip optional AS alias
+                if (afterClose < fromPos && toUpper(ft[afterClose]) == "AS") {
+                    ++afterClose;
+                    if (afterClose < fromPos) ++afterClose;
+                }
+                if (afterClose >= fromPos) {
+                    // Single aggregate — set isCount or isAggregate
+                    if (aggU == "COUNT") {
+                        cmd.isCount = true;
+                    } else {
+                        cmd.isAggregate = true;
+                        cmd.aggFunc = aggU;
+                        cmd.aggCol = aggColStr;
+                    }
+                    aggDetected167 = true;
+                    // Don't return — continue to parse WHERE below
+                }
+            }
+        }
+
         // Phase 31/32/64: CASE oder String-Funktion im Spaltenbereich?
         static const std::vector<std::string> SFUNCS32 =
             {"UPPER", "LOWER", "LENGTH", "CONCAT", "SUBSTR", "TRIM", "REPLACE",
@@ -5927,26 +5964,28 @@ private:
             if (toUpper(ft[i]) == "OVER") { hasWindowFunc = true; break; }
         }
 
-        if (hasCase || hasFunc || hasScalarSub37 || hasWindowFunc) {
-            parseCaseSelectItems(ft, selStart, fromPos, cmd);
-        } else {
-            // Group tokens between real commas as single column specs
-            // (preserves "t.depth + 1" and "a AS alias" as single entries)
-            std::string cur;
-            auto pushCur = [&]() {
-                while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
-                while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
-                if (cur != "*" && !cur.empty()) cmd.selectColumns.push_back(cur);
-                cur.clear();
-            };
-            for (size_t i = selStart; i < fromPos; ++i) {
-                if (ft[i] == ",") { pushCur(); }
-                else if (ft[i] != "(" && ft[i] != ")") {
-                    if (!cur.empty()) cur += " ";
-                    cur += ft[i];
+        if (!aggDetected167) {  // Phase 167: skip column parsing for standalone aggregates
+            if (hasCase || hasFunc || hasScalarSub37 || hasWindowFunc) {
+                parseCaseSelectItems(ft, selStart, fromPos, cmd);
+            } else {
+                // Group tokens between real commas as single column specs
+                // (preserves "t.depth + 1" and "a AS alias" as single entries)
+                std::string cur;
+                auto pushCur = [&]() {
+                    while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
+                    while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
+                    if (cur != "*" && !cur.empty()) cmd.selectColumns.push_back(cur);
+                    cur.clear();
+                };
+                for (size_t i = selStart; i < fromPos; ++i) {
+                    if (ft[i] == ",") { pushCur(); }
+                    else if (ft[i] != "(" && ft[i] != ")") {
+                        if (!cur.empty()) cur += " ";
+                        cur += ft[i];
+                    }
                 }
+                pushCur();
             }
-            pushCur();
         }
 
         // WHERE (mit IN-Unterstützung)

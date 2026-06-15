@@ -3154,12 +3154,43 @@ inline bool dispatchCommand(
                     cmd.whereConds, cmd.whereLogic);
                 for (const auto& tbl : fdwToClean)
                     engine.dropTempTable(tbl);
-                std::cout << "\n";
-                if (!cmd.orderByCols.empty())
-                    dispatch_sortWithVector(result, cmd.orderByCols);
-                if (!cmd.selectColumns.empty())
-                    result = result.project(cmd.selectColumns);
-                dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+
+                // Phase 167: JOIN + GROUP BY
+                if (cmd.isGroupBy) {
+                    std::string tmpName = "__join_tmp_main";
+                    engine.registerTempTable(tmpName, std::move(result));
+                    milansql::Table grouped;
+                    if (!cmd.groupingSets.empty()) {
+                        grouped = engine.groupByMulti(tmpName,
+                            {}, "", cmd.groupingSets, cmd.selectItems,
+                            cmd.havingConds, cmd.havingLogic);
+                    } else {
+                        grouped = engine.groupBy(tmpName,
+                            {}, "", cmd.groupByCols, cmd.selectItems,
+                            cmd.havingConds, cmd.havingLogic);
+                    }
+                    engine.dropTempTable(tmpName);
+                    std::cout << "\n";
+                    if (!cmd.orderByCols.empty()) dispatch_sortWithVector(grouped, cmd.orderByCols);
+                    dispatch_printTable(grouped, cmd.limit, cmd.limitOffset);
+                } else {
+                    std::cout << "\n";
+                    if (!cmd.orderByCols.empty())
+                        dispatch_sortWithVector(result, cmd.orderByCols);
+                    // Phase 167: Expression projection for JOINs
+                    if (!cmd.selectColumns.empty()) {
+                        if (dispatch_hasExprColumns(cmd.selectColumns)) {
+                            std::map<std::string,std::string> aliasMap;
+                            if (!cmd.tableAlias.empty()) aliasMap[cmd.tableAlias] = cmd.tableName;
+                            for (const auto& jc : cmd.joinClauses)
+                                if (!jc.tableAlias.empty()) aliasMap[jc.tableAlias] = jc.table;
+                            result = dispatch_projectExprs(result, cmd.selectColumns, aliasMap);
+                        } else {
+                            result = result.project(cmd.selectColumns);
+                        }
+                    }
+                    dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+                }
             }
             break;
         }

@@ -8750,6 +8750,86 @@ static void testGroup87() {
     }
 }
 
+// ── testGroup88: Parameterized Numeric Comparisons (10 Tests) ──
+// Fix: quoted params like '2000' must compare numerically against numeric columns
+
+static void testGroup88() {
+    std::cout << "\n── testGroup88: Parameterized Numeric Comparisons ──\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto run = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    run("CREATE TABLE shop_produkte (id INT PRIMARY KEY, name TEXT, preis INT, lager INT)");
+    run("INSERT INTO shop_produkte VALUES (1, 'Döner', 799, 50)");
+    run("INSERT INTO shop_produkte VALUES (2, 'Pizza', 1299, 30)");
+    run("INSERT INTO shop_produkte VALUES (3, 'Salat', 599, 100)");
+
+    // ── 1. SELECT WHERE preis < '2000' (quoted param) ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis < '2000'");
+        check(r.rows.size() == 3, "Param #1: preis < '2000' → 3 rows (all < 2000)");
+    }
+
+    // ── 2. SELECT WHERE preis > '1000' (quoted param) ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis > '1000'");
+        check(r.rows.size() == 1, "Param #2: preis > '1000' → 1 row (Pizza=1299)");
+    }
+
+    // ── 3. SELECT WHERE id = '1' (quoted param) ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE id = '1'");
+        check(r.rows.size() == 1, "Param #3: id = '1' → 1 row");
+    }
+
+    // ── 4. SELECT WHERE preis >= '799' ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis >= '799'");
+        check(r.rows.size() == 2, "Param #4: preis >= '799' → 2 rows (Döner+Pizza)");
+    }
+
+    // ── 5. SELECT WHERE preis <= '799' ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis <= '799'");
+        check(r.rows.size() == 2, "Param #5: preis <= '799' → 2 rows (Döner+Salat)");
+    }
+
+    // ── 6. SELECT WHERE preis != '799' ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis != '799'");
+        check(r.rows.size() == 2, "Param #6: preis != '799' → 2 rows (Pizza+Salat)");
+    }
+
+    // ── 7. Unquoted still works (regression check) ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis < 2000");
+        check(r.rows.size() == 3, "Param #7: preis < 2000 (unquoted) → 3 rows");
+    }
+
+    // ── 8. UPDATE WHERE id = '1' via quoted param ──
+    {
+        run("UPDATE shop_produkte SET lager = 99 WHERE id = '1'");
+        auto r = run("SELECT lager FROM shop_produkte WHERE id = 1");
+        check(!r.rows.empty() && r.rows[0].values[0] == "99",
+              "Param #8: UPDATE WHERE id = '1' → lager=99");
+    }
+
+    // ── 9. DELETE WHERE id = '3' (quoted equality param) ──
+    {
+        run("DELETE FROM shop_produkte WHERE id = '3'");
+        auto r = run("SELECT * FROM shop_produkte");
+        check(r.rows.size() == 2, "Param #9: DELETE WHERE id = '3' → 2 rows remain");
+    }
+
+    // ── 10. Mixed: quoted range query (after delete, Döner+Pizza remain) ──
+    {
+        auto r = run("SELECT * FROM shop_produkte WHERE preis >= '700' AND preis <= '1000'");
+        check(r.rows.size() == 1, "Param #10: preis BETWEEN '700' AND '1000' → 1 row (Döner=799)");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -9007,6 +9087,9 @@ int main() {
     }
     try { testGroup87(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 87 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup88(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 88 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

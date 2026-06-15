@@ -573,8 +573,102 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             if (cmd.isJoin) {
                 milansql::Table tbl = engine.executeJoins(cmd.tableName, cmd.joinClauses,
                                                           cmd.whereConds, cmd.whereLogic);
-                if (!cmd.selectColumns.empty())
-                    tbl = tbl.project(cmd.selectColumns);
+                // Phase 167: JOIN + GROUP BY
+                if (cmd.isGroupBy) {
+                    std::string tmpName = "__join_grp_tmp";
+                    engine.registerTempTable(tmpName, std::move(tbl));
+                    if (!cmd.groupingSets.empty()) {
+                        tbl = engine.groupByMulti(tmpName,
+                            {}, "", cmd.groupingSets, cmd.selectItems,
+                            cmd.havingConds, cmd.havingLogic);
+                    } else {
+                        tbl = engine.groupBy(tmpName,
+                            {}, "", cmd.groupByCols, cmd.selectItems,
+                            cmd.havingConds, cmd.havingLogic);
+                    }
+                    engine.dropTempTable(tmpName);
+                } else if (!cmd.selectColumns.empty()) {
+                    // Phase 167: Check if any selectColumn has expressions (*, +, -, /, AS)
+                    bool hasExpr = false;
+                    for (const auto& sc : cmd.selectColumns) {
+                        std::string up = sc;
+                        for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+                        if (up.find(" AS ") != std::string::npos ||
+                            up.find('+') != std::string::npos ||
+                            up.find('*') != std::string::npos ||
+                            up.find('/') != std::string::npos ||
+                            (up.find('-') != std::string::npos && up.find('-') > 0)) {
+                            hasExpr = true; break;
+                        }
+                    }
+                    if (hasExpr) {
+                        // Simple inline expression projection
+                        auto resolveCol = [&](const std::string& name, const milansql::Row& row) -> std::string {
+                            int ci = tbl.colOf(name);
+                            if (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
+                                return row.values[static_cast<size_t>(ci)];
+                            return name;  // literal
+                        };
+                        auto evalExpr = [&](const std::string& expr, const milansql::Row& row) -> std::string {
+                            // Parse "a op b" or just "a"
+                            std::istringstream ss(expr);
+                            std::vector<std::string> parts;
+                            std::string t;
+                            while (ss >> t) parts.push_back(t);
+                            if (parts.size() == 1) return resolveCol(parts[0], row);
+                            if (parts.size() == 3) {
+                                std::string lv = resolveCol(parts[0], row);
+                                std::string rv = resolveCol(parts[2], row);
+                                try {
+                                    bool lInt = true, rInt = true;
+                                    for (char c : lv) if (c != '-' && !std::isdigit((unsigned char)c)) { lInt = false; break; }
+                                    for (char c : rv) if (c != '-' && !std::isdigit((unsigned char)c)) { rInt = false; break; }
+                                    if (lInt && rInt && !lv.empty() && !rv.empty()) {
+                                        long long l = std::stoll(lv), r = std::stoll(rv);
+                                        long long res = (parts[1] == "+") ? l + r : (parts[1] == "-") ? l - r
+                                                      : (parts[1] == "*") ? l * r : (r != 0 ? l / r : 0);
+                                        return std::to_string(res);
+                                    }
+                                    double ld = std::stod(lv), rd = std::stod(rv);
+                                    double res = (parts[1] == "+") ? ld + rd : (parts[1] == "-") ? ld - rd
+                                               : (parts[1] == "*") ? ld * rd : (rd != 0 ? ld / rd : 0);
+                                    return std::to_string(res);
+                                } catch (...) {}
+                            }
+                            return expr;
+                        };
+                        // Parse selectColumns into {expr, alias} pairs
+                        struct ColSpec { std::string expr; std::string alias; };
+                        std::vector<ColSpec> specs;
+                        for (const auto& sc : cmd.selectColumns) {
+                            std::string up = sc;
+                            for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+                            auto asPos = up.find(" AS ");
+                            if (asPos != std::string::npos) {
+                                std::string e = sc.substr(0, asPos), a = sc.substr(asPos + 4);
+                                while (!e.empty() && e.back() == ' ') e.pop_back();
+                                while (!a.empty() && a.front() == ' ') a.erase(a.begin());
+                                specs.push_back({e, a});
+                            } else {
+                                auto dot = sc.rfind('.');
+                                specs.push_back({sc, dot != std::string::npos ? sc.substr(dot + 1) : sc});
+                            }
+                        }
+                        std::vector<milansql::Column> outCols;
+                        for (const auto& sp : specs) outCols.emplace_back(sp.alias, "TEXT");
+                        milansql::Table proj("__proj", outCols);
+                        for (const auto& row : tbl.rows()) {
+                            if (row.xmax != 0) continue;
+                            std::vector<std::string> vals;
+                            for (const auto& sp : specs)
+                                vals.push_back(evalExpr(sp.expr, row));
+                            proj.insert(milansql::Row(std::move(vals)));
+                        }
+                        tbl = std::move(proj);
+                    } else {
+                        tbl = tbl.project(cmd.selectColumns);
+                    }
+                }
                 for (const auto& c : tbl.columns())
                     qr.columns.push_back(c);
                 for (const auto& r : tbl.rows())

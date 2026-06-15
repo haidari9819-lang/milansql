@@ -6449,13 +6449,16 @@ private:
         // Globale Stop-Positionen
         size_t fromPos  = N, wherePos = N;
         size_t orderPos = N, limitPos = N;
+        size_t groupPos = N, havingPos = N;
 
         for (size_t i = 0; i < N; ++i) {
             std::string u = toUpper(ft[i]);
-            if      (u == "FROM"  && fromPos  == N) fromPos  = i;
-            else if (u == "WHERE" && wherePos == N) wherePos = i;
-            else if (u == "ORDER" && orderPos == N) orderPos = i;
-            else if (u == "LIMIT" && limitPos == N) limitPos = i;
+            if      (u == "FROM"   && fromPos   == N) fromPos   = i;
+            else if (u == "WHERE"  && wherePos  == N) wherePos  = i;
+            else if (u == "GROUP"  && groupPos  == N) groupPos  = i;
+            else if (u == "HAVING" && havingPos == N) havingPos = i;
+            else if (u == "ORDER"  && orderPos  == N) orderPos  = i;
+            else if (u == "LIMIT"  && limitPos  == N) limitPos  = i;
         }
 
         if (fromPos == N || fromPos + 1 >= N) {
@@ -6500,8 +6503,8 @@ private:
             pushCurJ();
         }
 
-        // JOIN-Klauseln scannen (zwischen Basistabelle und WHERE/ORDER/LIMIT)
-        size_t scanEnd = std::min({wherePos, orderPos, limitPos, N});
+        // JOIN-Klauseln scannen (zwischen Basistabelle und WHERE/ORDER/LIMIT/GROUP)
+        size_t scanEnd = std::min({wherePos, groupPos, orderPos, limitPos, N});
         size_t i = fromPos + 2;
         std::string curType = "INNER";  // Standard-JOIN-Typ
 
@@ -6563,13 +6566,131 @@ private:
 
         // WHERE
         if (wherePos != N) {
-            size_t whereEnd = std::min({orderPos, limitPos, N});
+            size_t whereEnd = std::min({groupPos, orderPos, limitPos, N});
             std::vector<std::string> wt;
             for (size_t k = wherePos; k < whereEnd; ++k) {
                 const std::string& t = ft[k];
                 if (t != "(" && t != ")" && t != ",") wt.push_back(t);
             }
             if (!wt.empty()) parseWhere(wt, 0, cmd);
+        }
+
+        // Phase 167: GROUP BY support for JOINs
+        if (groupPos != N && groupPos + 1 < N && toUpper(ft[groupPos + 1]) == "BY") {
+            cmd.isGroupBy = true;
+            // Parse GROUP BY columns
+            size_t gbEnd = std::min({havingPos, orderPos, limitPos, N});
+            std::string cur;
+            for (size_t k = groupPos + 2; k < gbEnd; ++k) {
+                if (ft[k] == ",") {
+                    if (!cur.empty()) { cmd.groupByCols.push_back(cur); cur.clear(); }
+                } else {
+                    if (!cur.empty()) cur += " ";
+                    cur += ft[k];
+                }
+            }
+            if (!cur.empty()) cmd.groupByCols.push_back(cur);
+
+            // Re-parse SELECT columns as SelectItems (aggregates + plain cols)
+            // Build the raw select list from tokens between SELECT and FROM
+            cmd.selectItems.clear();
+            std::vector<std::string> selTokenGroups;
+            {
+                std::string sg;
+                int depth = 0;
+                for (size_t k = selStart; k < fromPos; ++k) {
+                    if (ft[k] == "(") { depth++; if (!sg.empty()) sg += " "; sg += ft[k]; continue; }
+                    if (ft[k] == ")") { depth--; sg += ft[k]; continue; }
+                    if (ft[k] == "," && depth == 0) {
+                        if (!sg.empty()) selTokenGroups.push_back(sg);
+                        sg.clear(); continue;
+                    }
+                    if (!sg.empty()) sg += " ";
+                    sg += ft[k];
+                }
+                if (!sg.empty()) selTokenGroups.push_back(sg);
+            }
+            for (const auto& raw : selTokenGroups) {
+                SelectItem si;
+                // Check for alias: ... AS alias
+                std::string expr = raw, alias;
+                {
+                    std::string up = raw;
+                    for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+                    auto asP = up.find(" AS ");
+                    if (asP != std::string::npos) {
+                        expr  = raw.substr(0, asP);
+                        alias = raw.substr(asP + 4);
+                        while (!expr.empty()  && expr.back()  == ' ') expr.pop_back();
+                        while (!alias.empty() && alias.front() == ' ') alias.erase(alias.begin());
+                        while (!alias.empty() && alias.back()  == ' ') alias.pop_back();
+                    }
+                }
+                // Check for aggregate: SUM(...), COUNT(...), etc.
+                // Normalize: remove spaces before '(' for aggregate detection
+                std::string normExpr = expr;
+                {
+                    std::string tmp;
+                    for (size_t ci = 0; ci < normExpr.size(); ++ci) {
+                        if (normExpr[ci] == ' ' && ci + 1 < normExpr.size() && normExpr[ci + 1] == '(')
+                            continue;  // skip space before (
+                        tmp += normExpr[ci];
+                    }
+                    normExpr = tmp;
+                }
+                std::string up = normExpr;
+                for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+                bool isAgg = false;
+                for (const auto& af : {"SUM(", "COUNT(", "AVG(", "MIN(", "MAX("}) {
+                    if (up.find(af) == 0) { isAgg = true; break; }
+                }
+                if (isAgg) {
+                    auto pOpen = normExpr.find('(');
+                    auto pClose = normExpr.rfind(')');
+                    si.isAgg = true;
+                    si.aggFunc = normExpr.substr(0, pOpen);
+                    for (char& c : si.aggFunc) c = static_cast<char>(std::toupper((unsigned char)c));
+                    if (pOpen != std::string::npos && pClose != std::string::npos && pClose > pOpen) {
+                        si.aggCol = normExpr.substr(pOpen + 1, pClose - pOpen - 1);
+                        while (!si.aggCol.empty() && si.aggCol.front() == ' ') si.aggCol.erase(si.aggCol.begin());
+                        while (!si.aggCol.empty() && si.aggCol.back() == ' ') si.aggCol.pop_back();
+                    }
+                    si.alias = alias.empty() ? expr : alias;
+                } else {
+                    si.colName = expr;
+                    si.alias = alias.empty() ? expr : alias;
+                    // Strip table prefix for alias display if no explicit alias
+                    if (alias.empty()) {
+                        auto dot = si.alias.rfind('.');
+                        if (dot != std::string::npos) si.alias = si.alias.substr(dot + 1);
+                    }
+                }
+                cmd.selectItems.push_back(std::move(si));
+            }
+        }
+
+        // HAVING
+        if (havingPos != N) {
+            size_t hEnd = std::min({orderPos, limitPos, N});
+            std::vector<std::string> ht;
+            for (size_t k = havingPos + 1; k < hEnd; ++k) {
+                const std::string& t = ft[k];
+                if (t != "(" && t != ")") ht.push_back(t);
+            }
+            if (ht.size() >= 3) {
+                HavingCondition hc;
+                hc.aggFunc = toUpper(ht[0]);
+                // Parse "SUM col > val" or "COUNT * > val"
+                if (ht.size() >= 4) {
+                    hc.aggCol = ht[1];
+                    hc.op = ht[2];
+                    hc.val = ht[3];
+                } else {
+                    hc.op = ht[1];
+                    hc.val = ht[2];
+                }
+                cmd.havingConds.push_back(std::move(hc));
+            }
         }
 
         // ORDER BY (Phase 38: multi-column)

@@ -1725,13 +1725,13 @@ public:
         groupKeys.reserve(groupCols.size());
         for (const auto& gc : groupCols) {
             GroupByKey gk;
-            // Try direct column lookup first
+            // Try direct column lookup (with suffix matching for qualified names)
             bool found = false;
-            for (size_t si = 0; si < src.columns().size(); ++si) {
-                if (src.columns()[si].name == gc) {
-                    gk.ci = si;
+            {
+                int ci = src.colOf(gc);
+                if (ci >= 0) {
+                    gk.ci = static_cast<size_t>(ci);
                     found = true;
-                    break;
                 }
             }
             if (!found) {
@@ -5214,8 +5214,33 @@ private:
 
     // Spaltenindex; wirft bei unbekannter Spalte
     static std::size_t colIdx(const Table& t, const std::string& col) {
+        // 1. Exact match
         for (size_t i = 0; i < t.columns().size(); ++i)
             if (t.columns()[i].name == col) return i;
+        // 2. Suffix match for qualified names (e.g. "bestellungen.id" vs "public.bestellungen.id")
+        auto dot = col.rfind('.');
+        std::string raw = dot != std::string::npos ? col.substr(dot + 1) : col;
+        std::string tblPrefix = dot != std::string::npos ? col.substr(0, dot) : "";
+        int bestMatch = -1;
+        int matchCount = 0;
+        for (size_t i = 0; i < t.columns().size(); ++i) {
+            const auto& cn = t.columns()[i].name;
+            auto p = cn.rfind('.');
+            std::string suf = p != std::string::npos ? cn.substr(p + 1) : cn;
+            if (suf != raw) continue;
+            if (!tblPrefix.empty()) {
+                std::string cnTbl = p != std::string::npos ? cn.substr(0, p) : "";
+                if (!cnTbl.empty() && cnTbl != tblPrefix &&
+                    !(cnTbl.size() > tblPrefix.size() &&
+                      cnTbl.substr(cnTbl.size() - tblPrefix.size()) == tblPrefix &&
+                      cnTbl[cnTbl.size() - tblPrefix.size() - 1] == '.'))
+                    continue;
+                return i;  // Table-qualified: return immediately
+            }
+            bestMatch = static_cast<int>(i);
+            ++matchCount;
+        }
+        if (matchCount == 1) return static_cast<size_t>(bestMatch);
         throw std::runtime_error(
             "Spalte '" + col + "' nicht gefunden in '" + t.name() + "'.");
     }

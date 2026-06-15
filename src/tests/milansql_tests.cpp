@@ -8852,6 +8852,24 @@ static void testGroup88() {
         auto r = run("SELECT * FROM shop_produkte WHERE preis NOT BETWEEN '800' AND '2000'");
         check(r.rows.size() == 1, "Param #14: NOT BETWEEN '800' AND '2000' → 1 row (Döner=799)");
     }
+
+    // ── 15. UPDATE SET col = col - '1' WHERE id = '1' (expression + quoted params) ──
+    {
+        // Reset: Döner lager=99 from test #8
+        run("UPDATE shop_produkte SET lager = 50 WHERE id = 1");
+        run("UPDATE shop_produkte SET lager = lager - '1' WHERE id = '1'");
+        auto r = run("SELECT lager FROM shop_produkte WHERE id = 1");
+        check(!r.rows.empty() && r.rows[0].values[0] == "49",
+              "Param #15: SET lager=lager-'1' WHERE id='1' → lager=49");
+    }
+
+    // ── 16. UPDATE SET col = col + '10' WHERE id = '2' ──
+    {
+        run("UPDATE shop_produkte SET preis = preis + '100' WHERE id = '2'");
+        auto r = run("SELECT preis FROM shop_produkte WHERE id = 2");
+        check(!r.rows.empty() && r.rows[0].values[0] == "1399",
+              "Param #16: SET preis=preis+'100' WHERE id='2' → preis=1399");
+    }
 }
 
 // MAIN

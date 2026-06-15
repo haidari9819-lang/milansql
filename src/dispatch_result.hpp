@@ -573,6 +573,8 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             if (cmd.isJoin) {
                 milansql::Table tbl = engine.executeJoins(cmd.tableName, cmd.joinClauses,
                                                           cmd.whereConds, cmd.whereLogic);
+                if (!cmd.selectColumns.empty())
+                    tbl = tbl.project(cmd.selectColumns);
                 for (const auto& c : tbl.columns())
                     qr.columns.push_back(c);
                 for (const auto& r : tbl.rows())

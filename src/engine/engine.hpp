@@ -451,9 +451,11 @@ public:
 
     std::size_t updateWhere(std::size_t setCI, const std::string& newVal,
                             std::size_t wCI,  const std::string& wVal) {
+        const std::string stripped = milansql::dateutils::stripQuotes(wVal);
         std::size_t n = 0;
         for (auto& row : rows_)
-            if (wCI < row.values.size() && row.values[wCI] == wVal)
+            if (wCI < row.values.size() &&
+                (row.values[wCI] == wVal || row.values[wCI] == stripped))
                 { row.values[setCI] = newVal; ++n; }
         if (n) rebuildAll();
         return n;
@@ -463,9 +465,11 @@ public:
     std::size_t updateWhere(const std::vector<std::size_t>& setCIs,
                             const std::vector<std::string>& newVals,
                             std::size_t wCI, const std::string& wVal) {
+        const std::string stripped = milansql::dateutils::stripQuotes(wVal);
         std::size_t n = 0;
         for (auto& row : rows_)
-            if (wCI < row.values.size() && row.values[wCI] == wVal) {
+            if (wCI < row.values.size() &&
+                (row.values[wCI] == wVal || row.values[wCI] == stripped)) {
                 for (size_t k = 0; k < setCIs.size() && k < newVals.size(); ++k)
                     if (setCIs[k] < row.values.size())
                         row.values[setCIs[k]] = newVals[k];
@@ -494,9 +498,11 @@ public:
     }
 
     std::size_t deleteWhere(std::size_t wCI, const std::string& wVal) {
+        const std::string stripped = milansql::dateutils::stripQuotes(wVal);
         std::size_t before = rows_.size();
         rows_.erase(std::remove_if(rows_.begin(), rows_.end(), [&](const Row& r) {
-            return wCI < r.values.size() && r.values[wCI] == wVal;
+            return wCI < r.values.size() &&
+                   (r.values[wCI] == wVal || r.values[wCI] == stripped);
         }), rows_.end());
         std::size_t n = before - rows_.size();
         if (n) rebuildAll();
@@ -2343,9 +2349,11 @@ public:
         {
             const Table& t = getTable(tbl);
             size_t wCI = colIdx(t, wCol);
+            const std::string stripped = milansql::dateutils::stripQuotes(wVal);
             std::vector<Row> matched;
             for (const auto& row : t.rows())
-                if (wCI < row.values.size() && row.values[wCI] == wVal)
+                if (wCI < row.values.size() &&
+                    (row.values[wCI] == wVal || row.values[wCI] == stripped))
                     matched.push_back(row);
             for (const auto& row : matched)
                 cascadeDelete(tbl, row);
@@ -4576,12 +4584,14 @@ private:
 
     // Compare two values with an operator (for trigger IF conditions)
     static bool trgCompare(const std::string& a, const std::string& op, const std::string& b) {
+        const std::string ca = milansql::dateutils::stripQuotes(a);
+        const std::string cb = milansql::dateutils::stripQuotes(b);
         // Try numeric
         try {
             size_t ea = 0, eb = 0;
-            double da = std::stod(a, &ea);
-            double db = std::stod(b, &eb);
-            if (ea == a.size() && eb == b.size()) {
+            double da = std::stod(ca, &ea);
+            double db = std::stod(cb, &eb);
+            if (ea == ca.size() && eb == cb.size()) {
                 if (op == "=")  return da == db;
                 if (op == "!=") return da != db;
                 if (op == "<")  return da <  db;
@@ -4591,12 +4601,12 @@ private:
             }
         } catch (...) {}
         // String fallback
-        if (op == "=")  return a == b;
-        if (op == "!=") return a != b;
-        if (op == "<")  return a <  b;
-        if (op == ">")  return a >  b;
-        if (op == "<=") return a <= b;
-        if (op == ">=") return a >= b;
+        if (op == "=")  return ca == cb;
+        if (op == "!=") return ca != cb;
+        if (op == "<")  return ca <  cb;
+        if (op == ">")  return ca >  cb;
+        if (op == "<=") return ca <= cb;
+        if (op == ">=") return ca >= cb;
         return false;
     }
 
@@ -6229,14 +6239,17 @@ private:
             return c.op == "IN" ? found : !found;
         }
         if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+            const std::string sv  = milansql::dateutils::stripQuotes(val);
+            const std::string slo = milansql::dateutils::stripQuotes(c.betweenLow);
+            const std::string shi = milansql::dateutils::stripQuotes(c.betweenHigh);
             bool inRange = false;
             try {
-                double v  = std::stod(val);
-                double lo = std::stod(c.betweenLow);
-                double hi = std::stod(c.betweenHigh);
+                double v  = std::stod(sv);
+                double lo = std::stod(slo);
+                double hi = std::stod(shi);
                 inRange = (v >= lo && v <= hi);
             } catch (...) {
-                inRange = (val >= c.betweenLow && val <= c.betweenHigh);
+                inRange = (sv >= slo && sv <= shi);
             }
             return c.op == "BETWEEN" ? inRange : !inRange;
         }
@@ -6609,11 +6622,14 @@ private:
                 return (op == "REGEXP") ? match : !match;
             } catch (...) { return false; }
         }
+        // Strip quotes before numeric comparison so parameterized '2000' works
+        const std::string as = milansql::dateutils::stripQuotes(a);
+        const std::string bs = milansql::dateutils::stripQuotes(b);
         try {
             size_t ea = 0, eb = 0;
-            double da = std::stod(a, &ea);
-            double db = std::stod(b, &eb);
-            if (ea == a.size() && eb == b.size()) {
+            double da = std::stod(as, &ea);
+            double db = std::stod(bs, &eb);
+            if (ea == as.size() && eb == bs.size()) {
                 if (op == "=")  return da == db;
                 if (op == "!=") return da != db;
                 if (op == "<")  return da <  db;
@@ -6622,9 +6638,6 @@ private:
                 if (op == ">=") return da >= db;
             }
         } catch (...) {}
-        // Normalisiere Strings für Vergleich (entferne äußere Anführungszeichen)
-        const std::string as = milansql::dateutils::stripQuotes(a);
-        const std::string bs = milansql::dateutils::stripQuotes(b);
         if (op == "=")  return as == bs;
         if (op == "!=") return as != bs;
         if (op == "<")  return as <  bs;

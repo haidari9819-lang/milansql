@@ -8944,6 +8944,27 @@ static void testGroup89() {
               "JOIN #8: first row name=Döner");
         check(r.rows[0].values[1] == "2", "JOIN #8: first row menge=2");
     }
+
+    // ── 9. WHERE with qualified column names in JOIN ──
+    {
+        auto r = run("SELECT produkte.name, bestellungen.menge FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id WHERE produkte.preis > 1000");
+        check(r.rows.size() == 1, "JOIN #9: WHERE produkte.preis > 1000 → 1 row (Pizza)");
+    }
+
+    // ── 10. JOIN + GROUP BY with qualified names + aggregate ──
+    {
+        auto r = run("SELECT produkte.name, SUM(bestellungen.menge) AS total FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id GROUP BY produkte.name");
+        check(r.rows.size() == 2, "JOIN #10: GROUP BY produkte.name → 2 groups");
+    }
+
+    // ── 11. Expression over JOIN columns (preis * menge) ──
+    {
+        auto r = run("SELECT produkte.name, produkte.preis * bestellungen.menge AS umsatz FROM bestellungen JOIN produkte ON bestellungen.produkt_id = produkte.id");
+        check(r.rows.size() == 3, "JOIN #11: expression preis*menge → 3 rows");
+        // First row: Döner, 799*2 = 1598
+        check(r.rows[0].values[1] == "1598" || r.rows[0].values[1] == "1598.000000",
+              "JOIN #11: Döner umsatz = 1598, got: " + r.rows[0].values[1]);
+    }
 }
 
 // MAIN

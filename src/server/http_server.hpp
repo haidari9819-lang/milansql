@@ -2284,7 +2284,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="brand"><span>&#x26A1;</span> MilanSQL</div>
   <span class="badge" id="health-badge">checking...</span>
   <span class="badge blue" id="conn-badge">0 connections</span>
-  <span class="badge blue" id="test-badge">850 tests</span>
+  <span class="badge blue" id="test-badge">1221 tests</span>
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>

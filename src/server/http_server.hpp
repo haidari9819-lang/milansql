@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <algorithm>
 
 #include "../engine/engine.hpp"
@@ -55,28 +56,90 @@
 
 static std::string jsonEscape(const std::string& s) {
     std::string r;
-    for (char c : s) {
+    r.reserve(s.size() + 4);
+    for (unsigned char c : s) {
         if      (c == '"')  r += "\\\"";
         else if (c == '\\') r += "\\\\";
+        else if (c == '\b') r += "\\b";
+        else if (c == '\f') r += "\\f";
         else if (c == '\n') r += "\\n";
         else if (c == '\r') r += "\\r";
         else if (c == '\t') r += "\\t";
-        else r += c;
+        else if (c < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+            r += buf;
+        }
+        else r += static_cast<char>(c);
     }
     return r;
 }
 
+// Check if a column type name is numeric (INT, FLOAT, DECIMAL, etc.)
+static bool isNumericType(const std::string& type) {
+    if (type.empty()) return false;
+    // Uppercase first word for comparison
+    std::string t;
+    for (char c : type) {
+        if (c == '(' || c == ' ') break;
+        t += static_cast<char>(std::toupper((unsigned char)c));
+    }
+    return t == "INT" || t == "INTEGER" || t == "BIGINT" || t == "SMALLINT"
+        || t == "TINYINT" || t == "FLOAT" || t == "DOUBLE" || t == "DECIMAL"
+        || t == "NUMERIC" || t == "REAL" || t == "NUMBER" || t == "SERIAL"
+        || t == "BIGSERIAL" || t == "BOOLEAN" || t == "BOOL";
+}
+
+// Strict numeric literal check per RFC 8259:
+//   number = [ "-" ] int [ frac ] [ exp ]
+//   int    = "0" | digit1-9 *digit
+//   frac   = "." 1*digit
+//   exp    = ("e"|"E") ["+"|"-"] 1*digit
+static bool isJsonNumber(const std::string& v) {
+    if (v.empty()) return false;
+    size_t i = 0;
+    if (v[i] == '-') ++i;
+    if (i >= v.size()) return false;
+    // int part: no leading zeros (except standalone "0")
+    if (v[i] == '0') {
+        ++i;
+        if (i < v.size() && std::isdigit((unsigned char)v[i])) return false;
+    } else if (std::isdigit((unsigned char)v[i])) {
+        while (i < v.size() && std::isdigit((unsigned char)v[i])) ++i;
+    } else {
+        return false;
+    }
+    // frac
+    if (i < v.size() && v[i] == '.') {
+        ++i;
+        if (i >= v.size() || !std::isdigit((unsigned char)v[i])) return false;
+        while (i < v.size() && std::isdigit((unsigned char)v[i])) ++i;
+    }
+    // exp
+    if (i < v.size() && (v[i] == 'e' || v[i] == 'E')) {
+        ++i;
+        if (i < v.size() && (v[i] == '+' || v[i] == '-')) ++i;
+        if (i >= v.size() || !std::isdigit((unsigned char)v[i])) return false;
+        while (i < v.size() && std::isdigit((unsigned char)v[i])) ++i;
+    }
+    return i == v.size();
+}
+
+// Type-aware: use column type to decide quoting; only numeric columns
+// with valid numeric values are emitted unquoted.
+static std::string jsonValueTyped(const std::string& v, const std::string& colType) {
+    if (v == "NULL") return "null";
+    if (isNumericType(colType) && isJsonNumber(v)) return v;
+    // BOOLEAN special case
+    if ((colType == "BOOLEAN" || colType == "BOOL" || colType == "boolean" || colType == "bool")
+        && (v == "true" || v == "false")) return v;
+    return "\"" + jsonEscape(v) + "\"";
+}
+
+// Fallback for contexts without column type info (non-SELECT output).
 static std::string jsonValue(const std::string& v) {
     if (v == "NULL") return "null";
-    bool isNum = !v.empty();
-    bool hasDot = false;
-    for (size_t i = 0; i < v.size(); ++i) {
-        char c = v[i];
-        if (i == 0 && (c == '-' || c == '+')) continue;
-        if (c == '.' && !hasDot) { hasDot = true; continue; }
-        if (!std::isdigit((unsigned char)c)) { isNum = false; break; }
-    }
-    if (isNum) return v;
+    if (isJsonNumber(v)) return v;
     return "\"" + jsonEscape(v) + "\"";
 }
 
@@ -404,7 +467,8 @@ static std::string sanitizeError(const std::string& msg) {
 
 // ── Output parser: convert captured table output to JSON ──────
 
-static std::string parseOutputToJson(const std::string& output) {
+static std::string parseOutputToJson(const std::string& output,
+                                     const std::vector<std::string>& colTypes = {}) {
     std::vector<std::string> lines;
     std::istringstream iss(output);
     std::string line;
@@ -413,10 +477,12 @@ static std::string parseOutputToJson(const std::string& output) {
         if (!line.empty()) lines.push_back(line);
     }
 
-    // Find data lines (containing box-drawing │ or plain |)
+    // Find data lines (containing box-drawing │ U+2502 = E2 94 82)
+    // IMPORTANT: only split on the UTF-8 box-drawing │, NOT on ASCII '|'
+    // which can appear inside cell values (e.g. "Döner|Dürüm|Pizza").
     std::vector<std::vector<std::string>> dataLines;
     for (const auto& l : lines) {
-        if (l.find("\xe2\x94\x82") != std::string::npos || l.find('|') != std::string::npos) {
+        if (l.find("\xe2\x94\x82") != std::string::npos) {
             std::vector<std::string> cells;
             std::string cur;
             bool inCell = false;
@@ -434,15 +500,6 @@ static std::string parseOutputToJson(const std::string& output) {
                     }
                     inCell = true;
                     i += 3;
-                } else if (l[i] == '|') {
-                    if (inCell) {
-                        while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
-                        while (!cur.empty() && cur.front() == ' ') cur = cur.substr(1);
-                        cells.push_back(cur);
-                        cur = "";
-                    }
-                    inCell = true;
-                    ++i;
                 } else {
                     if (inCell) cur += l[i];
                     ++i;
@@ -472,7 +529,10 @@ static std::string parseOutputToJson(const std::string& output) {
             json += "[";
             for (size_t ci = 0; ci < row.size(); ++ci) {
                 if (ci > 0) json += ",";
-                json += jsonValue(row[ci]);
+                if (ci < colTypes.size())
+                    json += jsonValueTyped(row[ci], colTypes[ci]);
+                else
+                    json += jsonValue(row[ci]);
             }
             json += "]";
             rowCount++;
@@ -1574,6 +1634,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         std::ostringstream cap;
         std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
         bool ok = true; std::string errMsg;
+        std::vector<std::string> colTypesOut;
         try {
             milansql::Parser p;
             auto cmd = p.parse(oneSQL);
@@ -1632,11 +1693,34 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             }
 
             milansql::dispatchCommand(cmd, engine_, p, oneSQL, persistFn, saveProceduresFn, saveTriggFn);
+
+            // Extract column types for type-aware JSON serialization
+            if (cmd.type == milansql::CommandType::SELECT && !cmd.tableName.empty()
+                && engine_.tableExists(cmd.tableName)) {
+                const auto& tbl = engine_.selectAll(cmd.tableName);
+                const auto& cols = tbl.columns();
+                if (!cmd.selectColumns.empty()) {
+                    for (const auto& selCol : cmd.selectColumns) {
+                        bool found = false;
+                        for (const auto& col : cols) {
+                            if (col.name == selCol) {
+                                colTypesOut.push_back(col.type);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) colTypesOut.push_back("TEXT");
+                    }
+                } else {
+                    for (const auto& col : cols)
+                        colTypesOut.push_back(col.type);
+                }
+            }
         } catch (const std::exception& e) { ok = false; errMsg = sanitizeError(e.what()); }
           catch (...) { ok = false; errMsg = "Unknown error"; }
         std::cout.rdbuf(old);
         if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
-        return parseOutputToJson(cap.str());
+        return parseOutputToJson(cap.str(), colTypesOut);
     };
 
     auto stmts = milansql::splitStatements(sql);
@@ -1730,6 +1814,7 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
         std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
         bool ok = true;
         std::string errMsg;
+        std::vector<std::string> colTypesOut;
         try {
             milansql::Parser p;
             auto cmd = p.parse(oneSQL);
@@ -1741,11 +1826,33 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
             }
             milansql::dispatchCommand(cmd, engine_, p, oneSQL,
                                       persistFn, saveProceduresFn, saveTriggFn);
+            // Extract column types for type-aware JSON serialization
+            if (cmd.type == milansql::CommandType::SELECT && !cmd.tableName.empty()
+                && engine_.tableExists(cmd.tableName)) {
+                const auto& tbl = engine_.selectAll(cmd.tableName);
+                const auto& cols = tbl.columns();
+                if (!cmd.selectColumns.empty()) {
+                    for (const auto& selCol : cmd.selectColumns) {
+                        bool found = false;
+                        for (const auto& col : cols) {
+                            if (col.name == selCol) {
+                                colTypesOut.push_back(col.type);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) colTypesOut.push_back("TEXT");
+                    }
+                } else {
+                    for (const auto& col : cols)
+                        colTypesOut.push_back(col.type);
+                }
+            }
         } catch (const std::exception& e) { ok = false; errMsg = e.what(); }
           catch (...) { ok = false; errMsg = "Unbekannter Fehler"; }
         std::cout.rdbuf(old);
         if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
-        return parseOutputToJson(cap.str());
+        return parseOutputToJson(cap.str(), colTypesOut);
     };
 
     auto stmts = milansql::splitStatements(sql);

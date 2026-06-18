@@ -459,10 +459,7 @@ static inline void dispatch_printTable(const milansql::Table& tbl, int limit, in
     hline("\u251c", "\u253c", "\u2524", "\u2500");
 
     if (printRows == 0) {
-        std::cout << "\u2502";
-        for (size_t i = 0; i < cols.size(); ++i)
-            std::cout << "  " << std::string(widths[i], ' ') << "\u2502";
-        std::cout << "\n";
+        // Empty table — no data rows to print
     } else {
         for (size_t r = startRow; r < startRow + printRows; ++r) {
             std::cout << "\u2502";

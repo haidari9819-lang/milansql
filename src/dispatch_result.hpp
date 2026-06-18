@@ -451,8 +451,63 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             const auto& rows = cmd.multiValues.empty()
                 ? std::vector<std::vector<std::string>>{cmd.values}
                 : cmd.multiValues;
-            for (const auto& vals : rows)
+            // Phase 169: Capture inserted rows for RETURNING
+            std::vector<std::vector<std::string>> insertedRows;
+            bool hasReturning = !cmd.returningColumns.empty();
+            for (const auto& vals : rows) {
                 engine.insertRow(cmd.tableName, vals);
+                if (hasReturning) insertedRows.push_back(vals);
+            }
+            // Phase 169: Build RETURNING result
+            if (hasReturning && qr.error.empty()) {
+                const auto& tbl = engine.selectAll(cmd.tableName);
+                const auto& cols = tbl.columns();
+                bool isStar = (cmd.returningColumns.size() == 1 && cmd.returningColumns[0] == "*");
+                if (isStar) {
+                    for (const auto& c : cols) qr.columns.push_back(c);
+                } else {
+                    for (const auto& rc : cmd.returningColumns)
+                        qr.columns.push_back(milansql::Column{rc, "TEXT"});
+                }
+                for (const auto& irow : insertedRows) {
+                    if (isStar) {
+                        // Return all columns — the inserted row may need defaults applied
+                        // Get the last N rows from the table matching inserted values
+                        const auto& allRows = tbl.rows();
+                        // Find matching row (last inserted)
+                        for (auto it = allRows.rbegin(); it != allRows.rend(); ++it) {
+                            if (it->xmax != 0) continue;
+                            // Check if PK matches
+                            bool match = true;
+                            for (size_t ci = 0; ci < std::min(irow.size(), it->values.size()); ++ci) {
+                                std::string iv = irow[ci];
+                                if (iv.size() >= 2 && ((iv.front() == '\'' && iv.back() == '\'') ||
+                                    (iv.front() == '"' && iv.back() == '"')))
+                                    iv = iv.substr(1, iv.size() - 2);
+                                if (iv != it->values[ci]) { match = false; break; }
+                            }
+                            if (match) { qr.rows.push_back(*it); break; }
+                        }
+                    } else {
+                        std::vector<std::string> retVals;
+                        for (const auto& rc : cmd.returningColumns) {
+                            int ci = -1;
+                            for (size_t k = 0; k < cols.size(); ++k)
+                                if (cols[k].name == rc) { ci = static_cast<int>(k); break; }
+                            if (ci >= 0 && ci < static_cast<int>(irow.size())) {
+                                std::string v = irow[ci];
+                                if (v.size() >= 2 && ((v.front() == '\'' && v.back() == '\'') ||
+                                    (v.front() == '"' && v.back() == '"')))
+                                    v = v.substr(1, v.size() - 2);
+                                retVals.push_back(v);
+                            } else {
+                                retVals.push_back("NULL");
+                            }
+                        }
+                        qr.rows.push_back(milansql::Row(std::move(retVals)));
+                    }
+                }
+            }
         } catch (const std::exception& e) {
             qr.error = e.what();
         }
@@ -473,6 +528,57 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                                        cmd.updateCols, cmd.updateVals,
                                        cmd.whereColumn, cmd.whereValue);
             }
+            // Phase 169: RETURNING for UPDATE — re-query updated rows
+            if (!cmd.returningColumns.empty() && qr.error.empty()) {
+                const auto& tbl = engine.selectAll(cmd.tableName);
+                const auto& cols = tbl.columns();
+                bool isStar = (cmd.returningColumns.size() == 1 && cmd.returningColumns[0] == "*");
+                if (isStar) {
+                    for (const auto& c : cols) qr.columns.push_back(c);
+                } else {
+                    for (const auto& rc : cmd.returningColumns)
+                        qr.columns.push_back(milansql::Column{rc, "TEXT"});
+                }
+                // Find updated rows using WHERE condition
+                if (!cmd.whereColumn.empty()) {
+                    int wci = -1;
+                    for (size_t k = 0; k < cols.size(); ++k)
+                        if (cols[k].name == cmd.whereColumn) { wci = static_cast<int>(k); break; }
+                    for (const auto& row : tbl.rows()) {
+                        if (row.xmax != 0) continue;
+                        // Check if row matches updated values in SET columns
+                        bool match = true;
+                        for (size_t si = 0; si < cmd.updateCols.size() && match; ++si) {
+                            int sci = -1;
+                            for (size_t k = 0; k < cols.size(); ++k)
+                                if (cols[k].name == cmd.updateCols[si]) { sci = static_cast<int>(k); break; }
+                            if (sci >= 0 && static_cast<size_t>(sci) < row.values.size()) {
+                                std::string sv = cmd.updateVals[si];
+                                if (sv.size() >= 2 && ((sv.front() == '\'' && sv.back() == '\'') ||
+                                    (sv.front() == '"' && sv.back() == '"')))
+                                    sv = sv.substr(1, sv.size() - 2);
+                                if (row.values[sci] != sv) match = false;
+                            }
+                        }
+                        if (!match) continue;
+                        if (isStar) {
+                            qr.rows.push_back(row);
+                        } else {
+                            std::vector<std::string> retVals;
+                            for (const auto& rc : cmd.returningColumns) {
+                                int ci = -1;
+                                for (size_t k = 0; k < cols.size(); ++k)
+                                    if (cols[k].name == rc) { ci = static_cast<int>(k); break; }
+                                if (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
+                                    retVals.push_back(row.values[ci]);
+                                else
+                                    retVals.push_back("NULL");
+                            }
+                            qr.rows.push_back(milansql::Row(std::move(retVals)));
+                        }
+                    }
+                }
+            }
         } catch (const std::exception& e) {
             qr.error = e.what();
         }
@@ -481,10 +587,61 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
 
     case milansql::CommandType::DELETE: {
         try {
+            // Phase 169: Capture rows BEFORE delete for RETURNING
+            std::vector<milansql::Row> deletedRows;
+            bool hasReturning = !cmd.returningColumns.empty();
+            if (hasReturning) {
+                const auto& tbl = engine.selectAll(cmd.tableName);
+                const auto& cols = tbl.columns();
+                if (!cmd.whereColumn.empty()) {
+                    int wci = -1;
+                    for (size_t k = 0; k < cols.size(); ++k)
+                        if (cols[k].name == cmd.whereColumn) { wci = static_cast<int>(k); break; }
+                    for (const auto& row : tbl.rows()) {
+                        if (row.xmax != 0) continue;
+                        if (wci >= 0 && static_cast<size_t>(wci) < row.values.size()) {
+                            std::string wv = cmd.whereValue;
+                            if (wv.size() >= 2 && ((wv.front() == '\'' && wv.back() == '\'') ||
+                                (wv.front() == '"' && wv.back() == '"')))
+                                wv = wv.substr(1, wv.size() - 2);
+                            if (row.values[wci] == wv) deletedRows.push_back(row);
+                        }
+                    }
+                } else {
+                    for (const auto& row : tbl.rows())
+                        if (row.xmax == 0) deletedRows.push_back(row);
+                }
+            }
             if (cmd.whereColumn.empty() && cmd.whereConds.empty()) {
                 engine.deleteAll(cmd.tableName);
             } else {
                 engine.deleteWhere(cmd.tableName, cmd.whereColumn, cmd.whereValue);
+            }
+            // Phase 169: Build RETURNING result from captured rows
+            if (hasReturning && qr.error.empty()) {
+                const auto& tbl = engine.selectAll(cmd.tableName);
+                const auto& cols = tbl.columns();
+                bool isStar = (cmd.returningColumns.size() == 1 && cmd.returningColumns[0] == "*");
+                if (isStar) {
+                    for (const auto& c : cols) qr.columns.push_back(c);
+                    qr.rows = std::move(deletedRows);
+                } else {
+                    for (const auto& rc : cmd.returningColumns)
+                        qr.columns.push_back(milansql::Column{rc, "TEXT"});
+                    for (const auto& row : deletedRows) {
+                        std::vector<std::string> retVals;
+                        for (const auto& rc : cmd.returningColumns) {
+                            int ci = -1;
+                            for (size_t k = 0; k < cols.size(); ++k)
+                                if (cols[k].name == rc) { ci = static_cast<int>(k); break; }
+                            if (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
+                                retVals.push_back(row.values[ci]);
+                            else
+                                retVals.push_back("NULL");
+                        }
+                        qr.rows.push_back(milansql::Row(std::move(retVals)));
+                    }
+                }
             }
         } catch (const std::exception& e) {
             qr.error = e.what();

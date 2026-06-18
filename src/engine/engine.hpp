@@ -293,11 +293,22 @@ struct SelectItem {
 
     // Phase 42: Window Functions
     bool        isWindowFunc     = false;
-    std::string windowFunc;          // ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX
+    std::string windowFunc;          // ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG, COUNT, MIN, MAX, LAG, LEAD, NTILE, FIRST_VALUE, LAST_VALUE, PERCENT_RANK, CUME_DIST
     std::string windowFuncArg;       // argument for SUM/AVG/MIN/MAX (column name), or "*" for COUNT
     std::string windowPartitionBy;   // column name for PARTITION BY, empty = no partition
     std::string windowOrderBy;       // column name for ORDER BY inside OVER
     bool        windowOrderDesc = false;  // true = DESC
+
+    // Phase 168: LAG/LEAD extra args, NTILE buckets, Window Frame
+    int         windowLagLeadOffset = 1;     // LAG/LEAD offset (default 1)
+    std::string windowLagLeadDefault = "NULL"; // LAG/LEAD default value
+    int         windowNtileBuckets  = 1;     // NTILE(n) bucket count
+    // Window frame: ROWS BETWEEN <start> AND <end>
+    bool        hasWindowFrame      = false;
+    // Frame bounds: -N = N PRECEDING, 0 = CURRENT ROW, +N = N FOLLOWING
+    // INT_MIN = UNBOUNDED PRECEDING, INT_MAX = UNBOUNDED FOLLOWING
+    int         windowFrameStart    = INT_MIN; // default: UNBOUNDED PRECEDING
+    int         windowFrameEnd      = 0;       // default: CURRENT ROW
 
     // Phase 88: UNNEST
     bool        isUnnest    = false;
@@ -3531,83 +3542,219 @@ public:
             for (const auto& key : partOrder) {
                 auto& idxList = partitions[key];
 
-                if (wfunc == "ROW_NUMBER" || wfunc == "RANK" || wfunc == "DENSE_RANK") {
-                    // Sort partition by ORDER BY column
-                    std::vector<size_t> sorted = idxList;
-                    if (!item.windowOrderBy.empty()) {
-                        bool desc = item.windowOrderDesc;
-                        std::stable_sort(sorted.begin(), sorted.end(),
-                            [&](size_t a, size_t b) {
-                                return numCmp(
-                                    getColValue(rows[a], item.windowOrderBy),
-                                    getColValue(rows[b], item.windowOrderBy),
-                                    desc);
-                            });
+                // Sort partition by ORDER BY column (used by most window funcs)
+                std::vector<size_t> sorted = idxList;
+                if (!item.windowOrderBy.empty()) {
+                    bool desc = item.windowOrderDesc;
+                    std::stable_sort(sorted.begin(), sorted.end(),
+                        [&](size_t a, size_t b) {
+                            return numCmp(
+                                getColValue(rows[a], item.windowOrderBy),
+                                getColValue(rows[b], item.windowOrderBy),
+                                desc);
+                        });
+                }
+
+                if (wfunc == "ROW_NUMBER") {
+                    for (size_t r = 0; r < sorted.size(); ++r)
+                        windowVals[sorted[r]] = std::to_string(r + 1);
+                } else if (wfunc == "RANK") {
+                    int rank = 1;
+                    for (size_t r = 0; r < sorted.size(); ) {
+                        size_t j = r + 1;
+                        while (j < sorted.size() &&
+                               !item.windowOrderBy.empty() &&
+                               getColValue(rows[sorted[j]], item.windowOrderBy) ==
+                               getColValue(rows[sorted[r]], item.windowOrderBy))
+                            ++j;
+                        for (size_t k = r; k < j; ++k)
+                            windowVals[sorted[k]] = std::to_string(rank);
+                        rank += static_cast<int>(j - r);
+                        r = j;
+                    }
+                } else if (wfunc == "DENSE_RANK") {
+                    int rank = 1;
+                    for (size_t r = 0; r < sorted.size(); ) {
+                        size_t j = r + 1;
+                        while (j < sorted.size() &&
+                               !item.windowOrderBy.empty() &&
+                               getColValue(rows[sorted[j]], item.windowOrderBy) ==
+                               getColValue(rows[sorted[r]], item.windowOrderBy))
+                            ++j;
+                        for (size_t k = r; k < j; ++k)
+                            windowVals[sorted[k]] = std::to_string(rank);
+                        ++rank;
+                        r = j;
                     }
 
-                    if (wfunc == "ROW_NUMBER") {
-                        for (size_t r = 0; r < sorted.size(); ++r)
-                            windowVals[sorted[r]] = std::to_string(r + 1);
-                    } else if (wfunc == "RANK") {
-                        int rank = 1;
-                        for (size_t r = 0; r < sorted.size(); ) {
-                            // Find group of equal values
-                            size_t j = r + 1;
-                            while (j < sorted.size() &&
-                                   !item.windowOrderBy.empty() &&
-                                   getColValue(rows[sorted[j]], item.windowOrderBy) ==
-                                   getColValue(rows[sorted[r]], item.windowOrderBy))
-                                ++j;
-                            for (size_t k = r; k < j; ++k)
-                                windowVals[sorted[k]] = std::to_string(rank);
-                            rank += static_cast<int>(j - r);
-                            r = j;
+                // Phase 168: PERCENT_RANK = (rank - 1) / (partition_size - 1)
+                } else if (wfunc == "PERCENT_RANK") {
+                    size_t n = sorted.size();
+                    int rank = 1;
+                    for (size_t r = 0; r < sorted.size(); ) {
+                        size_t j = r + 1;
+                        while (j < sorted.size() &&
+                               !item.windowOrderBy.empty() &&
+                               getColValue(rows[sorted[j]], item.windowOrderBy) ==
+                               getColValue(rows[sorted[r]], item.windowOrderBy))
+                            ++j;
+                        double pr = (n <= 1) ? 0.0 : static_cast<double>(rank - 1) / static_cast<double>(n - 1);
+                        for (size_t k = r; k < j; ++k)
+                            windowVals[sorted[k]] = formatNum(pr);
+                        rank += static_cast<int>(j - r);
+                        r = j;
+                    }
+
+                // Phase 168: CUME_DIST = (number of rows <= current) / partition_size
+                } else if (wfunc == "CUME_DIST") {
+                    size_t n = sorted.size();
+                    for (size_t r = 0; r < sorted.size(); ) {
+                        size_t j = r + 1;
+                        while (j < sorted.size() &&
+                               !item.windowOrderBy.empty() &&
+                               getColValue(rows[sorted[j]], item.windowOrderBy) ==
+                               getColValue(rows[sorted[r]], item.windowOrderBy))
+                            ++j;
+                        double cd = static_cast<double>(j) / static_cast<double>(n);
+                        for (size_t k = r; k < j; ++k)
+                            windowVals[sorted[k]] = formatNum(cd);
+                        r = j;
+                    }
+
+                // Phase 168: NTILE(n) — distribute rows into n buckets
+                } else if (wfunc == "NTILE") {
+                    int buckets = item.windowNtileBuckets;
+                    if (buckets < 1) buckets = 1;
+                    size_t n = sorted.size();
+                    for (size_t r = 0; r < n; ++r) {
+                        int tile = static_cast<int>((r * buckets) / n) + 1;
+                        windowVals[sorted[r]] = std::to_string(tile);
+                    }
+
+                // Phase 168: LAG(col, offset, default) / LEAD(col, offset, default)
+                } else if (wfunc == "LAG" || wfunc == "LEAD") {
+                    int offset = item.windowLagLeadOffset;
+                    std::string defVal = item.windowLagLeadDefault;
+                    // Strip quotes from default value
+                    if (defVal.size() >= 2 &&
+                        ((defVal.front() == '\'' && defVal.back() == '\'') ||
+                         (defVal.front() == '"' && defVal.back() == '"')))
+                        defVal = defVal.substr(1, defVal.size() - 2);
+
+                    for (size_t r = 0; r < sorted.size(); ++r) {
+                        int targetIdx = (wfunc == "LAG")
+                            ? static_cast<int>(r) - offset
+                            : static_cast<int>(r) + offset;
+                        if (targetIdx >= 0 && targetIdx < static_cast<int>(sorted.size())) {
+                            windowVals[sorted[r]] = getColValue(rows[sorted[targetIdx]], item.windowFuncArg);
+                        } else {
+                            windowVals[sorted[r]] = defVal;
                         }
-                    } else {  // DENSE_RANK
-                        int rank = 1;
-                        for (size_t r = 0; r < sorted.size(); ) {
-                            size_t j = r + 1;
-                            while (j < sorted.size() &&
-                                   !item.windowOrderBy.empty() &&
-                                   getColValue(rows[sorted[j]], item.windowOrderBy) ==
-                                   getColValue(rows[sorted[r]], item.windowOrderBy))
-                                ++j;
-                            for (size_t k = r; k < j; ++k)
-                                windowVals[sorted[k]] = std::to_string(rank);
-                            ++rank;
-                            r = j;
+                    }
+
+                // Phase 168: FIRST_VALUE(col) / LAST_VALUE(col)
+                } else if (wfunc == "FIRST_VALUE") {
+                    if (!sorted.empty()) {
+                        // With frame: use frame start; without: first in partition
+                        if (item.hasWindowFrame) {
+                            for (size_t r = 0; r < sorted.size(); ++r) {
+                                int fs = (item.windowFrameStart == INT_MIN) ? 0 : static_cast<int>(r) + item.windowFrameStart;
+                                if (fs < 0) fs = 0;
+                                if (fs >= static_cast<int>(sorted.size())) fs = static_cast<int>(sorted.size()) - 1;
+                                windowVals[sorted[r]] = getColValue(rows[sorted[fs]], item.windowFuncArg);
+                            }
+                        } else {
+                            std::string fv = getColValue(rows[sorted[0]], item.windowFuncArg);
+                            for (size_t r = 0; r < sorted.size(); ++r)
+                                windowVals[sorted[r]] = fv;
+                        }
+                    }
+                } else if (wfunc == "LAST_VALUE") {
+                    if (!sorted.empty()) {
+                        if (item.hasWindowFrame) {
+                            for (size_t r = 0; r < sorted.size(); ++r) {
+                                int fe = (item.windowFrameEnd == INT_MAX)
+                                    ? static_cast<int>(sorted.size()) - 1
+                                    : static_cast<int>(r) + item.windowFrameEnd;
+                                if (fe < 0) fe = 0;
+                                if (fe >= static_cast<int>(sorted.size())) fe = static_cast<int>(sorted.size()) - 1;
+                                windowVals[sorted[r]] = getColValue(rows[sorted[fe]], item.windowFuncArg);
+                            }
+                        } else {
+                            // Without frame: default frame is UNBOUNDED PRECEDING to CURRENT ROW
+                            // so LAST_VALUE = current row
+                            for (size_t r = 0; r < sorted.size(); ++r)
+                                windowVals[sorted[r]] = getColValue(rows[sorted[r]], item.windowFuncArg);
                         }
                     }
 
                 } else {
-                    // Aggregate over entire partition: SUM, AVG, COUNT, MIN, MAX
-                    if (wfunc == "COUNT") {
-                        std::string cnt = std::to_string(idxList.size());
-                        for (size_t idx : idxList)
-                            windowVals[idx] = cnt;
-                    } else {
-                        // Get column index for the aggregate argument
-                        std::vector<double> nums;
-                        for (size_t idx : idxList) {
-                            std::string v = getColValue(rows[idx], item.windowFuncArg);
-                            try { nums.push_back(std::stod(v)); } catch (...) {}
-                        }
-                        std::string aggResult = "NULL";
-                        if (!nums.empty()) {
-                            if (wfunc == "SUM") {
-                                double s = 0; for (double v : nums) s += v;
-                                aggResult = formatNum(s);
-                            } else if (wfunc == "AVG") {
-                                double s = 0; for (double v : nums) s += v;
-                                aggResult = formatNum(s / static_cast<double>(nums.size()));
-                            } else if (wfunc == "MIN") {
-                                aggResult = formatNum(*std::min_element(nums.begin(), nums.end()));
-                            } else if (wfunc == "MAX") {
-                                aggResult = formatNum(*std::max_element(nums.begin(), nums.end()));
+                    // Aggregate over partition (or frame): SUM, AVG, COUNT, MIN, MAX
+                    if (item.hasWindowFrame) {
+                        // Phase 168: Framed aggregate — compute per row over its frame
+                        for (size_t r = 0; r < sorted.size(); ++r) {
+                            int fs = (item.windowFrameStart == INT_MIN) ? 0 : static_cast<int>(r) + item.windowFrameStart;
+                            int fe = (item.windowFrameEnd == INT_MAX) ? static_cast<int>(sorted.size()) - 1 : static_cast<int>(r) + item.windowFrameEnd;
+                            if (fs < 0) fs = 0;
+                            if (fe >= static_cast<int>(sorted.size())) fe = static_cast<int>(sorted.size()) - 1;
+                            if (fs > fe) { windowVals[sorted[r]] = "NULL"; continue; }
+
+                            std::vector<double> nums;
+                            int cnt = 0;
+                            for (int fi = fs; fi <= fe; ++fi) {
+                                cnt++;
+                                if (wfunc != "COUNT" || item.windowFuncArg != "*") {
+                                    std::string v = getColValue(rows[sorted[fi]], item.windowFuncArg);
+                                    try { nums.push_back(std::stod(v)); } catch (...) {}
+                                }
                             }
+                            std::string result = "NULL";
+                            if (wfunc == "COUNT") {
+                                result = (item.windowFuncArg == "*") ? std::to_string(cnt) : std::to_string(nums.size());
+                            } else if (!nums.empty()) {
+                                if (wfunc == "SUM") {
+                                    double s = 0; for (double v : nums) s += v;
+                                    result = formatNum(s);
+                                } else if (wfunc == "AVG") {
+                                    double s = 0; for (double v : nums) s += v;
+                                    result = formatNum(s / static_cast<double>(nums.size()));
+                                } else if (wfunc == "MIN") {
+                                    result = formatNum(*std::min_element(nums.begin(), nums.end()));
+                                } else if (wfunc == "MAX") {
+                                    result = formatNum(*std::max_element(nums.begin(), nums.end()));
+                                }
+                            }
+                            windowVals[sorted[r]] = result;
                         }
-                        for (size_t idx : idxList)
-                            windowVals[idx] = aggResult;
+                    } else {
+                        // No frame: aggregate over entire partition
+                        if (wfunc == "COUNT") {
+                            std::string cnt = std::to_string(idxList.size());
+                            for (size_t idx : idxList)
+                                windowVals[idx] = cnt;
+                        } else {
+                            std::vector<double> nums;
+                            for (size_t idx : idxList) {
+                                std::string v = getColValue(rows[idx], item.windowFuncArg);
+                                try { nums.push_back(std::stod(v)); } catch (...) {}
+                            }
+                            std::string aggResult = "NULL";
+                            if (!nums.empty()) {
+                                if (wfunc == "SUM") {
+                                    double s = 0; for (double v : nums) s += v;
+                                    aggResult = formatNum(s);
+                                } else if (wfunc == "AVG") {
+                                    double s = 0; for (double v : nums) s += v;
+                                    aggResult = formatNum(s / static_cast<double>(nums.size()));
+                                } else if (wfunc == "MIN") {
+                                    aggResult = formatNum(*std::min_element(nums.begin(), nums.end()));
+                                } else if (wfunc == "MAX") {
+                                    aggResult = formatNum(*std::max_element(nums.begin(), nums.end()));
+                                }
+                            }
+                            for (size_t idx : idxList)
+                                windowVals[idx] = aggResult;
+                        }
                     }
                 }
             }

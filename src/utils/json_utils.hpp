@@ -38,6 +38,37 @@ static inline void skipWhitespace(const std::string& s, size_t& pos) {
         ++pos;
 }
 
+// Phase 169-fix: decode \uXXXX in JSON strings to UTF-8
+static inline void ju_appendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x110000) {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+static inline uint32_t ju_parseHex4(const std::string& s, size_t pos) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4 && pos + i < s.size(); ++i) {
+        v <<= 4;
+        char c = s[pos + i];
+        if (c >= '0' && c <= '9') v |= (c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (c - 'A' + 10);
+    }
+    return v;
+}
+
 static inline std::string parseString(const std::string& s, size_t& pos) {
     // pos zeigt auf '"'
     ++pos; // skip opening "
@@ -46,18 +77,38 @@ static inline std::string parseString(const std::string& s, size_t& pos) {
         if (s[pos] == '\\' && pos + 1 < s.size()) {
             ++pos;
             switch (s[pos]) {
-                case '"':  result += '"';  break;
-                case '\\': result += '\\'; break;
-                case '/':  result += '/';  break;
-                case 'n':  result += '\n'; break;
-                case 'r':  result += '\r'; break;
-                case 't':  result += '\t'; break;
-                default:   result += s[pos]; break;
+                case '"':  result += '"';  ++pos; break;
+                case '\\': result += '\\'; ++pos; break;
+                case '/':  result += '/';  ++pos; break;
+                case 'n':  result += '\n'; ++pos; break;
+                case 'r':  result += '\r'; ++pos; break;
+                case 't':  result += '\t'; ++pos; break;
+                case 'b':  result += '\b'; ++pos; break;
+                case 'f':  result += '\f'; ++pos; break;
+                case 'u': {
+                    ++pos; // skip 'u'
+                    if (pos + 4 <= s.size()) {
+                        uint32_t cp = ju_parseHex4(s, pos);
+                        pos += 4;
+                        // Handle UTF-16 surrogate pairs
+                        if (cp >= 0xD800 && cp <= 0xDBFF &&
+                            pos + 5 < s.size() && s[pos] == '\\' && s[pos + 1] == 'u') {
+                            uint32_t lo = ju_parseHex4(s, pos + 2);
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                pos += 6;
+                            }
+                        }
+                        ju_appendUtf8(result, cp);
+                    }
+                    break;
+                }
+                default:   result += s[pos]; ++pos; break;
             }
         } else {
             result += s[pos];
+            ++pos;
         }
-        ++pos;
     }
     if (pos < s.size()) ++pos; // skip closing "
     return result;

@@ -255,6 +255,69 @@ static std::string urlDecode(const std::string& s) {
     return result;
 }
 
+// Phase 169-fix: decode \uXXXX JSON escape to UTF-8
+static inline void appendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x110000) {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+
+static inline uint32_t parseHex4(const std::string& s, size_t pos) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4 && pos + i < s.size(); ++i) {
+        v <<= 4;
+        char c = s[pos + i];
+        if (c >= '0' && c <= '9') v |= (c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (c - 'A' + 10);
+    }
+    return v;
+}
+
+// Unescape a JSON backslash sequence starting after the '\'.
+// Updates pos to point past the consumed chars.
+static inline void jsonUnescapeChar(const std::string& json, size_t& pos, std::string& out) {
+    if (pos >= json.size()) return;
+    char next = json[pos];
+    if      (next == '"')  { out += '"';  ++pos; }
+    else if (next == '\\') { out += '\\'; ++pos; }
+    else if (next == '/')  { out += '/';  ++pos; }
+    else if (next == 'n')  { out += '\n'; ++pos; }
+    else if (next == 'r')  { out += '\r'; ++pos; }
+    else if (next == 't')  { out += '\t'; ++pos; }
+    else if (next == 'b')  { out += '\b'; ++pos; }
+    else if (next == 'f')  { out += '\f'; ++pos; }
+    else if (next == 'u' && pos + 4 < json.size()) {
+        ++pos; // skip 'u'
+        uint32_t cp = parseHex4(json, pos);
+        pos += 4;
+        // Handle UTF-16 surrogate pairs: \uD800-\uDBFF followed by \uDC00-\uDFFF
+        if (cp >= 0xD800 && cp <= 0xDBFF &&
+            pos + 5 < json.size() && json[pos] == '\\' && json[pos + 1] == 'u') {
+            uint32_t lo = parseHex4(json, pos + 2);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                pos += 6; // skip \uXXXX
+            }
+        }
+        appendUtf8(out, cp);
+    } else {
+        out += next; ++pos;
+    }
+}
+
 static std::string extractSqlFromJson(const std::string& json) {
     auto pos = json.find("\"sql\"");
     if (pos == std::string::npos) return "";
@@ -266,14 +329,8 @@ static std::string extractSqlFromJson(const std::string& json) {
     std::string sql;
     while (pos < json.size() && json[pos] != '"') {
         if (json[pos] == '\\' && pos + 1 < json.size()) {
-            char next = json[pos + 1];
-            if      (next == '"')  sql += '"';
-            else if (next == '\\') sql += '\\';
-            else if (next == 'n')  sql += '\n';
-            else if (next == 'r')  sql += '\r';
-            else if (next == 't')  sql += '\t';
-            else sql += next;
-            pos += 2;
+            ++pos; // skip backslash
+            jsonUnescapeChar(json, pos, sql);
         } else {
             sql += json[pos++];
         }
@@ -298,20 +355,13 @@ static std::vector<std::string> extractParamsFromJson(const std::string& json) {
         if (pos >= json.size() || json[pos] == ']') break;
 
         if (json[pos] == '"') {
-            // String value — parse with JSON unescaping
+            // String value — parse with JSON unescaping (Phase 169-fix: \uXXXX)
             ++pos;
             std::string val;
             while (pos < json.size() && json[pos] != '"') {
                 if (json[pos] == '\\' && pos + 1 < json.size()) {
-                    char next = json[pos + 1];
-                    if      (next == '"')  val += '"';
-                    else if (next == '\\') val += '\\';
-                    else if (next == 'n')  val += '\n';
-                    else if (next == 'r')  val += '\r';
-                    else if (next == 't')  val += '\t';
-                    else if (next == '/')  val += '/';
-                    else val += next;
-                    pos += 2;
+                    ++pos; // skip backslash
+                    jsonUnescapeChar(json, pos, val);
                 } else {
                     val += json[pos++];
                 }
@@ -514,8 +564,19 @@ static std::string parseOutputToJson(const std::string& output,
         }
     }
 
-    if (dataLines.size() >= 2) {
-        const auto& cols = dataLines[0];
+    // Filter out ghost rows: rows where every cell is empty
+    // (produced by dispatch_printTable when a table has 0 data rows)
+    std::vector<std::vector<std::string>> filteredData;
+    for (const auto& dl : dataLines) {
+        bool allEmpty = true;
+        for (const auto& cell : dl) {
+            if (!cell.empty()) { allEmpty = false; break; }
+        }
+        if (!allEmpty) filteredData.push_back(dl);
+    }
+
+    if (filteredData.size() >= 1) {
+        const auto& cols = filteredData[0];
         std::string json = "{\"success\":true,\"columns\":[";
         for (size_t i = 0; i < cols.size(); ++i) {
             if (i > 0) json += ",";
@@ -523,8 +584,8 @@ static std::string parseOutputToJson(const std::string& output,
         }
         json += "],\"rows\":[";
         int rowCount = 0;
-        for (size_t ri = 1; ri < dataLines.size(); ++ri) {
-            const auto& row = dataLines[ri];
+        for (size_t ri = 1; ri < filteredData.size(); ++ri) {
+            const auto& row = filteredData[ri];
             if (ri > 1) json += ",";
             json += "[";
             for (size_t ci = 0; ci < row.size(); ++ci) {
@@ -827,23 +888,18 @@ inline std::string MilanHttpServer::extractJsonStr(const std::string& body, cons
     pos = body.find_first_not_of(" \t\r\n", pos+1);
     if (pos == std::string::npos || body[pos] != '"') return "";
     // Parse JSON string value: handle escape sequences and find true end quote
+    // Phase 169-fix: properly decode \uXXXX to UTF-8
     std::string result;
-    for (size_t i = pos + 1; i < body.size(); ++i) {
+    size_t i = pos + 1;
+    while (i < body.size()) {
         char c = body[i];
         if (c == '"') break;  // unescaped quote = end of string
         if (c == '\\' && i + 1 < body.size()) {
-            char next = body[i + 1];
-            switch (next) {
-                case '"':  result += '"';  ++i; break;
-                case '\\': result += '\\'; ++i; break;
-                case 'n':  result += '\n'; ++i; break;
-                case 'r':  result += '\r'; ++i; break;
-                case 't':  result += '\t'; ++i; break;
-                case '/':  result += '/';  ++i; break;
-                default:   result += c;         break;
-            }
+            ++i; // skip backslash
+            jsonUnescapeChar(body, i, result);
         } else {
             result += c;
+            ++i;
         }
     }
     return result;

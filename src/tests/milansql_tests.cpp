@@ -39,6 +39,7 @@
 
 // Phase 157: dispatch.hpp for recursive CTE tests
 #include "dispatch.hpp"
+#include "utils/json_utils.hpp"
 
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
@@ -9031,6 +9032,462 @@ static void testGroup90() {
     }
 }
 
+// ── testGroup91: LAG/LEAD/NTILE/FIRST_VALUE/LAST_VALUE/PERCENT_RANK/CUME_DIST + Window Frames (Phase 168) ──
+
+static void testGroup91() {
+    std::cout << "\n── testGroup91: Advanced Window Functions + Frames (Phase 168) ──\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto run = [&](const std::string& sql) {
+        return dispatch(parser.parse(sql), engine);
+    };
+
+    run("CREATE TABLE emp168 (id INT PRIMARY KEY, name TEXT, dept TEXT, gehalt INT)");
+    run("INSERT INTO emp168 VALUES (1, 'Anna', 'IT', 5000)");
+    run("INSERT INTO emp168 VALUES (2, 'Bob', 'IT', 6000)");
+    run("INSERT INTO emp168 VALUES (3, 'Clara', 'IT', 5500)");
+    run("INSERT INTO emp168 VALUES (4, 'David', 'HR', 4000)");
+    run("INSERT INTO emp168 VALUES (5, 'Eva', 'HR', 4500)");
+    run("INSERT INTO emp168 VALUES (6, 'Frank', 'HR', 4000)");
+
+    // 1. LAG(gehalt) OVER (ORDER BY gehalt)
+    {
+        auto r = run("SELECT name, gehalt, LAG(gehalt) OVER (ORDER BY gehalt) AS prev_gehalt FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #1: LAG basic → 6 rows");
+        // First row (lowest gehalt) should have NULL as LAG
+        check(r.rows[0].values[2] == "NULL",
+              "WIN168 #1b: first row LAG=NULL, got: " + r.rows[0].values[2]);
+    }
+
+    // 2. LAG(gehalt, 2) with offset 2
+    {
+        auto r = run("SELECT name, gehalt, LAG(gehalt, 2) OVER (ORDER BY gehalt) AS prev2 FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #2: LAG offset=2 → 6 rows");
+        // First two rows should be NULL
+        check(r.rows[0].values[2] == "NULL", "WIN168 #2b: row 0 LAG(2)=NULL");
+        check(r.rows[1].values[2] == "NULL", "WIN168 #2c: row 1 LAG(2)=NULL");
+    }
+
+    // 3. LAG with default value
+    {
+        auto r = run("SELECT name, gehalt, LAG(gehalt, 1, 0) OVER (ORDER BY gehalt) AS prev FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #3: LAG with default → 6 rows");
+        check(r.rows[0].values[2] == "0",
+              "WIN168 #3b: first row LAG default=0, got: " + r.rows[0].values[2]);
+    }
+
+    // 4. LEAD(gehalt) OVER (ORDER BY gehalt)
+    {
+        auto r = run("SELECT name, gehalt, LEAD(gehalt) OVER (ORDER BY gehalt) AS next_gehalt FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #4: LEAD basic → 6 rows");
+        // Last row should have NULL
+        check(r.rows[5].values[2] == "NULL",
+              "WIN168 #4b: last row LEAD=NULL, got: " + r.rows[5].values[2]);
+    }
+
+    // 5. LEAD with offset and default
+    {
+        auto r = run("SELECT name, gehalt, LEAD(gehalt, 2, -1) OVER (ORDER BY gehalt) AS next2 FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #5: LEAD offset=2 → 6 rows");
+        // Last two rows should have default -1
+        check(r.rows[5].values[2] == "-1",
+              "WIN168 #5b: last row LEAD(2) default=-1, got: " + r.rows[5].values[2]);
+        check(r.rows[4].values[2] == "-1",
+              "WIN168 #5c: second-last LEAD(2) default=-1, got: " + r.rows[4].values[2]);
+    }
+
+    // 6. LAG with PARTITION BY
+    {
+        auto r = run("SELECT name, dept, gehalt, LAG(gehalt) OVER (PARTITION BY dept ORDER BY gehalt) AS prev FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #6: LAG + PARTITION BY → 6 rows");
+        // Check that partitioning works — first in each dept should be NULL
+        bool foundNulls = false;
+        int nullCount = 0;
+        for (auto& row : r.rows) {
+            if (row.values[3] == "NULL") nullCount++;
+        }
+        check(nullCount == 2, "WIN168 #6b: 2 partition starts with NULL LAG, got: " + std::to_string(nullCount));
+    }
+
+    // 7. NTILE(2) — split into 2 buckets
+    {
+        auto r = run("SELECT name, gehalt, NTILE(2) OVER (ORDER BY gehalt) AS tile FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #7: NTILE(2) → 6 rows");
+        // 6 rows, 2 buckets: 3 in bucket 1, 3 in bucket 2
+        int b1 = 0, b2 = 0;
+        for (auto& row : r.rows) {
+            if (row.values[2] == "1") b1++;
+            else if (row.values[2] == "2") b2++;
+        }
+        check(b1 == 3 && b2 == 3,
+              "WIN168 #7b: NTILE(2) 3+3, got: " + std::to_string(b1) + "+" + std::to_string(b2));
+    }
+
+    // 8. NTILE(3) — 3 buckets
+    {
+        auto r = run("SELECT name, gehalt, NTILE(3) OVER (ORDER BY gehalt) AS tile FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #8: NTILE(3) → 6 rows");
+        int b1 = 0, b2 = 0, b3 = 0;
+        for (auto& row : r.rows) {
+            if (row.values[2] == "1") b1++;
+            else if (row.values[2] == "2") b2++;
+            else if (row.values[2] == "3") b3++;
+        }
+        check(b1 == 2 && b2 == 2 && b3 == 2,
+              "WIN168 #8b: NTILE(3) 2+2+2, got: " + std::to_string(b1) + "+" + std::to_string(b2) + "+" + std::to_string(b3));
+    }
+
+    // 9. FIRST_VALUE(name) OVER (ORDER BY gehalt)
+    {
+        auto r = run("SELECT name, gehalt, FIRST_VALUE(name) OVER (ORDER BY gehalt) AS first_name FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #9: FIRST_VALUE → 6 rows");
+        // All rows should have the name with lowest gehalt
+        bool allSame = true;
+        for (auto& row : r.rows)
+            if (row.values[2] != r.rows[0].values[2]) allSame = false;
+        check(allSame, "WIN168 #9b: all FIRST_VALUE same = " + r.rows[0].values[2]);
+    }
+
+    // 10. LAST_VALUE(name) without frame → current row (SQL default)
+    {
+        auto r = run("SELECT name, gehalt, LAST_VALUE(name) OVER (ORDER BY gehalt) AS last_name FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #10: LAST_VALUE (no frame) → 6 rows");
+        // Without ROWS BETWEEN, LAST_VALUE = current row's value
+        check(r.rows[0].values[2] == r.rows[0].values[0],
+              "WIN168 #10b: LAST_VALUE=current row name");
+    }
+
+    // 11. LAST_VALUE with ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    {
+        auto r = run("SELECT name, gehalt, LAST_VALUE(name) OVER (ORDER BY gehalt ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_name FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #11: LAST_VALUE + full frame → 6 rows");
+        // All rows should have the name of the highest gehalt
+        std::string lastVal = r.rows[0].values[2];
+        bool allSame = true;
+        for (auto& row : r.rows)
+            if (row.values[2] != lastVal) allSame = false;
+        check(allSame, "WIN168 #11b: all LAST_VALUE same with full frame = " + lastVal);
+    }
+
+    // 12. PERCENT_RANK
+    {
+        auto r = run("SELECT name, gehalt, PERCENT_RANK() OVER (ORDER BY gehalt) AS pr FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #12: PERCENT_RANK → 6 rows");
+        // First row = 0, last row = 1 (or close for ties)
+        check(r.rows[0].values[2] == "0",
+              "WIN168 #12b: first PERCENT_RANK=0, got: " + r.rows[0].values[2]);
+    }
+
+    // 13. CUME_DIST
+    {
+        auto r = run("SELECT name, gehalt, CUME_DIST() OVER (ORDER BY gehalt) AS cd FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #13: CUME_DIST → 6 rows");
+        // Last row = 1.0
+        check(r.rows[5].values[2] == "1",
+              "WIN168 #13b: last CUME_DIST=1, got: " + r.rows[5].values[2]);
+    }
+
+    // 14. SUM with ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING (moving sum)
+    {
+        auto r = run("SELECT name, gehalt, SUM(gehalt) OVER (ORDER BY gehalt ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_sum FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #14: SUM + frame → 6 rows");
+        // First row: sum of rows 0,1 only (no preceding)
+        // Middle rows: sum of 3 consecutive
+        bool hasData = !r.rows[0].values[2].empty() && r.rows[0].values[2] != "NULL";
+        check(hasData, "WIN168 #14b: moving SUM has values");
+    }
+
+    // 15. AVG with ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (running avg)
+    {
+        auto r = run("SELECT name, gehalt, AVG(gehalt) OVER (ORDER BY gehalt ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_avg FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #15: running AVG → 6 rows");
+        bool hasData = !r.rows[0].values[2].empty() && r.rows[0].values[2] != "NULL";
+        check(hasData, "WIN168 #15b: running AVG has values");
+    }
+
+    // 16. COUNT with window frame
+    {
+        auto r = run("SELECT name, gehalt, COUNT(*) OVER (ORDER BY gehalt ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_count FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #16: running COUNT → 6 rows");
+        // First row should be 1, last should be 6
+        check(r.rows[0].values[2] == "1",
+              "WIN168 #16b: first running COUNT=1, got: " + r.rows[0].values[2]);
+        check(r.rows[5].values[2] == "6",
+              "WIN168 #16c: last running COUNT=6, got: " + r.rows[5].values[2]);
+    }
+
+    // 17. SUM running total (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    {
+        auto r = run("SELECT name, gehalt, SUM(gehalt) OVER (ORDER BY gehalt ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum FROM emp168 ORDER BY gehalt");
+        check(r.rows.size() == 6, "WIN168 #17: running SUM → 6 rows");
+        // First row = its own gehalt
+        check(r.rows[0].values[2] == r.rows[0].values[1],
+              "WIN168 #17b: first running SUM = own gehalt, got: " + r.rows[0].values[2]);
+    }
+
+    // 18. FIRST_VALUE with PARTITION BY
+    {
+        auto r = run("SELECT name, dept, gehalt, FIRST_VALUE(name) OVER (PARTITION BY dept ORDER BY gehalt) AS first_in_dept FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #18: FIRST_VALUE + PARTITION → 6 rows");
+        // Each dept should have consistent first value
+        bool ok = true;
+        std::map<std::string, std::string> deptFirst;
+        for (auto& row : r.rows) {
+            std::string dept = row.values[1];
+            if (deptFirst.find(dept) == deptFirst.end()) deptFirst[dept] = row.values[3];
+            else if (deptFirst[dept] != row.values[3]) ok = false;
+        }
+        check(ok, "WIN168 #18b: FIRST_VALUE consistent within partitions");
+    }
+
+    // 19. LEAD with PARTITION BY
+    {
+        auto r = run("SELECT name, dept, gehalt, LEAD(gehalt) OVER (PARTITION BY dept ORDER BY gehalt) AS next_in_dept FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #19: LEAD + PARTITION → 6 rows");
+        // Last in each partition should be NULL
+        int nullCount = 0;
+        for (auto& row : r.rows) if (row.values[3] == "NULL") nullCount++;
+        check(nullCount == 2, "WIN168 #19b: 2 partition-end NULLs, got: " + std::to_string(nullCount));
+    }
+
+    // 20. NTILE with PARTITION BY
+    {
+        auto r = run("SELECT name, dept, gehalt, NTILE(2) OVER (PARTITION BY dept ORDER BY gehalt) AS tile FROM emp168");
+        check(r.rows.size() == 6, "WIN168 #20: NTILE + PARTITION → 6 rows");
+        bool hasValues = true;
+        for (auto& row : r.rows) {
+            if (row.values[3] != "1" && row.values[3] != "2") hasValues = false;
+        }
+        check(hasValues, "WIN168 #20b: all tiles are 1 or 2");
+    }
+}
+
+// ── testGroup92: RETURNING Clause for INSERT/UPDATE/DELETE (Phase 169) ──
+
+static void testGroup92() {
+    std::cout << "\n── testGroup92: RETURNING Clause (Phase 169) ──\n";
+    milansql::Engine engine;
+    milansql::Parser parser;
+    auto run = [&](const std::string& sql) {
+        return dispatch(parser.parse(sql), engine);
+    };
+
+    run("CREATE TABLE ret_test (id INT PRIMARY KEY, name TEXT, gehalt INT)");
+
+    // 1. INSERT ... RETURNING *
+    {
+        auto r = run("INSERT INTO ret_test VALUES (1, 'Anna', 5000) RETURNING *");
+        check(r.rows.size() == 1, "RET #1: INSERT RETURNING * → 1 row");
+        check(r.columns.size() == 3, "RET #1b: 3 columns returned");
+        check(r.rows[0].values[0] == "1",
+              "RET #1c: id=1, got: " + r.rows[0].values[0]);
+        check(r.rows[0].values[1] == "Anna",
+              "RET #1d: name=Anna, got: " + r.rows[0].values[1]);
+    }
+
+    // 2. INSERT ... RETURNING specific columns
+    {
+        auto r = run("INSERT INTO ret_test VALUES (2, 'Bob', 6000) RETURNING id, name");
+        check(r.rows.size() == 1, "RET #2: INSERT RETURNING id,name → 1 row");
+        check(r.columns.size() == 2, "RET #2b: 2 columns returned");
+        check(r.rows[0].values[0] == "2",
+              "RET #2c: id=2, got: " + r.rows[0].values[0]);
+        check(r.rows[0].values[1] == "Bob",
+              "RET #2d: name=Bob, got: " + r.rows[0].values[1]);
+    }
+
+    // 3. INSERT ... RETURNING single column
+    {
+        auto r = run("INSERT INTO ret_test VALUES (3, 'Clara', 7000) RETURNING id");
+        check(r.rows.size() == 1, "RET #3: INSERT RETURNING id → 1 row");
+        check(r.columns.size() == 1, "RET #3b: 1 column");
+        check(r.rows[0].values[0] == "3",
+              "RET #3c: id=3, got: " + r.rows[0].values[0]);
+    }
+
+    // 4. INSERT without RETURNING (regression: should still work normally)
+    {
+        auto r = run("INSERT INTO ret_test VALUES (4, 'David', 4000)");
+        check(r.rows.empty(), "RET #4: INSERT without RETURNING → 0 rows");
+        check(r.error.empty(), "RET #4b: no error");
+    }
+
+    // 5. DELETE ... RETURNING *
+    {
+        auto r = run("DELETE FROM ret_test WHERE id = 4 RETURNING *");
+        check(r.rows.size() == 1, "RET #5: DELETE RETURNING * → 1 row");
+        check(r.rows[0].values[0] == "4",
+              "RET #5b: deleted id=4, got: " + r.rows[0].values[0]);
+        check(r.rows[0].values[1] == "David",
+              "RET #5c: deleted name=David, got: " + r.rows[0].values[1]);
+    }
+
+    // 6. Verify row was actually deleted
+    {
+        auto r = run("SELECT * FROM ret_test WHERE id = 4");
+        check(r.rows.empty(), "RET #6: row id=4 actually deleted");
+    }
+
+    // 7. DELETE ... RETURNING specific column
+    {
+        auto r = run("DELETE FROM ret_test WHERE id = 3 RETURNING name");
+        check(r.rows.size() == 1, "RET #7: DELETE RETURNING name → 1 row");
+        check(r.rows[0].values[0] == "Clara",
+              "RET #7b: deleted name=Clara, got: " + r.rows[0].values[0]);
+    }
+
+    // 8. UPDATE ... RETURNING *
+    {
+        auto r = run("UPDATE ret_test SET gehalt = 8000 WHERE id = 1 RETURNING *");
+        check(r.rows.size() == 1, "RET #8: UPDATE RETURNING * → 1 row");
+        check(r.rows[0].values[2] == "8000",
+              "RET #8b: updated gehalt=8000, got: " + r.rows[0].values[2]);
+    }
+
+    // 9. UPDATE ... RETURNING specific columns
+    {
+        auto r = run("UPDATE ret_test SET gehalt = 9000 WHERE id = 2 RETURNING id, gehalt");
+        check(r.rows.size() == 1, "RET #9: UPDATE RETURNING id,gehalt → 1 row");
+        check(r.rows[0].values[0] == "2",
+              "RET #9b: id=2, got: " + r.rows[0].values[0]);
+        check(r.rows[0].values[1] == "9000",
+              "RET #9c: gehalt=9000, got: " + r.rows[0].values[1]);
+    }
+
+    // 10. UPDATE without RETURNING (regression)
+    {
+        auto r = run("UPDATE ret_test SET gehalt = 10000 WHERE id = 1");
+        check(r.rows.empty(), "RET #10: UPDATE without RETURNING → 0 rows");
+        check(r.error.empty(), "RET #10b: no error");
+    }
+
+    // 11. Multi-row INSERT ... RETURNING *
+    {
+        auto r = run("INSERT INTO ret_test VALUES (5, 'Eva', 3000), (6, 'Frank', 3500) RETURNING *");
+        check(r.rows.size() == 2, "RET #11: multi INSERT RETURNING * → 2 rows, got: " + std::to_string(r.rows.size()));
+    }
+
+    // 12. INSERT with quoted string values RETURNING
+    {
+        auto r = run("INSERT INTO ret_test VALUES (7, 'Günter', 4200) RETURNING name");
+        check(r.rows.size() == 1, "RET #12: INSERT RETURNING name → 1 row");
+        check(r.rows[0].values[0] == "Günter",
+              "RET #12b: name=Günter, got: " + r.rows[0].values[0]);
+    }
+}
+
+// ── testGroup93: Unicode/Umlaut JSON round-trip (Bug fix) ──
+
+static void testGroup93() {
+    std::cout << "\n── testGroup93: Unicode JSON Unescape (Umlaut Bug Fix) ──\n";
+
+    // Test 1: json_utils parseString with \uXXXX
+    {
+        std::string json = R"("Hallo \u00d6ffnungszeiten")";
+        size_t pos = 0;
+        std::string result = milansql::jsonutils::parseString(json, pos);
+        // \u00d6 = Ö (U+00D6) → UTF-8 bytes C3 96
+        check(result == "Hallo \xC3\x96""ffnungszeiten",
+              "UNI #1: \\u00d6 → Ö, got: " + result);
+    }
+
+    // Test 2: Basic German umlauts \u00e4 \u00f6 \u00fc \u00df
+    {
+        std::string json = R"("\u00e4\u00f6\u00fc\u00df")";
+        size_t pos = 0;
+        std::string result = milansql::jsonutils::parseString(json, pos);
+        check(result == "\xC3\xA4\xC3\xB6\xC3\xBC\xC3\x9F",
+              "UNI #2: äöüß from \\u escapes, got: " + result);
+    }
+
+    // Test 3: Euro sign \u20ac
+    {
+        std::string json = R"("Preis: 5\u20ac")";
+        size_t pos = 0;
+        std::string result = milansql::jsonutils::parseString(json, pos);
+        check(result == "Preis: 5\xE2\x82\xAC",
+              "UNI #3: \\u20ac → €, got: " + result);
+    }
+
+    // Test 4: ASCII characters via \u (should work)
+    {
+        std::string json = R"("\u0041\u0042\u0043")";
+        size_t pos = 0;
+        std::string result = milansql::jsonutils::parseString(json, pos);
+        check(result == "ABC", "UNI #4: \\u0041\\u0042\\u0043 → ABC, got: " + result);
+    }
+
+    // Test 5: Surrogate pair \uD83D\uDE00 → 😀 (U+1F600)
+    {
+        std::string json = R"("\uD83D\uDE00")";
+        size_t pos = 0;
+        std::string result = milansql::jsonutils::parseString(json, pos);
+        check(result == "\xF0\x9F\x98\x80",
+              "UNI #5: surrogate pair → emoji, got bytes: " + std::to_string(result.size()));
+    }
+
+    // Test 6: Mixed UTF-8 direct + \u escapes
+    {
+        std::string json = "\"M\xC3\xBCnchen \\u00d6sterreich\"";
+        size_t pos = 0;
+        std::string result = milansql::jsonutils::parseString(json, pos);
+        check(result == "M\xC3\xBC""nchen \xC3\x96""sterreich",
+              "UNI #6: mixed direct UTF-8 + \\u escape");
+    }
+
+    // Test 7: JSON serialize+parse round-trip with Umlauts
+    {
+        milansql::jsonutils::JsonValue v;
+        v.type = milansql::jsonutils::JsonValue::Type::STRING;
+        v.str = "\xC3\x96""ffnungszeiten: Mo-So 11-22 Uhr";  // Öffnungszeiten
+        std::string serialized = milansql::jsonutils::serializeValue(v);
+        auto parsed = milansql::jsonutils::parse(serialized);
+        check(parsed.str == v.str,
+              "UNI #7: JSON round-trip preserves Ö, got: " + parsed.str);
+    }
+
+    // Test 8: SQL INSERT + SELECT with Umlauts through engine (no HTTP)
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        auto run = [&](const std::string& sql) {
+            return dispatch(parser.parse(sql), engine);
+        };
+        run("CREATE TABLE uni_test (id INT PRIMARY KEY, inhalt TEXT)");
+        run("INSERT INTO uni_test VALUES (1, '\xC3\x96""ffnungszeiten: Mo-So 11-22 Uhr')");
+        auto r = run("SELECT inhalt FROM uni_test WHERE id = 1");
+        check(r.rows.size() == 1, "UNI #8: SELECT returns 1 row");
+        check(r.rows[0].values[0] == "\xC3\x96""ffnungszeiten: Mo-So 11-22 Uhr",
+              "UNI #8b: UTF-8 Ö preserved, got: " + r.rows[0].values[0]);
+    }
+
+    // Test 9: All common German special chars
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        auto run = [&](const std::string& sql) {
+            return dispatch(parser.parse(sql), engine);
+        };
+        run("CREATE TABLE de_test (id INT PRIMARY KEY, txt TEXT)");
+        std::string deChars = "\xC3\xA4\xC3\xB6\xC3\xBC\xC3\x84\xC3\x96\xC3\x9C\xC3\x9F\xE2\x82\xAC"; // äöüÄÖÜß€
+        run("INSERT INTO de_test VALUES (1, '" + deChars + "')");
+        auto r = run("SELECT txt FROM de_test WHERE id = 1");
+        check(r.rows.size() == 1 && r.rows[0].values[0] == deChars,
+              "UNI #9: äöüÄÖÜß€ round-trip OK, got: " + (r.rows.empty() ? "EMPTY" : r.rows[0].values[0]));
+    }
+
+    // Test 10: \u escape uppercase vs lowercase
+    {
+        std::string json1 = R"("\u00D6")";  // uppercase
+        std::string json2 = R"("\u00d6")";  // lowercase
+        size_t pos1 = 0, pos2 = 0;
+        std::string r1 = milansql::jsonutils::parseString(json1, pos1);
+        std::string r2 = milansql::jsonutils::parseString(json2, pos2);
+        check(r1 == r2 && r1 == "\xC3\x96",
+              "UNI #10: \\u00D6 == \\u00d6 → Ö");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -9297,6 +9754,15 @@ int main() {
     }
     try { testGroup90(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 90 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup91(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 91 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup92(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 92 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup93(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 93 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

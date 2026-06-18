@@ -512,6 +512,9 @@ struct ParsedCommand {
     std::vector<std::string> grantPrivs; // for GRANT/REVOKE (list of privileges)
     std::string grantTargetUser;    // for GRANT TO / REVOKE FROM / SHOW GRANTS FOR
 
+    // Phase 169: RETURNING clause (INSERT/UPDATE/DELETE ... RETURNING col1, col2, *)
+    std::vector<std::string> returningColumns;
+
     // Phase 51: Schema fields
     std::string schemaName;         // for schema commands (CREATE/DROP/USE/SHOW TABLES IN)
 
@@ -2009,6 +2012,8 @@ public:
                 if (!cmd.multiValues.empty())
                     cmd.values = cmd.multiValues[0];
             } else { cmd.type = CommandType::UNKNOWN; }
+            // Phase 169: RETURNING for INSERT
+            if (cmd.type == CommandType::INSERT) parseReturning(input, cmd);
 
         // ── Phase 43: CREATE TRIGGER ─────────────────────────────
         // Syntax: CREATE TRIGGER name BEFORE/AFTER INSERT/UPDATE/DELETE ON tbl
@@ -2558,21 +2563,40 @@ public:
             cmd.type = CommandType::UPDATE;
             if (tokens.size() >= 4 && toUpper(tokens[2]) == "SET") {
                 cmd.tableName = tokens[1];
-                // WHERE-Position ermitteln
-                size_t wherePos = tokens.size();
+                // Phase 169: find RETURNING position and exclude it from tokens
+                size_t tokEnd = tokens.size();
                 for (size_t i = 3; i < tokens.size(); ++i)
+                    if (toUpper(tokens[i]) == "RETURNING") { tokEnd = i; break; }
+                // WHERE-Position ermitteln (before RETURNING)
+                size_t wherePos = tokEnd;
+                for (size_t i = 3; i < tokEnd; ++i)
                     if (toUpper(tokens[i]) == "WHERE") { wherePos = i; break; }
                 // Phase 22: Multi-Column SET parsen
                 parseMultiAssignment(tokens, 3, wherePos, cmd);
-                parseWhere(tokens, wherePos, cmd);
+                // Build limited token list for WHERE (excluding RETURNING)
+                std::vector<std::string> tokLimited(tokens.begin(), tokens.begin() + tokEnd);
+                parseWhere(tokLimited, wherePos, cmd);
             } else { cmd.type = CommandType::UNKNOWN; }
+            // Phase 169: RETURNING for UPDATE
+            if (cmd.type == CommandType::UPDATE) parseReturning(input, cmd);
 
         // ── DELETE FROM ──────────────────────────────────────────
         } else if (kw0 == "DELETE" && kw1 == "FROM") {
             cmd.type = CommandType::DELETE;
             if (tokens.size() >= 3) {
                 cmd.tableName = tokens[2];
-                parseWhere(tokens, 3, cmd);
+                // Phase 169: Strip RETURNING before parseWhere
+                std::string inputForWhere = input;
+                {
+                    std::string up = inputForWhere;
+                    for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    auto rpos = up.rfind("RETURNING");
+                    if (rpos != std::string::npos) inputForWhere = inputForWhere.substr(0, rpos);
+                }
+                // Re-tokenize without RETURNING for WHERE parsing
+                auto tokNoRet = tokenize(inputForWhere);
+                parseWhere(tokNoRet, 3, cmd);
+                parseReturning(input, cmd);
             } else { cmd.type = CommandType::UNKNOWN; }
 
         // ── Phase 43: DROP TRIGGER ───────────────────────────────
@@ -4889,6 +4913,47 @@ private:
 
     // ── WHERE col op val [AND|OR ...] ─────────────────────────
     // Unterstützt: =, !=, <, >, <=, >=, LIKE,
+    // Phase 169: Parse RETURNING clause from raw SQL input
+    static void parseReturning(const std::string& input, ParsedCommand& cmd) {
+        std::string up = input;
+        for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        auto pos = up.rfind("RETURNING");
+        if (pos == std::string::npos) return;
+        // Make sure RETURNING is not inside quotes
+        int quoteCount = 0;
+        for (size_t i = 0; i < pos; ++i)
+            if (input[i] == '\'') quoteCount++;
+        if (quoteCount % 2 != 0) return;  // inside a string literal
+
+        std::string rest = input.substr(pos + 9);  // after "RETURNING"
+        // Trim
+        while (!rest.empty() && rest.front() == ' ') rest.erase(rest.begin());
+        while (!rest.empty() && rest.back() == ' ') rest.pop_back();
+        // Remove trailing semicolons
+        while (!rest.empty() && rest.back() == ';') rest.pop_back();
+        while (!rest.empty() && rest.back() == ' ') rest.pop_back();
+        if (rest.empty()) return;
+
+        // Split by commas
+        std::vector<std::string> cols;
+        std::string cur;
+        for (char c : rest) {
+            if (c == ',') {
+                std::string t = cur;
+                while (!t.empty() && t.front() == ' ') t.erase(t.begin());
+                while (!t.empty() && t.back() == ' ') t.pop_back();
+                if (!t.empty()) cols.push_back(t);
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
+        while (!cur.empty() && cur.back() == ' ') cur.pop_back();
+        if (!cur.empty()) cols.push_back(cur);
+        cmd.returningColumns = std::move(cols);
+    }
+
     //              IS NULL, IS NOT NULL,
     //              IN (v1, v2, ...) / IN (SELECT col FROM tbl [WHERE ...])
     //              NOT IN (...)
@@ -6128,7 +6193,8 @@ private:
 
                 // Phase 42: Window functions
                 static const std::vector<std::string> WFUNCS42 =
-                    {"ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "COUNT", "MIN", "MAX"};
+                    {"ROW_NUMBER", "RANK", "DENSE_RANK", "SUM", "AVG", "COUNT", "MIN", "MAX",
+                     "LAG", "LEAD", "NTILE", "FIRST_VALUE", "LAST_VALUE", "PERCENT_RANK", "CUME_DIST"};
                 bool isWinFunc = false;
                 for (const auto& f : WFUNCS42) if (u == f) { isWinFunc = true; break; }
 
@@ -6178,22 +6244,43 @@ private:
                     // Parse function arguments (between parens)
                     if (i < end && ft[i] == "(") {
                         ++i;  // skip "("
-                        // Collect args until matching ")"
-                        std::string argStr;
+                        // Collect comma-separated args until matching ")"
+                        std::vector<std::string> wfArgs;
+                        std::string currentArg;
                         int depth = 0;
                         while (i < end) {
-                            if (ft[i] == "(") { depth++; argStr += ft[i] + " "; ++i; continue; }
+                            if (ft[i] == "(") { depth++; currentArg += ft[i] + " "; ++i; continue; }
                             if (ft[i] == ")") {
                                 if (depth == 0) { ++i; break; }
-                                depth--; argStr += ft[i] + " "; ++i; continue;
+                                depth--; currentArg += ft[i] + " "; ++i; continue;
                             }
-                            if (depth == 0 && ft[i] == ",") { ++i; continue; }
-                            argStr += ft[i];
+                            if (depth == 0 && ft[i] == ",") {
+                                while (!currentArg.empty() && currentArg.back() == ' ') currentArg.pop_back();
+                                wfArgs.push_back(currentArg);
+                                currentArg.clear();
+                                ++i; continue;
+                            }
+                            currentArg += ft[i];
                             ++i;
                         }
-                        // Trim
-                        while (!argStr.empty() && argStr.back() == ' ') argStr.pop_back();
-                        item.windowFuncArg = argStr;  // e.g. "gehalt" or "*" or ""
+                        while (!currentArg.empty() && currentArg.back() == ' ') currentArg.pop_back();
+                        if (!currentArg.empty()) wfArgs.push_back(currentArg);
+
+                        if (!wfArgs.empty()) item.windowFuncArg = wfArgs[0];  // e.g. "gehalt" or "*" or ""
+
+                        // Phase 168: LAG/LEAD(col, offset, default) extra args
+                        if (item.windowFunc == "LAG" || item.windowFunc == "LEAD") {
+                            if (wfArgs.size() >= 2) {
+                                try { item.windowLagLeadOffset = std::stoi(wfArgs[1]); } catch (...) {}
+                            }
+                            if (wfArgs.size() >= 3) {
+                                item.windowLagLeadDefault = wfArgs[2];
+                            }
+                        }
+                        // Phase 168: NTILE(n)
+                        if (item.windowFunc == "NTILE" && !wfArgs.empty()) {
+                            try { item.windowNtileBuckets = std::stoi(wfArgs[0]); } catch (...) {}
+                        }
                     }
 
                     // Skip OVER
@@ -6235,6 +6322,43 @@ private:
                                         item.windowOrderDesc = false; ++oi;
                                     }
                                 }
+                            } else if ((ou == "ROWS" || ou == "RANGE") &&
+                                       oi + 1 < overToks.size() &&
+                                       toUpper(overToks[oi + 1]) == "BETWEEN") {
+                                // Phase 168: ROWS BETWEEN <start> AND <end>
+                                item.hasWindowFrame = true;
+                                oi += 2; // skip ROWS/RANGE BETWEEN
+                                // Parse frame start
+                                auto parseFrameBound = [&](int& bound) {
+                                    if (oi >= overToks.size()) return;
+                                    std::string t1 = toUpper(overToks[oi]);
+                                    if (t1 == "UNBOUNDED") {
+                                        ++oi;
+                                        if (oi < overToks.size() && toUpper(overToks[oi]) == "PRECEDING") {
+                                            bound = INT_MIN; ++oi;
+                                        } else if (oi < overToks.size() && toUpper(overToks[oi]) == "FOLLOWING") {
+                                            bound = INT_MAX; ++oi;
+                                        }
+                                    } else if (t1 == "CURRENT") {
+                                        ++oi;
+                                        if (oi < overToks.size() && toUpper(overToks[oi]) == "ROW") ++oi;
+                                        bound = 0;
+                                    } else {
+                                        // N PRECEDING or N FOLLOWING
+                                        int n = 0;
+                                        try { n = std::stoi(t1); } catch (...) {}
+                                        ++oi;
+                                        if (oi < overToks.size() && toUpper(overToks[oi]) == "PRECEDING") {
+                                            bound = -n; ++oi;
+                                        } else if (oi < overToks.size() && toUpper(overToks[oi]) == "FOLLOWING") {
+                                            bound = n; ++oi;
+                                        }
+                                    }
+                                };
+                                parseFrameBound(item.windowFrameStart);
+                                // Skip AND
+                                if (oi < overToks.size() && toUpper(overToks[oi]) == "AND") ++oi;
+                                parseFrameBound(item.windowFrameEnd);
                             } else {
                                 ++oi;
                             }

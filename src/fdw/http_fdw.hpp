@@ -93,6 +93,14 @@ private:
         }
         if (host.substr(0, 8) == "169.254.") return true;  // link-local / cloud metadata
         if (host == "metadata.google.internal") return true;
+        // MEDIUM-11: Block IPv6 private ranges + IPv4-mapped IPv6
+        if (host == "0.0.0.0" || host == "0" || host == "[::1]") return true;
+        if (host.size() >= 4 && (host.substr(0, 4) == "fc00" || host.substr(0, 4) == "fd00")) return true;
+        if (host.size() >= 3 && host.substr(0, 2) == "fe" && (host[2] == '8' || host[2] == '9' || host[2] == 'a' || host[2] == 'b')) return true;
+        if (host.find("::ffff:127.") != std::string::npos) return true;
+        if (host.find("::ffff:10.") != std::string::npos) return true;
+        if (host.find("::ffff:192.168.") != std::string::npos) return true;
+        if (host.find("::ffff:0.0.0.0") != std::string::npos) return true;
         return false;
     }
 

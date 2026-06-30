@@ -79,11 +79,24 @@ public:
 
     // Liest SQL-Dump und führt jede Zeile über executeSQL aus
     // Gibt Zusammenfassung zurück
+    // MEDIUM-08: Validate backup paths — prevent directory traversal
+    static bool isValidBackupPath(const std::string& path) {
+        if (path.find("..") != std::string::npos) return false;
+        if (path.empty()) return false;
+        if (path[0] == '/') {
+            if (path.substr(0, 5) != "/tmp/" && path.substr(0, 15) != "/opt/milansql/")
+                return false;
+        }
+        return true;
+    }
+
     static std::string restoreDatabase(const std::string& filepath,
                                        std::function<void(const std::string&)> executeSQL) {
+        if (!isValidBackupPath(filepath))
+            return "FEHLER: Ungueltiger Dateipfad.";
         std::ifstream in(filepath);
         if (!in.is_open())
-            return "FEHLER: Datei '" + filepath + "' nicht gefunden.";
+            return "FEHLER: Backup-Datei nicht gefunden.";
 
         int stmtCount = 0;
         int errCount  = 0;
@@ -124,10 +137,12 @@ public:
 
     static std::string dumpDatabase(Engine& engine, std::string filepath) {
         if (filepath.empty()) filepath = generateFilename();
+        if (!isValidBackupPath(filepath))
+            return "FEHLER: Ungueltiger Dateipfad.";
 
         std::ofstream out(filepath);
         if (!out.is_open())
-            return "FEHLER: Kann Datei '" + filepath + "' nicht erstellen.";
+            return "FEHLER: Backup-Datei konnte nicht erstellt werden.";
 
         // ── Header ──
         out << "-- MilanSQL Backup v1.0.0\n";

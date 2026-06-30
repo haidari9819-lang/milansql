@@ -51,6 +51,20 @@
 // The callback is set by main.cpp when --ws is active.
 #include <functional>
 namespace milansql {
+
+// LOW-02: Sanitize user input before logging to prevent log injection
+static std::string sanitizeForLog(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c == '\n') { r += "\\n"; }
+        else if (c == '\r') { r += "\\r"; }
+        else if (c < 0x20 && c != '\t') { r += "?"; }
+        else { r += static_cast<char>(c); }
+    }
+    if (r.size() > 200) r = r.substr(0, 200) + "...";
+    return r;
+}
 // Callback type: (tableName, op, colNames, values)
 using WsNotifyFn = std::function<void(const std::string&, const std::string&,
                                       const std::vector<std::string>&,
@@ -1318,7 +1332,7 @@ struct ProcExec {
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
             persistFn();
         } else {
-            std::cout << "  [CALL] Unbekannter Befehl: '" << sql << "'\n\n";
+            std::cout << "  [CALL] Unbekannter Befehl: '" << sanitizeForLog(sql) << "'\n\n";
         }
     }
 

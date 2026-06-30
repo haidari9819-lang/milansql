@@ -285,7 +285,7 @@ private:
         appendU8(pkt, 10);
 
         // Server version string (null-terminated)
-        appendNullStr(pkt, "MilanSQL 2.4.0");
+        appendNullStr(pkt, "8.0.0-MilanSQL");
 
         // Connection id (4 bytes LE)
         appendU32LE(pkt, connId);
@@ -429,7 +429,7 @@ private:
             upper.find("@@") != std::string::npos) {
             // Return a single-row result with the version string
             Table result("vars", {Column("Value", "TEXT")});
-            result.insert(Row({"MilanSQL 2.4.0"}));
+            result.insert(Row({"8.0.0-MilanSQL"}));
             sendResultSet(sock, seq, result, "vars");
             return;
         }

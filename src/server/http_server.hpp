@@ -493,7 +493,7 @@ static std::string buildHttpResponse(int statusCode, const std::string& body,
            "X-Content-Type-Options: nosniff\r\n"
            "X-XSS-Protection: 1; mode=block\r\n"
            "Referrer-Policy: strict-origin-when-cross-origin\r\n"
-           "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'\r\n"
+           "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'\r\n"
            "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
            "Permissions-Policy: geolocation=(), camera=(), microphone=()\r\n"
            + extraHeaders +
@@ -509,6 +509,17 @@ static std::string sanitizeError(const std::string& msg) {
         if (r[i] == '/' && (i == 0 || r[i-1] == ' ' || r[i-1] == ':' || r[i-1] == '"')) {
             size_t end = i + 1;
             while (end < r.size() && r[end] != ' ' && r[end] != '"' && r[end] != '\'') ++end;
+            r = r.substr(0, i) + "<path>" + r.substr(end);
+            i += 6;
+        } else {
+            ++i;
+        }
+    }
+    // Also strip Windows-style paths
+    for (size_t i = 0; i + 1 < r.size(); ) {
+        if (std::isalpha((unsigned char)r[i]) && r[i+1] == ':' && (i == 0 || r[i-1] == ' ' || r[i-1] == '"')) {
+            size_t end = i + 2;
+            while (end < r.size() && r[end] != ' ' && r[end] != '"') ++end;
             r = r.substr(0, i) + "<path>" + r.substr(end);
             i += 6;
         } else {
@@ -920,6 +931,13 @@ inline std::string MilanHttpServer::handleAuthRegister(const std::string& body, 
     std::string email    = extractJsonStr(body, "email");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
+    // MEDIUM-07: Input length limits
+    if (username.size() > 64)
+        return "{\"success\":false,\"error\":\"Username too long (max 64 chars)\"}";
+    if (password.size() > 256)
+        return "{\"success\":false,\"error\":\"Password too long (max 256 chars)\"}";
+    if (email.size() > 254)
+        return "{\"success\":false,\"error\":\"Email too long (max 254 chars)\"}";
     // Password strength: min 8 chars, min 1 digit
     if (password.size() < 8)
         return "{\"success\":false,\"error\":\"Password must be at least 8 characters\"}";
@@ -1938,7 +1956,7 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
                         colTypesOut.push_back(col.type);
                 }
             }
-        } catch (const std::exception& e) { ok = false; errMsg = e.what(); }
+        } catch (const std::exception& e) { ok = false; errMsg = sanitizeError(e.what()); }
           catch (...) { ok = false; errMsg = "Unbekannter Fehler"; }
         std::cout.rdbuf(old);
         if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
@@ -3570,11 +3588,14 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     // ── Phase 154: Auth routes ────────────────────────────────
     if (req.path == "/auth/register" && req.method == "POST") {
+        // MEDIUM-04: Rate limit registration
+        if (!loginLimiter_.allow(clientIp))
+            return buildHttpResponse(429, R"({"success":false,"error":"Too many registration attempts","retry_after":900})");
         auto result = handleAuthRegister(req.body, clientIp);
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure\r\n";
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict; Secure\r\n";
             return buildHttpResponse(200, result, "application/json", cookie);
         }
         return buildHttpResponse(200, result);
@@ -3591,7 +3612,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         } else if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure\r\n";
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict; Secure\r\n";
             response = buildHttpResponse(200, result, "application/json", cookie);
         } else {
             response = buildHttpResponse(200, result);
@@ -3607,6 +3628,9 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(200, result, "application/json", clearCookie);
     }
     if (req.path == "/auth/change-password" && req.method == "POST") {
+        // MEDIUM-05: Rate limit password changes
+        if (!loginLimiter_.allow(clientIp))
+            return buildHttpResponse(429, R"({"success":false,"error":"Too many attempts","retry_after":900})");
         std::string token = extractBearerToken(req);
         auto vr = authMgr_.validateToken(token);
         if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
@@ -3662,7 +3686,8 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.path == "/auth/me" && req.method == "GET") {
         auto result = handleAuthMe(extractBearerToken(req));
         int code = (result.find("\"success\":true") != std::string::npos) ? 200 : 401;
-        return buildHttpResponse(code, result);
+        return buildHttpResponse(code, result, "application/json",
+            "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n");
     }
     if (req.path == "/auth/refresh" && req.method == "POST")
         return buildHttpResponse(200, handleAuthRefresh(req.body));
@@ -3926,8 +3951,9 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             else if (fileContentType.find("png") != std::string::npos) fileExt = ".png";
             else if (fileContentType.find("gif") != std::string::npos) fileExt = ".gif";
             else if (fileContentType.find("webp") != std::string::npos) fileExt = ".webp";
-            else if (fileContentType.find("svg") != std::string::npos) fileExt = ".svg";
-            else if (fileContentType.find("mp4") != std::string::npos) fileExt = ".mp4";
+            else if (fileContentType.find("svg") != std::string::npos) {
+                return buildHttpResponse(400, R"JSON({"success":false,"error":"SVG uploads not allowed"})JSON");
+            } else if (fileContentType.find("mp4") != std::string::npos) fileExt = ".mp4";
             else if (fileContentType.find("webm") != std::string::npos) fileExt = ".webm";
             else return buildHttpResponse(400, "{\"success\":false,\"error\":\"File type not allowed\"}");
         }
@@ -4000,6 +4026,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/metrics") {
+        // MEDIUM-01: Require root auth for metrics
+        auto mctx = extractUserContext(req);
+        if (!mctx.valid || mctx.role != "root")
+            return buildHttpResponse(403, R"({"success":false,"error":"Authentication required"})");
         std::lock_guard<std::mutex> lock(engineMutex_);
         // Update uptime gauge
         double upSec = std::chrono::duration<double>(
@@ -4022,12 +4052,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "milansql_slow_query_threshold_ms " + std::to_string((int)engine_.slowQueryLog.thresholdMs) + "\n"
             "milansql_table_count " + std::to_string(engine_.tableCount()) + "\n";
         std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics;
-        return "HTTP/1.1 200 OK\r\n"
-               "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
-               "Content-Length: " + std::to_string(body.size()) + "\r\n"
-               "Access-Control-Allow-Origin: *\r\n"
-               "Connection: close\r\n"
-               "\r\n" + body;
+        return buildHttpResponse(200, body, "text/plain; version=0.0.4");
     }
 
     if (req.path == "/health") {
@@ -4036,11 +4061,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
-            "\"version\":\"9.9.0\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
-                "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"
-                "\"memory\":{\"status\":\"ok\",\"used_mb\":128},"
+                "\"storage\":{\"status\":\"ok\"},"
+                "\"memory\":{\"status\":\"ok\"},"
                 "\"wal\":{\"status\":\"ok\"},"
                 "\"connections\":{\"status\":\"ok\",\"active\":0,\"max\":100},"
                 "\"replication\":{\"status\":\"ok\",\"lag_ms\":0}"
@@ -4061,12 +4085,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     if (req.path == "/webui") {
         std::string html = handleWebUI();
-        return "HTTP/1.1 200 OK\r\n"
-               "Content-Type: text/html; charset=utf-8\r\n"
-               "Content-Length: " + std::to_string(html.size()) + "\r\n"
-               "Access-Control-Allow-Origin: *\r\n"
-               "Connection: close\r\n"
-               "\r\n" + html;
+        return buildHttpResponse(200, html, "text/html");
     }
 
     // Phase 163: Landing Page at /
@@ -4104,6 +4123,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/ws-playground") {
+        // LOW-08: Require auth for WebSocket playground
+        auto wsCtx = extractUserContext(req);
+        if (!wsCtx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
         std::string html = R"HTML(<!DOCTYPE html>
 <html>
 <head><title>MilanSQL WebSocket Playground</title>

@@ -64,7 +64,7 @@ h3{font-size:1.1rem;font-weight:600;margin-bottom:8px}
 .features-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px;margin-top:48px;max-width:1100px;margin-left:auto;margin-right:auto}
 .feature-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:28px;transition:border-color .2s}
 .feature-card:hover{border-color:var(--blue)}
-.feature-icon{font-size:2rem;margin-bottom:16px}
+.feature-icon{margin-bottom:16px;line-height:0}
 .feature-card p{color:var(--muted);font-size:0.9rem;line-height:1.7}
 
 /* PRICING */
@@ -164,32 +164,32 @@ footer{border-top:1px solid var(--border);padding:32px 24px;max-width:1100px;mar
   </div>
   <div class="features-grid">
     <div class="feature-card">
-      <div class="feature-icon">&#x1F512;</div>
+      <div class="feature-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><circle cx="12" cy="16" r="1"/></svg></div>
       <h3>Row-Level Security</h3>
       <p>Every user sees only their own data. Tables are cryptographically isolated with HMAC-SHA256 prefixes. Zero cross-user leakage — by design, not by accident.</p>
     </div>
     <div class="feature-card">
-      <div class="feature-icon">&#x26A1;</div>
+      <div class="feature-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#f0a500" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg></div>
       <h3>Blazing Fast</h3>
       <p>86,220 INSERTs/sec. 0.02ms indexed reads. Pure C++17 with zero external dependencies. Runs on a €5 VPS with 28KB memory overhead per 1000 requests.</p>
     </div>
     <div class="feature-card">
-      <div class="feature-icon">&#x1F916;</div>
+      <div class="feature-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#bc8cff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></svg></div>
       <h3>AI-Native</h3>
       <p>pgvector built-in. Semantic search and cosine similarity out of the box. JSONB support. Ready for your LLM applications and RAG pipelines.</p>
     </div>
     <div class="feature-card">
-      <div class="feature-icon">&#x1F310;</div>
+      <div class="feature-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
       <h3>Multi-Protocol</h3>
       <p>REST API, MySQL Wire Protocol, PostgreSQL Wire Protocol, WebSocket, GraphQL. Connect with any existing tool — no driver changes required.</p>
     </div>
     <div class="feature-card">
-      <div class="feature-icon">&#x1F4CB;</div>
+      <div class="feature-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#f78166" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
       <h3>Full SQL Support</h3>
       <p>JOINs, CTEs, Window Functions, Subqueries, Transactions, Stored Procedures, Triggers, Views, Materialized Views — the full SQL standard.</p>
     </div>
     <div class="feature-card">
-      <div class="feature-icon">&#x1F1E9;&#x1F1EA;</div>
+      <div class="feature-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg></div>
       <h3>Privacy First</h3>
       <p>Self-hosted in Germany. Your data never leaves your server. GDPR-compliant by architecture. Open source — audit the code yourself.</p>
     </div>

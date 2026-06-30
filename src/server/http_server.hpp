@@ -4104,7 +4104,17 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         // Fallback: redirect to admin UI
         return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
-    if (req.path == "/dashboard") {
+    // Impressum (legal requirement for .de domains)
+    if (req.path == "/impressum") {
+        std::ifstream imf("docs/impressum.html");
+        if (imf.good()) {
+            std::string html((std::istreambuf_iterator<char>(imf)),
+                              std::istreambuf_iterator<char>());
+            return buildHttpResponse(200, html, "text/html");
+        }
+        return buildHttpResponse(404, R"({"error":"Impressum not found"})");
+    }
+        if (req.path == "/dashboard") {
         return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
     // Phase 164: JS SDK at /sdk/milansql.js

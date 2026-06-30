@@ -2273,7 +2273,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v9.9.0</div>
+  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v9.9.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -3429,7 +3429,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
   <div style="background:#1e1e2e;border:1px solid #313244;border-radius:16px;padding:0;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.7);overflow:hidden">
     <!-- Header -->
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
-      <div style="font-size:36px;line-height:1">&#9889;</div>
+      <div style="line-height:0"><svg width="48" height="48" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg></div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
       <div style="color:#585b70;font-size:11px;margin-top:4px">v9.9.0 &mdash; Multi-User Database</div>
     </div>
@@ -3555,15 +3555,29 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(404, "{\"success\":false,\"error\":\"Not found\"}");
 
     // ── Favicon: lightning bolt SVG (no 404 in browser console) ──
-    if (req.path == "/favicon.ico" || req.path == "/favicon.svg") {
+    if (req.path == "/favicon.ico" || req.path == "/favicon.svg" || req.path == "/apple-touch-icon.png") {
         static const std::string FAVICON_SVG =
-            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
-            "<rect width='32' height='32' rx='5' fill='#1e1e2e'/>"
-            "<polygon points='21,2 11,18 18,18 11,30 25,14 18,14' fill='#00d9ff'/>"
-            "</svg>";
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='0' y='0' width='100' height='100' rx='8' fill='#161616' stroke='#ff6b1a' stroke-width='0.5'/><path d='M20 78 L20 22 L50 54 L80 22 L80 78' fill='none' stroke='#ff6b1a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/><circle cx='20' cy='22' r='5' fill='#ff6b1a'/><circle cx='20' cy='78' r='5' fill='#ff6b1a'/><circle cx='50' cy='54' r='5' fill='#ff6b1a'/><circle cx='80' cy='22' r='5' fill='#ff6b1a'/><circle cx='80' cy='78' r='5' fill='#ff6b1a'/></svg>";
         return buildHttpResponse(200, FAVICON_SVG, "image/svg+xml");
     }
 
+    // OG Image: social preview card
+    if (req.path == "/og-image.png" || req.path == "/og-image.svg") {
+        static const std::string OG_SVG =
+            "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='630' viewBox='0 0 1200 630'>"
+            "<rect width='1200' height='630' fill='#0d1117'/>"
+            "<rect x='440' y='115' width='320' height='320' rx='24' fill='#161616' stroke='#ff6b1a' stroke-width='2'/>"
+            "<path d='M504 374 L504 190 L600 294 L696 190 L696 374' fill='none' stroke='#ff6b1a' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'/>"
+            "<circle cx='504' cy='190' r='16' fill='#ff6b1a'/>"
+            "<circle cx='504' cy='374' r='16' fill='#ff6b1a'/>"
+            "<circle cx='600' cy='294' r='16' fill='#ff6b1a'/>"
+            "<circle cx='696' cy='190' r='16' fill='#ff6b1a'/>"
+            "<circle cx='696' cy='374' r='16' fill='#ff6b1a'/>"
+            "<text x='600' y='500' text-anchor='middle' fill='#e6edf3' font-family='-apple-system,BlinkMacSystemFont,sans-serif' font-size='48' font-weight='800'>MilanSQL</text>"
+            "<text x='600' y='545' text-anchor='middle' fill='#8b949e' font-family='-apple-system,BlinkMacSystemFont,sans-serif' font-size='22'>The Open Source Database for Developers</text>"
+            "</svg>";
+        return buildHttpResponse(200, OG_SVG, "image/svg+xml");
+    }
     // ── Service Account creation (root only) ──────────────────
     if (req.path == "/auth/service-account" && req.method == "POST") {
         auto ctx = extractUserContext(req);

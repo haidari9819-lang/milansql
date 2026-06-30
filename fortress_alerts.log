@@ -122,3 +122,4 @@
 [2026-06-30 05:49:20] ALERT IP=209.38.80.141: Honeypot triggered: /.git/config
 [2026-06-30 06:28:54] ALERT IP=34.20.200.58: Honeypot triggered: /actuator/dump
 [2026-06-30 06:49:09] ALERT IP=34.50.17.230: Honeypot triggered: /admin/.git/config
+[2026-06-30 08:52:54] ALERT IP=35.232.84.42: Honeypot triggered: /.env.live

@@ -121,6 +121,17 @@ private:
 #else
     static std::string generateLinux(const std::string& certPath,
                                      const std::string& keyPath) {
+        // Validate paths to prevent command injection
+        auto isSafePath = [](const std::string& p) {
+            for (char c : p) {
+                if (!std::isalnum(c) && c != '/' && c != '.' && c != '-' && c != '_')
+                    return false;
+            }
+            return !p.empty() && p.find("..") == std::string::npos;
+        };
+        if (!isSafePath(certPath) || !isSafePath(keyPath)) {
+            return "  ERROR: Invalid characters in cert/key path.\n\n";
+        }
         // Use openssl CLI to generate a self-signed cert
         std::string cmd =
             "openssl req -x509 -newkey rsa:2048 -keyout \"" + keyPath + "\""

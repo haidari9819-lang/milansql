@@ -18,6 +18,8 @@ public:
     {
         std::string file = tbl.options.count("file") ? tbl.options.at("file") : "";
         if (file.empty()) return {};
+        // Prevent path traversal — block absolute paths and ..
+        if (file.find("..") != std::string::npos || file[0] == '/' || file[0] == '\\') return {};
 
         char delim = ',';
         if (tbl.options.count("delimiter") && !tbl.options.at("delimiter").empty())

@@ -27,6 +27,7 @@
 #endif
 
 #include <thread>
+#include <future>
 #include <mutex>
 #include <condition_variable>
 #include <string>
@@ -51,6 +52,7 @@
 #include "../monitoring/prometheus.hpp"
 #include "../auth/auth_manager.hpp"
 #include "../auth/rate_limiter.hpp"
+#include "../security/fortress.hpp"
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -483,9 +485,10 @@ static std::string buildHttpResponse(int statusCode, const std::string& body,
     return "HTTP/1.1 " + std::to_string(statusCode) + " " + statusText + "\r\n"
            "Content-Type: " + contentType + "; charset=utf-8\r\n"
            "Content-Length: " + std::to_string(body.size()) + "\r\n"
-           "Access-Control-Allow-Origin: *\r\n"
+           "Access-Control-Allow-Origin: https://milansql.de\r\n"
            "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+           "Access-Control-Allow-Credentials: true\r\n"
            "X-Frame-Options: DENY\r\n"
            "X-Content-Type-Options: nosniff\r\n"
            "X-XSS-Protection: 1; mode=block\r\n"
@@ -806,6 +809,10 @@ inline void MilanHttpServer::initEngine() {
     // Load first (reads legacy secret + users), then init (resolves JWT secret)
     authMgr_.load(dbPath_ + ".auth");
     authMgr_.init();  // resolves secret: env → file → legacy → generate
+
+    // ══ FORTRESS: Load whitelist + persistent ban list ═══════
+    milansql::g_fortress().loadWhitelist(dbPath_ + ".whitelist");
+    milansql::g_fortress().loadBanList(dbPath_ + ".banlist");
 }
 
 // ── Auth helpers ─────────────────────────────────────────────
@@ -949,6 +956,24 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
     std::string password = extractJsonStr(body, "password");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
+
+    // ══ FORTRESS: Schicht 4 — Canary credential check ═════
+    if (milansql::g_fortress().isCanaryCredential(username, password)) {
+        milansql::g_fortress().recordHoneypotHit(clientIp, "CANARY_LOGIN: " + username);
+        milansql::g_fortress().saveBanList(dbPath_ + ".banlist");
+        // Return fake success with canary tokens
+        return milansql::g_fortress().getHoneypotLoginResponse();
+    }
+
+    // ══ FORTRESS: Schicht 2 — Progressive delay ═══════════
+    {
+        double delay = milansql::g_fortress().getDelay(clientIp);
+        if (delay > 0.0 && delay <= 16.0) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(delay * 1000)));
+        }
+    }
+
     // Layer 3: Per-username lockout (brute-force single account)
     {
         std::lock_guard<std::mutex> lk(lockoutMutex_);
@@ -962,6 +987,9 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
     }
     auto res = authMgr_.login(username, password);
     if (!res.ok) {
+        // ══ FORTRESS: Schicht 2 — Record failure for progressive delay ═══
+        milansql::g_fortress().recordFailure(clientIp, "LOGIN_FAIL: " + username);
+
         // Increment both per-username and per-IP failure counters
         std::lock_guard<std::mutex> lk(lockoutMutex_);
         auto& uInfo = loginLockouts_[username];
@@ -1061,8 +1089,8 @@ inline std::string MilanHttpServer::handleAuthApiKeyCreate(int userId, const std
     std::string expiresStr = "null";
     if (days > 0) {
         time_t exp = std::time(nullptr) + (time_t)days*86400;
-        char buf[32]; struct tm* tm = std::gmtime(&exp);
-        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm);
+        char buf[32]; std::tm tm = milansql::safe_gmtime(&exp);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
         expiresStr = "\"" + std::string(buf) + "\"";
     }
     return "{\"success\":true,\"key\":\"" + jsonEscape(key) +
@@ -1175,7 +1203,8 @@ inline std::string MilanHttpServer::handleBackup(const std::string& token) {
     out << "-- Generated: " << [](){
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
-        char buf[64]; std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+        char buf[64]; std::tm ltm = milansql::safe_localtime(&t);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ltm);
         return std::string(buf);
     }() << "\n";
     out << "-- ================================================\n\n";
@@ -1416,7 +1445,8 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     std::lock_guard<std::mutex> lock(engineMutex_);
 
     bool isRoot = (userId <= 0 || userRole == "root");
-    std::string prefix = isRoot ? "" : ("u" + std::to_string(userId) + "_");
+    bool isService = (userRole == "service");  // service accounts: no table prefix, but rate-limited
+    std::string prefix = (isRoot || isService) ? "" : ("u" + std::to_string(userId) + "_");
 
     auto persistFn = [this]() {
         if (engine_.isInTransaction()) return;
@@ -1445,14 +1475,15 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     // Phase 157: Set current user in engine so USER()/CURRENT_USER() work
     {
         std::string uname = "root";
-        if (!isRoot && userId > 0) {
+        if (!isRoot && !isService && userId > 0) {
             const AuthUser* au = authMgr_.getUserById(userId);
             if (au) uname = au->username;
         }
         engine_.setCurrentUserDirect(uname);
     }
     // v9.2.0: Set numeric userId for per-request context (used by SHOW TABLES filter etc.)
-    engine_.setCurrentUser(isRoot ? 0 : userId, isRoot);
+    // Service accounts get root-level table access (no prefix)
+    engine_.setCurrentUser((isRoot || isService) ? 0 : userId, isRoot || isService);
 
     // Intercept special SQL commands
     auto sqlUp = [](std::string s) {
@@ -1501,7 +1532,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             std::vector<std::array<std::string,4>> rows;
             for (const auto& t : all) {
                 std::string displayName;
-                if (isRoot) {
+                if (isRoot || isService) {
                     if (t.size()>=2 && t[0]=='_' && t[1]=='_') continue; // skip system tables
                     displayName = t;
                 } else {
@@ -1741,8 +1772,11 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                 }
             }
 
-            // Resolve subqueries
-            for (const auto& sq : cmd.subqueries) {
+            // Resolve subqueries (apply same user-prefix for isolation)
+            for (auto& sq : cmd.subqueries) {
+                if (!prefix.empty() && sq.subTable.find(prefix) != 0) {
+                    sq.subTable = prefix + sq.subTable;
+                }
                 if (sq.condIdx < cmd.whereConds.size())
                     cmd.whereConds[sq.condIdx].inList =
                         engine_.subqueryValues(sq.subTable, sq.subCol, sq.subWhere, sq.subWhereLogic);
@@ -2447,7 +2481,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="brand"><span>&#x26A1;</span> MilanSQL</div>
   <span class="badge" id="health-badge">checking...</span>
   <span class="badge blue" id="conn-badge">0 connections</span>
-  <span class="badge blue" id="test-badge">1221 tests</span>
+  <span class="badge blue" id="test-badge">1304 tests</span>
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -3435,12 +3469,74 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
 
+    // ══ FORTRESS: Schicht 1+2 — IP Ban Check + Honeypot ═══════
+    auto& fortress = milansql::g_fortress();
+
+    // Schicht 2: Check if IP is already blocked
+    if (!clientIp.empty() && fortress.isBlocked(clientIp)) {
+        return buildHttpResponse(403,
+            "{\"success\":false,\"error\":\"Access denied\"}");
+    }
+
+    // Schicht 1: Honeypot endpoints — trap scanners & bots
+    if (fortress.isHoneypotPath(req.path)) {
+        fortress.recordHoneypotHit(clientIp, req.path);
+        fortress.saveBanList(dbPath_ + ".banlist");
+        // Return realistic-looking but fake responses based on path
+        if (req.path == "/.env") {
+            // Fake .env with canary credentials
+            return buildHttpResponse(200,
+                "DB_HOST=localhost\nDB_USER=admin\nDB_PASS=msql_sk_live_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9\n"
+                "API_KEY=msql_ak_7f3d9a2b4c5e6f8a1b2c3d4e5f6a7b8c9d0e1f2a\n"
+                "JWT_SECRET=canary_secret_do_not_use\n",
+                "text/plain");
+        }
+        if (req.path == "/wp-login.php" || req.path == "/wp-admin") {
+            return buildHttpResponse(200,
+                "<html><head><title>WordPress &rsaquo; Log In</title></head>"
+                "<body><h1>Powered by WordPress</h1>"
+                "<form method='post'><input name='log'/><input name='pwd' type='password'/>"
+                "<input type='submit' value='Log In'/></form></body></html>",
+                "text/html");
+        }
+        if (req.path == "/phpmyadmin" || req.path == "/admin") {
+            return buildHttpResponse(200,
+                "<html><head><title>phpMyAdmin</title></head>"
+                "<body><h1>phpMyAdmin 5.2.1</h1>"
+                "<form method='post'><input name='pma_username'/>"
+                "<input name='pma_password' type='password'/>"
+                "<input type='submit' value='Go'/></form></body></html>",
+                "text/html");
+        }
+        // Generic 404 for other honeypots
+        return buildHttpResponse(404,
+            "{\"success\":false,\"error\":\"Not found\"}");
+    }
+
+    // Schicht 4: Canary token check on Authorization header
+    {
+        std::string authHeader;
+        auto ait = req.headers.find("authorization");
+        if (ait != req.headers.end()) authHeader = ait->second;
+        if (!authHeader.empty()) {
+            std::string token = authHeader;
+            if (token.size() > 7 && token.substr(0,7) == "Bearer ") token = token.substr(7);
+            if (token.size() > 7 && token.substr(0,7) == "ApiKey ") token = token.substr(7);
+            if (fortress.isCanaryToken(token)) {
+                fortress.recordHoneypotHit(clientIp, "CANARY_TOKEN_USED");
+                fortress.saveBanList(dbPath_ + ".banlist");
+                return buildHttpResponse(401,
+                    "{\"success\":false,\"error\":\"Invalid token\"}");
+            }
+        }
+    }
+
     // ── Path traversal guard ──────────────────────────────────────
     // Block any path containing ".." to prevent directory traversal attacks
     if (req.path.find("..") != std::string::npos)
-        return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");
+        return buildHttpResponse(404, "{\"success\":false,\"error\":\"Not found\"}");
 
-    // ── Favicon: ⚡ lightning bolt SVG (no 404 in browser console) ──
+    // ── Favicon: lightning bolt SVG (no 404 in browser console) ──
     if (req.path == "/favicon.ico" || req.path == "/favicon.svg") {
         static const std::string FAVICON_SVG =
             "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
@@ -3450,31 +3546,59 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(200, FAVICON_SVG, "image/svg+xml");
     }
 
+    // ── Service Account creation (root only) ──────────────────
+    if (req.path == "/auth/service-account" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, R"({"success":false,"error":"Root access required"})");
+        std::string username = extractJsonStr(req.body, "username");
+        std::string password = extractJsonStr(req.body, "password");
+        if (username.empty() || password.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"username and password required"})");
+        if (password.size() < 8)
+            return buildHttpResponse(400, R"({"success":false,"error":"Password must be at least 8 characters"})");
+        auto res = authMgr_.registerUser(username, password, "");
+        if (!res.ok)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}");
+        // Set role to "service" — no table prefix, but rate-limited per user
+        authMgr_.setUserRole(res.userId, "service");
+        authMgr_.save(dbPath_ + ".auth");
+        return buildHttpResponse(200,
+            "{\"success\":true,\"user_id\":" + std::to_string(res.userId) +
+            ",\"username\":\"" + jsonEscape(username) + "\"}");
+    }
+
     // ── Phase 154: Auth routes ────────────────────────────────
     if (req.path == "/auth/register" && req.method == "POST") {
         auto result = handleAuthRegister(req.body, clientIp);
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax\r\n";
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure\r\n";
             return buildHttpResponse(200, result, "application/json", cookie);
         }
         return buildHttpResponse(200, result);
     }
 
     if (req.path == "/auth/login" && req.method == "POST") {
+        // ══ FORTRESS: Schicht 5 — Timing-safe auth response ═══
+        auto authStart = std::chrono::steady_clock::now();
         auto result = handleAuthLogin(req.body, clientIp);
+        std::string response;
         if (result.find("\"code\":429") != std::string::npos) {
             std::string headers = "Retry-After: 900\r\n";
-            return buildHttpResponse(429, result, "application/json", headers);
-        }
-        if (result.find("\"success\":true") != std::string::npos) {
+            response = buildHttpResponse(429, result, "application/json", headers);
+        } else if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax\r\n";
-            return buildHttpResponse(200, result, "application/json", cookie);
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure\r\n";
+            response = buildHttpResponse(200, result, "application/json", cookie);
+        } else {
+            response = buildHttpResponse(200, result);
         }
-        return buildHttpResponse(200, result);
+        // Pad to constant 200ms to prevent timing-based user enumeration
+        milansql::FortressEngine::padResponseTime(authStart, std::chrono::milliseconds(200));
+        return response;
     }
     if (req.path == "/auth/logout" && req.method == "POST") {
         auto result = handleAuthLogout(extractBearerToken(req));
@@ -3634,7 +3758,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.path == "/query" || req.path == "/api/query") {
         // Resolve user from token (cookie or Bearer) or API key
         auto ctx = extractUserContext(req);
-        AuthManager::ValidateResult vr{0, "anonymous", "root", true};
+        AuthManager::ValidateResult vr{0, "anonymous", "user", false};
         if (ctx.valid) {
             vr.userId = ctx.userId; vr.username = ctx.username;
             vr.role = ctx.role; vr.valid = true;
@@ -3642,13 +3766,18 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::string apiKey = extractApiKey(req);
             if (!apiKey.empty()) vr = authMgr_.validateApiKey(apiKey);
         }
+        // Reject unauthenticated requests
+        if (!vr.valid) {
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
+        }
 
         // Rate limit by userId or IP (tiered)
         std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
         // Assign tier based on role — check every request so first request gets correct tier
         RateTier desiredTier = RateTier::ANONYMOUS;
-        if (vr.role == "root")       desiredTier = RateTier::ADMIN;
-        else if (vr.userId > 0)      desiredTier = RateTier::FREE;
+        if (vr.role == "root")          desiredTier = RateTier::ADMIN;
+        else if (vr.role == "service")  desiredTier = RateTier::FREE;   // service accounts: 600/min per user
+        else if (vr.userId > 0)         desiredTier = RateTier::FREE;
         if (requestLimiter_.getTier(rlKey) != desiredTier) {
             requestLimiter_.setTier(rlKey, desiredTier);
         }
@@ -3689,8 +3818,47 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             }
             sql = std::move(clean);
         }
+
+        // ══ FORTRESS: Schicht 3 — SQL Injection Detection ═════
+        {
+            // Honeypot table access check
+            if (fortress.checkHoneypotTableAccess(sql)) {
+                fortress.recordHoneypotHit(clientIp, "HONEYPOT_TABLE: " + sql.substr(0, 80));
+                fortress.saveBanList(dbPath_ + ".banlist");
+                return buildHttpResponse(403,
+                    "{\"success\":false,\"error\":\"Access denied\"}");
+            }
+
+            auto sqliResult = fortress.analyzeQuery(sql);
+            if (sqliResult.detected) {
+                if (sqliResult.severity >= 2) {
+                    // Medium/High: block + ban
+                    fortress.recordSqliAttempt(clientIp, sqliResult.pattern);
+                    fortress.saveBanList(dbPath_ + ".banlist");
+                    // Return fake SQL error to confuse attacker
+                    return buildHttpResponse(500,
+                        "{\"success\":false,\"error\":\"" +
+                        jsonEscape(fortress.getFakeSqlError()) + "\"}");
+                }
+                // Low severity: log but allow (might be legitimate)
+            }
+        }
+
         ++queryCounter_;  // Phase 166: track query count
-        return buildHttpResponse(200, handleQueryForUser(sql, vr.userId, vr.role));
+
+        // Bug #26: Query timeout (30 seconds max)
+        std::string queryResult;
+        {
+            auto fut = std::async(std::launch::async, [&]() {
+                return handleQueryForUser(sql, vr.userId, vr.role);
+            });
+            if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::timeout) {
+                return buildHttpResponse(504,
+                    std::string("{\"success\":false,\"error\":\"Query timeout (30s exceeded)\"}"));
+            }
+            queryResult = fut.get();
+        }
+        return buildHttpResponse(200, queryResult);
     }
 
     // Phase 121: Semantic Search REST API
@@ -3714,6 +3882,117 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     if (req.path == "/schemas") {
         return buildHttpResponse(200, handleListSchemas());
+    }
+
+    // ══ MEDIA UPLOAD: File storage on server ════════════════
+    if (req.path == "/api/media/upload" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid)
+            return buildHttpResponse(401, "{\"success\":false,\"error\":\"Authentication required\"}");
+
+        // Parse multipart boundary from Content-Type
+        std::string boundary;
+        auto ctIt = req.headers.find("content-type");
+        if (ctIt == req.headers.end()) ctIt = req.headers.find("Content-Type");
+        if (ctIt != req.headers.end()) {
+            auto bp = ctIt->second.find("boundary=");
+            if (bp != std::string::npos)
+                boundary = ctIt->second.substr(bp + 9);
+            // Remove quotes if present
+            if (!boundary.empty() && boundary.front() == '"')
+                boundary = boundary.substr(1, boundary.size() - 2);
+        }
+        if (boundary.empty())
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"Missing multipart boundary\"}");
+
+        // Find file data between boundaries
+        std::string delim = "--" + boundary;
+        auto partStart = req.body.find(delim);
+        if (partStart == std::string::npos)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"No file in upload\"}");
+
+        // Find Content-Type of the file part
+        std::string fileExt = ".bin";
+        std::string fileContentType;
+        auto ctPos = req.body.find("Content-Type:", partStart);
+        if (ctPos != std::string::npos) {
+            auto ctEnd = req.body.find("\r\n", ctPos);
+            fileContentType = req.body.substr(ctPos + 14, ctEnd - ctPos - 14);
+            // Trim
+            while (!fileContentType.empty() && fileContentType.front() == ' ')
+                fileContentType.erase(0, 1);
+
+            if (fileContentType.find("jpeg") != std::string::npos || fileContentType.find("jpg") != std::string::npos) fileExt = ".jpg";
+            else if (fileContentType.find("png") != std::string::npos) fileExt = ".png";
+            else if (fileContentType.find("gif") != std::string::npos) fileExt = ".gif";
+            else if (fileContentType.find("webp") != std::string::npos) fileExt = ".webp";
+            else if (fileContentType.find("svg") != std::string::npos) fileExt = ".svg";
+            else if (fileContentType.find("mp4") != std::string::npos) fileExt = ".mp4";
+            else if (fileContentType.find("webm") != std::string::npos) fileExt = ".webm";
+            else return buildHttpResponse(400, "{\"success\":false,\"error\":\"File type not allowed\"}");
+        }
+
+        // File data starts after \r\n\r\n
+        auto dataStart = req.body.find("\r\n\r\n", partStart);
+        if (dataStart == std::string::npos)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"Malformed upload\"}");
+        dataStart += 4;
+
+        auto dataEnd = req.body.find(delim, dataStart);
+        if (dataEnd == std::string::npos) dataEnd = req.body.size();
+        // Remove trailing \r\n before boundary
+        if (dataEnd >= 2 && req.body[dataEnd-1] == '\n' && req.body[dataEnd-2] == '\r')
+            dataEnd -= 2;
+
+        size_t fileSize = dataEnd - dataStart;
+        if (fileSize > 10 * 1024 * 1024)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"File too large (max 10MB)\"}");
+        if (fileSize == 0)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"Empty file\"}");
+
+        // Generate unique filename
+        std::random_device rd;
+        std::string filename;
+        for (int i = 0; i < 16; ++i) {
+            static const char hex[] = "0123456789abcdef";
+            uint8_t b = static_cast<uint8_t>(rd() & 0xff);
+            filename += hex[b >> 4];
+            filename += hex[b & 0xf];
+        }
+        filename += fileExt;
+
+        // Save to /opt/milansql/uploads/
+        std::string uploadDir = "/opt/milansql/uploads/";
+        std::string filePath = uploadDir + filename;
+        std::ofstream outFile(filePath, std::ios::binary);
+        if (!outFile)
+            return buildHttpResponse(500, "{\"success\":false,\"error\":\"Cannot write file\"}");
+        outFile.write(req.body.data() + dataStart, static_cast<std::streamsize>(fileSize));
+        outFile.close();
+
+        std::string url = "https://milansql.de/uploads/" + filename;
+        return buildHttpResponse(200,
+            "{\"success\":true,\"url\":\"" + url + "\",\"filename\":\"" + filename + "\"}");
+    }
+
+    // ══ FORTRESS: Security Dashboard Endpoints ═══════════════
+    if (req.path == "/fortress/stats") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, "{\"success\":false,\"error\":\"Root access required\"}");
+        return buildHttpResponse(200, fortress.getStats());
+    }
+    if (req.path == "/fortress/alerts") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, "{\"success\":false,\"error\":\"Root access required\"}");
+        return buildHttpResponse(200, "{\"alerts\":" + fortress.getAlertLog() + "}");
+    }
+    if (req.path == "/fortress/threats") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, "{\"success\":false,\"error\":\"Root access required\"}");
+        return buildHttpResponse(200, "{\"threats\":" + fortress.getThreatLog() + "}");
     }
 
     if (req.path == "/status") {
@@ -3894,11 +4173,38 @@ inline void MilanHttpServer::sendResponse(sock_t sock, const std::string& resp) 
 inline void MilanHttpServer::handleClient(sock_t clientSock) {
     auto req = parseHttpRequest(clientSock);
     if (!req.method.empty()) {
-        // Extract client IP from proxy headers or socket
+        // Extract client IP — only trust proxy headers if behind trusted reverse proxy
+        // (nginx on localhost). Direct connections use socket peer address.
         std::string clientIp = "unknown";
-        auto it = req.headers.find("x-forwarded-for");
-        if (it != req.headers.end() && !it->second.empty()) clientIp = it->second;
-        else { auto it2 = req.headers.find("x-real-ip"); if (it2 != req.headers.end()) clientIp = it2->second; }
+        {
+            struct sockaddr_storage addr;
+            socklen_t addrLen = sizeof(addr);
+            if (getpeername(clientSock, (struct sockaddr*)&addr, &addrLen) == 0) {
+                char ipBuf[INET6_ADDRSTRLEN] = {};
+                if (addr.ss_family == AF_INET) {
+                    inet_ntop(AF_INET, &((struct sockaddr_in*)&addr)->sin_addr, ipBuf, sizeof(ipBuf));
+                } else if (addr.ss_family == AF_INET6) {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6*)&addr)->sin6_addr, ipBuf, sizeof(ipBuf));
+                }
+                clientIp = ipBuf;
+            }
+            // Only trust proxy headers from loopback (nginx reverse proxy)
+            if (clientIp == "127.0.0.1" || clientIp == "::1") {
+                auto it = req.headers.find("x-forwarded-for");
+                if (it != req.headers.end() && !it->second.empty()) {
+                    // Take first IP (original client) from comma-separated list
+                    std::string xff = it->second;
+                    size_t comma = xff.find(',');
+                    clientIp = (comma != std::string::npos) ? xff.substr(0, comma) : xff;
+                    // Trim whitespace
+                    while (!clientIp.empty() && clientIp.front() == ' ') clientIp.erase(clientIp.begin());
+                    while (!clientIp.empty() && clientIp.back() == ' ') clientIp.pop_back();
+                } else {
+                    auto it2 = req.headers.find("x-real-ip");
+                    if (it2 != req.headers.end()) clientIp = it2->second;
+                }
+            }
+        }
         std::string response = handleRequest(req, clientIp);
         sendResponse(clientSock, response);
     }

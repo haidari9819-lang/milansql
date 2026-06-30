@@ -7315,15 +7315,15 @@ static void testGroup78() {
         check(allOk, "RateTier #4: ANONYMOUS allows 60 requests");
         check(!rl.allow("anon1"), "RateTier #5: ANONYMOUS blocks at 61");
     }
-    // 6. FREE: allows 200, blocks at 201
+    // 6. FREE: allows 600, blocks at 601
     {
         RateLimiter rl;
         rl.setTier("free1", RateTier::FREE);
         bool allOk = true;
-        for (int i = 0; i < 200; ++i)
+        for (int i = 0; i < 600; ++i)
             if (!rl.allow("free1")) allOk = false;
-        check(allOk, "RateTier #6: FREE allows 200 requests");
-        check(!rl.allow("free1"), "RateTier #7: FREE blocks at 201");
+        check(allOk, "RateTier #6: FREE allows 600 requests");
+        check(!rl.allow("free1"), "RateTier #7: FREE blocks at 601");
     }
     // 8. ADMIN: truly unlimited — 500k requests without blocking
     {
@@ -7337,9 +7337,9 @@ static void testGroup78() {
     // 9. Different keys have independent buckets
     {
         RateLimiter rl;
-        rl.setTier("a", RateTier::FREE);   // 200 capacity
+        rl.setTier("a", RateTier::FREE);   // 600 capacity
         rl.setTier("b", RateTier::FREE);
-        for (int i = 0; i < 200; ++i) rl.allow("a");
+        for (int i = 0; i < 600; ++i) rl.allow("a");
         check(!rl.allow("a"), "RateTier #9: key a exhausted");
         check(rl.allow("b"),  "RateTier #10: key b still has tokens");
     }
@@ -7384,10 +7384,10 @@ static void testGroup78() {
     // 18. remaining() reflects tokens left
     {
         RateLimiter rl;
-        rl.setTier("rem1", RateTier::FREE); // 200 capacity
+        rl.setTier("rem1", RateTier::FREE); // 600 capacity
         rl.allow("rem1");
         double rem = rl.remaining("rem1");
-        check(rem >= 198.0 && rem <= 200.0, "RateTier #18: remaining ~199 after 1 allow");
+        check(rem >= 598.0 && rem <= 600.0, "RateTier #18: remaining ~199 after 1 allow");
     }
     // 19. retryAfterSeconds returns positive
     {

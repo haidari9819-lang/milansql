@@ -83,10 +83,24 @@ private:
         }
     }
 
+    // Block SSRF to private/internal networks
+    static bool isPrivateHost(const std::string& host) {
+        if (host == "localhost" || host == "127.0.0.1" || host == "::1") return true;
+        if (host.substr(0, 3) == "10.") return true;
+        if (host.substr(0, 8) == "192.168.") return true;
+        if (host.substr(0, 4) == "172.") {
+            try { int oct2 = std::stoi(host.substr(4)); if (oct2 >= 16 && oct2 <= 31) return true; } catch (...) {}
+        }
+        if (host.substr(0, 8) == "169.254.") return true;  // link-local / cloud metadata
+        if (host == "metadata.google.internal") return true;
+        return false;
+    }
+
     static std::string httpGet(const std::string& url) {
         std::string host, path;
         int port = 80;
         parseUrl(url, host, path, port);
+        if (isPrivateHost(host)) return "{\"error\":\"SSRF blocked: private network access denied\"}";
 
 #ifdef _WIN32
         WSADATA wsa;

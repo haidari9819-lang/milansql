@@ -24,7 +24,7 @@ struct TierConfig {
     static TierConfig forTier(RateTier tier) {
         switch (tier) {
             case RateTier::ANONYMOUS: return {  60,   60.0/60.0};  //   60/min
-            case RateTier::FREE:     return { 200,  200.0/60.0};  //  200/min
+            case RateTier::FREE:     return { 600,  600.0/60.0};  //  600/min (10x anonymous)
             case RateTier::PRO:      return {5000, 5000.0/60.0};  // 5000/min
             case RateTier::API_KEY:  return {10000,10000.0/60.0}; //10000/min
             case RateTier::ADMIN:    return {100000,100000.0/60.0}; // effectively unlimited

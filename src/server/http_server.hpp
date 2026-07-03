@@ -99,7 +99,7 @@ static HttpRequest parseHttpRequest(sock_t sock) {
         int n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
         buf[n] = '\0';
-        raw += buf;
+        raw.append(buf, n); // binary-safe: Bilder enthalten NUL-Bytes
         // Guard: reject headers larger than 64 KB (likely attack)
         if (raw.size() > 65536) return {};
     }
@@ -163,7 +163,7 @@ static HttpRequest parseHttpRequest(sock_t sock) {
             int n = recv(sock, buf, sizeof(buf) - 1, 0);
             if (n <= 0) break;
             buf[n] = '\0';
-            bodyPart += buf;
+            bodyPart.append(buf, n); // binary-safe
         }
         req.body = bodyPart.substr(0, contentLen);
     }

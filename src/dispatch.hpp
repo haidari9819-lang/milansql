@@ -368,6 +368,7 @@ static inline milansql::Table dispatch_materializeView(milansql::Engine& engine,
 static inline milansql::Table dispatch_executeSelectToTable(milansql::Engine& engine, milansql::Parser& parser,
     milansql::ParsedCommand cmd);
 
+static inline bool dispatch_executeLiteralSelect(const std::string& sql, milansql::Table& result);
 // Forward declarations for expression projection (Phase 167)
 static inline bool dispatch_hasExprColumns(const std::vector<std::string>& cols);
 static inline milansql::Table dispatch_projectExprs(
@@ -777,7 +778,15 @@ static inline milansql::Table dispatch_materializeView(
     }
 
     milansql::Table base;
-    if (!vc.whereConds.empty()) {
+    if (vc.tableName.empty()) {
+        // Phase 173: FROM-less SELECT (e.g., SELECT 1 AS val, SELECT expression)
+        milansql::Table litResult("", {});
+        if (dispatch_executeLiteralSelect(vsql, litResult)) {
+            base = std::move(litResult);
+        } else {
+            base = dispatch_executeSelectToTable(engine, parser, vc);
+        }
+    } else if (!vc.whereConds.empty()) {
         auto qr = engine.selectWhere(vc.tableName, vc.whereConds, vc.whereLogic);
         base = std::move(qr.table);
     } else {
@@ -799,6 +808,27 @@ static inline milansql::Table dispatch_executeSelectToTable(
         milansql::Parser& parser,
         milansql::ParsedCommand cmd)
 {
+    // Phase 173: Handle FROM-less SELECT (e.g., SELECT 1 AS val)
+    if (cmd.tableName.empty() && !cmd.isSetOp && !cmd.isJoin) {
+        // Build the SQL string back and use literal select
+        std::string literalSql = "SELECT ";
+        for (size_t i = 0; i < cmd.selectColumns.size(); ++i) {
+            if (i > 0) literalSql += ", ";
+            literalSql += cmd.selectColumns[i];
+        }
+        milansql::Table result("", {});
+        if (dispatch_executeLiteralSelect(literalSql, result))
+            return result;
+        // If literal select fails, create a single-row table with empty values
+        std::vector<milansql::Column> cols;
+        for (const auto& sc : cmd.selectColumns)
+            cols.push_back({sc, "TEXT"});
+        milansql::Table fallback("", cols);
+        std::vector<std::string> vals(cols.size(), "");
+        fallback.insert(milansql::Row(vals));
+        return fallback;
+    }
+
     for (const auto& sq : cmd.subqueries) {
         if (sq.condIdx < cmd.whereConds.size()) {
             cmd.whereConds[sq.condIdx].inList =
@@ -3971,21 +4001,29 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::SHOW_TRIGGERS: {
         auto triggers = engine.showTriggers(cmd.showTriggersTable);
-        if (triggers.empty()) {
-            std::cout << "  Keine Trigger";
-            if (!cmd.showTriggersTable.empty())
-                std::cout << " auf '" << cmd.showTriggersTable << "'";
-            std::cout << ".\n\n";
-        } else {
-            std::cout << "\n";
-            for (const auto& t : triggers) {
-                std::string gran = t.granularity.empty() ? "ROW" : t.granularity;
-                std::cout << "  " << t.name << " | " << t.timing
-                          << " " << t.event << " ON " << t.tableName
-                          << " | FOR EACH " << gran << "\n";
-            }
-            std::cout << "\n  " << triggers.size() << " Trigger\n\n";
+        // User-Isolation: Nicht-Root sieht nur eigene Trigger (u<id>_-Praefix)
+        std::string trgPf;
+        if (engine.getCurrentUserId() > 0 && !engine.isRootUser())
+            trgPf = "u" + std::to_string(engine.getCurrentUserId()) + "_";
+        auto trgStrip = [&trgPf](const std::string& n) {
+            return (!trgPf.empty() && n.rfind(trgPf, 0) == 0)
+                ? n.substr(trgPf.size()) : n;
+        };
+        std::cout << "\n";
+        milansql::Table tt("", {milansql::Column("Trigger","TEXT"),
+                                milansql::Column("Timing","TEXT"),
+                                milansql::Column("Event","TEXT"),
+                                milansql::Column("Tabelle","TEXT"),
+                                milansql::Column("Granularitaet","TEXT"),
+                                milansql::Column("Body","TEXT")});
+        for (const auto& t : triggers) {
+            if (!trgPf.empty() && t.name.rfind(trgPf, 0) != 0 &&
+                t.tableName.rfind(trgPf, 0) != 0) continue;
+            std::string gran = t.granularity.empty() ? "ROW" : t.granularity;
+            tt.insert(milansql::Row({trgStrip(t.name), t.timing, t.event,
+                                     trgStrip(t.tableName), gran, t.body}));
         }
+        dispatch_printTable(tt, -1, 0);
         break;
     }
 
@@ -4016,20 +4054,50 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::SHOW_PROCEDURES: {
         auto procs = engine.showProcedures();
-        if (procs.empty()) {
-            std::cout << "  Keine Procedures.\n\n";
-        } else {
-            std::cout << "\n";
-            for (const auto& p : procs) {
-                std::string paramStr;
-                for (size_t pi = 0; pi < p.params.size(); ++pi) {
-                    if (pi > 0) paramStr += ", ";
-                    paramStr += p.params[pi].first + " " + p.params[pi].second;
-                }
-                std::cout << "  " << p.name << "(" << paramStr << ")\n";
+        // User-Isolation: Nicht-Root sieht nur eigene Procedures
+        std::string prcPf;
+        if (engine.getCurrentUserId() > 0 && !engine.isRootUser())
+            prcPf = "u" + std::to_string(engine.getCurrentUserId()) + "_";
+        std::cout << "\n";
+        milansql::Table pt("", {milansql::Column("Procedure","TEXT"),
+                                milansql::Column("Parameter","TEXT"),
+                                milansql::Column("Body","TEXT")});
+        for (const auto& p : procs) {
+            std::string display = p.name;
+            if (!prcPf.empty()) {
+                if (p.name.rfind(prcPf, 0) != 0) continue;
+                display = p.name.substr(prcPf.size());
             }
-            std::cout << "\n  " << procs.size() << " Procedure(n)\n\n";
+            std::string paramStr;
+            for (size_t pi = 0; pi < p.params.size(); ++pi) {
+                if (pi > 0) paramStr += ", ";
+                paramStr += p.params[pi].first;
+                if (!p.params[pi].second.empty())
+                    paramStr += " " + p.params[pi].second;
+            }
+            pt.insert(milansql::Row({display, paramStr, p.body}));
         }
+        dispatch_printTable(pt, -1, 0);
+        break;
+    }
+
+    case milansql::CommandType::SHOW_VIEWS: {
+        // User-Isolation: Nicht-Root sieht nur eigene Views
+        std::string vwPf;
+        if (engine.getCurrentUserId() > 0 && !engine.isRootUser())
+            vwPf = "u" + std::to_string(engine.getCurrentUserId()) + "_";
+        std::cout << "\n";
+        milansql::Table vt("", {milansql::Column("View","TEXT"),
+                                milansql::Column("Definition","TEXT")});
+        for (const auto& vname : engine.getAllViewNames()) {
+            std::string display = vname;
+            if (!vwPf.empty()) {
+                if (vname.rfind(vwPf, 0) != 0) continue;
+                display = vname.substr(vwPf.size());
+            }
+            vt.insert(milansql::Row({display, engine.getViewSql(vname)}));
+        }
+        dispatch_printTable(vt, -1, 0);
         break;
     }
 
@@ -5144,11 +5212,12 @@ inline bool dispatchCommand(
     // ── Phase 75: Row-Level Security ─────────────────────────
     case milansql::CommandType::CREATE_POLICY: {
         milansql::Engine::RlsPolicy p;
-        p.name      = cmd.policyName;
-        p.table     = cmd.tableName;
-        p.command   = cmd.policyCommand.empty() ? "ALL" : cmd.policyCommand;
-        p.role      = cmd.policyUser.empty()    ? "PUBLIC" : cmd.policyUser;
-        p.usingExpr = cmd.policyUsingExpr;
+        p.name           = cmd.policyName;
+        p.table          = cmd.tableName;
+        p.command        = cmd.policyCommand.empty() ? "ALL" : cmd.policyCommand;
+        p.role           = cmd.policyUser.empty()    ? "PUBLIC" : cmd.policyUser;
+        p.usingExpr      = cmd.policyUsingExpr;
+        p.withCheckExpr  = cmd.policyWithCheckExpr;  // Phase 170
         engine.createRlsPolicy(p);
         std::cout << "  Policy " << p.name << " created.\n\n";
         break;

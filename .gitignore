@@ -35,3 +35,7 @@ desktop.ini
 # macOS
 .DS_Store
 jwt.secret
+
+# Runtime-Daten
+uploads/
+*.log

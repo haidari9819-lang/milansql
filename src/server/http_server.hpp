@@ -29,6 +29,7 @@
 #include <thread>
 #include <future>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <string>
 #include <sstream>
@@ -674,7 +675,7 @@ private:
     std::string dbPath_;
     milansql::Engine engine_;
     milansql::MilanBinaryStorage storage_;
-    std::mutex engineMutex_;
+    mutable std::shared_mutex engineMutex_;  // Phase 173: shared for reads, exclusive for writes
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
     std::atomic<long long> queryCounter_{0};   // Phase 166: live query counter
 
@@ -703,7 +704,7 @@ private:
     std::string handleStatus();
     std::string handleDashboard();   // Phase 54C
     std::string handleWebUI();       // Phase 135: Professional Admin Dashboard
-    std::string handleSemanticSearch(const std::string& body);  // Phase 121
+    std::string handleSemanticSearch(const std::string& body, int userId = 0, bool isRoot = true);  // Phase 121
 
     // Phase 154: Auth routes
     std::string handleAuthRegister(const std::string& body, const std::string& clientIp);
@@ -1159,7 +1160,7 @@ inline std::string MilanHttpServer::handleAdminUsers(const std::string& token) {
 inline std::string MilanHttpServer::handleAdminStats(const std::string& token) {
     auto v = authMgr_.validateToken(token);
     if (!v.valid || v.role != "root") return "{\"success\":false,\"error\":\"Access denied\"}";
-    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::unique_lock<std::shared_mutex> lk(engineMutex_);
     auto tables = engine_.getAllTableNames();
     long long totalRows = 0;
     for (const auto& t : tables) { try { totalRows += engine_.countRows(t,true); } catch(...){} }
@@ -1177,7 +1178,7 @@ inline std::string MilanHttpServer::handleMyQuota(const std::string& token) {
     if (!token.empty()) v = authMgr_.validateToken(token);
     if (!v.valid && !token.empty()) return "{\"success\":false,\"error\":\"Unauthorized\"}";
     auto quota = authMgr_.getQuota(v.userId);
-    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::unique_lock<std::shared_mutex> lk(engineMutex_);
     auto allTables = engine_.getAllTableNames();
     int myTables = 0;
     long long myRows = 0;
@@ -1212,7 +1213,7 @@ inline std::string MilanHttpServer::handleBackup(const std::string& token) {
     bool isRoot = (v.role == "root");
     std::string userPrefix = (v.userId > 0) ? "u" + std::to_string(v.userId) + "_" : "";
 
-    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::unique_lock<std::shared_mutex> lk(engineMutex_);
     std::ostringstream out;
     out << "-- MilanSQL Backup";
     if (!isRoot && v.userId > 0)
@@ -1460,7 +1461,7 @@ inline std::string MilanHttpServer::handleRestore(const std::string& token,
 // ── MilanHttpServer::handleQueryForUser (Phase 154-155) ───────
 
 inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, int userId, const std::string& userRole) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
 
     bool isRoot = (userId <= 0 || userRole == "root");
     bool isService = (userRole == "service");  // service accounts: no table prefix, but rate-limited
@@ -1540,6 +1541,24 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         if (u2 == "SELECT @@TRANSACTION_ISOLATION" || u2 == "SELECT @@TX_ISOLATION")
             return makeScalar("@@transaction_isolation", "READ-COMMITTED");
     }
+
+
+    // Phase 170: SHOW POLICIES ON <table> — return as JSON result set
+    if (upper.rfind("SHOW POLICIES", 0) == 0) {
+        // Extract table name after ON
+        std::string tblName;
+        auto onPos = upper.find(" ON ");
+        if (onPos != std::string::npos) {
+            tblName = trimmed.substr(onPos + 4);
+            while (!tblName.empty() && (tblName.back()==';'||tblName.back()==' ')) tblName.pop_back();
+            while (!tblName.empty() && tblName.front()==' ') tblName.erase(0,1);
+        }
+        if (!tblName.empty()) {
+            return engine_.getTablePoliciesJson(tblName);
+        }
+        return engine_.getRlsPoliciesJson();
+    }
+
 
     // v9.2.0: SHOW TABLES — filtered per-user to prevent cross-user table name leakage
     {
@@ -1777,6 +1796,18 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                         !(jc.table.size()>2 && jc.table[0]=='u' && std::isdigit((unsigned char)jc.table[1])))
                         jc.table = prefix + jc.table;
                 }
+                // Views/Procedures/Triggers: Namen + Zieltabellen isolieren,
+                // damit CREATE/DROP/CALL/SHOW pro User getrennt sind
+                auto pfxName = [&prefix](std::string& n) {
+                    if (n.empty()) return;
+                    if (n.size() >= 2 && n[0]=='_' && n[1]=='_') return;
+                    if (n.size() > 2 && n[0]=='u' && std::isdigit((unsigned char)n[1])) return;
+                    n = prefix + n;
+                };
+                pfxName(cmd.triggerName);
+                pfxName(cmd.triggerTable);
+                pfxName(cmd.showTriggersTable);
+                pfxName(cmd.procedureName);
             } else {
                 // Root: handle "user.table" notation (cross-user)
                 if (!cmd.tableName.empty()) {
@@ -1855,7 +1886,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
 // ── MilanHttpServer::handleListTablesForUser ──────────────────
 
 inline std::string MilanHttpServer::handleListTablesForUser(int userId) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     auto all = engine_.getAllTableNames();
     std::string json = "{\"success\":true,\"tables\":[";
     bool first = true;
@@ -1883,7 +1914,7 @@ inline std::string MilanHttpServer::handleListTablesForUser(int userId) {
 // when more than one statement is present.
 
 inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
 
     auto persistFn = [this]() {
         if (engine_.isInTransaction()) return;
@@ -1990,7 +2021,7 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
 // ── MilanHttpServer::handleListTables ─────────────────────────
 
 inline std::string MilanHttpServer::handleListTables() {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     auto tables = engine_.getAllTableNames();
     std::string json = "{\"success\":true,\"tables\":[";
     for (size_t i = 0; i < tables.size(); ++i) {
@@ -2004,7 +2035,7 @@ inline std::string MilanHttpServer::handleListTables() {
 // ── MilanHttpServer::handleDescribeTable ──────────────────────
 
 inline std::string MilanHttpServer::handleDescribeTable(const std::string& tableName) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     std::ostringstream captured;
     std::streambuf* old = std::cout.rdbuf(captured.rdbuf());
     try {
@@ -2025,7 +2056,7 @@ inline std::string MilanHttpServer::handleDescribeTable(const std::string& table
 // ── MilanHttpServer::handleListSchemas ────────────────────────
 
 inline std::string MilanHttpServer::handleListSchemas() {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     auto schemas = engine_.showSchemas();
     std::string json = "{\"success\":true,\"schemas\":[";
     for (size_t i = 0; i < schemas.size(); ++i) {
@@ -2039,7 +2070,7 @@ inline std::string MilanHttpServer::handleListSchemas() {
 // ── MilanHttpServer::handleStatus ─────────────────────────────
 
 inline std::string MilanHttpServer::handleStatus() {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - startTime_).count();
     auto tables  = engine_.getAllTableNames();
@@ -2080,8 +2111,8 @@ inline std::string MilanHttpServer::handleStatus() {
 //             "query_vector":"[1.0,0.0,0.0]","limit":5,
 //             "filter":"category = 'tech'","include_score":true}
 
-inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body, int userId, bool isRoot) {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
 
     // Simple JSON field extraction helper
     auto extractStr = [&](const std::string& key) -> std::string {
@@ -2121,6 +2152,25 @@ inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body
 
     if (table.empty() || vecCol.empty() || queryVecStr.empty())
         return R"({"success":false,"error":"Missing required fields: table, vector_column, query_vector"})";
+
+    // Phase 173: Validate table ownership for non-root users
+    if (!isRoot && userId > 0) {
+        std::string userPrefix = "u" + std::to_string(userId) + "_";
+        std::string bareName = table;
+        auto dot = table.find('.');
+        if (dot != std::string::npos) bareName = table.substr(dot + 1);
+        if (bareName.substr(0, userPrefix.size()) != userPrefix)
+            return R"({"success":false,"error":"Access denied: table not owned by user"})";
+    }
+    // Validate identifiers: reject SQL injection chars in table/column names
+    auto isValidIdent = [](const std::string& s) -> bool {
+        for (char c : s) {
+            if (!std::isalnum(c) && c != '_' && c != '.') return false;
+        }
+        return !s.empty();
+    };
+    if (!isValidIdent(table) || !isValidIdent(vecCol))
+        return R"({"success":false,"error":"Invalid table or column name"})";
 
     int limitN = 10;
     if (!limitStr.empty()) {
@@ -2467,6 +2517,34 @@ td.null-val{color:#484f58;font-style:italic}
 .slow-queries-section{padding:0 16px 16px}
 .slow-queries-section h3{font-size:0.8rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
 
+
+/* SCHEMA VISUALIZER */
+#page-schema{flex-direction:column;position:relative}
+.schema-zoom-ctrl{display:flex;align-items:center;gap:4px}
+.schema-zoom-ctrl button{background:#21262d;border:1px solid #30363d;color:#e6edf3;width:26px;height:26px;border-radius:4px;cursor:pointer;font-size:0.85rem;display:flex;align-items:center;justify-content:center;padding:0}
+.schema-zoom-ctrl button:hover{background:#30363d;border-color:#484f58}
+.schema-zoom-pct{font-size:0.7rem;color:#8b949e;min-width:36px;text-align:center}
+#schema-minimap{position:absolute;bottom:12px;right:12px;width:200px;height:150px;background:#0d1117;border:1px solid #30363d;border-radius:6px;z-index:50;overflow:hidden;cursor:crosshair}
+#schema-minimap canvas{width:100%;height:100%}
+.schema-card{position:absolute;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:180px;max-width:260px;cursor:move;transition:box-shadow .15s,opacity .15s;user-select:none;z-index:2}
+.schema-card:hover{box-shadow:0 0 0 1px #ff6b1a}
+.schema-card.dimmed{opacity:0.3}
+.schema-card.highlighted{box-shadow:0 0 0 2px #ff6b1a}
+.schema-card-header{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid #21262d;font-size:0.8rem;font-weight:600;color:#e6edf3}
+.schema-card-header .rls-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.schema-card-header .rls-dot.on{background:#3fb950}
+.schema-card-header .rls-dot.off{background:#484f58}
+.schema-card-header .pol-count{margin-left:auto;font-size:9px;font-weight:600;background:#1c3a2a;color:#3fb950;padding:1px 5px;border-radius:8px}
+.schema-card-cols{padding:4px 0;font-size:0.75rem;max-height:200px;overflow-y:auto}
+.schema-col{display:flex;align-items:center;gap:4px;padding:2px 10px;color:#8b949e}
+.schema-col .col-icon{width:12px;font-size:9px;text-align:center;flex-shrink:0}
+.schema-col .col-icon.pk{color:#f0a500}
+.schema-col .col-icon.fk{color:#3fb950}
+.schema-col .col-name{flex:1;color:#cdd6f4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.schema-col .col-name.fk-col{color:#3fb950}
+.schema-col .col-type{color:#484f58;font-size:0.7rem;font-family:monospace;flex-shrink:0}
+.schema-card-rls{padding:5px 10px;border-top:1px solid #21262d;background:#0d1117;border-radius:0 0 7px 7px;font-size:0.7rem;font-family:monospace;color:#6e7681;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-height:60px}
+.schema-card-rls:hover{color:#8b949e}
 /* TABLE BROWSER PAGE */
 #page-browser .browser-wrap{display:flex;flex:1;gap:0;overflow:hidden}
 #page-browser .tbl-list{width:200px;border-right:1px solid #21262d;overflow-y:auto;padding:8px}
@@ -2520,6 +2598,9 @@ td.null-val{color:#484f58;font-style:italic}
       <div class="nav-item" data-page="browser" onclick="showPage('browser',this)">
         <span class="icon">&#x1F5C3;</span> Table Browser
       </div>
+      <div class="nav-item" data-page="schema" onclick="showPage('schema',this)">
+        <span class="icon">&#x25C9;</span> Schema
+      </div>
       <div class="nav-item" data-page="monitoring" onclick="showPage('monitoring',this)">
         <span class="icon">&#x1F4CA;</span> Monitoring
       </div>
@@ -2554,6 +2635,7 @@ td.null-val{color:#484f58;font-style:italic}
           <button class="btn btn-gray" onclick="formatSQL()">Format</button>
           <button class="btn btn-gray" onclick="clearEditor()">&#x2715; Clear</button>
           <button class="btn btn-gray" onclick="copyCSV()" title="Copy results as CSV">&#x1F4CB; CSV</button>
+          <button class="btn btn-gray" onclick="showRlsPolicies()" title="Show RLS policies for selected table" style="border-color:#f0a500;color:#f0a500">&#x1F6E1; RLS</button>
           <span class="exec-time" id="exec-time"></span>
         </div>
         <div style="position:relative">
@@ -2598,6 +2680,65 @@ td.null-val{color:#484f58;font-style:italic}
       </div>
     </div>
 
+
+    <!-- SCHEMA VISUALIZER PAGE -->
+    <div class="page" id="page-schema">
+      <div id="schema-toolbar" style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #21262d;background:#0d1117">
+        <input id="schema-search" type="text" placeholder="Filter tables..." style="background:#161b22;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 10px;font-size:0.8rem;width:180px;outline:none">
+        <button class="btn btn-gray" onclick="schemaAutoLayout()" style="font-size:0.75rem;padding:4px 10px">&#x2B50; Auto Layout</button>
+        <button class="btn btn-gray" onclick="schemaFitAll()" style="font-size:0.75rem;padding:4px 10px">&#x26F6; Fit</button>
+        <button class="btn btn-gray" onclick="schemaReload()" style="font-size:0.75rem;padding:4px 10px">&#x21BB; Reload</button>
+        <div class="schema-zoom-ctrl" style="margin-left:auto;margin-right:8px">
+          <button onclick="schemaZoom(-0.1)" title="Zoom Out (Ctrl+-)">&#x2212;</button>
+          <span id="schema-zoom-pct" class="schema-zoom-pct">100%</span>
+          <button onclick="schemaZoom(0.1)" title="Zoom In (Ctrl++)">+</button>
+          <button onclick="schemaZoomReset()" title="Reset Zoom (Ctrl+0)" style="font-size:0.65rem;width:auto;padding:0 6px">Reset</button>
+        </div>
+        <span id="schema-status" style="font-size:0.72rem;color:#8b949e"></span>
+      </div>
+      <div id="schema-canvas" style="flex:1;position:relative;overflow:hidden;background:#0a0c10;cursor:grab">
+        <div id="schema-transform" style="position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform">
+          <svg id="schema-svg" style="position:absolute;top:0;left:0;width:10000px;height:10000px;pointer-events:none;z-index:1"></svg>
+          <div id="schema-cards" style="position:absolute;top:0;left:0;z-index:2"></div>
+        </div>
+        <div id="schema-minimap"><canvas id="schema-minimap-canvas" width="400" height="300"></canvas></div>
+      </div>
+      <div id="schema-policy-editor" style="display:none;position:absolute;bottom:0;left:0;right:0;background:#161b22;border-top:2px solid #ff6b1a;padding:12px 16px;z-index:100">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="font-size:0.85rem;font-weight:600;color:#ff6b1a">&#x1F6E1; Edit RLS Policy</span>
+          <span id="schema-pe-table" style="font-size:0.8rem;color:#8b949e"></span>
+          <button onclick="closePolicyEditor()" style="margin-left:auto;background:none;border:none;color:#8b949e;cursor:pointer;font-size:1rem">&#x2715;</button>
+        </div>
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex:1;min-width:200px">
+            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">Policy Name</label>
+            <input id="schema-pe-name" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+          </div>
+          <div style="flex:1;min-width:80px;max-width:120px">
+            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">Command</label>
+            <select id="schema-pe-cmd" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+              <option>ALL</option><option>SELECT</option><option>INSERT</option><option>UPDATE</option><option>DELETE</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:100px;max-width:120px">
+            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">Role</label>
+            <input id="schema-pe-role" value="PUBLIC" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+          </div>
+          <div style="flex:2;min-width:200px">
+            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">USING Expression</label>
+            <input id="schema-pe-using" placeholder="e.g. owner = CURRENT_USER_ID()" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
+          </div>
+          <div style="flex:2;min-width:200px">
+            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">WITH CHECK</label>
+            <input id="schema-pe-check" placeholder="optional" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
+          </div>
+          <div style="display:flex;align-items:flex-end">
+            <button class="btn btn-green" onclick="savePolicyFromEditor()" style="font-size:0.8rem;padding:5px 14px;margin-top:14px">Save Policy</button>
+          </div>
+        </div>
+        <div id="schema-pe-msg" style="font-size:0.75rem;margin-top:6px;color:#8b949e"></div>
+      </div>
+    </div>
     <!-- MONITORING PAGE -->
     <div class="page" id="page-monitoring">
       <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #21262d">
@@ -2794,6 +2935,7 @@ function showPage(name, el) {
   document.getElementById('page-' + name).classList.add('active');
   if (el) el.classList.add('active');
   if (name === 'browser') loadBrowserTables();
+  if (name === 'schema') loadSchemaViz();
   if (name === 'history') renderHistory();
   if (name === 'monitoring') { monLastQ = 0; monQueryHistory = []; loadMonitoring(); }
   else stopMonitoring();
@@ -2891,7 +3033,7 @@ function renderTable(cols, rows, container) {
   html += '</tr></thead><tbody>';
   rows.forEach(function(row) {
     html += '<tr>';
-    var vals = Array.isArray(row) ? row : (row.values || Object.values(row));
+    var vals = rowVals(row);
     vals.forEach(function(v) {
       if (v === null || v === 'NULL' || v === '') {
         html += '<td class="null-val">NULL</td>';
@@ -2992,7 +3134,7 @@ function copyCSV() {
   var csvCols = cols.map(function(c){ return typeof c==='string'?c:(c.name||String(c)); });
   var lines = [csvCols.join(',')];
   rows.forEach(function(row){
-    var vals = Array.isArray(row) ? row : (row.values||Object.values(row));
+    var vals = rowVals(row);
     lines.push(vals.map(function(v){
       var s = v===null||v===undefined?'':String(v);
       return s.includes(',') || s.includes('"') || s.includes('\n') ? '"'+s.replace(/"/g,'""')+'"' : s;
@@ -3046,8 +3188,102 @@ document.addEventListener('click', function(e) {
 });
 
 // Table sidebar
+var _rlsPoliciesCache = {};
+
+// Phase 170: Show RLS Policies for table in editor
+async function showRlsPolicies() {
+  var sql = document.getElementById('sql-editor').value.trim();
+  var tblMatch = sql.match(/(?:FROM|JOIN|TABLE|ON|INTO|UPDATE|POLICIES)\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+  if (!tblMatch) {
+    try {
+      var r = await fetch('/api/rls-policies', {credentials:'include'});
+      var data = await r.json();
+      var out = document.getElementById('output-area');
+      var html = '<div style="padding:12px"><h3 style="color:#f0a500;margin-bottom:12px">&#x1F6E1; RLS Policies Overview</h3>';
+      var enabled = data.enabled_tables || [];
+      html += '<div style="color:#8b949e;margin-bottom:8px">Protected tables: <b style="color:#3fb950">' + enabled.length + '</b></div>';
+      if (enabled.length === 0) {
+        html += '<div style="color:#484f58">No tables have RLS enabled.</div>';
+      } else {
+        html += '<table><thead><tr><th>Table</th><th>Policies</th><th>Details</th></tr></thead><tbody>';
+        for (var i = 0; i < enabled.length; i++) {
+          var tbl = enabled[i];
+          var pols = (data.policies || {})[tbl] || [];
+          var details = pols.map(function(p) { return '<span style="color:#58a6ff">' + escHtml(p.name) + '</span> (' + p.command + ' TO ' + p.role + ')'; }).join(', ') || '<span style="color:#484f58">none</span>';
+          html += '<tr><td style="color:#cdd6f4;font-weight:600">' + escHtml(tbl) + '</td><td style="text-align:center">' + pols.length + '</td><td>' + details + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      html += '</div>';
+      if (out) out.innerHTML = html;
+    } catch(e) {}
+    return;
+  }
+  var tblName = tblMatch[1];
+  try {
+    var r = await fetch('/api/rls-policies/' + encodeURIComponent(tblName), {credentials:'include'});
+    var data = await r.json();
+    var out = document.getElementById('output-area');
+    var html = '<div style="padding:12px"><h3 style="color:#f0a500;margin-bottom:12px">&#x1F6E1; RLS Policies: ' + escHtml(tblName) + '</h3>';
+    html += '<div style="margin-bottom:8px;color:#8b949e">RLS Status: ' + (data.rls_enabled ? '<b style="color:#3fb950">ENABLED</b>' : '<b style="color:#f38ba8">DISABLED</b>') + '</div>';
+    var pols = data.policies || [];
+    if (pols.length === 0) {
+      html += '<div style="color:#484f58;margin-bottom:8px">No policies defined.</div>';
+      html += '<div style="color:#8b949e;font-size:0.8rem">Create: <code style="color:#58a6ff">CREATE POLICY name ON ' + escHtml(tblName) + ' FOR ALL TO PUBLIC USING (expr);</code></div>';
+    } else {
+      html += '<table><thead><tr><th>Policy</th><th>Command</th><th>Role</th><th>USING</th><th>WITH CHECK</th></tr></thead><tbody>';
+      for (var i = 0; i < pols.length; i++) {
+        var p = pols[i];
+        html += '<tr>';
+        html += '<td style="color:#58a6ff;font-weight:600">' + escHtml(p.name) + '</td>';
+        html += '<td><span style="background:#21262d;padding:2px 6px;border-radius:3px;font-size:0.75rem;color:#f0a500">' + escHtml(p.command) + '</span></td>';
+        html += '<td>' + escHtml(p.role) + '</td>';
+        html += '<td style="font-family:monospace;font-size:0.8rem;color:#cdd6f4">' + escHtml(p['using']||'') + '</td>';
+        html += '<td style="font-family:monospace;font-size:0.8rem;color:#cdd6f4">' + escHtml(p.with_check||'-') + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+    if (out) out.innerHTML = html;
+  } catch(e) {}
+}
+
+
+async function loadRlsPolicies() {
+  try {
+    var r = await fetch('/api/rls-policies', {credentials:'include'});
+    _rlsPoliciesCache = await r.json();
+  } catch(e) { _rlsPoliciesCache = {}; }
+}
+
+function getRlsBadge(tableName) {
+  var pols = _rlsPoliciesCache.policies || {};
+  // Check both raw name and with user prefix
+  var count = 0;
+  var enabled = false;
+  var enabledTables = _rlsPoliciesCache.enabled_tables || [];
+  for (var key in pols) {
+    if (key === tableName || key.endsWith('_' + tableName)) {
+      count = pols[key].length;
+    }
+  }
+  for (var i = 0; i < enabledTables.length; i++) {
+    if (enabledTables[i] === tableName || enabledTables[i].endsWith('_' + tableName)) {
+      enabled = true;
+    }
+  }
+  if (!enabled && count === 0) return '';
+  if (enabled && count > 0)
+    return '<span style="margin-left:auto;background:#1c3a2a;color:#3fb950;font-size:9px;padding:1px 5px;border-radius:8px;font-weight:600" title="' + count + ' RLS ' + (count===1?'Policy':'Policies') + '">' + count + ' RLS</span>';
+  if (enabled)
+    return '<span style="margin-left:auto;background:#1c3a2a;color:#3fb950;font-size:9px;padding:1px 5px;border-radius:8px" title="RLS enabled (no policies)">RLS</span>';
+  return '';
+}
+
 async function loadSidebarTables() {
   try {
+    await loadRlsPolicies();
     var r = await fetch('/tables', {credentials:'include'});
     var data = await r.json();
     var tables = Array.isArray(data) ? data : (data.tables || []);
@@ -3055,7 +3291,9 @@ async function loadSidebarTables() {
     if (!tables.length) { el.innerHTML = '<div style="font-size:0.75rem;color:#484f58;padding:4px 8px">No tables</div>'; return; }
     el.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
-      return '<div class="table-item" onclick="selectFromTable(\'' + escAttr(name) + '\')">' + escHtml(name) + '</div>';
+      var badge = getRlsBadge(name);
+      return '<div class="table-item" style="display:flex;align-items:center" onclick="selectFromTable(\'' + escAttr(name) + '\')">'
+        + '<span>' + escHtml(name) + '</span>' + badge + '</div>';
     }).join('');
   } catch(e) { /* silent */ }
 }
@@ -3076,7 +3314,8 @@ async function loadBrowserTables() {
     var listEl = document.getElementById('browser-tbl-list');
     listEl.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
-      return '<button class="tbl-btn" onclick="browseTable(\'' + escAttr(name) + '\',this)">' + escHtml(name) + '</button>';
+      var badge = getRlsBadge(name);
+      return '<button class="tbl-btn" style="display:flex;align-items:center" onclick="browseTable(\'' + escAttr(name) + '\',this)"><span>' + escHtml(name) + '</span>' + badge + '</button>';
     }).join('') || '<div style="font-size:0.75rem;color:#484f58">No tables</div>';
   } catch(e) {}
 }
@@ -3099,7 +3338,7 @@ async function browseTable(name, btn) {
       html += '</tr></thead><tbody>';
       (desc.rows||[]).forEach(function(row) {
         html += '<tr>';
-        (row.values||row||[]).forEach(function(v){ html += '<td>' + escHtml(String(v != null ? v : '')) + '</td>'; });
+        rowVals(row).forEach(function(v){ html += '<td>' + escHtml(String(v != null ? v : '')) + '</td>'; });
         html += '</tr>';
       });
       html += '</tbody></table></div>';
@@ -3111,7 +3350,7 @@ async function browseTable(name, btn) {
     html += '</tr></thead><tbody>';
     rows.forEach(function(row) {
       html += '<tr>';
-      (row.values||row||[]).forEach(function(v) {
+      rowVals(row).forEach(function(v) {
         var sv = String(v != null ? v : '');
         html += (!isNaN(sv)&&sv!=='') ? '<td class="num">'+escHtml(sv)+'</td>' : '<td>'+escHtml(sv)+'</td>';
       });
@@ -3204,7 +3443,7 @@ async function loadSlowQueriesMon() {
     html += '</tr>';
     d.rows.slice(0,8).forEach(function(row){
       html += '<tr style="border-bottom:1px solid #161b22">';
-      (row.values||row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#e6edf3">'+escHtml(String(v||''))+'</td>'; });
+      rowVals(row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#e6edf3">'+escHtml(String(v||''))+'</td>'; });
       html += '</tr>';
     });
     html += '</table>';
@@ -3296,6 +3535,7 @@ async function pollStatus() {
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+function rowVals(row) { return Array.isArray(row) ? row : (row && typeof row === 'object' && row.values && typeof row.values !== 'function' ? row.values : (row && typeof row === 'object' ? Object.values(row) : [])); }
 function escAttr(s) { return String(s).replace(/'/g,"\\'"); }
 
 // Init
@@ -3353,12 +3593,457 @@ function updateUserBadge() {
   var rp=document.getElementById('rls-panel');
   if(rp){
     var tables=document.querySelectorAll('#sidebar-tables .tbl-btn');
-    rp.innerHTML='<div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
+    var rlsHtml='<div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
       +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="color:#3fb950;font-size:9px">●</span><span style="font-size:11px;color:#3fb950;font-weight:600">ACTIVE</span></div>'
-      +'<div style="font-size:10px;color:#8b949e">User: <b style="color:#cdd6f4">'+escHtml(msUser)+'</b> (id: '+msUserId+')</div>'
-      +'<div style="font-size:10px;color:#8b949e">Isolation: <b style="color:#3fb950">ENABLED</b></div>';
+      +'<div style="font-size:10px;color:#8b949e;margin-bottom:3px">User: <b style="color:#cdd6f4">'+escHtml(msUser)+'</b></div>';
+    var enabledCount = (_rlsPoliciesCache.enabled_tables||[]).length;
+    var totalPolicies = 0;
+    var pols = _rlsPoliciesCache.policies || {};
+    for (var k in pols) totalPolicies += pols[k].length;
+    rlsHtml += '<div style="font-size:10px;color:#8b949e;margin-bottom:2px">Tables: <b style="color:#58a6ff">'+enabledCount+'</b> protected</div>';
+    rlsHtml += '<div style="font-size:10px;color:#8b949e">Policies: <b style="color:#f0a500">'+totalPolicies+'</b> active</div>';
+    rp.innerHTML = rlsHtml;
   }
 }
+
+// Phase 171: Schema Visualizer
+var _schemaData = null;
+var _schemaPositions = {};
+var _schemaDrag = null;
+
+function schemaStorageKey() { return 'milansql_schema_pos_' + (msUser||'anon'); }
+function loadSchemaPositions() { try { _schemaPositions = JSON.parse(localStorage.getItem(schemaStorageKey())) || {}; } catch(e) { _schemaPositions = {}; } }
+function saveSchemaPositions() { try { localStorage.setItem(schemaStorageKey(), JSON.stringify(_schemaPositions)); } catch(e) {} }
+
+async function loadSchemaViz() {
+  var status = document.getElementById('schema-status');
+  if (status) status.textContent = 'Loading...';
+  loadSchemaPositions();
+  try { var r = await fetch('/api/schema', {credentials:'include'}); _schemaData = await r.json(); }
+  catch(e) { if(status) status.textContent='Error'; return; }
+  renderSchemaViz();
+}
+function schemaReload() { loadSchemaViz(); }
+
+function buildFkMap() {
+  var tables = (_schemaData && _schemaData.tables) || [];
+  var fkMap = [], fkCols = {}, tblNames = {};
+  tables.forEach(function(t) {
+    fkCols[t.name] = {};
+    tblNames[t.name] = true;
+    // Strip public. and u<N>_ prefixes for FK inference matching
+    var noSchema = t.name.replace(/^public\./, '');
+    if (noSchema !== t.name) tblNames[noSchema] = t.name;
+    var bare = noSchema.replace(/^u[0-9]+_/, '');
+    if (bare !== noSchema) tblNames[bare] = t.name;
+  });
+  tables.forEach(function(t) {
+    (t.foreign_keys||[]).forEach(function(fk) { fkMap.push({from:t.name,fromCol:fk.from,to:fk.ref_table,toCol:fk.ref_col}); fkCols[t.name][fk.from]=fk.ref_table; });
+    (t.columns||[]).forEach(function(c) {
+      if (c.name.endsWith('_id') && !fkCols[t.name][c.name]) {
+        var ref = c.name.slice(0,-3);
+        [ref,ref+'s',ref+'e',ref+'en',ref+'es'].forEach(function(cn) {
+          if(tblNames[cn]&&cn!==t.name) { var real=typeof tblNames[cn]==='string'?tblNames[cn]:cn; if(real!==t.name){fkMap.push({from:t.name,fromCol:c.name,to:real,toCol:'id',inferred:true}); fkCols[t.name][c.name]=real;} }
+        });
+      }
+    });
+  });
+  return {fkMap:fkMap,fkCols:fkCols};
+}
+
+function renderSchemaViz() {
+  var tables = (_schemaData && _schemaData.tables) || [];
+  var cardsEl = document.getElementById('schema-cards');
+  var svgEl = document.getElementById('schema-svg');
+  if (!cardsEl||!svgEl) return;
+  cardsEl.innerHTML = '';
+  var filter = (document.getElementById('schema-search')||{}).value||'';
+  filter = filter.toLowerCase();
+  var fi = buildFkMap(), fkMap=fi.fkMap, fkCols=fi.fkCols;
+  var cols = Math.max(2, Math.ceil(Math.sqrt(tables.length)));
+  tables.forEach(function(t,i) { if(!_schemaPositions[t.name]) _schemaPositions[t.name]={x:40+(i%cols)*280,y:40+Math.floor(i/cols)*260}; });
+  var ft = tables.filter(function(t){return !filter||t.name.toLowerCase().indexOf(filter)>=0;});
+  var vis = {}; ft.forEach(function(t){vis[t.name]=true;});
+  ft.forEach(function(t) {
+    var card = document.createElement('div');
+    card.className = 'schema-card'; card.dataset.table = t.name;
+    var pos = _schemaPositions[t.name];
+    card.style.left = pos.x+'px'; card.style.top = pos.y+'px';
+    var pc = (t.policies||[]).length, rlsOn = t.rls_enabled;
+    var h = '<div class="schema-card-header"><span class="rls-dot '+(rlsOn?'on':'off')+'" title="RLS '+(rlsOn?'active':'inactive')+'"></span><span>'+escHtml(t.name)+'</span>';
+    if(pc>0) h+='<span class="pol-count">'+pc+'</span>';
+    h+='</div><div class="schema-card-cols">';
+    (t.columns||[]).forEach(function(c) {
+      var isFk=!!(fkCols[t.name]||{})[c.name];
+      var icon='';
+      if(c.pk) icon='<span class="col-icon pk" title="PK">&#x1F511;</span>';
+      else if(isFk) icon='<span class="col-icon fk" title="FK">&#x2192;</span>';
+      else icon='<span class="col-icon"></span>';
+      h+='<div class="schema-col">'+icon+'<span class="col-name'+(isFk?' fk-col':'')+'">'+escHtml(c.name)+'</span><span class="col-type">'+escHtml(c.type)+'</span></div>';
+    });
+    h+='</div>';
+    if(rlsOn&&pc>0) { var fp=t.policies[0]; h+='<div class="schema-card-rls" title="Click to edit" onclick="openPolicyEditor(\''+t.name.replace(/'/g,"\\'")+'\')">' +escHtml(fp.name)+': '+escHtml(fp['using']||'')+'</div>'; }
+    else if(rlsOn) h+='<div class="schema-card-rls" onclick="openPolicyEditor(\''+t.name.replace(/'/g,"\\'")+'\')">' +'+ Add policy</div>';
+    card.innerHTML = h;
+    card.addEventListener('mouseenter', function() {
+      var conn={}; conn[t.name]=true;
+      fkMap.forEach(function(fk){if(fk.from===t.name)conn[fk.to]=true;if(fk.to===t.name)conn[fk.from]=true;});
+      document.querySelectorAll('.schema-card').forEach(function(c){if(conn[c.dataset.table])c.classList.add('highlighted');else c.classList.add('dimmed');});
+      document.querySelectorAll('.schema-line').forEach(function(l){if(l.dataset.from===t.name||l.dataset.to===t.name){l.style.opacity='1';l.style.strokeWidth='2';}else l.style.opacity='0.15';});
+      document.querySelectorAll('.schema-line-label').forEach(function(l){if(l.dataset.from===t.name||l.dataset.to===t.name)l.style.opacity='1';else l.style.opacity='0.15';});
+    });
+    card.addEventListener('mouseleave', function() {
+      document.querySelectorAll('.schema-card').forEach(function(c){c.classList.remove('highlighted','dimmed');});
+      document.querySelectorAll('.schema-line').forEach(function(l){l.style.opacity='';l.style.strokeWidth='';});
+      document.querySelectorAll('.schema-line-label').forEach(function(l){l.style.opacity='';});
+    });
+    card.addEventListener('mousedown', function(e) {
+      if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='BUTTON'||e.target.closest('.schema-card-rls'))return;
+      e.preventDefault(); _schemaDrag={el:card,name:t.name,sx:e.clientX,sy:e.clientY,ox:pos.x,oy:pos.y};
+    });
+    cardsEl.appendChild(card);
+  });
+  drawSchemaLines(fkMap, vis);
+  schemaApplyTransform();
+  var status=document.getElementById('schema-status');
+  if(status)status.textContent=ft.length+' tables, '+fkMap.length+' relations';
+}
+
+function drawSchemaLines(fkMap,vis) {
+  var svg=document.getElementById('schema-svg'); if(!svg)return; svg.innerHTML='';
+  var ns='http://www.w3.org/2000/svg';
+  fkMap.forEach(function(fk) {
+    if(!vis[fk.from]||!vis[fk.to])return;
+    var fp=_schemaPositions[fk.from],tp=_schemaPositions[fk.to]; if(!fp||!tp)return;
+    var fc=document.querySelector('.schema-card[data-table="'+fk.from+'"]');
+    var tc=document.querySelector('.schema-card[data-table="'+fk.to+'"]');
+    if(!fc||!tc)return;
+    var fw=fc.offsetWidth||200,fh=fc.offsetHeight||120,tw=tc.offsetWidth||200,th=tc.offsetHeight||120;
+    var fx=fp.x+fw,fy=fp.y+fh/2,tx=tp.x,ty=tp.y+th/2;
+    if(tp.x+tw<fp.x){fx=fp.x;tx=tp.x+tw;}
+    else if(Math.abs(fp.x-tp.x)<fw){if(tp.y>fp.y){fx=fp.x+fw/2;fy=fp.y+fh;tx=tp.x+tw/2;ty=tp.y;}else{fx=fp.x+fw/2;fy=fp.y;tx=tp.x+tw/2;ty=tp.y+th;}}
+    var ft2=(_schemaData.tables||[]).find(function(t){return t.name===fk.from;});
+    var tt2=(_schemaData.tables||[]).find(function(t){return t.name===fk.to;});
+    var bothRls=ft2&&tt2&&ft2.rls_enabled&&tt2.rls_enabled;
+    var lc=bothRls?'#ff6b1a':'#30363d';
+    var line=document.createElementNS(ns,'line');
+    line.setAttribute('x1',fx);line.setAttribute('y1',fy);line.setAttribute('x2',tx);line.setAttribute('y2',ty);
+    line.setAttribute('stroke',lc);line.setAttribute('stroke-width','1');line.setAttribute('stroke-dasharray','4,3');
+    line.classList.add('schema-line');line.dataset.from=fk.from;line.dataset.to=fk.to;line.style.pointerEvents='none';
+    svg.appendChild(line);
+    var mx=(fx+tx)/2,my=(fy+ty)/2;
+    var text=document.createElementNS(ns,'text');
+    text.setAttribute('x',mx);text.setAttribute('y',my-4);text.setAttribute('fill','#6e7681');
+    text.setAttribute('font-size','9');text.setAttribute('text-anchor','middle');text.setAttribute('font-family','-apple-system,sans-serif');
+    text.classList.add('schema-line-label');text.dataset.from=fk.from;text.dataset.to=fk.to;text.style.pointerEvents='none';
+    text.textContent=fk.fromCol;svg.appendChild(text);
+  });
+}
+
+
+// Phase 172: Zoom, Pan, Mini-Map, Keyboard Shortcuts
+var _schemaZoom = 1.0;
+var _schemaPan = {x: 0, y: 0};
+var _schemaPanning = false;
+var _schemaPanStart = null;
+var _schemaSpaceDown = false;
+var _minimapDrag = false;
+
+function schemaApplyTransform() {
+  var tf = document.getElementById('schema-transform');
+  if (tf) tf.style.transform = 'translate(' + _schemaPan.x + 'px,' + _schemaPan.y + 'px) scale(' + _schemaZoom + ')';
+  var pct = document.getElementById('schema-zoom-pct');
+  if (pct) pct.textContent = Math.round(_schemaZoom * 100) + '%';
+  updateMinimap();
+}
+
+function schemaZoom(delta, cx, cy) {
+  var oldZ = _schemaZoom;
+  _schemaZoom = Math.max(0.2, Math.min(2.0, _schemaZoom + delta));
+  if (cx !== undefined && cy !== undefined) {
+    // Zoom centered on mouse position
+    var canvas = document.getElementById('schema-canvas');
+    if (canvas) {
+      var rect = canvas.getBoundingClientRect();
+      var mx = cx - rect.left;
+      var my = cy - rect.top;
+      // Adjust pan so point under mouse stays fixed
+      var ratio = _schemaZoom / oldZ;
+      _schemaPan.x = mx - ratio * (mx - _schemaPan.x);
+      _schemaPan.y = my - ratio * (my - _schemaPan.y);
+    }
+  }
+  schemaApplyTransform();
+}
+
+function schemaZoomReset() {
+  _schemaZoom = 1.0;
+  _schemaPan = {x: 0, y: 0};
+  schemaApplyTransform();
+}
+
+function schemaFitAllZoom() {
+  var tables = (_schemaData && _schemaData.tables) || [];
+  if (!tables.length) return;
+  var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  tables.forEach(function(t) {
+    var p = _schemaPositions[t.name];
+    if (p) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x + 220 > maxX) maxX = p.x + 220;
+      if (p.y + 200 > maxY) maxY = p.y + 200;
+    }
+  });
+  var canvas = document.getElementById('schema-canvas');
+  if (!canvas) return;
+  var cw = canvas.clientWidth, ch = canvas.clientHeight;
+  if (cw < 10 || ch < 10) return;
+  var contentW = maxX - minX + 80, contentH = maxY - minY + 80;
+  _schemaZoom = Math.max(0.2, Math.min(2.0, Math.min(cw / contentW, ch / contentH)));
+  _schemaPan.x = (cw - contentW * _schemaZoom) / 2 - minX * _schemaZoom + 40 * _schemaZoom;
+  _schemaPan.y = (ch - contentH * _schemaZoom) / 2 - minY * _schemaZoom + 40 * _schemaZoom;
+  schemaApplyTransform();
+}
+
+// ── Mini-Map ──
+function updateMinimap() {
+  var cvs = document.getElementById('schema-minimap-canvas');
+  if (!cvs) return;
+  var ctx = cvs.getContext('2d');
+  var mw = cvs.width, mh = cvs.height;
+  ctx.clearRect(0, 0, mw, mh);
+  var tables = (_schemaData && _schemaData.tables) || [];
+  if (!tables.length) return;
+  // Find bounds of all tables
+  var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  tables.forEach(function(t) {
+    var p = _schemaPositions[t.name];
+    if (p) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x + 200 > maxX) maxX = p.x + 200;
+      if (p.y + 120 > maxY) maxY = p.y + 120;
+    }
+  });
+  var pad = 40;
+  var cW = maxX - minX + pad * 2, cH = maxY - minY + pad * 2;
+  var scale = Math.min(mw / cW, mh / cH);
+  var offX = (mw - cW * scale) / 2, offY = (mh - cH * scale) / 2;
+  // Draw FK lines
+  var fi = buildFkMap();
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 0.5;
+  fi.fkMap.forEach(function(fk) {
+    var fp = _schemaPositions[fk.from], tp = _schemaPositions[fk.to];
+    if (!fp || !tp) return;
+    ctx.beginPath();
+    ctx.moveTo(offX + (fp.x - minX + pad + 100) * scale, offY + (fp.y - minY + pad + 60) * scale);
+    ctx.lineTo(offX + (tp.x - minX + pad + 100) * scale, offY + (tp.y - minY + pad + 60) * scale);
+    ctx.stroke();
+  });
+  // Draw table rectangles
+  tables.forEach(function(t) {
+    var p = _schemaPositions[t.name];
+    if (!p) return;
+    var rx = offX + (p.x - minX + pad) * scale;
+    var ry = offY + (p.y - minY + pad) * scale;
+    var rw = 200 * scale, rh = 120 * scale;
+    ctx.fillStyle = '#161b22';
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 0.5;
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeRect(rx, ry, rw, rh);
+    // RLS dot
+    var dotR = Math.max(2, 4 * scale);
+    ctx.fillStyle = t.rls_enabled ? '#3fb950' : '#484f58';
+    ctx.beginPath();
+    ctx.arc(rx + dotR + 2, ry + dotR + 2, dotR, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  // Draw viewport rectangle
+  var canvas = document.getElementById('schema-canvas');
+  if (canvas) {
+    var cw = canvas.clientWidth, ch = canvas.clientHeight;
+    // Viewport in content coords: top-left = -pan/zoom, size = canvasSize/zoom
+    var vx = -_schemaPan.x / _schemaZoom;
+    var vy = -_schemaPan.y / _schemaZoom;
+    var vw = cw / _schemaZoom;
+    var vh = ch / _schemaZoom;
+    // Map to minimap coords
+    var vrx = offX + (vx - minX + pad) * scale;
+    var vry = offY + (vy - minY + pad) * scale;
+    var vrw = vw * scale;
+    var vrh = vh * scale;
+    ctx.strokeStyle = '#ff6b1a';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(vrx, vry, vrw, vrh);
+  }
+  // Store mapping for click-to-navigate
+  cvs._mmMinX = minX; cvs._mmMinY = minY;
+  cvs._mmScale = scale; cvs._mmPad = pad;
+  cvs._mmOffX = offX; cvs._mmOffY = offY;
+}
+
+function minimapNavigate(e) {
+  var cvs = document.getElementById('schema-minimap-canvas');
+  if (!cvs || !cvs._mmScale) return;
+  var rect = cvs.getBoundingClientRect();
+  var sx = cvs.width / rect.width, sy = cvs.height / rect.height;
+  var mx = (e.clientX - rect.left) * sx;
+  var my = (e.clientY - rect.top) * sy;
+  // Convert minimap coords back to content coords
+  var contentX = (mx - cvs._mmOffX) / cvs._mmScale + cvs._mmMinX - cvs._mmPad;
+  var contentY = (my - cvs._mmOffY) / cvs._mmScale + cvs._mmMinY - cvs._mmPad;
+  // Center viewport on this point
+  var canvas = document.getElementById('schema-canvas');
+  if (canvas) {
+    _schemaPan.x = -contentX * _schemaZoom + canvas.clientWidth / 2;
+    _schemaPan.y = -contentY * _schemaZoom + canvas.clientHeight / 2;
+    schemaApplyTransform();
+  }
+}
+
+// ── Wheel zoom on canvas ──
+document.addEventListener('wheel', function(e) {
+  var canvas = document.getElementById('schema-canvas');
+  if (!canvas || !canvas.contains(e.target)) return;
+  var page = document.getElementById('page-schema');
+  if (!page || !page.classList.contains('active')) return;
+  e.preventDefault();
+  var delta = e.deltaY < 0 ? 0.08 : -0.08;
+  if (e.ctrlKey) delta *= 1.5;
+  schemaZoom(delta, e.clientX, e.clientY);
+}, {passive: false});
+
+// ── Minimap click + drag ──
+document.addEventListener('mousedown', function(e) {
+  var mm = document.getElementById('schema-minimap');
+  if (mm && mm.contains(e.target)) {
+    e.preventDefault();
+    _minimapDrag = true;
+    minimapNavigate(e);
+  }
+});
+
+// ── Space for pan mode ──
+document.addEventListener('keydown', function(e) {
+  if (e.key === ' ' && !e.target.matches('input,textarea,select')) {
+    var page = document.getElementById('page-schema');
+    if (page && page.classList.contains('active')) {
+      e.preventDefault();
+      _schemaSpaceDown = true;
+      var canvas = document.getElementById('schema-canvas');
+      if (canvas) canvas.style.cursor = 'grabbing';
+    }
+  }
+  // Ctrl+0 = reset zoom
+  if (e.ctrlKey && e.key === '0') {
+    var page = document.getElementById('page-schema');
+    if (page && page.classList.contains('active')) {
+      e.preventDefault();
+      schemaZoomReset();
+    }
+  }
+  // Ctrl+Shift+F = fit all
+  if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+    var page = document.getElementById('page-schema');
+    if (page && page.classList.contains('active')) {
+      e.preventDefault();
+      schemaFitAllZoom();
+    }
+  }
+});
+document.addEventListener('keyup', function(e) {
+  if (e.key === ' ') {
+    _schemaSpaceDown = false;
+    var canvas = document.getElementById('schema-canvas');
+    if (canvas) canvas.style.cursor = 'grab';
+  }
+});
+
+document.addEventListener('mousemove',function(e){
+  // Minimap drag
+  if (_minimapDrag) { minimapNavigate(e); return; }
+  // Canvas pan (space+drag or middle-button)
+  if (_schemaPanning && _schemaPanStart) {
+    _schemaPan.x += e.clientX - _schemaPanStart.x;
+    _schemaPan.y += e.clientY - _schemaPanStart.y;
+    _schemaPanStart = {x: e.clientX, y: e.clientY};
+    schemaApplyTransform();
+    return;
+  }
+  // Card drag
+  if(_schemaDrag){var d=_schemaDrag,nx=d.ox+(e.clientX-d.sx)/_schemaZoom,ny=d.oy+(e.clientY-d.sy)/_schemaZoom;
+    d.el.style.left=nx+'px';d.el.style.top=ny+'px';_schemaPositions[d.name]={x:nx,y:ny};
+    var fi=buildFkMap(),vis={};(_schemaData.tables||[]).forEach(function(t){vis[t.name]=true;});drawSchemaLines(fi.fkMap,vis);updateMinimap();}
+});
+document.addEventListener('mouseup',function(){
+  if (_minimapDrag) { _minimapDrag = false; return; }
+  if (_schemaPanning) { _schemaPanning = false; _schemaPanStart = null; var cv = document.getElementById('schema-canvas'); if(cv) cv.style.cursor = 'grab'; return; }
+  if(_schemaDrag){saveSchemaPositions();_schemaDrag=null;}
+});
+document.addEventListener('input',function(e){if(e.target.id==='schema-search')renderSchemaViz();});
+
+// Pan: space+click or middle-click on canvas
+document.addEventListener('mousedown', function(e) {
+  var canvas = document.getElementById('schema-canvas');
+  if (!canvas || !canvas.contains(e.target)) return;
+  var page = document.getElementById('page-schema');
+  if (!page || !page.classList.contains('active')) return;
+  if (_schemaSpaceDown || e.button === 1) {
+    e.preventDefault();
+    _schemaPanning = true;
+    _schemaPanStart = {x: e.clientX, y: e.clientY};
+    canvas.style.cursor = 'grabbing';
+  }
+});
+
+function schemaAutoLayout(){
+  var tables=(_schemaData&&_schemaData.tables)||[];if(!tables.length)return;
+  var adj={};tables.forEach(function(t){adj[t.name]=[];});
+  tables.forEach(function(t){(t.foreign_keys||[]).forEach(function(fk){if(adj[fk.ref_table]){adj[t.name].push(fk.ref_table);adj[fk.ref_table].push(t.name);}});});
+  var sorted=tables.slice().sort(function(a,b){return(adj[b.name]||[]).length-(adj[a.name]||[]).length;});
+  var cols=Math.max(2,Math.ceil(Math.sqrt(tables.length)));
+  sorted.forEach(function(t,i){_schemaPositions[t.name]={x:40+(i%cols)*280,y:40+Math.floor(i/cols)*260};});
+  saveSchemaPositions();renderSchemaViz();
+}
+function schemaFitAll(){
+  schemaFitAllZoom();
+}
+
+function openPolicyEditor(tn){
+  var pe=document.getElementById('schema-policy-editor');if(!pe)return;pe.style.display='block';
+  document.getElementById('schema-pe-table').textContent=tn;pe.dataset.table=tn;
+  var tbl=(_schemaData.tables||[]).find(function(t){return t.name===tn;});
+  if(tbl&&tbl.policies&&tbl.policies.length>0){var p=tbl.policies[0];document.getElementById('schema-pe-name').value=p.name;document.getElementById('schema-pe-cmd').value=p.command;document.getElementById('schema-pe-role').value=p.role;document.getElementById('schema-pe-using').value=p['using']||'';document.getElementById('schema-pe-check').value=p.with_check||'';}
+  else{document.getElementById('schema-pe-name').value=tn+'_policy';document.getElementById('schema-pe-cmd').value='ALL';document.getElementById('schema-pe-role').value='PUBLIC';document.getElementById('schema-pe-using').value='';document.getElementById('schema-pe-check').value='';}
+  document.getElementById('schema-pe-msg').textContent='';
+}
+function closePolicyEditor(){var pe=document.getElementById('schema-policy-editor');if(pe)pe.style.display='none';}
+
+async function savePolicyFromEditor(){
+  var pe=document.getElementById('schema-policy-editor'),tbl=pe.dataset.table;
+  var name=document.getElementById('schema-pe-name').value.trim(),cmd=document.getElementById('schema-pe-cmd').value;
+  var role=document.getElementById('schema-pe-role').value.trim()||'PUBLIC';
+  var ue=document.getElementById('schema-pe-using').value.trim(),ce=document.getElementById('schema-pe-check').value.trim();
+  var msg=document.getElementById('schema-pe-msg');
+  if(!name||!ue){msg.style.color='#f85149';msg.textContent='Name and USING required';return;}
+  // Phase 173: Validate policy fields to prevent SQL injection
+  var idRe=/^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  if(!idRe.test(name)){msg.style.color='#f85149';msg.textContent='Invalid policy name (letters/digits/underscore only)';return;}
+  if(role&&!idRe.test(role)){msg.style.color='#f85149';msg.textContent='Invalid role name';return;}
+  if(ue.indexOf(';')>=0||ce.indexOf(';')>=0){msg.style.color='#f85149';msg.textContent='Semicolons not allowed in expressions';return;}
+  await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'ALTER TABLE '+tbl+' ENABLE ROW LEVEL SECURITY'})});
+  await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DROP POLICY '+name+' ON '+tbl})});
+  var sql='CREATE POLICY '+name+' ON '+tbl+' FOR '+cmd+' TO '+role+' USING ('+ue+')';
+  if(ce)sql+=' WITH CHECK ('+ce+')';
+  try{var r=await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sql})});var data=await r.json();
+    if(data.error){msg.style.color='#f85149';msg.textContent='Error: '+data.error;}
+    else{msg.style.color='#3fb950';msg.textContent='Policy saved!';setTimeout(function(){closePolicyEditor();loadSchemaViz();},800);}
+  }catch(e){msg.style.color='#f85149';msg.textContent='Network error';}
+}
+
 // Patch all fetch calls to include auth token + cookie credentials
 var _origFetch2=window.fetch;
 window.fetch=function(url,opts){
@@ -3905,21 +4590,71 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     // Body: {"table":"docs","vector_column":"embedding","query_vector":"[1.0,0.0,0.0]",
     //        "limit":5,"filter":"category = 'tech'","include_score":true}
     if (req.path == "/semantic-search" && req.method == "POST") {
-        return buildHttpResponse(200, handleSemanticSearch(req.body));
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleSemanticSearch(req.body, ctx.userId, ctx.isRoot));
     }
 
-    if (req.path == "/tables") {
+    // Phase 171: Schema Visualizer API
+    if (req.path == "/api/schema") {
         auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.getSchemaJsonForUser(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // Phase 170: RLS policies API
+    if (req.path == "/api/rls-policies") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.getRlsPoliciesJsonForUser(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // Phase 170: Per-table RLS policies
+    if (req.path.rfind("/api/rls-policies/", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string tblName = req.path.substr(18);  // after "/api/rls-policies/"
+        // Non-root: verify table belongs to user
+        if (!ctx.isRoot && ctx.userId > 0) {
+            std::string userPrefix = "u" + std::to_string(ctx.userId) + "_";
+            std::string bareName = tblName;
+            auto dot = tblName.find('.');
+            if (dot != std::string::npos) bareName = tblName.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix)
+                return buildHttpResponse(403, R"({"error":"Access denied"})");
+        }
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.getTablePoliciesJson(tblName), "application/json");
+    }
+
+        if (req.path == "/tables") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         int listId = ctx.isRoot ? 0 : ctx.userId;
         return buildHttpResponse(200, handleListTablesForUser(listId));
     }
 
     if (req.path.size() > 8 && req.path.substr(0, 8) == "/tables/") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         std::string tableName = req.path.substr(8);
+        // Non-root: verify table belongs to user
+        if (!ctx.isRoot && ctx.userId > 0) {
+            std::string userPrefix = "u" + std::to_string(ctx.userId) + "_";
+            std::string bareName = tableName;
+            auto dot = tableName.find('.');
+            if (dot != std::string::npos) bareName = tableName.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix)
+                return buildHttpResponse(403, R"({"error":"Access denied"})");
+        }
         return buildHttpResponse(200, handleDescribeTable(tableName));
     }
 
     if (req.path == "/schemas") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         return buildHttpResponse(200, handleListSchemas());
     }
 
@@ -4036,6 +4771,8 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/status") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         return buildHttpResponse(200, handleStatus());
     }
 
@@ -4044,7 +4781,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         auto mctx = extractUserContext(req);
         if (!mctx.valid || mctx.role != "root")
             return buildHttpResponse(403, R"({"success":false,"error":"Authentication required"})");
-        std::lock_guard<std::mutex> lock(engineMutex_);
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
         // Update uptime gauge
         double upSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startTime_).count();
@@ -4070,7 +4807,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/health") {
-        std::lock_guard<std::mutex> lock(engineMutex_);
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
         double upSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
@@ -4252,7 +4989,16 @@ inline void MilanHttpServer::handleClient(sock_t clientSock) {
                 }
             }
         }
-        std::string response = handleRequest(req, clientIp);
+        std::string response;
+        try {
+            response = handleRequest(req, clientIp);
+        } catch (const std::bad_alloc&) {
+            response = buildHttpResponse(503, R"({"success":false,"error":"Server out of memory"})");
+        } catch (const std::exception& e) {
+            response = buildHttpResponse(500, "{\"success\":false,\"error\":\"Internal error\"}");
+        } catch (...) {
+            response = buildHttpResponse(500, R"({"success":false,"error":"Internal server error"})");
+        }
         sendResponse(clientSock, response);
     }
     closesocket(clientSock);

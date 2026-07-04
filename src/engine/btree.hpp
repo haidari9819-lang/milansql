@@ -81,6 +81,18 @@ public:
         return searchNode(root_.get(), key);
     }
 
+    // Phase 173: Range scan — collect all row indices where key is in [lo, hi]
+    // op: ">" ">=" "<" "<=" "BETWEEN"
+    // For ">" and ">=": collect keys > lo (or >= lo), hi ignored
+    // For "<" and "<=": collect keys < hi (or <= hi), lo ignored
+    // For "BETWEEN": collect keys >= lo AND <= hi
+    std::vector<size_t> rangeSearch(const std::string& lo, const std::string& hi,
+                                     const std::string& op) const {
+        std::vector<size_t> result;
+        rangeCollect(root_.get(), lo, hi, op, result);
+        return result;
+    }
+
     // Index leeren (für Rebuild nach UPDATE/DELETE)
     void clear() {
         root_ = std::make_unique<Node>(true);
@@ -206,7 +218,42 @@ private:
     }
 
     // Hilfsfunktion: Keys zählen (für Debugging)
-    static size_t countKeys(const Node* n) {
+    // Phase 173: Range collect helper (in-order traversal)
+    void rangeCollect(const Node* node, const std::string& lo, const std::string& hi,
+                       const std::string& op, std::vector<size_t>& result) const {
+        if (!node) return;
+        int n = static_cast<int>(node->keys.size());
+        for (int i = 0; i < n; ++i) {
+            if (!node->isLeaf)
+                rangeCollect(node->children[i].get(), lo, hi, op, result);
+            const auto& k = node->keys[i];
+            bool match = false;
+            bool numeric = true;
+            double kd = 0, lod = 0, hid = 0;
+            try { kd = std::stod(k); } catch (...) { numeric = false; }
+            if (numeric && !lo.empty()) { try { lod = std::stod(lo); } catch (...) { numeric = false; } }
+            if (numeric && !hi.empty()) { try { hid = std::stod(hi); } catch (...) { numeric = false; } }
+            if (numeric) {
+                if (op == ">") match = kd > lod;
+                else if (op == ">=") match = kd >= lod;
+                else if (op == "<") match = kd < hid;
+                else if (op == "<=") match = kd <= hid;
+                else if (op == "BETWEEN") match = kd >= lod && kd <= hid;
+            } else {
+                if (op == ">") match = k > lo;
+                else if (op == ">=") match = k >= lo;
+                else if (op == "<") match = k < hi;
+                else if (op == "<=") match = k <= hi;
+                else if (op == "BETWEEN") match = k >= lo && k <= hi;
+            }
+            if (match)
+                for (size_t ri : node->rowIndices[i]) result.push_back(ri);
+        }
+        if (!node->isLeaf && n < static_cast<int>(node->children.size()))
+            rangeCollect(node->children[n].get(), lo, hi, op, result);
+    }
+
+        static size_t countKeys(const Node* n) {
         size_t c = n->keys.size();
         for (const auto& child : n->children) c += countKeys(child.get());
         return c;

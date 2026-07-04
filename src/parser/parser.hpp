@@ -43,6 +43,7 @@ enum class CommandType {
     CREATE_TRIGGER,
     DROP_TRIGGER,
     SHOW_TRIGGERS,
+    SHOW_VIEWS,
     // Phase 44: Stored Procedures
     CREATE_PROCEDURE,
     DROP_PROCEDURE,
@@ -586,6 +587,7 @@ struct ParsedCommand {
     std::string policyCommand;
     std::string policyUser;
     std::string policyUsingExpr;
+    std::string policyWithCheckExpr;  // Phase 170
 
     // Phase 76: LISTEN / NOTIFY / UNLISTEN
     std::string channelName;
@@ -2651,6 +2653,9 @@ public:
             // Phase 44: SHOW PROCEDURES
             } else if (kw1 == "PROCEDURES") {
                 cmd.type = CommandType::SHOW_PROCEDURES;
+            // SHOW VIEWS (nur Views, nicht Tabellen)
+            } else if (kw1 == "VIEWS") {
+                cmd.type = CommandType::SHOW_VIEWS;
             // Phase 45: SHOW PREPARED (but not SHOW PREPARED TRANSACTIONS which is Phase 148)
             } else if (kw1 == "PREPARED" && !(tokens.size() >= 3 && toUpper(tokens[2]) == "TRANSACTIONS")) {
                 cmd.type = CommandType::SHOW_PREPARED;
@@ -3077,6 +3082,46 @@ public:
                         cmd.policyUsingExpr.erase(cmd.policyUsingExpr.begin());
                     while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.back() == ' ')
                         cmd.policyUsingExpr.pop_back();
+                }
+            }
+            // Phase 170: Extract WITH CHECK expression
+            {
+                std::string upIn = input;
+                for (auto& c : upIn) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                auto wcpos = upIn.find("WITH CHECK");
+                if (wcpos != std::string::npos) {
+                    std::string after = input.substr(wcpos + 10);  // skip "WITH CHECK"
+                    size_t start = 0;
+                    while (start < after.size() && after[start] == ' ') ++start;
+                    if (start < after.size() && after[start] == '(') {
+                        int depth = 0; size_t end = start;
+                        for (size_t k = start; k < after.size(); ++k) {
+                            if (after[k] == '(') ++depth;
+                            else if (after[k] == ')') { --depth; if (depth == 0) { end = k; break; } }
+                        }
+                        cmd.policyWithCheckExpr = after.substr(start + 1, end - start - 1);
+                    } else {
+                        cmd.policyWithCheckExpr = after.substr(start);
+                    }
+                    while (!cmd.policyWithCheckExpr.empty() && cmd.policyWithCheckExpr.front() == ' ')
+                        cmd.policyWithCheckExpr.erase(cmd.policyWithCheckExpr.begin());
+                    while (!cmd.policyWithCheckExpr.empty() && cmd.policyWithCheckExpr.back() == ' ')
+                        cmd.policyWithCheckExpr.pop_back();
+                    // If USING expr accidentally captured WITH CHECK, trim it
+                    auto wcInUsing = cmd.policyUsingExpr.find("WITH CHECK");
+                    if (wcInUsing == std::string::npos) {
+                        // Also check uppercase version
+                        std::string usingUp = cmd.policyUsingExpr;
+                        for (auto& c : usingUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        wcInUsing = usingUp.find("WITH CHECK");
+                    }
+                    if (wcInUsing != std::string::npos) {
+                        cmd.policyUsingExpr = cmd.policyUsingExpr.substr(0, wcInUsing);
+                        while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.back() == ' ')
+                            cmd.policyUsingExpr.pop_back();
+                        while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.back() == ')')
+                            cmd.policyUsingExpr.pop_back();
+                    }
                 }
             }
 

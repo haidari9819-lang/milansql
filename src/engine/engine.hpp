@@ -45,6 +45,7 @@
 #include <regex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 
 #ifdef _WIN32
@@ -119,6 +120,13 @@
 // ============================================================
 
 namespace milansql {
+
+// Phase 173 P5: Memory safety limits
+constexpr size_t MAX_RESULT_ROWS   = 100000;   // Max rows in any single result set
+constexpr size_t MAX_JOIN_ROWS     = 500000;    // Max intermediate rows during JOIN
+constexpr size_t MAX_SUBQUERY_ROWS = 50000;     // Max rows from a subquery
+constexpr size_t MAX_IN_LIST       = 10000;     // Max elements in IN (...) list
+
 
 // ── Basis-Datenstrukturen ─────────────────────────────────────
 
@@ -529,6 +537,11 @@ public:
         return n;
     }
 
+    // Phase 173 P5: Truncate rows to limit
+    void truncateRows(size_t maxRows) {
+        if (rows_.size() > maxRows) rows_.erase(rows_.begin() + static_cast<long>(maxRows), rows_.end());
+    }
+
     std::size_t deleteAll() {
         std::size_t n = rows_.size();
         rows_.clear();
@@ -650,6 +663,15 @@ public:
         return {};
     }
 
+    // Phase 173: Range search on indexed column
+    std::vector<size_t> indexRangeSearch(const std::string& col, const std::string& lo,
+                                          const std::string& hi, const std::string& op) const {
+        for (const auto& [idxName, entry] : indices_)
+            if (!entry.cols.empty() && entry.cols[0] == col)
+                return entry.tree->rangeSearch(lo, hi, op);
+        return {};
+    }
+
     std::vector<IndexInfo> getIndexes() const {
         std::vector<IndexInfo> result;
         for (const auto& [idxName, entry] : indices_) {
@@ -759,12 +781,20 @@ public:
     }
 
     void makeDistinct() {
+        // Phase 173: O(n) dedup using hash set
+        struct VecHash {
+            size_t operator()(const std::vector<std::string>& v) const {
+                size_t h = 0;
+                for (const auto& s : v) h ^= std::hash<std::string>{}(s) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+        std::unordered_set<std::vector<std::string>, VecHash> seen;
         std::vector<Row> uniq;
-        for (auto& row : rows_) {
-            bool found = false;
-            for (const auto& u : uniq)
-                if (u.values == row.values) { found = true; break; }
-            if (!found) uniq.push_back(std::move(row));
+        uniq.reserve(rows_.size());
+        for (auto& r : rows_) {
+            if (r.xmax != 0) continue;
+            if (seen.insert(r.values).second) uniq.push_back(std::move(r));
         }
         rows_ = std::move(uniq);
     }
@@ -1275,6 +1305,7 @@ public:
         std::string command;
         std::string role;
         std::string usingExpr;
+        std::string withCheckExpr;  // Phase 170: WITH CHECK for INSERT/UPDATE validation
     };
 
     // ── DDL ───────────────────────────────────────────────────
@@ -1395,6 +1426,13 @@ public:
         checkInsertFK(tbl, vals);       // FOREIGN KEY prüfen
         checkAllConstraints(tbl, vals); // Phase 23: CHECK constraints prüfen
         checkJsonColumns(t, vals);      // Phase 56: JSON-Validierung
+
+        // Phase 170: RLS WITH CHECK enforcement for INSERT
+        if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+            Row checkRow(vals);
+            if (!checkRlsWithCheck_(tbl, checkRow, "INSERT"))
+                throw std::runtime_error("RLS WITH CHECK violation: INSERT denied on " + tbl);
+        }
 
         // Phase 43: BEFORE INSERT triggers
         {
@@ -1569,11 +1607,26 @@ public:
             return {std::move(result), false};
         }
 
-        // Index nur bei einzelner "="-Bedingung
-        if (conds.size() == 1 && conds[0].op == "=" && src.hasIndex(conds[0].col)) {
+        // Phase 173: Index for single-condition queries (=, >, <, >=, <=, BETWEEN)
+        if (conds.size() == 1 && src.hasIndex(conds[0].col) &&
+            (conds[0].op == "=" || conds[0].op == ">" || conds[0].op == ">=" ||
+             conds[0].op == "<" || conds[0].op == "<=" || conds[0].op == "BETWEEN")) {
             usedIndex = true;
             const std::string idxSearchVal = milansql::dateutils::stripQuotes(conds[0].val);
-            for (size_t ri : src.indexSearch(conds[0].col, idxSearchVal))
+            std::vector<size_t> idxResults;
+            if (conds[0].op == "=") {
+                idxResults = src.indexSearch(conds[0].col, idxSearchVal);
+            } else if (conds[0].op == "BETWEEN") {
+                std::string bLo = milansql::dateutils::stripQuotes(conds[0].betweenLow);
+                std::string bHi = milansql::dateutils::stripQuotes(conds[0].betweenHigh);
+                idxResults = src.indexRangeSearch(conds[0].col, bLo, bHi, "BETWEEN");
+            } else {
+                // >, >=, <, <=
+                std::string lo = (conds[0].op == ">" || conds[0].op == ">=") ? idxSearchVal : "";
+                std::string hi = (conds[0].op == "<" || conds[0].op == "<=") ? idxSearchVal : "";
+                idxResults = src.indexRangeSearch(conds[0].col, lo, hi, conds[0].op);
+            }
+            for (size_t ri : idxResults)
                 if (ri < src.rows().size() && src.rows()[ri].xmax == 0)  // Phase 71
                     result.insert(src.rows()[ri]);
             // Phase 75: RLS
@@ -1585,7 +1638,8 @@ public:
                     return {std::move(rlsResult), usedIndex};
                 }
             }
-            return {std::move(result), usedIndex};
+            result.truncateRows(MAX_RESULT_ROWS);
+        return {std::move(result), usedIndex};
         }
 
         // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries + CAST-LHS + MATCH AGAINST brauchen rowMatches
@@ -1650,6 +1704,7 @@ public:
                 return {std::move(rlsResult), usedIndex};
             }
         }
+        result.truncateRows(MAX_RESULT_ROWS);
         return {std::move(result), usedIndex};
     }
 
@@ -1975,8 +2030,12 @@ public:
                 vals.insert(vals.end(), row2.values.begin(), row2.values.end());
 
                 Row combined(vals);
-                if (rowMatches(result, combined, whereConds, whereLogic))
+                if (rowMatches(result, combined, whereConds, whereLogic)) {
                     result.insert(std::move(combined));
+                    if (result.rows().size() > MAX_JOIN_ROWS)
+                        throw std::runtime_error("JOIN result exceeds maximum row limit ("
+                            + std::to_string(MAX_JOIN_ROWS) + " rows). Add WHERE conditions or use LIMIT.");
+                }
             }
         }
         return result;
@@ -2294,7 +2353,7 @@ public:
                     const std::string& colName,
                     const std::string& colType,    // nur für ADD
                     const std::string& newName,    // nur für RENAME
-                    const std::string& defaultVal = "") {  // Phase 146: DEFAULT value for ADD
+                    const std::string& defaultValue = "") {  // Phase 146: DEFAULT value for ADD
         auto tblName = resolveTableName(tblNameRaw);
         if (inTransaction_) {
             BufferedOp bufOp;
@@ -2314,7 +2373,7 @@ public:
                 throw std::runtime_error(
                     "ALTER TABLE: Spalte '" + colName + "' existiert bereits.");
             Column col(colName, colType.empty() ? "TEXT" : colType);
-            if (!defaultVal.empty()) { col.hasDefault = true; col.defaultValue = defaultVal; }
+            if (!defaultValue.empty()) { col.hasDefault = true; col.defaultValue = defaultValue; }
             t.addColumn(col);
         } else if (op == "DROP") {
             t.dropColumn(colName);
@@ -2355,6 +2414,22 @@ public:
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
+
+        // Phase 170: RLS enforcement for UPDATE
+        if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+            const Table& t = getTable(tbl);
+            size_t wCI = colIdx(t, wCol);
+            const std::string stripped = milansql::dateutils::stripQuotes(wVal);
+            for (const auto& row : t.rows()) {
+                if (wCI < row.values.size() &&
+                    (row.values[wCI] == wVal || row.values[wCI] == stripped)) {
+                    auto allowed = applyRls_(tbl, {row}, "UPDATE");
+                    if (allowed.empty())
+                        throw std::runtime_error("RLS policy violation: UPDATE denied on " + tbl);
+                }
+            }
+        }
+
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
         if (inTransaction_) {
             BufferedOp op;
@@ -2402,6 +2477,24 @@ public:
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
+
+        // Phase 170: RLS enforcement for DELETE — filter matched rows
+        if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+            const Table& t = getTable(tbl);
+            size_t wCI = colIdx(t, wCol);
+            const std::string stripped = milansql::dateutils::stripQuotes(wVal);
+            for (const auto& row : t.rows()) {
+                if (wCI < row.values.size() &&
+                    (row.values[wCI] == wVal || row.values[wCI] == stripped)) {
+                    std::vector<std::string> colNames;
+                    for (const auto& c : t.columns()) colNames.push_back(c.name);
+                    auto allowed = applyRls_(tbl, {row}, "DELETE");
+                    if (allowed.empty())
+                        throw std::runtime_error("RLS policy violation: DELETE denied on " + tbl);
+                }
+            }
+        }
+
         // Phase 21: CASCADE / SET NULL / RESTRICT für betroffene Zeilen
         {
             const Table& t = getTable(tbl);
@@ -2482,6 +2575,22 @@ public:
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
+
+        // Phase 170: RLS enforcement for UPDATE
+        if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+            const Table& t = getTable(tbl);
+            size_t wCI = colIdx(t, wCol);
+            const std::string stripped = milansql::dateutils::stripQuotes(wVal);
+            for (const auto& row : t.rows()) {
+                if (wCI < row.values.size() &&
+                    (row.values[wCI] == wVal || row.values[wCI] == stripped)) {
+                    auto allowed = applyRls_(tbl, {row}, "UPDATE");
+                    if (allowed.empty())
+                        throw std::runtime_error("RLS policy violation: UPDATE denied on " + tbl);
+                }
+            }
+        }
+
         // Phase 44: Check if any setVal contains an expression (col op num)
         // If so, do per-row evaluation
         bool hasExpr = false;
@@ -2513,6 +2622,11 @@ public:
                     }
                     // Phase 68: recompute generated cols after row update
                     applyGeneratedCols(tblRef, row.values);
+                    // Phase 170: WITH CHECK on updated row
+                    if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+                        if (!checkRlsWithCheck_(tbl, row, "UPDATE"))
+                            throw std::runtime_error("RLS WITH CHECK violation: UPDATE would create row that violates policy on " + tbl);
+                    }
                     ++n;
                 }
             }
@@ -3422,48 +3536,40 @@ public:
             for (const auto& r : right.rows()) result.insert(r);
 
         } else if (op == "UNION") {
-            // Vereinigung ohne Duplikate
-            std::vector<std::vector<std::string>> seen;
-            auto isDup = [&](const Row& r) {
-                for (const auto& s : seen) if (s == r.values) return true;
-                return false;
-            };
+            // Phase 173: O(n) dedup using hash set
+            struct _UnionHash { size_t operator()(const std::vector<std::string>& v) const {
+                size_t h = 0; for (const auto& s : v) h ^= std::hash<std::string>{}(s) + 0x9e3779b9 + (h << 6) + (h >> 2); return h;
+            }};
+            std::unordered_set<std::vector<std::string>, _UnionHash> seen;
             for (const auto& r : left.rows())
-                if (!isDup(r)) { result.insert(r); seen.push_back(r.values); }
+                if (seen.insert(r.values).second) result.insert(r);
             for (const auto& r : right.rows())
-                if (!isDup(r)) { result.insert(r); seen.push_back(r.values); }
+                if (seen.insert(r.values).second) result.insert(r);
 
         } else if (op == "INTERSECT") {
-            // Nur Zeilen, die in beiden vorkommen (ohne Duplikate)
-            std::vector<std::vector<std::string>> seen;
-            auto isDup = [&](const Row& r) {
-                for (const auto& s : seen) if (s == r.values) return true;
-                return false;
-            };
+            // Phase 173: O(n) INTERSECT using hash sets
+            struct _IntHash { size_t operator()(const std::vector<std::string>& v) const {
+                size_t h = 0; for (const auto& s : v) h ^= std::hash<std::string>{}(s) + 0x9e3779b9 + (h << 6) + (h >> 2); return h;
+            }};
+            std::unordered_set<std::vector<std::string>, _IntHash> rightSet;
+            for (const auto& rr : right.rows()) rightSet.insert(rr.values);
+            std::unordered_set<std::vector<std::string>, _IntHash> seen;
             for (const auto& lr : left.rows()) {
-                if (isDup(lr)) continue;
-                for (const auto& rr : right.rows()) {
-                    if (lr.values == rr.values) {
-                        result.insert(lr);
-                        seen.push_back(lr.values);
-                        break;
-                    }
-                }
+                if (rightSet.count(lr.values) && seen.insert(lr.values).second)
+                    result.insert(lr);
             }
 
         } else if (op == "EXCEPT") {
-            // Zeilen aus links, die NICHT in rechts vorkommen (ohne Duplikate)
-            std::vector<std::vector<std::string>> seen;
-            auto isDup = [&](const Row& r) {
-                for (const auto& s : seen) if (s == r.values) return true;
-                return false;
-            };
+            // Phase 173: O(n) EXCEPT using hash sets
+            struct _ExcHash { size_t operator()(const std::vector<std::string>& v) const {
+                size_t h = 0; for (const auto& s : v) h ^= std::hash<std::string>{}(s) + 0x9e3779b9 + (h << 6) + (h >> 2); return h;
+            }};
+            std::unordered_set<std::vector<std::string>, _ExcHash> rightSet;
+            for (const auto& rr : right.rows()) rightSet.insert(rr.values);
+            std::unordered_set<std::vector<std::string>, _ExcHash> seen;
             for (const auto& lr : left.rows()) {
-                if (isDup(lr)) continue;
-                bool inRight = false;
-                for (const auto& rr : right.rows())
-                    if (lr.values == rr.values) { inRight = true; break; }
-                if (!inRight) { result.insert(lr); seen.push_back(lr.values); }
+                if (!rightSet.count(lr.values) && seen.insert(lr.values).second)
+                    result.insert(lr);
             }
         } else {
             throw std::runtime_error("Unbekannte Mengenoperation: " + op);
@@ -3825,7 +3931,7 @@ public:
         for (auto& [trgName, trg] : triggers_) {
             if (trgUpper(trg.timing)       != "AFTER")          continue;
             if (trgUpper(trg.event)        != trgUpper(event))  continue;
-            if (trg.tableName              != tableName)         continue;
+            if (resolveTableName(trg.tableName) != resolveTableName(tableName)) continue;
             if (trgUpper(trg.granularity)  != "STATEMENT")      continue;
             // Execute body without row context (empty OLD/NEW)
             std::vector<std::string> emptyRow;
@@ -4639,6 +4745,254 @@ public:
         v.erase(std::remove_if(v.begin(), v.end(),
             [&](const RlsPolicy& p){ return p.name == policyName; }), v.end());
     }
+    // Phase 171: Full schema JSON for Schema Visualizer
+    std::string getSchemaJson() const {
+        auto je = [](const std::string& s) -> std::string {
+            std::string r;
+            for (char c : s) {
+                if (c == '"') r += "\\\"";
+                else if (c == '\\') r += "\\\\";
+                else if (c == '\n') r += "\\n";
+                else r += c;
+            }
+            return r;
+        };
+        std::string json = "{\"tables\":[";
+        bool first = true;
+        for (const auto& [name, tbl] : tables_) {
+            if (!first) json += ",";
+            json += "{\"name\":\"" + je(name) + "\",\"columns\":[";
+            const auto& cols = tbl.columns();
+            for (size_t i = 0; i < cols.size(); ++i) {
+                if (i > 0) json += ",";
+                json += "{\"name\":\"" + je(cols[i].name) + "\",\"type\":\"" + je(cols[i].type) + "\"";
+                if (cols[i].isPrimaryKey) json += ",\"pk\":true";
+                if (cols[i].isUnique) json += ",\"unique\":true";
+                if (cols[i].notNull) json += ",\"not_null\":true";
+                if (cols[i].autoIncrement) json += ",\"auto_increment\":true";
+                if (!cols[i].defaultValue.empty()) json += ",\"default\":\"" + je(cols[i].defaultValue) + "\"";
+                json += "}";
+            }
+            json += "],\"foreign_keys\":[";
+            const auto& fks = tbl.getForeignKeys();
+            for (size_t i = 0; i < fks.size(); ++i) {
+                if (i > 0) json += ",";
+                json += "{\"from\":\"" + je(fks[i].fromCol) + "\",\"ref_table\":\"" + je(fks[i].refTable)
+                       + "\",\"ref_col\":\"" + je(fks[i].refCol) + "\",\"on_delete\":\"" + je(fks[i].onDelete) + "\"}";
+            }
+            json += "]";
+            // RLS info
+            bool rlsOn = rlsEnabled_.count(name) > 0;
+            json += ",\"rls_enabled\":" + std::string(rlsOn ? "true" : "false");
+            auto pit = rlsPolicies_.find(name);
+            if (pit != rlsPolicies_.end() && !pit->second.empty()) {
+                json += ",\"policies\":[";
+                for (size_t i = 0; i < pit->second.size(); ++i) {
+                    if (i > 0) json += ",";
+                    const auto& p = pit->second[i];
+                    json += "{\"name\":\"" + je(p.name) + "\",\"command\":\"" + je(p.command)
+                           + "\",\"role\":\"" + je(p.role) + "\",\"using\":\"" + je(p.usingExpr) + "\"";
+                    if (!p.withCheckExpr.empty())
+                        json += ",\"with_check\":\"" + je(p.withCheckExpr) + "\"";
+                    json += "}";
+                }
+                json += "]";
+            }
+            json += "}";
+            first = false;
+        }
+        json += "]}";
+        return json;
+    }
+
+    // Phase 172: User-filtered schema JSON (security: non-root sees only own tables)
+    std::string getSchemaJsonForUser(int userId, bool isRoot) const {
+        if (isRoot || userId <= 0) return getSchemaJson();
+        std::string userPrefix = "u" + std::to_string(userId) + "_";
+        auto je = [](const std::string& s) -> std::string {
+            std::string r;
+            for (char c : s) {
+                if (c == '"') r += "\\\"";
+                else if (c == '\\') r += "\\\\";
+                else if (c == '\n') r += "\\n";
+                else r += c;
+            }
+            return r;
+        };
+        std::string json = "{\"tables\":[";
+        bool first = true;
+        for (const auto& [name, tbl] : tables_) {
+            std::string bareName = name;
+            auto dot = name.find('.');
+            if (dot != std::string::npos) bareName = name.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (!first) json += ",";
+            json += "{\"name\":\"" + je(name) + "\",\"columns\":[";
+            const auto& cols = tbl.columns();
+            for (size_t i = 0; i < cols.size(); ++i) {
+                if (i > 0) json += ",";
+                json += "{\"name\":\"" + je(cols[i].name) + "\",\"type\":\"" + je(cols[i].type) + "\"";
+                if (cols[i].isPrimaryKey) json += ",\"pk\":true";
+                if (cols[i].isUnique) json += ",\"unique\":true";
+                if (cols[i].notNull) json += ",\"not_null\":true";
+                if (cols[i].autoIncrement) json += ",\"auto_increment\":true";
+                if (!cols[i].defaultValue.empty()) json += ",\"default\":\"" + je(cols[i].defaultValue) + "\"";
+                json += "}";
+            }
+            json += "],\"foreign_keys\":[";
+            const auto& fks = tbl.getForeignKeys();
+            for (size_t i = 0; i < fks.size(); ++i) {
+                if (i > 0) json += ",";
+                json += "{\"from\":\"" + je(fks[i].fromCol) + "\",\"ref_table\":\"" + je(fks[i].refTable)
+                       + "\",\"ref_col\":\"" + je(fks[i].refCol) + "\",\"on_delete\":\"" + je(fks[i].onDelete) + "\"}";
+            }
+            json += "]";
+            bool rlsOn = rlsEnabled_.count(name) > 0;
+            json += ",\"rls_enabled\":" + std::string(rlsOn ? "true" : "false");
+            auto pit = rlsPolicies_.find(name);
+            if (pit != rlsPolicies_.end() && !pit->second.empty()) {
+                json += ",\"policies\":[";
+                for (size_t pi = 0; pi < pit->second.size(); ++pi) {
+                    if (pi > 0) json += ",";
+                    const auto& p = pit->second[pi];
+                    json += "{\"name\":\"" + je(p.name) + "\",\"command\":\"" + je(p.command)
+                           + "\",\"role\":\"" + je(p.role) + "\",\"using\":\"" + je(p.usingExpr) + "\"";
+                    if (!p.withCheckExpr.empty())
+                        json += ",\"with_check\":\"" + je(p.withCheckExpr) + "\"";
+                    json += "}";
+                }
+                json += "]";
+            }
+            json += "}";
+            first = false;
+        }
+        json += "]}";
+        return json;
+    }
+
+    // Phase 172: User-filtered RLS policies JSON
+    std::string getRlsPoliciesJsonForUser(int userId, bool isRoot) const {
+        if (isRoot || userId <= 0) return getRlsPoliciesJson();
+        std::string userPrefix = "u" + std::to_string(userId) + "_";
+        std::string json = "{\"enabled_tables\":[";
+        bool first = true;
+        for (const auto& tbl : rlsEnabled_) {
+            std::string bareName = tbl;
+            auto dot = tbl.find('.');
+            if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (!first) json += ",";
+            json += "\"" + tbl + "\"";
+            first = false;
+        }
+        json += "],\"policies\":{";
+        first = true;
+        for (const auto& [tbl, pols] : rlsPolicies_) {
+            std::string bareName = tbl;
+            auto dot = tbl.find('.');
+            if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (!first) json += ",";
+            json += "\"" + tbl + "\":[";
+            for (size_t pi = 0; pi < pols.size(); ++pi) {
+                if (pi > 0) json += ",";
+                const auto& p = pols[pi];
+                json += "{\"name\":\"" + p.name + "\",\"command\":\"" + p.command
+                       + "\",\"role\":\"" + p.role + "\",\"using\":\"" + p.usingExpr + "\"";
+                if (!p.withCheckExpr.empty())
+                    json += ",\"with_check\":\"" + p.withCheckExpr + "\"";
+                json += "}";
+            }
+            json += "]";
+            first = false;
+        }
+        json += "}}";
+        return json;
+    }
+
+    // Phase 170: JSON export of all RLS policies (for WebUI)
+    std::string getRlsPoliciesJson() const {
+        std::string json = "{";
+        // Enabled tables
+        json += "\"enabled_tables\":[";
+        bool first = true;
+        for (const auto& tbl : rlsEnabled_) {
+            if (!first) json += ",";
+            json += "\"" + tbl + "\"";
+            first = false;
+        }
+        json += "],\"policies\":{";
+        first = true;
+        for (const auto& [tbl, pols] : rlsPolicies_) {
+            if (!first) json += ",";
+            json += "\"" + tbl + "\":[";
+            bool first2 = true;
+            for (const auto& p : pols) {
+                if (!first2) json += ",";
+                json += "{\"name\":\"" + p.name + "\",\"command\":\"" + p.command
+                       + "\",\"role\":\"" + p.role + "\",\"using\":\"";
+                // Escape quotes in expressions
+                for (char c : p.usingExpr) {
+                    if (c == '"') json += "\\\"";
+                    else if (c == '\\') json += "\\\\";
+                    else json += c;
+                }
+                json += "\"";
+                if (!p.withCheckExpr.empty()) {
+                    json += ",\"with_check\":\"";
+                    for (char c : p.withCheckExpr) {
+                        if (c == '"') json += "\\\"";
+                        else if (c == '\\') json += "\\\\";
+                        else json += c;
+                    }
+                    json += "\"";
+                }
+                json += "}";
+                first2 = false;
+            }
+            json += "]";
+            first = false;
+        }
+        json += "}}";
+        return json;
+    }
+
+    // Phase 170: JSON policies for a specific table
+    std::string getTablePoliciesJson(const std::string& table) const {
+        auto key = resolveTableName(table);
+        bool enabled = rlsEnabled_.count(key) > 0;
+        std::string json = "{\"table\":\"" + key + "\",\"rls_enabled\":" + (enabled ? "true" : "false");
+        json += ",\"policies\":[";
+        auto it = rlsPolicies_.find(key);
+        if (it != rlsPolicies_.end()) {
+            bool first = true;
+            for (const auto& p : it->second) {
+                if (!first) json += ",";
+                json += "{\"name\":\"" + p.name + "\",\"command\":\"" + p.command
+                       + "\",\"role\":\"" + p.role + "\",\"using\":\"";
+                for (char c : p.usingExpr) {
+                    if (c == '"') json += "\\\"";
+                    else if (c == '\\') json += "\\\\";
+                    else json += c;
+                }
+                json += "\"";
+                if (!p.withCheckExpr.empty()) {
+                    json += ",\"with_check\":\"";
+                    for (char c : p.withCheckExpr) {
+                        if (c == '"') json += "\\\"";
+                        else if (c == '\\') json += "\\\\";
+                        else json += c;
+                    }
+                    json += "\"";
+                }
+                json += "}";
+                first = false;
+            }
+        }
+        json += "]}";
+        return json;
+    }
+
     void showPolicies(const std::string& table) const {
         auto key = resolveTableName(table);
         auto it = rlsPolicies_.find(key);
@@ -4647,10 +5001,14 @@ public:
             std::cout << "  (none)\n";
             return;
         }
-        for (const auto& p : it->second)
+        for (const auto& p : it->second) {
             std::cout << "  " << p.name << " | " << p.command
                       << " | TO " << p.role
-                      << " | USING (" << p.usingExpr << ")\n";
+                      << " | USING (" << p.usingExpr << ")";
+            if (!p.withCheckExpr.empty())
+                std::cout << " WITH CHECK (" << p.withCheckExpr << ")";
+            std::cout << "\n";
+        }
     }
     void saveRls(const std::string& path) const {
         std::ofstream f(path);
@@ -4659,7 +5017,8 @@ public:
         for (const auto& [tbl, policies] : rlsPolicies_)
             for (const auto& p : policies)
                 f << "POLICY " << p.name << "|" << p.table << "|"
-                  << p.command << "|" << p.role << "|" << p.usingExpr << "\n";
+                  << p.command << "|" << p.role << "|" << p.usingExpr
+                  << "|" << p.withCheckExpr << "\n";
     }
     void loadRls(const std::string& path) {
         std::ifstream f(path);
@@ -4675,6 +5034,7 @@ public:
                     p.name = parts[0]; p.table = parts[1];
                     p.command = parts[2]; p.role = parts[3];
                     p.usingExpr = parts[4];
+                    if (parts.size() >= 6) p.withCheckExpr = parts[5];
                     rlsPolicies_[p.table].push_back(p);
                 }
             }
@@ -4750,6 +5110,16 @@ public:
     std::string resolveTableName(const std::string& name) const {
         if (name.find('.') != std::string::npos) return name;
         if (tables_.count(name)) return name;
+        // Tenant-Fallback: View-/Procedure-/Trigger-Bodies speichern
+        // unpraefixierte Tabellennamen ("vtest"), physisch heisst die
+        // Tabelle aber "u<id>_vtest". Bei gesetztem User-Kontext den
+        // Praefix probieren, bevor auf das Schema ausgewichen wird.
+        if (currentUserId_ > 0 && !isRootUser_) {
+            std::string pf = "u" + std::to_string(currentUserId_) + "_" + name;
+            if (tables_.count(pf)) return pf;
+            std::string spf = currentSchema_ + "." + pf;
+            if (tables_.count(spf)) return spf;
+        }
         return currentSchema_ + "." + name;
     }
 
@@ -5125,7 +5495,7 @@ private:
         for (auto& [trgName, trg] : triggers_) {
             if (trgUpper(trg.timing)   != trgUpper(timing))   continue;
             if (trgUpper(trg.event)    != trgUpper(event))    continue;
-            if (trg.tableName != tableName)                    continue;
+            if (resolveTableName(trg.tableName) != resolvedTbl) continue;
             // Phase 93: skip STATEMENT-level triggers here
             if (trgUpper(trg.granularity) == "STATEMENT")     continue;
 
@@ -8593,39 +8963,255 @@ private:
         return parts;
     }
 
-    bool evaluateRlsExpr_(const std::string& expr, const Row& row,
-                          const std::vector<std::string>& colNames) const {
-        if (expr == "1 = 1" || expr == "1=1") return true;
-        if (expr == "1 = 0" || expr == "1=0") return false;
-
+    // Phase 170: Substitute CURRENT_USER_ID() / current_user in RLS expression
+    std::string rlsSubstituteVars_(const std::string& expr) const {
         std::string e = expr;
+        // Replace CURRENT_USER_ID() with current user name
         size_t p;
         while ((p = e.find("CURRENT_USER_ID()")) != std::string::npos)
             e.replace(p, 17, currentUser_);
-
-        auto eqPos = e.find('=');
-        if (eqPos == std::string::npos) return true;
-        std::string lhs = e.substr(0, eqPos);
-        std::string rhs = e.substr(eqPos + 1);
-        auto trim = [](std::string& s) {
-            while (!s.empty() && s.front() == ' ') s.erase(s.begin());
-            while (!s.empty() && s.back()  == ' ') s.pop_back();
-        };
-        trim(lhs); trim(rhs);
-        if (rhs.size() >= 2 && rhs.front() == '\'' && rhs.back() == '\'')
-            rhs = rhs.substr(1, rhs.size() - 2);
-
-        for (size_t i = 0; i < colNames.size(); ++i) {
-            if (colNames[i] == lhs) {
-                if (i >= row.values.size()) return false;
-                std::string cellVal = row.values[i];
-                // Strip surrounding single quotes stored by the engine
-                if (cellVal.size() >= 2 && cellVal.front() == '\'' && cellVal.back() == '\'')
-                    cellVal = cellVal.substr(1, cellVal.size() - 2);
-                return cellVal == rhs;
+        while ((p = e.find("current_user_id()")) != std::string::npos)
+            e.replace(p, 17, currentUser_);
+        // Replace current_user (standalone, not part of _id)
+        {
+            std::string pat = "current_user";
+            size_t pos = 0;
+            while ((pos = e.find(pat, pos)) != std::string::npos) {
+                // Make sure it's not part of current_user_id
+                if (pos + pat.size() < e.size() && e[pos + pat.size()] == '_') {
+                    pos += pat.size();
+                    continue;
+                }
+                e.replace(pos, pat.size(), "'" + currentUser_ + "'");
+                pos += currentUser_.size() + 2;
             }
         }
-        return true;
+        return e;
+    }
+
+    // Phase 170: Inline tokenizer for RLS expressions (no Parser dependency)
+    static std::vector<std::string> rlsTokenize_(const std::string& s) {
+        std::vector<std::string> tokens;
+        std::string cur;
+        bool inStr = false;
+        char strChar = 0;
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (inStr) {
+                cur += c;
+                if (c == strChar) { inStr = false; tokens.push_back(cur); cur.clear(); }
+                continue;
+            }
+            if (c == '\'' || c == '"') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                inStr = true; strChar = c; cur += c;
+                continue;
+            }
+            if (c == '(' || c == ')' || c == ',') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                tokens.push_back(std::string(1, c));
+                continue;
+            }
+            // Handle multi-char operators
+            if (c == '!' && i + 1 < s.size() && s[i+1] == '=') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                tokens.push_back("!="); ++i; continue;
+            }
+            if (c == '>' && i + 1 < s.size() && s[i+1] == '=') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                tokens.push_back(">="); ++i; continue;
+            }
+            if (c == '<' && i + 1 < s.size() && s[i+1] == '=') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                tokens.push_back("<="); ++i; continue;
+            }
+            if (c == '<' && i + 1 < s.size() && s[i+1] == '>') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                tokens.push_back("!="); ++i; continue;
+            }
+            if (c == '=' || c == '<' || c == '>') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                tokens.push_back(std::string(1, c));
+                continue;
+            }
+            if (c == ' ' || c == '\t' || c == '\n') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+                continue;
+            }
+            cur += c;
+        }
+        if (!cur.empty()) tokens.push_back(cur);
+        return tokens;
+    }
+
+    // Phase 170: Parse tokenized RLS expression into WhereConditions
+    static std::pair<std::vector<WhereCondition>, std::string>
+    parseRlsTokens_(const std::vector<std::string>& tokens) {
+        std::vector<WhereCondition> conds;
+        std::string logic = "AND";
+        size_t i = 0;
+
+        auto toUp = [](const std::string& s) {
+            std::string r = s;
+            for (auto& c : r) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return r;
+        };
+
+        while (i < tokens.size()) {
+            std::string u = toUp(tokens[i]);
+            if (u == "AND") { logic = "AND"; ++i; continue; }
+            if (u == "OR")  { logic = "OR";  ++i; continue; }
+
+            WhereCondition cond;
+            bool parsed = false;
+
+            // IS NULL / IS NOT NULL
+            if (i + 2 < tokens.size() && toUp(tokens[i+1]) == "IS" && toUp(tokens[i+2]) == "NULL") {
+                cond.col = tokens[i]; cond.op = "IS NULL"; i += 3; parsed = true;
+            } else if (i + 3 < tokens.size() && toUp(tokens[i+1]) == "IS" &&
+                       toUp(tokens[i+2]) == "NOT" && toUp(tokens[i+3]) == "NULL") {
+                cond.col = tokens[i]; cond.op = "IS NOT NULL"; i += 4; parsed = true;
+
+            // NOT IN (...)
+            } else if (i + 2 < tokens.size() && toUp(tokens[i+1]) == "NOT" && toUp(tokens[i+2]) == "IN") {
+                cond.col = tokens[i]; cond.op = "NOT IN"; i += 3;
+                if (i < tokens.size() && tokens[i] == "(") {
+                    ++i;
+                    while (i < tokens.size() && tokens[i] != ")") {
+                        if (tokens[i] != ",") {
+                            std::string v = tokens[i];
+                            if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'')
+                                v = v.substr(1, v.size() - 2);
+                            cond.inList.push_back(v);
+                        }
+                        ++i;
+                    }
+                    if (i < tokens.size()) ++i;  // skip )
+                }
+                parsed = true;
+
+            // IN (...)
+            } else if (i + 1 < tokens.size() && toUp(tokens[i+1]) == "IN") {
+                cond.col = tokens[i]; cond.op = "IN"; i += 2;
+                if (i < tokens.size() && tokens[i] == "(") {
+                    ++i;
+                    while (i < tokens.size() && tokens[i] != ")") {
+                        if (tokens[i] != ",") {
+                            std::string v = tokens[i];
+                            if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'')
+                                v = v.substr(1, v.size() - 2);
+                            cond.inList.push_back(v);
+                        }
+                        ++i;
+                    }
+                    if (i < tokens.size()) ++i;  // skip )
+                }
+                parsed = true;
+
+            // BETWEEN
+            } else if (i + 4 < tokens.size() && toUp(tokens[i+1]) == "BETWEEN") {
+                cond.col = tokens[i]; cond.op = "BETWEEN";
+                cond.betweenLow = tokens[i+2];
+                // skip AND
+                cond.betweenHigh = tokens[i+4];
+                i += 5; parsed = true;
+
+            // NOT BETWEEN
+            } else if (i + 5 < tokens.size() && toUp(tokens[i+1]) == "NOT" && toUp(tokens[i+2]) == "BETWEEN") {
+                cond.col = tokens[i]; cond.op = "NOT BETWEEN";
+                cond.betweenLow = tokens[i+3];
+                // skip AND
+                cond.betweenHigh = tokens[i+5];
+                i += 6; parsed = true;
+
+            // LIKE
+            } else if (i + 2 < tokens.size() && toUp(tokens[i+1]) == "LIKE") {
+                cond.col = tokens[i]; cond.op = "LIKE"; cond.val = tokens[i+2];
+                i += 3; parsed = true;
+
+            // Standard operator: col op val
+            } else if (i + 2 < tokens.size()) {
+                std::string opStr = tokens[i+1];
+                if (opStr == "=" || opStr == "!=" || opStr == "<" || opStr == ">" ||
+                    opStr == "<=" || opStr == ">=") {
+                    cond.col = tokens[i]; cond.op = opStr; cond.val = tokens[i+2];
+                    // Strip quotes from value
+                    if (cond.val.size() >= 2 && cond.val.front() == '\'' && cond.val.back() == '\'')
+                        cond.val = cond.val.substr(1, cond.val.size() - 2);
+                    i += 3; parsed = true;
+                }
+            }
+
+            if (parsed) {
+                conds.push_back(cond);
+            } else {
+                ++i;  // skip unparseable token
+            }
+        }
+        return {conds, logic};
+    }
+
+    // Phase 170: Parse RLS expression string into WhereConditions
+    std::pair<std::vector<WhereCondition>, std::string>
+    parseRlsExpr_(const std::string& rawExpr) const {
+        std::string expr = rlsSubstituteVars_(rawExpr);
+        auto tokens = rlsTokenize_(expr);
+        return parseRlsTokens_(tokens);
+    }
+
+    // Phase 170: Evaluate RLS expression using the full WHERE engine
+    bool evaluateRlsExpr_(const std::string& expr, const Row& row,
+                          const std::vector<std::string>& colNames) const {
+        if (expr.empty()) return true;
+        if (expr == "1 = 1" || expr == "1=1") return true;
+        if (expr == "1 = 0" || expr == "1=0") return false;
+
+        try {
+            auto [conds, logic] = parseRlsExpr_(expr);
+            if (conds.empty()) return true;
+
+            // Build a temporary Table for rowMatches
+            std::vector<Column> cols;
+            for (const auto& cn : colNames)
+                cols.push_back(Column(cn, "TEXT"));
+            Table evalTbl("_rls_eval", cols);
+
+            return const_cast<Engine*>(this)->rowMatches(evalTbl, row, conds, logic);
+        } catch (...) {
+            // Fallback: deny if expression can\'t be parsed
+            return false;
+        }
+    }
+
+    // Phase 170: Check WITH CHECK expression for a row being written
+    bool checkRlsWithCheck_(const std::string& table, const Row& row,
+                            const std::string& cmd) const {
+        if (!isRlsEnabled(table)) return true;
+        if (currentUser_ == "root" || currentUser_.empty()) return true;
+
+        auto pit = rlsPolicies_.find(table);
+        if (pit == rlsPolicies_.end() || pit->second.empty()) return false;
+
+        std::vector<std::string> colNames;
+        try {
+            const auto& cols = getTable(table).columns();
+            colNames.reserve(cols.size());
+            for (const auto& c : cols) colNames.push_back(c.name);
+        } catch (...) {
+            return false;
+        }
+
+        for (const auto& pol : pit->second) {
+            if (pol.command != "ALL" && pol.command != cmd) continue;
+            if (pol.role != "PUBLIC" && pol.role != currentUser_) continue;
+            // Use withCheckExpr if present, otherwise fall back to usingExpr
+            const std::string& checkExpr = pol.withCheckExpr.empty()
+                                           ? pol.usingExpr : pol.withCheckExpr;
+            if (evaluateRlsExpr_(checkExpr, row, colNames)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ── Phase 78: Inheritance helpers ────────────────────────────

@@ -1542,12 +1542,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "9.9.0");
+            return makeScalar("@@version", "10.1.0");
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.9.0\",\"MilanSQL Database Engine\"]]}";
+            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"10.1.0\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -2108,7 +2108,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v9.9.0\",";
+    json += "\"version\":\"MilanSQL v10.1.0\",";
     json += "\"uptime\":"       + std::to_string(elapsed) + ",";
     json += "\"uptime_fmt\":\"" + uptimeFmt + "\",";
     json += "\"tables\":"       + std::to_string(tables.size()) + ",";
@@ -2341,7 +2341,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v9.9.0</div>
+  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v10.1.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -2527,7 +2527,13 @@ td.null-val{color:#484f58;font-style:italic}
 .status-dot.err{background:#f85149}
 
 /* MONITORING PAGE */
-#page-monitoring .mon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:16px}
+#page-monitoring .mon-grid,#page-vacuum .mon-grid,#page-replication .mon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:16px}
+.mon-tab{background:none;border:1px solid transparent;color:#8b949e;font-size:0.8rem;padding:4px 12px;border-radius:6px;cursor:pointer;font-family:inherit}
+.mon-tab:hover{color:#e6edf3;background:#161b22}
+.mon-tab.active{color:#e6edf3;background:#21262d;border-color:#30363d;font-weight:600}
+.vac-btn{background:#1c3a2a;color:#3fb950;border:1px solid #238636;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:0.72rem;font-family:inherit}
+.vac-btn:hover{background:#238636;color:#fff}
+.vac-btn:disabled{opacity:0.5;cursor:wait}
 .stat-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
 .stat-card .label{font-size:0.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
 .stat-card .value{font-size:1.6rem;font-weight:700;color:#e6edf3}
@@ -2599,7 +2605,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.9.0</span>
+    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v10.1.0</span>
   </div>
 </div>
 
@@ -2622,6 +2628,12 @@ td.null-val{color:#484f58;font-style:italic}
       <div class="nav-item" data-page="monitoring" onclick="showPage('monitoring',this)">
         <span class="icon">&#x1F4CA;</span> Monitoring
       </div>
+      <div class="nav-item" data-page="vacuum" onclick="showPage('vacuum',this)" style="padding-left:26px">
+        <span class="icon">&#x1F9F9;</span> Vacuum
+      </div>
+      <div class="nav-item" data-page="replication" onclick="showPage('replication',this)">
+        <span class="icon">&#x1F501;</span> Replication
+      </div>
       <div class="nav-item" data-page="history" onclick="showPage('history',this)">
         <span class="icon">&#x1F550;</span> Query History
       </div>
@@ -2638,7 +2650,7 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#484f58;font-size:9px">●</span><span style="font-size:11px;color:#484f58">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v9.9.0</div>
+    <div class="sidebar-footer">MilanSQL Admin v10.1.0</div>
   </nav>
 
   <!-- MAIN -->
@@ -2759,10 +2771,14 @@ td.null-val{color:#484f58;font-style:italic}
     </div>
     <!-- MONITORING PAGE -->
     <div class="page" id="page-monitoring">
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #21262d">
-        <span style="font-size:0.85rem;color:#8b949e">Live Server Metrics</span>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 16px;border-bottom:1px solid #21262d">
+        <div style="display:flex;gap:4px;align-items:center">
+          <button class="mon-tab active" id="mtab-overview" onclick="monShowTab('overview')">Overview</button>
+          <button class="mon-tab" id="mtab-pool" onclick="monShowTab('pool')">Pool Stats</button>
+        </div>
         <span style="font-size:0.75rem;color:#484f58">Auto-refresh: <span id="m-countdown" style="color:#3fb950;font-weight:600">5s</span></span>
       </div>
+      <div id="mon-overview">
       <div class="mon-grid" id="mon-grid">
         <div class="stat-card"><div class="label">&#x1F4C1; Tables</div><div class="value" id="m-tables">--</div></div>
         <div class="stat-card"><div class="label">&#x1F4CA; Total Rows</div><div class="value" id="m-rows">--</div></div>
@@ -2786,6 +2802,30 @@ td.null-val{color:#484f58;font-style:italic}
         <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Recent Slow Queries</div>
         <div id="slow-queries-list" style="font-size:0.8rem;color:#8b949e;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;min-height:40px">Loading...</div>
       </div>
+      </div><!-- /mon-overview -->
+      <!-- POOL STATS TAB (Phase 173) -->
+      <div id="mon-pool" style="display:none">
+        <div class="mon-grid">
+          <div class="stat-card"><div class="label">&#x1F7E2; Aktive Connections</div><div class="value" id="p-active">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F4A4; Idle</div><div class="value" id="p-idle">--</div></div>
+          <div class="stat-card"><div class="label">&#x23F3; Wartend</div><div class="value" id="p-waiting">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F4CF; Pool-Gr&ouml;&szlig;e (Min/Max)</div><div class="value" id="p-minmax" style="font-size:1rem">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F522; Total Connections</div><div class="value" id="p-total">--</div></div>
+          <div class="stat-card"><div class="label">&#x23F1; Avg Wait</div><div class="value" id="p-avgwait" style="font-size:1rem">--</div></div>
+          <div class="stat-card"><div class="label">&#x26A0; Timeouts</div><div class="value" id="p-timeouts">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F504; Requests Total</div><div class="value" id="p-requests">--</div></div>
+        </div>
+        <div style="padding:16px">
+          <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Pool-Auslastung</div>
+          <canvas id="p-chart" height="90" style="width:100%;background:#0d1117;border-radius:6px;border:1px solid #21262d"></canvas>
+          <div style="display:flex;gap:16px;margin-top:6px;font-size:0.7rem;color:#8b949e">
+            <span><span style="color:#3fb950">&#x25A0;</span> Aktiv</span>
+            <span><span style="color:#58a6ff">&#x25A0;</span> Idle</span>
+            <span><span style="color:#f0a500">&#x25A0;</span> Wartend</span>
+            <span><span style="color:#30363d">&#x25A0;</span> Frei (bis Max)</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- HISTORY PAGE -->
@@ -2797,6 +2837,54 @@ td.null-val{color:#484f58;font-style:italic}
       <div id="history-list" style="flex:1;overflow-y:auto;padding:12px"></div>
     </div>
 
+    <!-- VACUUM PAGE (Phase 173) -->
+    <div class="page" id="page-vacuum">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #21262d">
+        <span style="font-size:0.85rem;color:#8b949e">&#x1F9F9; MVCC Vacuum &mdash; Dead Tuple Cleanup</span>
+        <span style="font-size:0.75rem;color:#484f58">Auto-refresh: <span style="color:#3fb950;font-weight:600">5s</span></span>
+      </div>
+      <div class="mon-grid">
+        <div class="stat-card"><div class="label">&#x1F550; Letzter Vacuum</div><div class="value" id="v-lastrun" style="font-size:0.9rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x23ED; N&auml;chster Auto-Vacuum</div><div class="value" id="v-nextrun" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F5D1; Befreite Zeilen (total)</div><div class="value" id="v-freedrows">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F4BE; Befreiter Speicher (total)</div><div class="value" id="v-freedbytes" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F504; Vacuum-L&auml;ufe</div><div class="value" id="v-runs">--</div></div>
+        <div class="stat-card"><div class="label">&#x26A0; Dead Tuples (pending)</div><div class="value" id="v-pending">--</div></div>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="font-size:0.85rem;font-weight:600;color:#e6edf3">Tabellen</span>
+          <span id="v-msg" style="font-size:0.75rem;color:#3fb950;margin-left:auto"></span>
+        </div>
+        <div id="vacuum-table-list" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:6px;font-size:0.8rem;color:#8b949e">Loading...</div>
+      </div>
+    </div>
+
+    <!-- REPLICATION PAGE (Phase 173) -->
+    <div class="page" id="page-replication">
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #21262d">
+        <span id="rep-light" style="font-size:1.1rem;color:#484f58">&#x25CF;</span>
+        <span id="rep-light-text" style="font-size:0.85rem;color:#8b949e">Loading...</span>
+        <span style="font-size:0.75rem;color:#484f58;margin-left:auto">Auto-refresh: <span style="color:#3fb950;font-weight:600">2s</span></span>
+      </div>
+      <div class="mon-grid">
+        <div class="stat-card"><div class="label">&#x1F3AD; Rolle</div><div class="value" id="r-role" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x23F1; Replica-Lag</div><div class="value" id="r-lag" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F4CD; Binlog-Position</div><div class="value" id="r-binlog">--</div></div>
+        <div class="stat-card"><div class="label">&#x2705; Ack-Position</div><div class="value" id="r-ack">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F517; Verbundene Replicas</div><div class="value" id="r-slaves">--</div></div>
+        <div class="stat-card"><div class="label">&#x2699; Modus</div><div class="value" id="r-mode" style="font-size:1rem">--</div></div>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Replicas</div>
+        <div id="rep-slave-list" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;font-size:0.8rem;color:#8b949e;margin-bottom:16px">Loading...</div>
+        <div id="rep-replica-detail" style="display:none">
+          <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Replica-Verbindung</div>
+          <div id="rep-replica-info" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;font-size:0.8rem;color:#8b949e"></div>
+        </div>
+      </div>
+    </div>
+
   </div><!-- /main -->
 </div><!-- /layout -->
 
@@ -2806,7 +2894,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.9.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v10.1.0 &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2957,6 +3045,8 @@ function showPage(name, el) {
   if (name === 'history') renderHistory();
   if (name === 'monitoring') { monLastQ = 0; monQueryHistory = []; loadMonitoring(); }
   else stopMonitoring();
+  if (name === 'vacuum') loadVacuumPage(); else stopVacuumPage();
+  if (name === 'replication') loadReplicationPage(); else stopReplicationPage();
 }
 
 // ── SQL Execution ──────────────────────────────────────────────
@@ -3408,6 +3498,8 @@ async function fetchMonitoring() {
     drawMonChart();
     // Slow queries
     loadSlowQueriesMon();
+    // Phase 173: Pool tab auto-refresh (same 5s cycle)
+    if (monTab === 'pool') fetchPoolStats();
   } catch(e) {
     var el = document.getElementById('m-last-update');
     if(el) el.textContent = 'Error fetching status';
@@ -3490,6 +3582,235 @@ function startMonCountdown() {
 async function loadMonitoring() {
   await fetchMonitoring();
   startMonCountdown();
+}
+
+// ── Pool Stats Tab (Phase 173) ────────────────────────────────
+var monTab = 'overview';
+function monShowTab(tab) {
+  monTab = tab;
+  document.getElementById('mon-overview').style.display = (tab === 'overview') ? '' : 'none';
+  document.getElementById('mon-pool').style.display     = (tab === 'pool') ? '' : 'none';
+  document.getElementById('mtab-overview').classList.toggle('active', tab === 'overview');
+  document.getElementById('mtab-pool').classList.toggle('active', tab === 'pool');
+  if (tab === 'pool') fetchPoolStats();
+}
+
+async function fetchPoolStats() {
+  try {
+    var r = await fetch('/pool/stats', {credentials:'include'});
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    set('p-active',   d.active   != null ? d.active   : '--');
+    set('p-idle',     d.idle     != null ? d.idle     : '--');
+    set('p-waiting',  d.waiting  != null ? d.waiting  : '--');
+    set('p-minmax',   (d.min != null ? d.min : '?') + ' / ' + (d.max != null ? d.max : '?'));
+    set('p-total',    d.total    != null ? d.total    : '--');
+    set('p-avgwait',  d.avg_wait_ms != null ? d.avg_wait_ms + ' ms' : '--');
+    set('p-timeouts', d.timeouts != null ? d.timeouts : '--');
+    set('p-requests', d.total_requests != null ? d.total_requests : '--');
+    drawPoolChart(d);
+  } catch(e) {}
+}
+
+function drawPoolChart(d) {
+  var canvas = document.getElementById('p-chart');
+  if (!canvas || !canvas.getContext) return;
+  canvas.width = canvas.offsetWidth || 400;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height || 90;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+  var max = Math.max(1, d.max || 1);
+  var active = d.active || 0, idle = d.idle || 0, waiting = d.waiting || 0;
+  var barY = 18, barH = 28, pad = 10, barW = W - 2 * pad;
+  // Stacked utilization bar: active | idle | free
+  var wActive = Math.round(barW * active / max);
+  var wIdle   = Math.round(barW * idle / max);
+  ctx.fillStyle = '#30363d'; ctx.fillRect(pad, barY, barW, barH);
+  ctx.fillStyle = '#3fb950'; ctx.fillRect(pad, barY, wActive, barH);
+  ctx.fillStyle = '#58a6ff'; ctx.fillRect(pad + wActive, barY, wIdle, barH);
+  ctx.fillStyle = '#e6edf3'; ctx.font = '11px monospace';
+  var pct = Math.round(100 * active / max);
+  ctx.fillText('Auslastung: ' + active + '/' + max + ' (' + pct + '%)', pad, 12);
+  // Waiting bar (below, orange)
+  if (waiting > 0) {
+    var wWait = Math.min(barW, Math.round(barW * waiting / max));
+    ctx.fillStyle = '#f0a500'; ctx.fillRect(pad, barY + barH + 14, wWait, 12);
+    ctx.fillStyle = '#f0a500'; ctx.font = '10px monospace';
+    ctx.fillText(waiting + ' wartend', pad, barY + barH + 12);
+  } else {
+    ctx.fillStyle = '#484f58'; ctx.font = '10px monospace';
+    ctx.fillText('Keine wartenden Requests', pad, barY + barH + 24);
+  }
+}
+
+// ── Vacuum Page (Phase 173) ───────────────────────────────────
+var vacTimer = null;
+function stopVacuumPage() { if (vacTimer) { clearInterval(vacTimer); vacTimer = null; } }
+function loadVacuumPage() {
+  fetchVacuumStats();
+  if (vacTimer) clearInterval(vacTimer);
+  vacTimer = setInterval(fetchVacuumStats, 5000);
+}
+
+function fmtBytes(b) {
+  if (b == null) return '--';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+
+async function fetchVacuumStats() {
+  try {
+    var r = await fetch('/vacuum/stats', {credentials:'include'});
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    set('v-lastrun',    d.last_run || 'never');
+    set('v-nextrun',    d.auto_vacuum_enabled === false ? 'deaktiviert'
+                        : (d.next_auto_run_in_seconds != null ? 'in ' + d.next_auto_run_in_seconds + 's' : '--'));
+    set('v-freedrows',  d.total_freed_rows != null ? d.total_freed_rows : '--');
+    set('v-freedbytes', fmtBytes(d.total_freed_bytes));
+    set('v-runs',       d.runs_total != null ? d.runs_total + ' (' + (d.auto_runs||0) + ' auto)' : '--');
+    set('v-pending',    d.pending_dead_tuples != null ? d.pending_dead_tuples : '--');
+    // Merge table list: all tables + dead tuples + last vacuum time
+    var tr = await fetch('/tables', {credentials:'include'});
+    var td = await tr.json();
+    var tables = Array.isArray(td) ? td : (td.tables || []);
+    var dead = d.tables || {}, lastVac = d.last_vacuum_per_table || {};
+    var el = document.getElementById('vacuum-table-list');
+    if (!tables.length) { el.textContent = 'Keine Tabellen.'; return; }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">';
+    html += '<tr style="color:#636e7b;border-bottom:1px solid #21262d">'
+          + '<th style="text-align:left;padding:5px 8px">Tabelle</th>'
+          + '<th style="text-align:right;padding:5px 8px">Dead Tuples</th>'
+          + '<th style="text-align:left;padding:5px 8px">Letzter Vacuum</th>'
+          + '<th style="text-align:right;padding:5px 8px">Aktion</th></tr>';
+    tables.forEach(function(t) {
+      var name = typeof t === 'string' ? t : t.name;
+      var dt = dead[name] != null ? dead[name] : (dead['public.' + name] != null ? dead['public.' + name] : 0);
+      var lv = lastVac[name] || lastVac['public.' + name] || '&mdash;';
+      var dtColor = dt > 0 ? '#f0a500' : '#3fb950';
+      html += '<tr style="border-bottom:1px solid #161b22">'
+        + '<td style="padding:5px 8px;color:#e6edf3">' + escHtml(name) + '</td>'
+        + '<td style="padding:5px 8px;text-align:right;color:' + dtColor + ';font-weight:600">' + dt + '</td>'
+        + '<td style="padding:5px 8px;color:#8b949e">' + lv + '</td>'
+        + '<td style="padding:5px 8px;text-align:right"><button class="vac-btn" onclick="runVacuumNow(\'' + escAttr(name) + '\', this)">VACUUM jetzt</button></td>'
+        + '</tr>';
+    });
+    html += '</table>';
+    el.innerHTML = html;
+  } catch(e) {
+    var el = document.getElementById('vacuum-table-list');
+    if (el) el.textContent = 'Fehler beim Laden der Vacuum-Statistiken.';
+  }
+}
+
+async function runVacuumNow(table, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'l\u00e4uft...'; }
+  var msg = document.getElementById('v-msg');
+  try {
+    var r = await fetch('/api/query', {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sql: 'VACUUM ' + table})});
+    var d = await r.json();
+    if (msg) {
+      msg.textContent = d.success !== false ? ('VACUUM ' + table + ' \u2713 ' + (d.message || '')) : ('Fehler: ' + (d.error || 'unbekannt'));
+      msg.style.color = d.success !== false ? '#3fb950' : '#f38ba8';
+      setTimeout(function(){ msg.textContent = ''; }, 6000);
+    }
+  } catch(e) {
+    if (msg) { msg.textContent = 'Netzwerkfehler'; msg.style.color = '#f38ba8'; }
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'VACUUM jetzt'; }
+  fetchVacuumStats();
+}
+
+// ── Replication Page (Phase 173) ──────────────────────────────
+var repTimer = null;
+function stopReplicationPage() { if (repTimer) { clearInterval(repTimer); repTimer = null; } }
+function loadReplicationPage() {
+  fetchReplicationStatus();
+  if (repTimer) clearInterval(repTimer);
+  repTimer = setInterval(fetchReplicationStatus, 2000);
+}
+
+async function fetchReplicationStatus() {
+  try {
+    var r = await fetch('/replication/status', {credentials:'include'});
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    var role = d.role || 'standalone';
+    set('r-role', role === 'master' ? 'Master' : role === 'replica' ? 'Replica' : 'Standalone');
+    set('r-mode', (d.sync_mode || 'async') + ' \u00b7 Port ' + (d.replication_port || '?'));
+    set('r-binlog', d.binlog_pos != null && d.binlog_pos >= 0 ? d.binlog_pos : (d.replica ? d.replica.position : '--'));
+    set('r-ack', d.max_slave_ack_pos != null ? d.max_slave_ack_pos : '--');
+    set('r-slaves', d.connected_slaves != null ? d.connected_slaves : '--');
+    var rep = d.replica || {};
+    set('r-lag', role === 'replica' ? (rep.lag_ms != null ? rep.lag_ms + ' ms' : '--')
+                : (d.binlog_pos > d.max_slave_ack_pos ? (d.binlog_pos - d.max_slave_ack_pos) + ' Entries' : '0'));
+    // Traffic light: green = in sync, yellow = lagging, red = disconnected
+    var light = document.getElementById('rep-light');
+    var text  = document.getElementById('rep-light-text');
+    var color = '#484f58', msg = 'Standalone \u2014 keine Replikation konfiguriert';
+    if (role === 'replica') {
+      if (rep.master_down || !rep.running) { color = '#f38ba8'; msg = 'MASTER DOWN \u2014 Verbindung verloren (>30s)'; }
+      else if ((rep.lag_ms || 0) > 1000)   { color = '#f0a500'; msg = 'Lag: ' + rep.lag_ms + ' ms \u2014 Replica h\u00e4ngt hinterher'; }
+      else { color = '#3fb950'; msg = 'In Sync \u2014 Lag ' + (rep.lag_ms||0) + ' ms \u00b7 ' + (rep.status||''); }
+    } else if (role === 'master') {
+      var slaves = d.slaves || [];
+      var connected = slaves.filter(function(s){ return s.connected; }).length;
+      if (connected === 0 && (d.connected_slaves||0) === 0) { color = '#f38ba8'; msg = 'Keine Replica verbunden'; }
+      else if (d.binlog_pos > d.max_slave_ack_pos) { color = '#f0a500'; msg = 'Replicas h\u00e4ngen hinterher (ack ' + d.max_slave_ack_pos + ' / pos ' + d.binlog_pos + ')'; }
+      else { color = '#3fb950'; msg = 'In Sync \u2014 ' + Math.max(connected, d.connected_slaves||0) + ' Replica(s) aktuell'; }
+    }
+    if (light) light.style.color = color;
+    if (text) { text.textContent = msg; text.style.color = color; }
+    // Replica list (master side)
+    var listEl = document.getElementById('rep-slave-list');
+    if (listEl) {
+      var slaves2 = d.slaves || [];
+      if (role !== 'master') {
+        listEl.textContent = role === 'replica' ? 'Dieser Server ist eine Replica.' : 'Keine Replikation aktiv.';
+      } else if (!slaves2.length) {
+        listEl.textContent = 'Keine Replicas registriert.';
+      } else {
+        var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">'
+          + '<tr style="color:#636e7b;border-bottom:1px solid #21262d">'
+          + '<th style="text-align:left;padding:5px 8px">Host</th>'
+          + '<th style="text-align:right;padding:5px 8px">Ack-Position</th>'
+          + '<th style="text-align:right;padding:5px 8px">Zuletzt gesehen</th>'
+          + '<th style="text-align:left;padding:5px 8px">Status</th></tr>';
+        slaves2.forEach(function(s) {
+          var st = s.connected ? '<span style="color:#3fb950">&#x25CF; verbunden</span>'
+                               : '<span style="color:#f38ba8">&#x25CF; getrennt</span>';
+          var seen = s.ms_since_seen < 1000 ? 'gerade eben' : Math.round(s.ms_since_seen/1000) + 's';
+          html += '<tr style="border-bottom:1px solid #161b22">'
+            + '<td style="padding:5px 8px;color:#e6edf3">' + escHtml(s.host||'?') + '</td>'
+            + '<td style="padding:5px 8px;text-align:right">' + (s.ack_pos != null ? s.ack_pos : '--') + '</td>'
+            + '<td style="padding:5px 8px;text-align:right">' + seen + '</td>'
+            + '<td style="padding:5px 8px">' + st + '</td></tr>';
+        });
+        html += '</table>';
+        listEl.innerHTML = html;
+      }
+    }
+    // Replica-side connection detail
+    var det = document.getElementById('rep-replica-detail');
+    if (det) {
+      if (role === 'replica') {
+        det.style.display = '';
+        document.getElementById('rep-replica-info').innerHTML =
+          'Master: <b style="color:#e6edf3">' + escHtml(rep.master_host||'?') + ':' + (rep.master_port||'?') + '</b>'
+          + ' &middot; Status: <b style="color:#e6edf3">' + escHtml(rep.status||'?') + '</b>'
+          + ' &middot; Position: <b style="color:#e6edf3">' + (rep.position != null ? rep.position : '?') + '</b>'
+          + ' &middot; Letzter Sync: <b style="color:#e6edf3">' + (rep.ms_since_last_sync >= 0 ? rep.ms_since_last_sync + ' ms' : 'nie') + '</b>';
+      } else det.style.display = 'none';
+    }
+  } catch(e) {
+    var text = document.getElementById('rep-light-text');
+    if (text) text.textContent = 'Fehler beim Laden des Replikationsstatus';
+  }
 }
 
 // History
@@ -4134,7 +4455,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
       <div style="line-height:0"><svg width="48" height="48" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg></div>
       <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.9.0 &mdash; Multi-User Database</div>
+      <div style="color:#585b70;font-size:11px;margin-top:4px">v10.1.0 &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #313244">

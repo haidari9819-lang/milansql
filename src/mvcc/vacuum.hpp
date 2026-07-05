@@ -120,6 +120,12 @@ public:
         long long secsSince = -1;
         if (lastRunUnix_ != 0)
             secsSince = (long long)(std::time(nullptr) - lastRunUnix_);
+        // Phase 173: seconds until next scheduled auto-vacuum run
+        long long nextRun = AUTO_VACUUM_INTERVAL;
+        if (secsSince >= 0) {
+            nextRun = AUTO_VACUUM_INTERVAL - secsSince;
+            if (nextRun < 0) nextRun = 0;
+        }
         size_t pending = 0;
         for (const auto& [t, n] : deadTupleCount_) pending += n;
         std::ostringstream oss;
@@ -131,6 +137,7 @@ public:
             << "\"auto_runs\":"           << autoVacuumCount_ << ","
             << "\"last_run\":\""          << (lastRunTime_.empty() ? "never" : lastRunTime_) << "\","
             << "\"seconds_since_last_run\":" << secsSince << ","
+            << "\"next_auto_run_in_seconds\":" << nextRun << ","
             << "\"last_freed_rows\":"     << lastFreedRows_ << ","
             << "\"last_freed_bytes\":"    << lastFreedBytes_ << ","
             << "\"total_freed_rows\":"    << totalFreedRows_ << ","
@@ -142,6 +149,13 @@ public:
             if (!first) oss << ",";
             first = false;
             oss << "\"" << tbl << "\":" << cnt;
+        }
+        oss << "},\"last_vacuum_per_table\":{";
+        first = true;
+        for (const auto& [tbl, ts] : lastVacuumTime_) {
+            if (!first) oss << ",";
+            first = false;
+            oss << "\"" << tbl << "\":\"" << ts << "\"";
         }
         oss << "}}";
         return oss.str();

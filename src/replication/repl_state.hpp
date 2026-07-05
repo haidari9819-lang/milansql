@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <functional>
 #include <vector>
+#include <map>
 #include <chrono>
 #include <sstream>
 
@@ -58,6 +59,11 @@ struct ReplState {
     // New-binlog-data notification (master side, for streaming long-poll)
     std::mutex              dataMu;
     std::condition_variable dataCv;
+
+    // Phase 173: per-replica registry (master side, for WebUI list)
+    struct SlaveInfo { long long lastSeenMs = 0; long long ackPos = 0; };
+    mutable std::mutex               slavesMu;
+    std::map<std::string, SlaveInfo> slaves;   // key = replica IP
 };
 
 inline ReplState g_replState;
@@ -122,6 +128,14 @@ inline bool replWaitForNewData(int timeoutMs, Pred pred) {
                                        std::move(pred));
 }
 
+// Master: register/refresh a replica in the registry (Phase 173: WebUI list)
+inline void replRecordSlaveInfo(const std::string& ip, long long ackPos) {
+    std::lock_guard<std::mutex> lk(g_replState.slavesMu);
+    auto& s = g_replState.slaves[ip];
+    s.lastSeenMs = replNowMs();
+    if (ackPos > s.ackPos) s.ackPos = ackPos;
+}
+
 // Slave: check + update failover state. Returns true if master is down.
 inline bool replCheckFailover() {
     long long last = g_replState.lastSyncUnixMs.load();
@@ -159,6 +173,23 @@ inline std::string replicationStatusJson() {
         << "\"binlog_pos\":" << masterPos << ","
         << "\"max_slave_ack_pos\":" << st.maxSlaveAckPos.load() << ","
         << "\"sync_wait_timeouts\":" << st.syncWaitTimeouts.load() << ","
+        << "\"slaves\":[";
+    {
+        std::lock_guard<std::mutex> lk(st.slavesMu);
+        long long now = replNowMs();
+        bool first = true;
+        for (const auto& [ip, si] : st.slaves) {
+            long long age = now - si.lastSeenMs;
+            if (age > 300000) continue;   // hide replicas silent > 5min
+            if (!first) oss << ",";
+            first = false;
+            oss << "{\"host\":\"" << ip << "\","
+                << "\"ack_pos\":" << si.ackPos << ","
+                << "\"ms_since_seen\":" << age << ","
+                << "\"connected\":" << (age < 10000 ? "true" : "false") << "}";
+        }
+    }
+    oss << "],"
         << "\"replica\":{"
         <<   "\"running\":" << (st.slaveRunning.load() ? "true" : "false") << ","
         <<   "\"status\":\"" << slaveStatus << "\","

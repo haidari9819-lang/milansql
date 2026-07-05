@@ -8020,7 +8020,7 @@ public:
         // Phase 157: System info functions (instance-level, know currentUser_)
         std::string fnUp = fn;
         for (char& c : fnUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (fnUp == "VERSION") return "MilanSQL v9.9.0";
+        if (fnUp == "VERSION") return "MilanSQL v10.1.0";
         if (fnUp == "DATABASE") return "public";
         if (fnUp == "USER" || fnUp == "CURRENT_USER" || fnUp == "SESSION_USER" || fnUp == "SYSTEM_USER")
             return currentUser_.empty() ? "root" : currentUser_;
@@ -8760,11 +8760,10 @@ public:
             size_t cleaned = tbl.vacuum([this](uint64_t txId) {
                 return txManager_.isCommitted(txId);
             }, horizon, &bytes);
-            if (cleaned) {
-                total      += cleaned;
-                totalBytes += bytes;
-                vacuumMgr_.resetDeadTuples(name);
-            }
+            total      += cleaned;
+            totalBytes += bytes;
+            // Phase 173: always reset — records last-vacuum time per table
+            vacuumMgr_.resetDeadTuples(name);
         }
         vacuumMgr_.recordVacuumRun(total, totalBytes, automatic);
         return total;
@@ -8776,7 +8775,7 @@ public:
         size_t cleaned = getTable(name).vacuum([this](uint64_t txId) {
             return txManager_.isCommitted(txId);
         }, txManager_.minActiveTxId(), &bytes);
-        if (cleaned) vacuumMgr_.resetDeadTuples(name);
+        vacuumMgr_.resetDeadTuples(name);   // Phase 173: records last-vacuum time
         vacuumMgr_.recordVacuumRun(cleaned, bytes, false);
         return cleaned;
     }

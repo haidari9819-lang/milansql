@@ -217,7 +217,7 @@ private:
     // tight re-poll loop this delivers statements in realtime.
     static constexpr int STREAM_WAIT_MS = 3000;
 
-    std::string processRequest(const std::string& req) {
+    std::string processRequest(const std::string& req, const char* ipStr) {
         long long fromPos = 0;
         auto it = req.find("FROM_POS:");
         if (it != std::string::npos) {
@@ -228,6 +228,8 @@ private:
         // Phase 172: FROM_POS doubles as the slave's ack position
         // (slave has durably applied everything up to fromPos)
         replRecordAck(fromPos);
+        // Phase 173: per-replica registry for /replication/status
+        replRecordSlaveInfo(ipStr ? ipStr : "?", fromPos);
 
         auto entries = binlog_.readFrom(fromPos);
 
@@ -273,7 +275,7 @@ private:
             return;
         }
 
-        std::string response = processRequest(req);
+        std::string response = processRequest(req, ipStr);
         ts.write(response.c_str(), static_cast<int>(response.size()));
     }
 
@@ -296,7 +298,7 @@ private:
             return;
         }
 
-        std::string response = processRequest(req);
+        std::string response = processRequest(req, ipStr);
         send(client, response.c_str(),
              static_cast<int>(response.size()), 0);
         repl_closesock(client);

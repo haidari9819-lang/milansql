@@ -5048,8 +5048,8 @@ static void testGroup68() {
     };
 
     // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
-    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.9.0",
-          "version() returns MilanSQL v9.9.0");
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v10.1.0",
+          "version() returns MilanSQL v10.1.0");
     check(engine.evalFuncPublic("DATABASE", {}) == "public",
           "database() returns 'public'");
     check(engine.evalFuncPublic("USER", {}) == "root",
@@ -5976,8 +5976,8 @@ static void testGroup72() {
     // 15. Version v9.2.0
     {
         milansql::Engine eng;
-        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.9.0",
-              "Isolation #15: version() returns MilanSQL v9.9.0");
+        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v10.1.0",
+              "Isolation #15: version() returns MilanSQL v10.1.0");
     }
 }
 

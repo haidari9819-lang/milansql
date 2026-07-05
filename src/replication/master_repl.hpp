@@ -77,13 +77,18 @@ inline void loadOrCreateReplToken(const std::string& dbPath) {
 
 class MasterReplication {
 public:
-    explicit MasterReplication(int replPort, BinlogWriter& binlog)
+    // Phase 172: bindAny=true listens on 0.0.0.0 (remote replicas);
+    // default remains loopback-only (Bug #12 hardening).
+    explicit MasterReplication(int replPort, BinlogWriter& binlog,
+                               bool bindAny = false)
         : replPort_(replPort), binlog_(binlog)
+        , bindAny_(bindAny)
         , running_(false), slaveCount_(0)
     {}
 
     ~MasterReplication() {
         running_ = false;
+        replNotifyNewData();   // Phase 172: wake long-poll waiters
         if (acceptThread_.joinable()) acceptThread_.join();
     }
 
@@ -95,6 +100,7 @@ public:
 private:
     int           replPort_;
     BinlogWriter& binlog_;
+    bool          bindAny_;
     std::atomic<bool> running_;
     std::thread   acceptThread_;
     std::atomic<int> slaveCount_;
@@ -122,7 +128,8 @@ private:
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
         addr.sin_port        = htons(static_cast<uint16_t>(replPort_));
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // Bug #12: bind to localhost only
+        // Bug #12: loopback by default; Phase 172: 0.0.0.0 with --repl-bind-any
+        addr.sin_addr.s_addr = htonl(bindAny_ ? INADDR_ANY : INADDR_LOOPBACK);
 
         if (bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
             std::cerr << "MasterRepl: bind() failed on port " << replPort_ << "\n";
@@ -203,7 +210,13 @@ private:
         return true;
     }
 
-    // Process replication request and build response
+    // Process replication request and build response.
+    // Phase 172 streaming: if the request contains "WAIT", long-poll —
+    // block up to STREAM_WAIT_MS for new binlog entries instead of
+    // immediately answering REPL_UPTODATE. Combined with the slave's
+    // tight re-poll loop this delivers statements in realtime.
+    static constexpr int STREAM_WAIT_MS = 3000;
+
     std::string processRequest(const std::string& req) {
         long long fromPos = 0;
         auto it = req.find("FROM_POS:");
@@ -212,19 +225,32 @@ private:
             catch (...) { fromPos = 0; }
         }
 
-        auto entries = binlog_.readFrom(fromPos);
-        std::string response;
+        // Phase 172: FROM_POS doubles as the slave's ack position
+        // (slave has durably applied everything up to fromPos)
+        replRecordAck(fromPos);
 
+        auto entries = binlog_.readFrom(fromPos);
+
+        // Phase 172: streaming long-poll — wait for new data
+        if (entries.empty() && req.find("WAIT") != std::string::npos) {
+            replWaitForNewData(STREAM_WAIT_MS, [this, fromPos]() {
+                return binlog_.getCurrentPos() > fromPos || !running_;
+            });
+            entries = binlog_.readFrom(fromPos);
+        }
+
+        std::string ts = "TS:" + std::to_string(replNowMs()) + "\n";
+        std::string response;
         if (entries.empty()) {
             response = "REPL_UPTODATE\nPOS:" +
-                       std::to_string(binlog_.getCurrentPos()) + "\nEND\n";
+                       std::to_string(binlog_.getCurrentPos()) + "\n" + ts + "END\n";
         } else {
             response = "REPL_DATA\n";
             for (const auto& e : entries) {
                 response += "STMT:" + e.sql + "\n";
                 response += "POS:"  + std::to_string(e.pos) + "\n";
             }
-            response += "END\n";
+            response += ts + "END\n";
         }
         return response;
     }

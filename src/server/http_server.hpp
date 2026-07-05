@@ -45,6 +45,8 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
@@ -663,12 +665,28 @@ struct UserContext {
     bool valid = false;
 };
 
+// Phase 170: graceful shutdown flag (set by SIGINT/SIGTERM handler)
+inline std::atomic<bool> g_httpShutdownRequested{false};
+inline void httpShutdownSignalHandler(int) { g_httpShutdownRequested.store(true); }
+
 class MilanHttpServer {
 public:
-    MilanHttpServer(int port, const std::string& dbPath)
-        : port_(port), dbPath_(dbPath), storage_(dbPath_) {}
+    MilanHttpServer(int port, const std::string& dbPath,
+                    int poolMin = milansql::ConnectionPool::DEFAULT_MIN,
+                    int poolMax = milansql::ConnectionPool::DEFAULT_MAX)
+        : port_(port), dbPath_(dbPath), storage_(dbPath_) {
+        milansql::g_connectionPool.configure(poolMin, poolMax);
+    }
 
     void run();
+
+    // Phase 172: replay a binlog statement from the master (replica mode).
+    // Sets tl_binlogReplay so dispatch skips the slave read-only check.
+    void replayBinlogSql(const std::string& sql) {
+        milansql::tl_binlogReplay = true;
+        try { handleQuery(sql); } catch (...) {}
+        milansql::tl_binlogReplay = false;
+    }
 
 private:
     int port_;
@@ -4817,7 +4835,11 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
                 "\"storage\":{\"status\":\"ok\"},"
                 "\"memory\":{\"status\":\"ok\"},"
                 "\"wal\":{\"status\":\"ok\"},"
-                "\"connections\":{\"status\":\"ok\",\"active\":0,\"max\":100},"
+                "\"connections\":{\"status\":\"ok\",\"active\":" +
+                    std::to_string(milansql::g_connectionPool.activeCount()) +
+                    ",\"idle\":" + std::to_string(milansql::g_connectionPool.idleCount()) +
+                    ",\"waiting\":" + std::to_string(milansql::g_connectionPool.waitingCount()) +
+                    ",\"max\":" + std::to_string(milansql::g_connectionPool.getMaxConnections()) + "},"
                 "\"replication\":{\"status\":\"ok\",\"lag_ms\":0}"
             "},"
             "\"warnings\":[],"
@@ -4828,6 +4850,22 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     if (req.path == "/ready") {
         return buildHttpResponse(200, "{\"ready\":true}");
+    }
+
+    // Phase 170: Connection pool statistics
+    if (req.path == "/pool/stats") {
+        return buildHttpResponse(200, milansql::g_connectionPool.statsJson());
+    }
+
+    // Phase 171: MVCC vacuum statistics
+    if (req.path == "/vacuum/stats") {
+        std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.vacuumManager().statsJson());
+    }
+
+    // Phase 172: Streaming replication status (role, lag, failover)
+    if (req.path == "/replication/status") {
+        return buildHttpResponse(200, milansql::replicationStatusJson());
     }
 
     if (req.path == "/live") {
@@ -4989,6 +5027,33 @@ inline void MilanHttpServer::handleClient(sock_t clientSock) {
                 }
             }
         }
+        // Phase 170: acquire a pooled connection for engine-touching
+        // requests. Monitoring/static endpoints stay pool-exempt so
+        // observability keeps working even when the pool is exhausted.
+        bool poolExempt =
+            req.method == "OPTIONS" ||
+            req.path == "/health"  || req.path == "/ready" ||
+            req.path == "/live"    || req.path == "/metrics" ||
+            req.path == "/pool/stats" || req.path == "/vacuum/stats" ||
+            req.path == "/replication/status" ||
+            req.path == "/" || req.path == "/webui" ||
+            req.path == "/dashboard" || req.path == "/impressum" ||
+            req.path.rfind("/favicon", 0) == 0 ||
+            req.path.rfind("/apple-touch-icon", 0) == 0;
+
+        milansql::PoolLease lease;
+        if (!poolExempt) {
+            lease = milansql::PoolLease(milansql::g_connectionPool);
+            if (!lease) {
+                std::string err = milansql::g_connectionPool.isShuttingDown()
+                    ? "{\"success\":false,\"error\":\"Server is shutting down\"}"
+                    : "{\"success\":false,\"error\":\"Connection pool exhausted (30s timeout)\"}";
+                sendResponse(clientSock, buildHttpResponse(503, err));
+                closesocket(clientSock);
+                return;
+            }
+        }
+
         std::string response;
         try {
             response = handleRequest(req, clientIp);
@@ -5030,14 +5095,44 @@ inline void MilanHttpServer::run() {
     constexpr size_t POOL_SIZE = 256;
     threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE, 4096);
 
-    std::cout << "MilanSQL HTTP Server auf Port " << port_
-              << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024)\n" << std::flush;
+    // Phase 170: Connection pool health checker + graceful shutdown
+    milansql::g_connectionPool.startHealthChecker();
 
-    while (true) {
+    // Phase 171: Auto-vacuum thread — every 60s, exclusive engine lock
+    // (the thread lives in VacuumManager; the callback takes engineMutex_
+    //  so it never races with HTTP request handlers)
+    engine_.vacuumManager().startAutoVacuum([this]() -> size_t {
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        return engine_.vacuumAllTracked(/*automatic=*/true);
+    });
+
+    std::signal(SIGINT,  httpShutdownSignalHandler);
+#ifdef SIGTERM
+    std::signal(SIGTERM, httpShutdownSignalHandler);
+#endif
+
+    std::cout << "MilanSQL HTTP Server auf Port " << port_
+              << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024, "
+              << "Conn-Pool: " << milansql::g_connectionPool.getMinConnections()
+              << "-" << milansql::g_connectionPool.getMaxConnections() << ")\n" << std::flush;
+
+    while (!g_httpShutdownRequested.load()) {
+        // select() with timeout so we can notice the shutdown flag
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(srv, &fds);
+        timeval tv{0, 500000};   // 500ms
+        int sel = select(static_cast<int>(srv) + 1, &fds, nullptr, nullptr, &tv);
+        if (sel < 0) break;
+        if (sel == 0) continue;
+
         sockaddr_in clientAddr{};
         socklen_t len = sizeof(clientAddr);
         sock_t client = accept(srv, (sockaddr*)&clientAddr, &len);
-        if (client == INVALID_SOCK) break;
+        if (client == INVALID_SOCK) {
+            if (g_httpShutdownRequested.load()) break;
+            continue;
+        }
 
         // Submit to thread pool; if queue full → 503 Service Unavailable
         bool submitted = threadPool_->enqueue([this, client]() {
@@ -5057,7 +5152,17 @@ inline void MilanHttpServer::run() {
         }
     }
 
+    // Phase 170: Graceful shutdown — stop accepting, drain active queries
     closesocket(srv);
+    std::cout << "HTTP Server: Shutdown angefordert — warte auf aktive Queries...\n" << std::flush;
+    engine_.vacuumManager().stopAutoVacuum();   // Phase 171
+    milansql::g_connectionPool.stopHealthChecker();
+    bool drained = milansql::g_connectionPool.shutdown(30000);
+    threadPool_.reset();   // joins worker threads (in-flight requests finish)
+    std::cout << "HTTP Server: Shutdown "
+              << (drained ? "sauber abgeschlossen (alle Queries beendet)."
+                          : "nach 30s Timeout erzwungen.")
+              << "\n" << std::flush;
 #ifdef _WIN32
     WSACleanup();
 #endif

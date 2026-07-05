@@ -13,6 +13,9 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cmath>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
@@ -28,6 +31,13 @@
 #include "timeseries/continuous_aggregate.hpp"
 #include "transaction/distributed_tx.hpp"
 #include "lock/distributed_lock.hpp"
+#include "pool/connection_pool.hpp"   // Phase 170: real connection pool
+
+// Phase 172: Streaming Replication
+#include "replication/binlog.hpp"
+#include "replication/repl_state.hpp"
+#include "replication/master_repl.hpp"
+#include "replication/slave_repl.hpp"
 
 // Phase 154-156: Auth system
 #include "auth/auth_manager.hpp"
@@ -9488,6 +9498,530 @@ static void testGroup93() {
     }
 }
 
+// ============================================================
+// Group 94: Connection Pool (Phase 170 — real pool)
+// ============================================================
+
+static void testGroup94() {
+    std::cout << "\n── testGroup94: Connection Pool (Phase 170) ──\n";
+
+    using milansql::ConnectionPool;
+    using milansql::PoolLease;
+
+    // Test 1: Prewarm to min
+    {
+        ConnectionPool pool(5, 20);
+        check(pool.idleCount() == 5,  "POOL #1a: prewarm creates min (5) idle conns");
+        check(pool.totalCount() == 5, "POOL #1b: total == min after prewarm");
+        check(pool.activeCount() == 0, "POOL #1c: no active conns initially");
+    }
+
+    // Test 2: Acquire reuses idle connection (connection reuse)
+    {
+        ConnectionPool pool(2, 10);
+        auto c1 = pool.acquire(100);
+        check(c1 != nullptr, "POOL #2a: acquire returns connection");
+        check(pool.activeCount() == 1, "POOL #2b: active == 1 after acquire");
+        uint64_t firstId = c1->id;
+        pool.release(c1);
+        check(pool.activeCount() == 0, "POOL #2c: active == 0 after release");
+        auto c2 = pool.acquire(100);
+        // idle deque is FIFO: after release, c1 is at the back; front is the
+        // other prewarmed conn. Acquire both to verify c1's id is reused.
+        auto c3 = pool.acquire(100);
+        bool reused = (c2->id == firstId) || (c3->id == firstId);
+        check(reused, "POOL #2d: released connection is reused (no new conn)");
+        check(pool.totalCount() == 2, "POOL #2e: pool did not grow beyond min");
+        pool.release(c2); pool.release(c3);
+    }
+
+    // Test 3: Pool grows up to max, then acquire times out
+    {
+        ConnectionPool pool(1, 3);
+        auto a = pool.acquire(50);
+        auto b = pool.acquire(50);
+        auto c = pool.acquire(50);
+        check(a && b && c, "POOL #3a: pool grows to max (3)");
+        check(pool.totalCount() == 3, "POOL #3b: total == max");
+        auto t0 = std::chrono::steady_clock::now();
+        auto d = pool.acquire(200);   // exhausted → wait → timeout
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        check(d == nullptr, "POOL #3c: acquire on exhausted pool times out");
+        check(ms >= 180, "POOL #3d: timeout respected (waited >= ~200ms)");
+        check(pool.timeoutCount() == 1, "POOL #3e: timeout counter incremented");
+        pool.release(a); pool.release(b); pool.release(c);
+    }
+
+    // Test 4: Waiting client gets connection when one is released
+    {
+        ConnectionPool pool(1, 1);
+        auto a = pool.acquire(50);
+        check(a != nullptr, "POOL #4a: single connection acquired");
+        std::atomic<bool> gotIt{false};
+        std::thread waiter([&pool, &gotIt]() {
+            auto c = pool.acquire(5000);   // waits in queue
+            if (c) { gotIt = true; pool.release(c); }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        check(pool.waitingCount() == 1, "POOL #4b: waiter is queued");
+        pool.release(a);                   // → waiter is served
+        waiter.join();
+        check(gotIt.load(), "POOL #4c: queued waiter got the released conn");
+    }
+
+    // Test 5: Health check replaces dead connections and tops up to min
+    {
+        ConnectionPool pool(3, 10);
+        auto c = pool.acquire(100);
+        c->markUnhealthy();               // simulate dead connection
+        pool.release(c);                  // dead conn is dropped on release
+        check(pool.deadReplacedCount() >= 1, "POOL #5a: dead conn detected on release");
+        size_t replaced = pool.runHealthCheck();
+        (void)replaced;
+        check(pool.totalCount() >= 3, "POOL #5b: health check topped up to min");
+        check(pool.idleCount() >= 3, "POOL #5c: replacements are idle and usable");
+        auto c2 = pool.acquire(100);
+        check(c2 && c2->healthy.load(), "POOL #5d: acquired conn is healthy");
+        pool.release(c2);
+    }
+
+    // Test 6: Graceful shutdown waits for active connections
+    {
+        ConnectionPool pool(1, 2);
+        auto a = pool.acquire(50);
+        std::thread worker([&pool, a]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            pool.release(a);              // "query finishes" after 300ms
+        });
+        auto t0 = std::chrono::steady_clock::now();
+        bool drained = pool.shutdown(5000);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        worker.join();
+        check(drained, "POOL #6a: graceful shutdown drained all active conns");
+        check(ms >= 250, "POOL #6b: shutdown waited for the active query");
+        check(pool.acquire(50) == nullptr, "POOL #6c: no new conns after shutdown");
+    }
+
+    // Test 7: Shutdown timeout when a query never finishes
+    {
+        ConnectionPool pool(1, 1);
+        auto a = pool.acquire(50);        // never released
+        bool drained = pool.shutdown(200);
+        check(!drained, "POOL #7a: shutdown reports timeout if query still active");
+        pool.release(a);                  // cleanup
+    }
+
+    // Test 8: PoolLease RAII
+    {
+        ConnectionPool pool(2, 5);
+        {
+            PoolLease lease(pool, 100);
+            check((bool)lease, "POOL #8a: lease acquires connection");
+            check(pool.activeCount() == 1, "POOL #8b: active == 1 with lease held");
+        }
+        check(pool.activeCount() == 0, "POOL #8c: lease released on scope exit");
+    }
+
+    // Test 9: Legacy API (SHOW POOL STATUS / SET POOL_* commands)
+    {
+        ConnectionPool pool(1, 4);
+        pool.setMode("transaction");
+        check(pool.getMode() == milansql::PoolMode::TRANSACTION,
+              "POOL #9a: setMode(transaction) works");
+        pool.setMaxConnections(8);
+        check(pool.getMaxConnections() == 8, "POOL #9b: setMaxConnections works");
+        pool.setMaxWait(1234);
+        check(pool.getMaxWaitMs() == 1234, "POOL #9c: setMaxWait works");
+        std::string st = pool.showStatus();
+        check(st.find("Max Connections:     8") != std::string::npos,
+              "POOL #9d: showStatus shows max connections");
+        check(st.find("transaction") != std::string::npos,
+              "POOL #9e: showStatus shows pool mode");
+    }
+
+    // Test 10: statsJson for /pool/stats endpoint
+    {
+        ConnectionPool pool(2, 6);
+        auto a = pool.acquire(100);
+        std::string js = pool.statsJson();
+        check(js.find("\"active\":1") != std::string::npos,
+              "POOL #10a: statsJson reports active=1");
+        check(js.find("\"min\":2") != std::string::npos &&
+              js.find("\"max\":6") != std::string::npos,
+              "POOL #10b: statsJson reports min/max");
+        check(js.find("\"waiting\":0") != std::string::npos,
+              "POOL #10c: statsJson reports waiting=0");
+        pool.release(a);
+    }
+
+    // Test 11: Concurrent stress — 50 threads through pool of 5
+    {
+        ConnectionPool pool(2, 5);
+        std::atomic<int> success{0};
+        std::atomic<int> maxSeen{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 50; ++i) {
+            threads.emplace_back([&pool, &success, &maxSeen]() {
+                auto c = pool.acquire(5000);
+                if (!c) return;
+                int act = pool.activeCount();
+                int prev = maxSeen.load();
+                while (act > prev && !maxSeen.compare_exchange_weak(prev, act)) {}
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                pool.release(c);
+                success++;
+            });
+        }
+        for (auto& t : threads) t.join();
+        check(success.load() == 50, "POOL #11a: all 50 concurrent requests served");
+        check(maxSeen.load() <= 5, "POOL #11b: active never exceeded max (5)");
+        check(pool.activeCount() == 0, "POOL #11c: all conns returned to pool");
+        check(pool.totalCount() <= 5, "POOL #11d: pool size bounded by max");
+    }
+}
+
+// ============================================================
+// testGroup95: MVCC Vacuum / GC (Phase 171)
+// ============================================================
+
+static void testGroup95() {
+    std::cout << "\n── testGroup95: MVCC Vacuum GC (Phase 171) ──\n";
+
+    // ── 1) TransactionManager: minActiveTxId horizon ─────────
+    {
+        milansql::TransactionManager tm;
+        uint64_t base = tm.minActiveTxId();
+        check(base >= 1, "VAC #1a: horizon starts >= 1 with no active txs");
+        uint64_t t1 = tm.beginTx();
+        uint64_t t2 = tm.beginTx();
+        check(t2 > t1, "VAC #1b: tx ids monotonically increasing");
+        check(tm.minActiveTxId() == t1, "VAC #1c: horizon = oldest active tx");
+        tm.commitTx(t2);
+        check(tm.minActiveTxId() == t1, "VAC #1d: horizon unchanged while older tx active");
+        tm.commitTx(t1);
+        check(tm.minActiveTxId() > t2, "VAC #1e: horizon advances after all commits");
+        check(tm.isCommitted(t1) && tm.isCommitted(t2), "VAC #1f: committed txs recognized");
+    }
+
+    // ── 2) Table::vacuum respects the horizon ─────────────────
+    {
+        milansql::TransactionManager tm;
+        std::vector<milansql::Column> cols;
+        cols.emplace_back("id", "INT");
+        milansql::Table tbl("vac_t", cols);
+        tbl.insert(milansql::Row({"1"}));
+        tbl.insert(milansql::Row({"2"}));
+        tbl.insert(milansql::Row({"3"}));
+
+        uint64_t oldTx = tm.beginTx();          // stays active (snapshot reader)
+        uint64_t delTx = tm.beginTx();          // deletes row 2
+        tbl.stampDeleteWhere(0, "2", delTx);
+        tm.commitTx(delTx);
+
+        check(tbl.deadRowCount() == 1, "VAC #2a: one dead row after stamped delete");
+
+        auto isCom = [&tm](uint64_t id) { return tm.isCommitted(id); };
+        // horizon = oldTx: delTx > oldTx → version must be KEPT
+        size_t removed = tbl.vacuum(isCom, tm.minActiveTxId());
+        check(removed == 0, "VAC #2b: active older tx blocks vacuum (horizon)");
+        check(tbl.rowCount() == 3, "VAC #2c: row physically retained for old snapshot");
+
+        tm.commitTx(oldTx);                     // horizon advances past delTx
+        size_t freedBytes = 0;
+        removed = tbl.vacuum(isCom, tm.minActiveTxId(), &freedBytes);
+        check(removed == 1, "VAC #2d: vacuum removes version after horizon advances");
+        check(tbl.rowCount() == 2, "VAC #2e: physical row count reduced");
+        check(freedBytes > 0, "VAC #2f: freed bytes reported > 0");
+        check(tbl.deadRowCount() == 0, "VAC #2g: no dead rows left");
+    }
+
+    // ── 3) Uncommitted delete is never vacuumed ───────────────
+    {
+        milansql::TransactionManager tm;
+        std::vector<milansql::Column> cols;
+        cols.emplace_back("id", "INT");
+        milansql::Table tbl("vac_u", cols);
+        tbl.insert(milansql::Row({"1"}));
+        uint64_t t = tm.beginTx();
+        tbl.stampDeleteWhere(0, "1", t);        // delete NOT committed
+        auto isCom = [&tm](uint64_t id) { return tm.isCommitted(id); };
+        size_t removed = tbl.vacuum(isCom, UINT64_MAX);
+        check(removed == 0, "VAC #3a: uncommitted delete survives vacuum");
+        tm.rollbackTx(t);
+    }
+
+    // ── 4) VacuumManager: run statistics + statsJson ─────────
+    {
+        milansql::VacuumManager vm;
+        vm.addDeadTuples("orders", 42);
+        vm.addDeadTuples("users", 8);
+        check(vm.getDeadTupleCount("orders") == 42, "VAC #4a: dead tuple tracking per table");
+        check(vm.getTotalDeadTuples() == 50, "VAC #4b: total dead tuples aggregated");
+
+        vm.recordVacuumRun(50, 4096, false);
+        check(vm.getVacuumRuns() == 1, "VAC #4c: run counter incremented");
+        check(vm.getTotalFreedRows() == 50, "VAC #4d: freed rows accumulated");
+        check(vm.getTotalFreedBytes() == 4096, "VAC #4e: freed bytes accumulated");
+        vm.recordVacuumRun(10, 512, true);
+        check(vm.getTotalFreedRows() == 60, "VAC #4f: totals accumulate over runs");
+        check(!vm.getLastRunTime().empty(), "VAC #4g: last run timestamp set");
+
+        std::string js = vm.statsJson();
+        check(js.find("\"runs_total\":2") != std::string::npos, "VAC #4h: statsJson runs_total");
+        check(js.find("\"auto_runs\":1") != std::string::npos, "VAC #4i: statsJson auto_runs");
+        check(js.find("\"total_freed_rows\":60") != std::string::npos, "VAC #4j: statsJson total_freed_rows");
+        check(js.find("\"total_freed_bytes\":4608") != std::string::npos, "VAC #4k: statsJson total_freed_bytes");
+        check(js.find("\"last_freed_rows\":10") != std::string::npos, "VAC #4l: statsJson last_freed_rows");
+        check(js.find("\"pending_dead_tuples\":50") != std::string::npos, "VAC #4m: statsJson pending dead tuples");
+        check(js.find("\"orders\":42") != std::string::npos, "VAC #4n: statsJson per-table counts");
+        check(js.find("\"interval_seconds\":60") != std::string::npos, "VAC #4o: statsJson 60s interval");
+        check(js.find("\"seconds_since_last_run\":") != std::string::npos, "VAC #4p: statsJson seconds_since_last_run");
+    }
+
+    // ── 5) VacuumManager: auto-vacuum background thread ──────
+    {
+        milansql::VacuumManager vm;
+        std::atomic<int> calls{0};
+        vm.startAutoVacuum([&calls]() -> size_t { ++calls; return 1; }, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        vm.stopAutoVacuum();
+        int c = calls.load();
+        check(c >= 1, "VAC #5a: auto-vacuum thread ran at interval");
+        check(c <= 4, "VAC #5b: auto-vacuum did not spin");
+        // disabled → no more calls
+        milansql::VacuumManager vm2;
+        std::atomic<int> calls2{0};
+        vm2.setAutoVacuumEnabled(false);
+        vm2.startAutoVacuum([&calls2]() -> size_t { ++calls2; return 1; }, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        vm2.stopAutoVacuum();
+        check(calls2.load() == 0, "VAC #5c: disabled auto-vacuum never fires");
+    }
+
+    // ── 6) Engine end-to-end: BEGIN → DELETE → COMMIT → VACUUM ─
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        const std::string wal = "test_vacuum_g95.wal";
+        execSQL(engine, parser, "CREATE TABLE vac_e2e (id INT, name TEXT)");
+        for (int i = 1; i <= 5; ++i)
+            execSQL(engine, parser,
+                "INSERT INTO vac_e2e VALUES (" + std::to_string(i) + ", 'n" + std::to_string(i) + "')");
+
+        engine.beginTransaction(wal);
+        execSQL(engine, parser, "DELETE FROM vac_e2e WHERE id = 2");
+        execSQL(engine, parser, "DELETE FROM vac_e2e WHERE id = 4");
+        engine.applyAndCommit();
+
+        check(engine.deadRowCount() == 2, "VAC #6a: committed tx leaves 2 dead versions");
+        check(engine.vacuumManager().getDeadTupleCount("public.vac_e2e") == 2,
+              "VAC #6b: VacuumManager tracked dead tuples from tx delete");
+
+        size_t cleaned = engine.vacuumAllTracked();
+        check(cleaned == 2, "VAC #6c: vacuumAllTracked removes 2 dead versions");
+        check(engine.deadRowCount() == 0, "VAC #6d: no dead rows after vacuum");
+        check(engine.countRows("vac_e2e", true) == 3, "VAC #6e: live rows intact");
+        check(engine.vacuumManager().getDeadTupleCount("public.vac_e2e") == 0,
+              "VAC #6f: dead tuple counter reset after vacuum");
+        check(engine.vacuumManager().getTotalFreedRows() >= 2, "VAC #6g: freed rows recorded");
+        check(engine.vacuumManager().getTotalFreedBytes() > 0, "VAC #6h: freed bytes recorded");
+        check(engine.vacuumManager().getVacuumRuns() >= 1, "VAC #6i: vacuum run recorded");
+        std::remove(wal.c_str());
+    }
+
+    // ── 7) Engine: vacuumTableTracked single table ────────────
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        const std::string wal = "test_vacuum_g95b.wal";
+        execSQL(engine, parser, "CREATE TABLE vac_one (id INT)");
+        execSQL(engine, parser, "CREATE TABLE vac_two (id INT)");
+        execSQL(engine, parser, "INSERT INTO vac_one VALUES (1)");
+        execSQL(engine, parser, "INSERT INTO vac_two VALUES (1)");
+
+        engine.beginTransaction(wal);
+        execSQL(engine, parser, "DELETE FROM vac_one WHERE id = 1");
+        execSQL(engine, parser, "DELETE FROM vac_two WHERE id = 1");
+        engine.applyAndCommit();
+
+        size_t cleaned = engine.vacuumTableTracked("vac_one");
+        check(cleaned == 1, "VAC #7a: vacuumTableTracked cleans target table");
+        check(engine.deadRowCount() == 1, "VAC #7b: other table untouched");
+        check(engine.vacuumManager().getDeadTupleCount("public.vac_two") == 1,
+              "VAC #7c: other table counter untouched");
+        std::remove(wal.c_str());
+    }
+}
+
+// ============================================================
+// testGroup96: Streaming Replication (Phase 172)
+// ============================================================
+
+static void testGroup96() {
+    std::cout << "\n── testGroup96: Streaming Replication (Phase 172) ──\n";
+    using namespace milansql;
+
+    // ── 1) BinlogWriter: write / incremental read ─────────────
+    {
+        const char* path = "test_g96.binlog";
+        std::remove(path);
+        BinlogWriter bl(path);
+        check(bl.getCurrentPos() == 0, "REPL #1a: fresh binlog at pos 0");
+        long long p1 = bl.write("INSERT INTO t VALUES (1)");
+        long long p2 = bl.write("INSERT INTO t VALUES (2)");
+        check(p1 == 1 && p2 == 2, "REPL #1b: positions increase");
+        auto all = bl.readFrom(0);
+        check(all.size() == 2 && all[1].sql == "INSERT INTO t VALUES (2)",
+              "REPL #1c: readFrom(0) returns all entries");
+        auto tail = bl.readFrom(1);
+        check(tail.size() == 1 && tail[0].pos == 2,
+              "REPL #1d: readFrom(pos) is incremental");
+        std::remove(path);
+    }
+
+    // ── 2) Slave-ack tracking + sync-mode wait ────────────────
+    {
+        g_replState.maxSlaveAckPos.store(0);
+        replRecordAck(5);
+        replRecordAck(3);   // must not regress
+        check(g_replState.maxSlaveAckPos.load() == 5, "REPL #2a: ack pos monotonic");
+        check(replWaitForAck(5, 100), "REPL #2b: already-acked pos returns immediately");
+        long long t0 = replNowMs();
+        bool ok = replWaitForAck(10, 200);
+        long long dt = replNowMs() - t0;
+        check(!ok && dt >= 150, "REPL #2c: unacked pos times out");
+        std::thread notifier([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            replRecordAck(10);
+        });
+        ok = replWaitForAck(10, 3000);
+        notifier.join();
+        check(ok, "REPL #2d: ack from another thread wakes sync waiter");
+        g_replState.maxSlaveAckPos.store(0);
+    }
+
+    // ── 3) Failover detection (master >30s unreachable) ───────
+    {
+        g_replState.isSlave.store(true);
+        g_replState.lastSyncUnixMs.store(replNowMs());
+        check(!replCheckFailover(), "REPL #3a: fresh sync — master up");
+        g_replState.lastSyncUnixMs.store(replNowMs() - 31000);
+        check(replCheckFailover(), "REPL #3b: >30s silence — master down");
+        check(g_replState.masterDown.load(), "REPL #3c: masterDown flag set");
+        std::string js = replicationStatusJson();
+        check(js.find("\"master_down\":true") != std::string::npos,
+              "REPL #3d: status JSON reports failover");
+        check(js.find("\"role\":\"replica\"") != std::string::npos,
+              "REPL #3e: status JSON reports replica role");
+        check(js.find("\"lag_ms\":") != std::string::npos,
+              "REPL #3f: status JSON contains lag_ms");
+        g_replState.isSlave.store(false);
+        g_replState.masterDown.store(false);
+        g_replState.lastSyncUnixMs.store(0);
+        std::string js2 = replicationStatusJson();
+        check(js2.find("\"role\":\"standalone\"") != std::string::npos,
+              "REPL #3g: standalone role when no replication");
+    }
+
+    // ── 4) Read-only replica enforcement ─────────────────────
+    {
+        g_replState.isSlave.store(true);
+        check(dispatch_slaveReadOnly(), "REPL #4a: writes blocked on replica");
+        milansql::tl_binlogReplay = true;
+        check(!dispatch_slaveReadOnly(), "REPL #4b: binlog replay bypasses read-only");
+        milansql::tl_binlogReplay = false;
+        g_replState.isSlave.store(false);
+        check(!dispatch_slaveReadOnly(), "REPL #4c: writes allowed when not replica");
+    }
+
+    // ── 5) End-to-end: master streams to replica (localhost) ──
+    {
+        const char* blPath  = "test_g96_e2e.binlog";
+        const char* tokPath = "test_g96_db.repl_token";
+        std::remove(blPath);
+        std::remove(tokPath);
+        loadOrCreateReplToken("test_g96_db");
+        g_replState.slavePos.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+
+        const int port = 15472;
+        {
+            BinlogWriter bl(blPath);
+            {
+                MasterReplication master(port, bl);
+                master.start();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                std::mutex mu;
+                std::vector<std::string> received;
+                {
+                    SlaveReplication slave("127.0.0.1", port,
+                        [&](const std::string& sql) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            received.push_back(sql);
+                        });
+                    slave.start();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                    long long p = bl.write("INSERT INTO r VALUES (42)");
+                    replNotifyNewData();
+
+                    bool got = false;
+                    for (int i = 0; i < 100 && !got; ++i) {
+                        { std::lock_guard<std::mutex> lk(mu); got = !received.empty(); }
+                        if (!got) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(got, "REPL #5a: statement streamed to replica");
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        check(!received.empty() &&
+                              received[0] == "INSERT INTO r VALUES (42)",
+                              "REPL #5b: statement replayed verbatim");
+                    }
+                    check(g_replState.slavePos.load() == p,
+                          "REPL #5c: replica position advanced");
+                    long long lag = g_replState.slaveLagMs.load();
+                    check(lag >= 0 && lag < 5000, "REPL #5d: lag_ms measured");
+                    check(g_replState.slaveRunning.load(), "REPL #5e: replica running");
+
+                    // Ack propagates via the next poll's FROM_POS
+                    bool acked = false;
+                    for (int i = 0; i < 100 && !acked; ++i) {
+                        acked = g_replState.maxSlaveAckPos.load() >= p;
+                        if (!acked) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(acked, "REPL #5f: master received replica ack");
+
+                    // Sync mode: write is acknowledged within timeout
+                    g_replState.syncMode.store(true);
+                    long long p2 = bl.write("INSERT INTO r VALUES (43)");
+                    replNotifyNewData();
+                    bool syncOk = replWaitForAck(p2, 5000);
+                    check(syncOk, "REPL #5g: sync-mode write acked by replica");
+                    g_replState.syncMode.store(false);
+                } // slave stops + joins
+            }     // master stops + joins accept thread
+            // Let detached per-slave handler threads drain before bl dies
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        std::remove(blPath);
+        std::remove(tokPath);
+
+        // Reset global replication state for subsequent groups
+        g_replState.isSlave.store(false);
+        g_replState.isMaster.store(false);
+        g_replState.slaveRunning.store(false);
+        g_replState.slavePos.store(0);
+        g_replState.connectedSlaves.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+        g_replState.lastSyncUnixMs.store(0);
+        g_replState.masterDown.store(false);
+        g_replState.syncMode.store(false);
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -9763,6 +10297,15 @@ int main() {
     }
     try { testGroup93(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 93 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup95(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 95 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup94(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 94 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup96(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 96 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

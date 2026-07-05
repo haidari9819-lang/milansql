@@ -908,14 +908,31 @@ public:
         if (!rows_.empty()) rows_.back().xmin = txId;
     }
 
-    // VACUUM: physically remove rows whose xmax is committed (callable predicate)
-    std::size_t vacuum(const std::function<bool(uint64_t)>& isCommitted) {
+    // VACUUM: physically remove rows whose xmax is committed (callable predicate).
+    // Phase 171: horizon = minActiveTxId — only remove versions no active
+    // transaction can still see (xmax < horizon AND xmax committed).
+    // freedBytes (optional) receives an estimate of the memory reclaimed.
+    std::size_t vacuum(const std::function<bool(uint64_t)>& isCommitted,
+                       uint64_t horizon = UINT64_MAX,
+                       std::size_t* freedBytes = nullptr) {
         std::size_t before = rows_.size();
+        std::size_t bytes  = 0;
         rows_.erase(std::remove_if(rows_.begin(), rows_.end(),
-            [&](const Row& r) { return r.xmax != 0 && isCommitted(r.xmax); }),
+            [&](const Row& r) {
+                bool dead = r.xmax != 0 && r.xmax < horizon && isCommitted(r.xmax);
+                if (dead) {
+                    bytes += sizeof(Row);
+                    for (const auto& v : r.values) bytes += v.capacity() + sizeof(std::string);
+                }
+                return dead;
+            }),
             rows_.end());
         std::size_t n = before - rows_.size();
-        if (n) rebuildAll();
+        if (n) {
+            rows_.shrink_to_fit();   // actually release memory
+            rebuildAll();
+        }
+        if (freedBytes) *freedBytes = bytes;
         return n;
     }
 
@@ -8704,13 +8721,16 @@ public:
 
     // ── Phase 71: MVCC public API ─────────────────────────────
 
-    // VACUUM: physically remove logically-deleted rows from all tables
+    // VACUUM: physically remove logically-deleted rows from all tables.
+    // Phase 171: only removes versions below the minActiveTxId horizon,
+    // i.e. versions that no active transaction can still see.
     size_t vacuumAll() {
+        uint64_t horizon = txManager_.minActiveTxId();
         size_t total = 0;
         for (auto& [name, tbl] : tables_) {
             total += tbl.vacuum([this](uint64_t txId) {
                 return txManager_.isCommitted(txId);
-            });
+            }, horizon);
         }
         return total;
     }
@@ -8720,7 +8740,7 @@ public:
         auto name = resolveTableName(tblRaw);
         return getTable(name).vacuum([this](uint64_t txId) {
             return txManager_.isCommitted(txId);
-        });
+        }, txManager_.minActiveTxId());
     }
 
     // Count dead rows across all tables (for diagnostics)
@@ -8731,27 +8751,33 @@ public:
         return total;
     }
 
-    // ── Phase 85: VACUUM with VacuumManager integration ──────
-    size_t vacuumAllTracked() {
-        size_t total = 0;
+    // ── Phase 85/171: VACUUM with VacuumManager integration ──
+    size_t vacuumAllTracked(bool automatic = false) {
+        uint64_t horizon = txManager_.minActiveTxId();
+        size_t total = 0, totalBytes = 0;
         for (auto& [name, tbl] : tables_) {
+            size_t bytes = 0;
             size_t cleaned = tbl.vacuum([this](uint64_t txId) {
                 return txManager_.isCommitted(txId);
-            });
+            }, horizon, &bytes);
             if (cleaned) {
-                total += cleaned;
+                total      += cleaned;
+                totalBytes += bytes;
                 vacuumMgr_.resetDeadTuples(name);
             }
         }
+        vacuumMgr_.recordVacuumRun(total, totalBytes, automatic);
         return total;
     }
 
     size_t vacuumTableTracked(const std::string& tblRaw) {
         auto name = resolveTableName(tblRaw);
+        size_t bytes = 0;
         size_t cleaned = getTable(name).vacuum([this](uint64_t txId) {
             return txManager_.isCommitted(txId);
-        });
+        }, txManager_.minActiveTxId(), &bytes);
         if (cleaned) vacuumMgr_.resetDeadTuples(name);
+        vacuumMgr_.recordVacuumRun(cleaned, bytes, false);
         return cleaned;
     }
 
@@ -8790,9 +8816,16 @@ public:
     // Called from main.cpp to start background thread
     void startAutoVacuum() {
         vacuumMgr_.startAutoVacuum([this]() {
-            return vacuumAllTracked();
+            return vacuumAllTracked(/*automatic=*/true);
         });
     }
+
+    // Phase 171: direct access for HTTP endpoints / external vacuum thread
+    VacuumManager&       vacuumManager()       { return vacuumMgr_; }
+    const VacuumManager& vacuumManager() const { return vacuumMgr_; }
+
+    // Phase 171: MVCC horizon (smallest tx id still active)
+    uint64_t minActiveTxId() const { return txManager_.minActiveTxId(); }
 
     void stopAutoVacuum() {
         vacuumMgr_.stopAutoVacuum();

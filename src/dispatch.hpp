@@ -77,8 +77,9 @@ inline WsNotifyFn& g_wsNotifyFn() {
 
 namespace milansql {
 
-// ── Phase 94: Global Connection Pool ─────────────────────────
-static ConnectionPool g_connectionPool;
+// ── Phase 94/170: Global Connection Pool ─────────────────────
+// g_connectionPool is now an inline global in pool/connection_pool.hpp
+// (shared between SQL commands and the HTTP server).
 
 // ── Phase 93: Global Statement Cache ─────────────────────────
 static StatementCache g_stmtCache;
@@ -4943,8 +4944,19 @@ inline bool dispatchCommand(
     case milansql::CommandType::VACUUM_ANALYZE: {
         size_t cleaned = engine.vacuumAllTracked();
         std::cout << "  VACUUM: " << cleaned << " alte Version(en) bereinigt.\n";
-        if (cmd.type == milansql::CommandType::VACUUM_ANALYZE)
-            std::cout << "  ANALYZE: Tabellenstatistiken aktualisiert.\n";
+        if (cmd.type == milansql::CommandType::VACUUM_ANALYZE) {
+            // Phase 171: really refresh optimizer statistics after vacuum
+            const auto& tables = engine.getTables();
+            for (const auto& kv : tables) {
+                g_tableStats.analyzeTable(kv.first, kv.second);
+                g_adaptiveStats.analyzeTable(kv.first);
+            }
+            g_tableStats.saveStats();
+            g_adaptiveStats.saveStats();
+            milansql::g_dpPlanner().invalidate();
+            std::cout << "  ANALYZE: " << tables.size()
+                      << " Tabelle(n) — Statistiken aktualisiert.\n";
+        }
         std::cout << "\n";
         persistFn();
         break;

@@ -83,6 +83,7 @@ private:
     ExecFn            execFn_;
     std::atomic<bool> running_;
     std::atomic<bool> paused_;
+    bool              failoverLogged_ = false;   // Phase 172
     std::thread       thread_;
 
     void setStatus(const std::string& s) {
@@ -100,13 +101,27 @@ private:
             }
 
             if (!trySync()) {
-                setStatus("Reconnecting...");
+                // Phase 172: failover detection — master unreachable > 30s
+                if (replCheckFailover()) {
+                    if (!failoverLogged_) {
+                        std::cerr << "  [Slave] FAILOVER: Master "
+                                  << masterHost_ << ":" << masterPort_
+                                  << " seit >30s nicht erreichbar!\n";
+                        failoverLogged_ = true;
+                    }
+                    setStatus("MASTER DOWN (failover)");
+                } else {
+                    setStatus("Reconnecting...");
+                }
                 g_replState.slaveRunning.store(false);
                 // Wait up to 5s before retry, checking running_ / paused_ periodically
                 for (int i = 0; i < 50 && running_ && !paused_; ++i)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                // Phase 172: streaming — master long-polls server-side, so we
+                // re-request immediately for realtime delivery
+                failoverLogged_ = false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
 
@@ -140,9 +155,10 @@ private:
         }
 
         // Build sync request with auth token
+        // Phase 172: WAIT = streaming long-poll (master blocks until new data)
         long long myPos = g_replState.slavePos.load();
         std::string req = "AUTH_TOKEN:" + g_replAuthToken() +
-                          "\nREPL_SYNC\nFROM_POS:" + std::to_string(myPos) + "\nEND\n";
+                          "\nREPL_SYNC\nWAIT\nFROM_POS:" + std::to_string(myPos) + "\nEND\n";
         if (send(sock, req.c_str(), static_cast<int>(req.size()), 0) <= 0) {
             slave_closesock(sock);
             return false;
@@ -174,10 +190,24 @@ private:
             return false;
         }
 
+        // Phase 172: lag = local time minus master's send timestamp (TS:<ms>).
+        // Fallback: round-trip time when TS is missing (old master).
         auto t1  = std::chrono::high_resolution_clock::now();
         long long lagMs = std::chrono::duration_cast<
             std::chrono::milliseconds>(t1 - t0).count();
+        auto tsIt = resp.find("\nTS:");
+        if (tsIt != std::string::npos) {
+            try {
+                long long masterTs = std::stoll(resp.substr(tsIt + 4));
+                long long diff = replNowMs() - masterTs;
+                if (diff >= 0) lagMs = diff;
+            } catch (...) {}
+        }
         g_replState.slaveLagMs.store(lagMs);
+
+        // Phase 172: successful contact with master
+        g_replState.lastSyncUnixMs.store(replNowMs());
+        g_replState.masterDown.store(false);
 
         // Handle REPL_UPTODATE
         if (resp.find("REPL_UPTODATE") != std::string::npos) {

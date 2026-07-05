@@ -57,6 +57,10 @@
 #include "../auth/rate_limiter.hpp"
 #include "../security/fortress.hpp"
 
+// Phase 174: test suite size — served via /health as test_count,
+// displayed dynamically in the WebUI navbar badge.
+static constexpr int MILANSQL_TEST_COUNT = 1413;
+
 // ── JSON helpers ──────────────────────────────────────────────
 
 static std::string jsonEscape(const std::string& s) {
@@ -2601,7 +2605,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="brand"><svg width="22" height="22" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL</div>
   <span class="badge" id="health-badge">checking...</span>
   <span class="badge blue" id="conn-badge">0 connections</span>
-  <span class="badge blue" id="test-badge">1304 tests</span>
+  <span class="badge blue" id="test-badge">&hellip; tests</span>
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -3877,9 +3881,20 @@ function escHtml(s) {
 function rowVals(row) { return Array.isArray(row) ? row : (row && typeof row === 'object' && row.values && typeof row.values !== 'function' ? row.values : (row && typeof row === 'object' ? Object.values(row) : [])); }
 function escAttr(s) { return String(s).replace(/'/g,"\\'"); }
 
+// Phase 174: load test count dynamically from /health
+async function loadTestBadge() {
+  try {
+    var r = await fetch('/health', {credentials:'include'});
+    var d = await r.json();
+    if (d.test_count != null)
+      document.getElementById('test-badge').textContent = d.test_count + ' tests';
+  } catch(e) {}
+}
+
 // Init
 updateEditorDecor();
 loadSidebarTables();
+loadTestBadge();
 pollStatus();
 setInterval(pollStatus, 5000);
 setInterval(loadSidebarTables, 30000);
@@ -5151,6 +5166,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             std::chrono::steady_clock::now() - startTime_).count();
         std::string body = "{"
             "\"status\":\"healthy\","
+            "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":{\"status\":\"ok\"},"

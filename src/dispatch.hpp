@@ -804,6 +804,28 @@ static inline milansql::Table dispatch_materializeView(
     return base;
 }
 
+// ── JOIN-Alias-Aufloesung ─────────────────────────────────────
+// Ersetzt User-Aliase ("o" aus FROM demo_orders o) durch die echten
+// Tabellennamen in den ON-Klauseln, damit executeJoins sie
+// qualifiziert aufloesen kann (Tenant-Prefixe u<id>_ loest
+// executeJoins selbst via resolveTableName auf).
+// SELECT/WHERE/ORDER BY bleiben unangetastet — deren Aufloesung
+// uebernimmt dispatch_evalExprAtom per aliasMap/Suffix-Matching.
+static inline void dispatch_resolveJoinAliases(milansql::ParsedCommand& cmd) {
+    std::map<std::string, std::string> aliasMap;
+    if (!cmd.tableAlias.empty()) aliasMap[cmd.tableAlias] = cmd.tableName;
+    for (const auto& jc : cmd.joinClauses)
+        if (!jc.tableAlias.empty()) aliasMap[jc.tableAlias] = jc.table;
+    if (aliasMap.empty()) return;
+    auto repl = [&](std::string& s) {
+        auto dot = s.find('.');
+        if (dot == std::string::npos) return;
+        auto it = aliasMap.find(s.substr(0, dot));
+        if (it != aliasMap.end()) s = it->second + s.substr(dot);
+    };
+    for (auto& jc : cmd.joinClauses) { repl(jc.onLeft); repl(jc.onRight); }
+}
+
 // ── executeSelectToTable ──────────────────────────────────────
 static inline milansql::Table dispatch_executeSelectToTable(
         milansql::Engine& engine,
@@ -873,6 +895,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
     }
 
     if (cmd.isJoin) {
+        dispatch_resolveJoinAliases(cmd);
         // Phase 89: Register any foreign tables as temp tables before join
         {
             std::vector<std::string> fdwToClean;
@@ -3215,6 +3238,7 @@ inline bool dispatchCommand(
                              "FROM t1 [LEFT|INNER] JOIN t2 ON t1.col = t2.col\n";
                 break;
             }
+            dispatch_resolveJoinAliases(cmd);
             // Phase 89: Register any foreign tables as temp tables before join
             {
                 std::vector<std::string> fdwToClean;

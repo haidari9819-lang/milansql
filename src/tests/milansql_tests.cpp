@@ -5987,6 +5987,25 @@ static void testGroup72() {
         check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v10.1.0",
               "Isolation #15: version() returns MilanSQL v10.1.0");
     }
+
+    // 16-18. Tenant-JOIN: logische ON-Namen auf u<id>_-Tabellen (Bug 2026-07)
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE u12_demo_products (id INT, name TEXT, price INT)");
+        exec(eng, "INSERT INTO u12_demo_products VALUES (1, 'Laptop', 1200)");
+        exec(eng, "INSERT INTO u12_demo_products VALUES (2, 'Monitor', 450)");
+        exec(eng, "CREATE TABLE u12_demo_orders (id INT, product_id INT, qty INT)");
+        exec(eng, "INSERT INTO u12_demo_orders VALUES (1, 1, 2)");
+        exec(eng, "INSERT INTO u12_demo_orders VALUES (2, 2, 5)");
+
+        eng.setCurrentUser(12, false);
+        auto r = exec(eng, "SELECT o.id, p.name, o.qty FROM demo_orders o "
+                           "JOIN demo_products p ON o.product_id = p.id");
+        check(r.find("ERROR:") == std::string::npos, "Isolation #16: tenant JOIN with alias runs without error");
+        check(r.find("Laptop") != std::string::npos, "Isolation #17: tenant JOIN returns row 1 (Laptop)");
+        check(r.find("Monitor") != std::string::npos, "Isolation #18: tenant JOIN returns row 2 (Monitor)");
+        eng.setCurrentUser(0, true);
+    }
 }
 
 // testGroup73: v9.3.0 — INSERT quoted VALUES → correct column headers

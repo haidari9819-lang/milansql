@@ -59,7 +59,11 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1511;
+static constexpr int MILANSQL_TEST_COUNT = 1514;
+
+// Redesign 2026-07: version served via /health — Landing Page und
+// WebUI lesen sie dynamisch (Elemente mit class="ms-version").
+static constexpr const char* MILANSQL_VERSION = "10.3.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -1563,12 +1567,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "10.3.0");
+            return makeScalar("@@version", MILANSQL_VERSION);
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"10.3.0\",\"MilanSQL Database Engine\"]]}";
+            return std::string("{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"") + MILANSQL_VERSION + "\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -2142,7 +2146,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v10.3.0\",";
+    json += "\"version\":\"MilanSQL v" + std::string(MILANSQL_VERSION) + "\",";
     json += "\"uptime\":"       + std::to_string(elapsed) + ",";
     json += "\"uptime_fmt\":\"" + uptimeFmt + "\",";
     json += "\"tables\":"       + std::to_string(tables.size()) + ",";
@@ -2463,43 +2467,61 @@ loadSidebar();
 // ── MilanHttpServer::handleWebUI (Phase 135) ─────────────────
 
 inline std::string MilanHttpServer::handleWebUI() {
-    static const std::string html = R"WEBUIEND(<!DOCTYPE html>
+    // Cache-Busting: Versions-Query am einzigen externen Asset (Favicon);
+    // CSS/JS sind inline und haengen an der HTML-Seite (no-store, s.u.).
+    static const std::string html = std::string(R"WEBUIEND(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MilanSQL Admin</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<link rel="icon" type="image/svg+xml" href="/favicon.ico?v=)WEBUIEND") + MILANSQL_VERSION + R"WEBUIEND(">
 <style>
+/* ── MilanSQL Design System (Redesign 2026-07) ── */
+:root{
+  --bg-primary:#080c18;--bg-secondary:#0d1224;--bg-card:#111827;--bg-hover:#1a2235;
+  --accent:#00d4ff;--accent-2:#7c3aed;
+  --danger:#ef4444;--success:#10b981;--warning:#f59e0b;
+  --text-1:#f8fafc;--text-2:#94a3b8;--text-3:#475569;
+  --border:#1e2d40;--border-2:#2d4060;
+  --glow-cyan:0 0 30px rgba(0,212,255,0.15);
+  --glow-card:0 0 60px rgba(0,212,255,0.08);
+  --ease:cubic-bezier(0.4,0,0.2,1);
+  --mono:'JetBrains Mono','Cascadia Code','SF Mono','Fira Code',monospace;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+body{background:var(--bg-primary);color:var(--text-1);font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
 
-/* TOPBAR */
-#topbar{height:48px;background:#161b22;border-bottom:1px solid #21262d;display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:100}
-#topbar .brand{font-weight:700;font-size:1rem;color:#e6edf3;margin-right:8px}
-#topbar .brand span{color:#f0a500}
-.badge{display:inline-flex;align-items:center;gap:4px;background:#21262d;border:1px solid #30363d;border-radius:20px;padding:3px 10px;font-size:0.75rem;color:#8b949e}
-.badge.green{color:#3fb950}.badge.green::before{content:'';margin-right:2px;color:#3fb950}
-.badge.yellow{color:#d29922}.badge.yellow::before{content:'';margin-right:2px;color:#d29922}
-.badge.blue{color:#58a6ff}
-.topbar-right{margin-left:auto;display:flex;gap:8px}
+/* TOPBAR (glassmorphism) */
+#topbar{height:56px;background:rgba(255,255,255,0.03);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:100}
+#topbar .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1rem;color:var(--text-1);margin-right:8px;letter-spacing:-0.02em}
+.logo-m{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1rem;color:#080c18;background:linear-gradient(135deg,var(--accent),#0ea5e9);box-shadow:var(--glow-cyan)}
+.badge{display:inline-flex;align-items:center;gap:6px;background:var(--bg-hover);border:1px solid var(--border);border-radius:20px;padding:4px 12px;font-size:0.75rem;color:var(--text-2);transition:border-color .2s var(--ease)}
+.badge.green{color:var(--success)}
+.badge.green::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px rgba(16,185,129,0.8);animation:pulse 2s var(--ease) infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.badge.yellow{color:var(--warning)}
+.badge.yellow::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--warning)}
+.badge.blue{color:var(--accent)}
+.topbar-right{margin-left:auto;display:flex;gap:8px;align-items:center}
 
 /* LAYOUT */
 #layout{display:flex;flex:1;overflow:hidden}
 
 /* SIDEBAR */
-#sidebar{width:220px;background:#0d1117;border-right:1px solid #21262d;display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+#sidebar{width:220px;background:var(--bg-secondary);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
 .nav-section{padding:8px 0}
-.nav-label{font-size:0.7rem;text-transform:uppercase;letter-spacing:.08em;color:#8b949e;padding:8px 16px 4px}
-.nav-item{display:flex;align-items:center;gap:8px;padding:7px 16px;font-size:0.85rem;color:#8b949e;cursor:pointer;border-radius:4px;margin:1px 8px;transition:background .15s,color .15s}
-.nav-item:hover{background:#161b22;color:#e6edf3}
-.nav-item.active{background:#1c2128;color:#58a6ff}
+.nav-label{font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3);padding:10px 16px 4px}
+.nav-item{position:relative;display:flex;align-items:center;gap:9px;padding:8px 16px;font-size:0.85rem;color:var(--text-2);cursor:pointer;border-radius:6px;margin:1px 8px;transition:background .2s var(--ease),color .2s var(--ease)}
+.nav-item:hover{background:var(--bg-hover);color:var(--text-1)}
+.nav-item.active{background:var(--bg-hover);color:var(--accent);font-weight:600}
+.nav-item.active::before{content:'';position:absolute;left:-8px;top:6px;bottom:6px;width:3px;border-radius:2px;background:var(--accent);box-shadow:0 0 8px rgba(0,212,255,0.6)}
 .nav-item .icon{font-size:0.9rem;width:16px;text-align:center}
 .tables-list{padding:0 8px}
-.table-item{padding:5px 8px;font-size:0.82rem;color:#8b949e;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:6px;transition:background .15s,color .15s}
-.table-item:hover{background:#161b22;color:#58a6ff}
-.table-item::before{content:'\229E';font-size:0.75rem;color:#30363d}
-.sidebar-footer{margin-top:auto;padding:12px;font-size:0.72rem;color:#8b949e;border-top:1px solid #21262d}
+.table-item{padding:5px 8px;font-size:0.82rem;color:var(--text-2);cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:6px;transition:background .2s var(--ease),color .2s var(--ease)}
+.table-item:hover{background:var(--bg-hover);color:var(--accent)}
+.table-item::before{content:'\229E';font-size:0.75rem;color:var(--border-2)}
+.sidebar-footer{margin-top:auto;padding:12px;font-size:0.72rem;color:var(--text-3);border-top:1px solid var(--border)}
 
 /* MAIN */
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
@@ -2511,135 +2533,141 @@ body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFo
 /* SQL EDITOR PAGE */
 #editor-area{padding:12px;display:flex;flex-direction:column;gap:8px;flex-shrink:0}
 .editor-toolbar{display:flex;gap:8px;align-items:center}
-.editor-toolbar .exec-time{margin-left:auto;font-size:0.75rem;color:#8b949e}
-/* New: editor with line numbers + syntax highlight */
-#editor-container{display:flex;border:1px solid #30363d;border-radius:6px;overflow:hidden;background:#161b22;transition:border-color .15s}
-#editor-container:focus-within{border-color:#388bfd}
-#line-numbers{background:#0d1117;color:#484f58;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;line-height:1.6;padding:12px 8px;text-align:right;user-select:none;min-width:40px;overflow:hidden;white-space:pre;flex-shrink:0;border-right:1px solid #21262d}
+.editor-toolbar .exec-time{margin-left:auto;font-size:0.75rem;color:var(--text-2)}
+/* Editor with line numbers + syntax highlight */
+#editor-container{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--bg-card);transition:border-color .2s var(--ease),box-shadow .2s var(--ease)}
+#editor-container:focus-within{border-color:var(--accent);box-shadow:var(--glow-cyan)}
+#line-numbers{background:var(--bg-primary);color:var(--text-3);font-family:var(--mono);font-size:0.85rem;line-height:1.6;padding:12px 8px;text-align:right;user-select:none;min-width:40px;overflow:hidden;white-space:pre;flex-shrink:0;border-right:1px solid var(--border)}
 #editor-wrap{position:relative;flex:1;overflow:hidden}
-#highlight-backdrop{position:absolute;top:0;left:0;right:0;bottom:0;padding:12px;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow:hidden;pointer-events:none;color:transparent}
-#sql-editor{position:relative;width:100%;height:140px;background:transparent;border:none;color:#e6edf3;caret-color:#e6edf3;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4;z-index:1;overflow:auto}
+#highlight-backdrop{position:absolute;top:0;left:0;right:0;bottom:0;padding:12px;font-family:var(--mono);font-size:0.85rem;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow:hidden;pointer-events:none;color:transparent}
+#sql-editor{position:relative;width:100%;height:140px;background:transparent;border:none;color:var(--text-1);caret-color:var(--accent);font-family:var(--mono);font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4;z-index:1;overflow:auto}
 /* Autocomplete dropdown */
-#autocomplete{display:none;position:absolute;background:#1c2128;border:1px solid #30363d;border-radius:6px;z-index:9999;max-height:200px;overflow-y:auto;min-width:160px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
-.ac-item{padding:6px 12px;font-size:0.82rem;font-family:'JetBrains Mono',monospace;color:#e6edf3;cursor:pointer;white-space:nowrap}
-.ac-item:hover,.ac-item.ac-selected{background:#388bfd;color:#fff}
+#autocomplete{display:none;position:absolute;background:var(--bg-hover);border:1px solid var(--border-2);border-radius:8px;z-index:9999;max-height:200px;overflow-y:auto;min-width:160px;box-shadow:0 8px 24px rgba(0,0,0,.6),var(--glow-card)}
+.ac-item{padding:6px 12px;font-size:0.82rem;font-family:var(--mono);color:var(--text-1);cursor:pointer;white-space:nowrap}
+.ac-item:hover,.ac-item.ac-selected{background:var(--accent);color:#080c18}
 /* Error line highlight */
-.error-line-badge{display:inline-block;background:#da3633;color:#fff;border-radius:4px;padding:2px 8px;font-size:0.75rem;margin-bottom:4px}
+.error-line-badge{display:inline-block;background:rgba(239,68,68,.15);color:var(--danger);border:1px solid var(--danger);border-radius:6px;padding:2px 8px;font-size:0.75rem;margin-bottom:4px}
 
 /* BUTTONS */
-.btn{padding:6px 14px;border-radius:6px;border:none;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s}
-.btn:hover{opacity:.85}
-.btn-green{background:#238636;color:#fff}
-.btn-blue{background:#1f6feb;color:#fff}
-.btn-gray{background:#21262d;color:#8b949e;border:1px solid #30363d}
-.btn-red{background:#da3633;color:#fff}
+.btn{padding:6px 14px;border-radius:8px;border:1px solid transparent;font-size:0.82rem;cursor:pointer;font-weight:600;font-family:inherit;transition:all .2s var(--ease)}
+.btn-green{background:var(--accent);color:#080c18}
+.btn-green:hover{box-shadow:var(--glow-cyan);filter:brightness(1.1)}
+.btn-blue{background:var(--accent-2);color:#fff}
+.btn-blue:hover{box-shadow:0 0 30px rgba(124,58,237,.3);filter:brightness(1.1)}
+.btn-gray{background:transparent;color:var(--text-2);border:1px solid var(--border-2)}
+.btn-gray:hover{color:var(--text-1);border-color:var(--accent);background:var(--bg-hover)}
+.btn-red{background:transparent;color:var(--danger);border:1px solid var(--danger)}
+.btn-red:hover{background:var(--danger);color:#fff}
 
 /* RESULTS */
 #results-area{flex:1;overflow:auto;padding:0 12px 12px}
-.result-header{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:0.8rem;color:#8b949e;margin-bottom:4px}
-.result-header .pill{background:#1c2128;border:1px solid #238636;color:#3fb950;border-radius:20px;padding:2px 10px;font-size:0.75rem}
-.result-header .pill.error{border-color:#da3633;color:#f85149}
-.result-header .pill.info{border-color:#1f6feb;color:#58a6ff}
-#result-table-wrap{overflow:auto;border:1px solid #21262d;border-radius:6px}
+.result-header{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:0.8rem;color:var(--text-2);margin-bottom:4px}
+.result-header .pill{background:rgba(16,185,129,.1);border:1px solid var(--success);color:var(--success);border-radius:20px;padding:2px 10px;font-size:0.75rem}
+.result-header .pill.error{background:rgba(239,68,68,.1);border-color:var(--danger);color:var(--danger)}
+.result-header .pill.info{background:rgba(0,212,255,.08);border-color:var(--accent);color:var(--accent)}
+#result-table-wrap{overflow:auto;border:1px solid var(--border);border-radius:8px}
 table{width:100%;border-collapse:collapse;font-size:0.82rem}
-th{background:#161b22;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #21262d;font-weight:500;white-space:nowrap;position:sticky;top:0;cursor:pointer;user-select:none}
-th:hover{color:#e6edf3}
-th.sort-asc::after{content:' \25B2';font-size:0.7rem}
-th.sort-desc::after{content:' \25BC';font-size:0.7rem}
-td{padding:7px 12px;border-bottom:1px solid #161b22;color:#e6edf3;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
-tr:hover td{background:#1c2128}
-td.num{color:#58a6ff;font-family:monospace}
-td.null-val{color:#484f58;font-style:italic}
-.error-box{background:#1a0f0f;border:1px solid #da3633;border-radius:6px;padding:12px;color:#f85149;font-family:monospace;font-size:0.82rem;margin-top:4px}
-.affected-box{background:#0d1f0d;border:1px solid #238636;border-radius:6px;padding:12px;color:#3fb950;font-size:0.85rem;margin-top:4px}
+th{background:var(--bg-secondary);color:var(--text-2);text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;white-space:nowrap;position:sticky;top:0;cursor:pointer;user-select:none;text-transform:uppercase;font-size:0.72rem;letter-spacing:.05em}
+th:hover{color:var(--accent)}
+th.sort-asc::after{content:' \25B2';font-size:0.7rem;color:var(--accent)}
+th.sort-desc::after{content:' \25BC';font-size:0.7rem;color:var(--accent)}
+td{padding:7px 12px;border-bottom:1px solid var(--border);color:var(--text-1);white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono);font-size:0.8rem}
+tbody tr:nth-child(even) td{background:rgba(255,255,255,0.015)}
+tr:hover td{background:var(--bg-hover)}
+td.num{color:#a78bfa}
+td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
+.error-box{background:rgba(239,68,68,.06);border:1px solid var(--danger);border-radius:8px;padding:12px;color:var(--danger);font-family:var(--mono);font-size:0.82rem;margin-top:4px}
+.affected-box{background:rgba(16,185,129,.06);border:1px solid var(--success);border-radius:8px;padding:12px;color:var(--success);font-size:0.85rem;margin-top:4px}
 
 /* STATUS BAR */
-#statusbar{height:26px;background:#161b22;border-top:1px solid #21262d;display:flex;align-items:center;padding:0 12px;gap:16px;font-size:0.72rem;color:#8b949e;flex-shrink:0}
+#statusbar{height:26px;background:var(--bg-secondary);border-top:1px solid var(--border);display:flex;align-items:center;padding:0 12px;gap:16px;font-size:0.72rem;color:var(--text-2);flex-shrink:0}
 .status-item{display:flex;align-items:center;gap:4px}
-.status-dot{width:6px;height:6px;border-radius:50%;background:#3fb950}
-.status-dot.warn{background:#d29922}
-.status-dot.err{background:#f85149}
+.status-dot{width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 6px rgba(16,185,129,.6)}
+.status-dot.warn{background:var(--warning);box-shadow:0 0 6px rgba(245,158,11,.6)}
+.status-dot.err{background:var(--danger);box-shadow:0 0 6px rgba(239,68,68,.6)}
 
 /* MONITORING PAGE */
 #page-monitoring .mon-grid,#page-vacuum .mon-grid,#page-replication .mon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:16px}
-.mon-tab{background:none;border:1px solid transparent;color:#8b949e;font-size:0.8rem;padding:4px 12px;border-radius:6px;cursor:pointer;font-family:inherit}
-.mon-tab:hover{color:#e6edf3;background:#161b22}
-.mon-tab.active{color:#e6edf3;background:#21262d;border-color:#30363d;font-weight:600}
-.vac-btn{background:#1c3a2a;color:#3fb950;border:1px solid #238636;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:0.72rem;font-family:inherit}
-.vac-btn:hover{background:#238636;color:#fff}
+.mon-tab{background:none;border:1px solid transparent;color:var(--text-2);font-size:0.8rem;padding:4px 12px;border-radius:8px;cursor:pointer;font-family:inherit;transition:all .2s var(--ease)}
+.mon-tab:hover{color:var(--text-1);background:var(--bg-hover)}
+.mon-tab.active{color:var(--accent);background:rgba(0,212,255,.08);border-color:var(--accent);font-weight:600}
+.vac-btn{background:rgba(16,185,129,.1);color:var(--success);border:1px solid var(--success);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:0.72rem;font-family:inherit;transition:all .2s var(--ease)}
+.vac-btn:hover{background:var(--success);color:#080c18}
 .vac-btn:disabled{opacity:0.5;cursor:wait}
-.stat-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
-.stat-card .label{font-size:0.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
-.stat-card .value{font-size:1.6rem;font-weight:700;color:#e6edf3}
-.stat-card .unit{font-size:0.75rem;color:#8b949e;margin-left:4px}
+.stat-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;transition:all .2s var(--ease)}
+.stat-card:hover{border-color:var(--border-2);box-shadow:var(--glow-card);transform:translateY(-1px)}
+.stat-card .label{font-size:0.72rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.stat-card .value{font-size:1.6rem;font-weight:700;color:var(--text-1);font-family:var(--mono)}
+.stat-card .unit{font-size:0.75rem;color:var(--text-2);margin-left:4px}
 .slow-queries-section{padding:0 16px 16px}
-.slow-queries-section h3{font-size:0.8rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
+.slow-queries-section h3{font-size:0.8rem;color:var(--text-2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
 
 
 /* SCHEMA VISUALIZER */
 #page-schema{flex-direction:column;position:relative}
 .schema-zoom-ctrl{display:flex;align-items:center;gap:4px}
-.schema-zoom-ctrl button{background:#21262d;border:1px solid #30363d;color:#e6edf3;width:26px;height:26px;border-radius:4px;cursor:pointer;font-size:0.85rem;display:flex;align-items:center;justify-content:center;padding:0}
-.schema-zoom-ctrl button:hover{background:#30363d;border-color:#484f58}
-.schema-zoom-pct{font-size:0.7rem;color:#8b949e;min-width:36px;text-align:center}
-#schema-minimap{position:absolute;bottom:12px;right:12px;width:200px;height:150px;background:#0d1117;border:1px solid #30363d;border-radius:6px;z-index:50;overflow:hidden;cursor:crosshair}
+.schema-zoom-ctrl button{background:var(--bg-hover);border:1px solid var(--border-2);color:var(--text-1);width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:0.85rem;display:flex;align-items:center;justify-content:center;padding:0;transition:all .2s var(--ease)}
+.schema-zoom-ctrl button:hover{border-color:var(--accent);color:var(--accent)}
+.schema-zoom-pct{font-size:0.7rem;color:var(--text-2);min-width:36px;text-align:center}
+#schema-minimap{position:absolute;bottom:12px;right:12px;width:200px;height:150px;background:var(--bg-primary);border:1px solid var(--border-2);border-radius:8px;z-index:50;overflow:hidden;cursor:crosshair}
 #schema-minimap canvas{width:100%;height:100%}
-.schema-card{position:absolute;background:#161b22;border:1px solid #30363d;border-radius:8px;min-width:180px;max-width:260px;cursor:move;transition:box-shadow .15s,opacity .15s;user-select:none;z-index:2}
-.schema-card:hover{box-shadow:0 0 0 1px #ff6b1a}
+.schema-card{position:absolute;background:var(--bg-card);border:1px solid var(--border-2);border-radius:12px;min-width:180px;max-width:260px;cursor:move;transition:box-shadow .2s var(--ease),opacity .2s var(--ease);user-select:none;z-index:2}
+.schema-card:hover{box-shadow:0 0 0 1px var(--accent),var(--glow-cyan)}
 .schema-card.dimmed{opacity:0.3}
-.schema-card.highlighted{box-shadow:0 0 0 2px #ff6b1a}
-.schema-card-header{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid #21262d;font-size:0.8rem;font-weight:600;color:#e6edf3}
+.schema-card.highlighted{box-shadow:0 0 0 2px var(--accent),var(--glow-cyan)}
+.schema-card-header{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);font-size:0.8rem;font-weight:600;color:var(--text-1)}
 .schema-card-header .rls-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.schema-card-header .rls-dot.on{background:#3fb950}
-.schema-card-header .rls-dot.off{background:#484f58}
-.schema-card-header .pol-count{margin-left:auto;font-size:9px;font-weight:600;background:#1c3a2a;color:#3fb950;padding:1px 5px;border-radius:8px}
+.schema-card-header .rls-dot.on{background:var(--success);box-shadow:0 0 5px rgba(16,185,129,.7)}
+.schema-card-header .rls-dot.off{background:var(--text-3)}
+.schema-card-header .pol-count{margin-left:auto;font-size:9px;font-weight:600;background:rgba(16,185,129,.12);color:var(--success);padding:1px 5px;border-radius:8px}
 .schema-card-cols{padding:4px 0;font-size:0.75rem;max-height:200px;overflow-y:auto}
-.schema-col{display:flex;align-items:center;gap:4px;padding:2px 10px;color:#8b949e}
+.schema-col{display:flex;align-items:center;gap:4px;padding:2px 10px;color:var(--text-2)}
 .schema-col .col-icon{width:12px;font-size:9px;text-align:center;flex-shrink:0}
-.schema-col .col-icon.pk{color:#f0a500}
-.schema-col .col-icon.fk{color:#3fb950}
-.schema-col .col-name{flex:1;color:#cdd6f4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.schema-col .col-name.fk-col{color:#3fb950}
-.schema-col .col-type{color:#484f58;font-size:0.7rem;font-family:monospace;flex-shrink:0}
-.schema-card-rls{padding:5px 10px;border-top:1px solid #21262d;background:#0d1117;border-radius:0 0 7px 7px;font-size:0.7rem;font-family:monospace;color:#6e7681;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-height:60px}
-.schema-card-rls:hover{color:#8b949e}
+.schema-col .col-icon.pk{color:var(--warning)}
+.schema-col .col-icon.fk{color:var(--accent)}
+.schema-col .col-name{flex:1;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.schema-col .col-name.fk-col{color:var(--accent)}
+.schema-col .col-type{color:var(--text-3);font-size:0.7rem;font-family:var(--mono);flex-shrink:0}
+.schema-card-rls{padding:5px 10px;border-top:1px solid var(--border);background:var(--bg-primary);border-radius:0 0 11px 11px;font-size:0.7rem;font-family:var(--mono);color:var(--text-3);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-height:60px}
+.schema-card-rls:hover{color:var(--text-2)}
 /* TABLE BROWSER PAGE */
 #page-browser .browser-wrap{display:flex;flex:1;gap:0;overflow:hidden}
-#page-browser .tbl-list{width:200px;border-right:1px solid #21262d;overflow-y:auto;padding:8px}
-#page-browser .tbl-list .tbl-btn{width:100%;text-align:left;padding:7px 10px;background:none;border:none;color:#8b949e;font-size:0.82rem;cursor:pointer;border-radius:4px;display:block;transition:background .1s,color .1s}
-#page-browser .tbl-list .tbl-btn:hover{background:#161b22;color:#e6edf3}
-#page-browser .tbl-list .tbl-btn.active{background:#1c2128;color:#58a6ff}
+#page-browser .tbl-list{width:200px;border-right:1px solid var(--border);overflow-y:auto;padding:8px}
+#page-browser .tbl-list .tbl-btn{width:100%;text-align:left;padding:7px 10px;background:none;border:none;color:var(--text-2);font-size:0.82rem;cursor:pointer;border-radius:6px;display:block;transition:all .2s var(--ease);font-family:inherit}
+#page-browser .tbl-list .tbl-btn:hover{background:var(--bg-hover);color:var(--text-1)}
+#page-browser .tbl-list .tbl-btn.active{background:rgba(0,212,255,.08);color:var(--accent)}
 #page-browser .tbl-detail{flex:1;overflow:auto;padding:12px}
-#page-browser .tbl-detail h3{font-size:0.9rem;color:#e6edf3;margin-bottom:8px}
+#page-browser .tbl-detail h3{font-size:0.9rem;color:var(--text-1);margin-bottom:8px}
 
 /* HISTORY PAGE */
 #page-history{overflow-y:auto;padding:12px}
-.hist-item{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 14px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
-.hist-item:hover{border-color:#388bfd}
-.hist-item .hist-sql{font-family:monospace;font-size:0.82rem;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hist-item .hist-meta{font-size:0.72rem;color:#8b949e;margin-top:4px;display:flex;gap:8px;align-items:center}
-.hist-badge{display:inline-block;border-radius:10px;padding:1px 7px;font-size:0.7rem;font-weight:600}
-.hist-badge.ok{background:#1a3a1a;color:#3fb950;border:1px solid #238636}
-.hist-badge.err{background:#2a1010;color:#f85149;border:1px solid #da3633}
+.hist-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:8px;cursor:pointer;transition:all .2s var(--ease)}
+.hist-item:hover{border-color:var(--accent);box-shadow:var(--glow-card)}
+.hist-item .hist-sql{font-family:var(--mono);font-size:0.82rem;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist-item .hist-meta{font-size:0.72rem;color:var(--text-2);margin-top:4px;display:flex;gap:8px;align-items:center}
+.hist-badge{display:inline-block;border-radius:10px;padding:1px 7px;font-size:0.7rem;font-weight:600;font-family:var(--mono)}
+.hist-badge.ok{background:rgba(16,185,129,.1);color:var(--success);border:1px solid var(--success)}
+.hist-badge.err{background:rgba(239,68,68,.1);color:var(--danger);border:1px solid var(--danger)}
 
 /* SCROLLBAR */
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:#0d1117}
-::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:var(--bg-primary)}
+::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--accent)}
 </style>
 </head>
 <body>
 
 <!-- TOPBAR -->
 <div id="topbar">
-  <div class="brand"><svg width="22" height="22" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL</div>
+  <div class="brand"><span class="logo-m">M</span> MilanSQL</div>
   <span class="badge" id="health-badge">checking...</span>
   <span class="badge blue" id="conn-badge">0 connections</span>
   <span class="badge blue" id="test-badge">&hellip; tests</span>
   <div class="topbar-right">
-    <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
-    <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v10.3.0</span>
+    <span id="ms-user-badge" style="display:none;background:rgba(16,185,129,.1);color:#10b981;border:1px solid #10b981;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
+    <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:transparent;color:#94a3b8;border:1px solid #2d4060;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
+    <span style="font-size:0.75rem;color:#94a3b8" id="version-label" class="ms-version">v10.3.0</span>
   </div>
 </div>
 
@@ -2675,16 +2703,16 @@ td.null-val{color:#484f58;font-style:italic}
     <div class="nav-section">
       <div class="nav-label">Tables</div>
       <div class="tables-list" id="sidebar-tables">
-        <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
+        <div style="font-size:0.75rem;color:#475569;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div style="padding:8px 12px;border-top:1px solid #21262d;margin-top:auto">
-      <div id="rls-panel" style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:11px;color:#8b949e">
-        <div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>
-        <div style="display:flex;align-items:center;gap:6px"><span style="color:#484f58;font-size:9px">●</span><span style="font-size:11px;color:#484f58">Not connected</span></div>
+    <div style="padding:8px 12px;border-top:1px solid #1e2d40;margin-top:auto">
+      <div id="rls-panel" style="background:#111827;border:1px solid #1e2d40;border-radius:8px;padding:8px 10px;font-size:11px;color:#94a3b8">
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>
+        <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v10.3.0</div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.3.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -2699,7 +2727,7 @@ td.null-val{color:#484f58;font-style:italic}
           <button class="btn btn-gray" onclick="formatSQL()">Format</button>
           <button class="btn btn-gray" onclick="clearEditor()">&#x2715; Clear</button>
           <button class="btn btn-gray" onclick="copyCSV()" title="Copy results as CSV">&#x1F4CB; CSV</button>
-          <button class="btn btn-gray" onclick="showRlsPolicies()" title="Show RLS policies for selected table" style="border-color:#f0a500;color:#f0a500">&#x1F6E1; RLS</button>
+          <button class="btn btn-gray" onclick="showRlsPolicies()" title="Show RLS policies for selected table" style="border-color:#f59e0b;color:#f59e0b">&#x1F6E1; RLS</button>
           <span class="exec-time" id="exec-time"></span>
         </div>
         <div style="position:relative">
@@ -2713,7 +2741,7 @@ td.null-val{color:#484f58;font-style:italic}
           <div id="autocomplete"></div>
         </div>
         <div id="example-queries" style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0">
-          <span style="font-size:0.7rem;color:#484f58;align-self:center">Examples:</span>
+          <span style="font-size:0.7rem;color:#475569;align-self:center">Examples:</span>
           <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- JOIN with expression\nSELECT p.name, p.preis * b.menge AS gesamt\nFROM produkte p\nJOIN bestellungen b ON p.id = b.produkt_id')">JOIN + Calc</button>
           <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- JOIN with GROUP BY\nSELECT p.name, SUM(b.menge) AS total\nFROM produkte p\nJOIN bestellungen b ON p.id = b.produkt_id\nGROUP BY p.name')">JOIN + GROUP BY</button>
           <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- Aggregate with BETWEEN\nSELECT COUNT(*) FROM produkte\nWHERE preis BETWEEN 100 AND 1000')">COUNT + BETWEEN</button>
@@ -2727,7 +2755,7 @@ td.null-val{color:#484f58;font-style:italic}
           <span class="pill" id="result-pill"></span>
           <span id="result-info"></span>
         </div>
-        <div id="exec-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:6px;background:#1c2128;margin:4px 0 2px 0"></div>
+        <div id="exec-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:6px;background:#1a2235;margin:4px 0 2px 0"></div>
         <div id="result-content"></div>
       </div>
     </div>
@@ -2736,10 +2764,10 @@ td.null-val{color:#484f58;font-style:italic}
     <div class="page" id="page-browser">
       <div class="browser-wrap" style="display:flex;flex:1;overflow:hidden">
         <div class="tbl-list" id="browser-tbl-list">
-          <div style="font-size:0.75rem;color:#484f58;padding:4px">Loading...</div>
+          <div style="font-size:0.75rem;color:#475569;padding:4px">Loading...</div>
         </div>
         <div class="tbl-detail" id="browser-tbl-detail">
-          <div style="color:#484f58;font-size:0.85rem;margin-top:20px">Select a table to browse</div>
+          <div style="color:#475569;font-size:0.85rem;margin-top:20px">Select a table to browse</div>
         </div>
       </div>
     </div>
@@ -2747,8 +2775,8 @@ td.null-val{color:#484f58;font-style:italic}
 
     <!-- SCHEMA VISUALIZER PAGE -->
     <div class="page" id="page-schema">
-      <div id="schema-toolbar" style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #21262d;background:#0d1117">
-        <input id="schema-search" type="text" placeholder="Filter tables..." style="background:#161b22;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 10px;font-size:0.8rem;width:180px;outline:none">
+      <div id="schema-toolbar" style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #1e2d40;background:#080c18">
+        <input id="schema-search" type="text" placeholder="Filter tables..." style="background:#111827;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 10px;font-size:0.8rem;width:180px;outline:none">
         <button class="btn btn-gray" onclick="schemaAutoLayout()" style="font-size:0.75rem;padding:4px 10px">&#x2B50; Auto Layout</button>
         <button class="btn btn-gray" onclick="schemaFitAll()" style="font-size:0.75rem;padding:4px 10px">&#x26F6; Fit</button>
         <button class="btn btn-gray" onclick="schemaReload()" style="font-size:0.75rem;padding:4px 10px">&#x21BB; Reload</button>
@@ -2758,59 +2786,59 @@ td.null-val{color:#484f58;font-style:italic}
           <button onclick="schemaZoom(0.1)" title="Zoom In (Ctrl++)">+</button>
           <button onclick="schemaZoomReset()" title="Reset Zoom (Ctrl+0)" style="font-size:0.65rem;width:auto;padding:0 6px">Reset</button>
         </div>
-        <span id="schema-status" style="font-size:0.72rem;color:#8b949e"></span>
+        <span id="schema-status" style="font-size:0.72rem;color:#94a3b8"></span>
       </div>
-      <div id="schema-canvas" style="flex:1;position:relative;overflow:hidden;background:#0a0c10;cursor:grab">
+      <div id="schema-canvas" style="flex:1;position:relative;overflow:hidden;background:#080c18;cursor:grab">
         <div id="schema-transform" style="position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform">
           <svg id="schema-svg" style="position:absolute;top:0;left:0;width:10000px;height:10000px;pointer-events:none;z-index:1"></svg>
           <div id="schema-cards" style="position:absolute;top:0;left:0;z-index:2"></div>
         </div>
         <div id="schema-minimap"><canvas id="schema-minimap-canvas" width="400" height="300"></canvas></div>
       </div>
-      <div id="schema-policy-editor" style="display:none;position:absolute;bottom:0;left:0;right:0;background:#161b22;border-top:2px solid #ff6b1a;padding:12px 16px;z-index:100">
+      <div id="schema-policy-editor" style="display:none;position:absolute;bottom:0;left:0;right:0;background:#111827;border-top:2px solid #00d4ff;padding:12px 16px;z-index:100">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-          <span style="font-size:0.85rem;font-weight:600;color:#ff6b1a">&#x1F6E1; Edit RLS Policy</span>
-          <span id="schema-pe-table" style="font-size:0.8rem;color:#8b949e"></span>
-          <button onclick="closePolicyEditor()" style="margin-left:auto;background:none;border:none;color:#8b949e;cursor:pointer;font-size:1rem">&#x2715;</button>
+          <span style="font-size:0.85rem;font-weight:600;color:#00d4ff">&#x1F6E1; Edit RLS Policy</span>
+          <span id="schema-pe-table" style="font-size:0.8rem;color:#94a3b8"></span>
+          <button onclick="closePolicyEditor()" style="margin-left:auto;background:none;border:none;color:#94a3b8;cursor:pointer;font-size:1rem">&#x2715;</button>
         </div>
         <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
           <div style="flex:1;min-width:200px">
-            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">Policy Name</label>
-            <input id="schema-pe-name" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Policy Name</label>
+            <input id="schema-pe-name" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;margin-top:2px">
           </div>
           <div style="flex:1;min-width:80px;max-width:120px">
-            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">Command</label>
-            <select id="schema-pe-cmd" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Command</label>
+            <select id="schema-pe-cmd" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;margin-top:2px">
               <option>ALL</option><option>SELECT</option><option>INSERT</option><option>UPDATE</option><option>DELETE</option>
             </select>
           </div>
           <div style="flex:1;min-width:100px;max-width:120px">
-            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">Role</label>
-            <input id="schema-pe-role" value="PUBLIC" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Role</label>
+            <input id="schema-pe-role" value="PUBLIC" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;margin-top:2px">
           </div>
           <div style="flex:2;min-width:200px">
-            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">USING Expression</label>
-            <input id="schema-pe-using" placeholder="e.g. owner = CURRENT_USER_ID()" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">USING Expression</label>
+            <input id="schema-pe-using" placeholder="e.g. owner = CURRENT_USER_ID()" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
           </div>
           <div style="flex:2;min-width:200px">
-            <label style="font-size:0.7rem;color:#6e7681;text-transform:uppercase;letter-spacing:.5px">WITH CHECK</label>
-            <input id="schema-pe-check" placeholder="optional" style="width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e6edf3;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">WITH CHECK</label>
+            <input id="schema-pe-check" placeholder="optional" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
           </div>
           <div style="display:flex;align-items:flex-end">
             <button class="btn btn-green" onclick="savePolicyFromEditor()" style="font-size:0.8rem;padding:5px 14px;margin-top:14px">Save Policy</button>
           </div>
         </div>
-        <div id="schema-pe-msg" style="font-size:0.75rem;margin-top:6px;color:#8b949e"></div>
+        <div id="schema-pe-msg" style="font-size:0.75rem;margin-top:6px;color:#94a3b8"></div>
       </div>
     </div>
     <!-- MONITORING PAGE -->
     <div class="page" id="page-monitoring">
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 16px;border-bottom:1px solid #21262d">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 16px;border-bottom:1px solid #1e2d40">
         <div style="display:flex;gap:4px;align-items:center">
           <button class="mon-tab active" id="mtab-overview" onclick="monShowTab('overview')">Overview</button>
           <button class="mon-tab" id="mtab-pool" onclick="monShowTab('pool')">Pool Stats</button>
         </div>
-        <span style="font-size:0.75rem;color:#484f58">Auto-refresh: <span id="m-countdown" style="color:#3fb950;font-weight:600">5s</span></span>
+        <span style="font-size:0.75rem;color:#475569">Auto-refresh: <span id="m-countdown" style="color:#10b981;font-weight:600">5s</span></span>
       </div>
       <div id="mon-overview">
       <div class="mon-grid" id="mon-grid">
@@ -2823,18 +2851,18 @@ td.null-val{color:#484f58;font-style:italic}
       </div>
       <div style="padding:16px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-          <span style="font-size:0.85rem;font-weight:600;color:#e6edf3">Query History (last 10)</span>
-          <span id="m-last-update" style="font-size:0.7rem;color:#484f58;margin-left:auto"></span>
+          <span style="font-size:0.85rem;font-weight:600;color:#f8fafc">Query History (last 10)</span>
+          <span id="m-last-update" style="font-size:0.7rem;color:#475569;margin-left:auto"></span>
         </div>
-        <canvas id="m-chart" height="60" style="width:100%;background:#0d1117;border-radius:6px;border:1px solid #21262d"></canvas>
+        <canvas id="m-chart" height="60" style="width:100%;background:#080c18;border-radius:6px;border:1px solid #1e2d40"></canvas>
         <div style="display:flex;justify-content:space-between;margin-top:4px">
-          <span style="font-size:0.65rem;color:#484f58">10 samples · 5s interval</span>
-          <span style="font-size:0.65rem;color:#484f58">queries/poll</span>
+          <span style="font-size:0.65rem;color:#475569">10 samples · 5s interval</span>
+          <span style="font-size:0.65rem;color:#475569">queries/poll</span>
         </div>
       </div>
       <div style="padding:0 16px 16px">
-        <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Recent Slow Queries</div>
-        <div id="slow-queries-list" style="font-size:0.8rem;color:#8b949e;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;min-height:40px">Loading...</div>
+        <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Recent Slow Queries</div>
+        <div id="slow-queries-list" style="font-size:0.8rem;color:#94a3b8;background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:10px;min-height:40px">Loading...</div>
       </div>
       </div><!-- /mon-overview -->
       <!-- POOL STATS TAB (Phase 173) -->
@@ -2850,13 +2878,13 @@ td.null-val{color:#484f58;font-style:italic}
           <div class="stat-card"><div class="label">&#x1F504; Requests Total</div><div class="value" id="p-requests">--</div></div>
         </div>
         <div style="padding:16px">
-          <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Pool-Auslastung</div>
-          <canvas id="p-chart" height="90" style="width:100%;background:#0d1117;border-radius:6px;border:1px solid #21262d"></canvas>
-          <div style="display:flex;gap:16px;margin-top:6px;font-size:0.7rem;color:#8b949e">
-            <span><span style="color:#3fb950">&#x25A0;</span> Aktiv</span>
-            <span><span style="color:#58a6ff">&#x25A0;</span> Idle</span>
-            <span><span style="color:#f0a500">&#x25A0;</span> Wartend</span>
-            <span><span style="color:#30363d">&#x25A0;</span> Frei (bis Max)</span>
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Pool-Auslastung</div>
+          <canvas id="p-chart" height="90" style="width:100%;background:#080c18;border-radius:6px;border:1px solid #1e2d40"></canvas>
+          <div style="display:flex;gap:16px;margin-top:6px;font-size:0.7rem;color:#94a3b8">
+            <span><span style="color:#10b981">&#x25A0;</span> Aktiv</span>
+            <span><span style="color:#00d4ff">&#x25A0;</span> Idle</span>
+            <span><span style="color:#f59e0b">&#x25A0;</span> Wartend</span>
+            <span><span style="color:#2d4060">&#x25A0;</span> Frei (bis Max)</span>
           </div>
         </div>
       </div>
@@ -2864,8 +2892,8 @@ td.null-val{color:#484f58;font-style:italic}
 
     <!-- HISTORY PAGE -->
     <div class="page" id="page-history">
-      <div style="padding:12px;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center">
-        <span style="font-size:0.85rem;color:#8b949e">Query History</span>
+      <div style="padding:12px;border-bottom:1px solid #1e2d40;display:flex;gap:8px;align-items:center">
+        <span style="font-size:0.85rem;color:#94a3b8">Query History</span>
         <button class="btn btn-gray" style="margin-left:auto;font-size:0.75rem" onclick="clearHistory()">Clear</button>
       </div>
       <div id="history-list" style="flex:1;overflow-y:auto;padding:12px"></div>
@@ -2873,9 +2901,9 @@ td.null-val{color:#484f58;font-style:italic}
 
     <!-- VACUUM PAGE (Phase 173) -->
     <div class="page" id="page-vacuum">
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #21262d">
-        <span style="font-size:0.85rem;color:#8b949e">&#x1F9F9; MVCC Vacuum &mdash; Dead Tuple Cleanup</span>
-        <span style="font-size:0.75rem;color:#484f58">Auto-refresh: <span style="color:#3fb950;font-weight:600">5s</span></span>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.85rem;color:#94a3b8">&#x1F9F9; MVCC Vacuum &mdash; Dead Tuple Cleanup</span>
+        <span style="font-size:0.75rem;color:#475569">Auto-refresh: <span style="color:#10b981;font-weight:600">5s</span></span>
       </div>
       <div class="mon-grid">
         <div class="stat-card"><div class="label">&#x1F550; Letzter Vacuum</div><div class="value" id="v-lastrun" style="font-size:0.9rem">--</div></div>
@@ -2887,19 +2915,19 @@ td.null-val{color:#484f58;font-style:italic}
       </div>
       <div style="padding:16px;flex:1;overflow-y:auto">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-          <span style="font-size:0.85rem;font-weight:600;color:#e6edf3">Tabellen</span>
-          <span id="v-msg" style="font-size:0.75rem;color:#3fb950;margin-left:auto"></span>
+          <span style="font-size:0.85rem;font-weight:600;color:#f8fafc">Tabellen</span>
+          <span id="v-msg" style="font-size:0.75rem;color:#10b981;margin-left:auto"></span>
         </div>
-        <div id="vacuum-table-list" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:6px;font-size:0.8rem;color:#8b949e">Loading...</div>
+        <div id="vacuum-table-list" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:6px;font-size:0.8rem;color:#94a3b8">Loading...</div>
       </div>
     </div>
 
     <!-- REPLICATION PAGE (Phase 173) -->
     <div class="page" id="page-replication">
-      <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #21262d">
-        <span id="rep-light" style="font-size:1.1rem;color:#484f58">&#x25CF;</span>
-        <span id="rep-light-text" style="font-size:0.85rem;color:#8b949e">Loading...</span>
-        <span style="font-size:0.75rem;color:#484f58;margin-left:auto">Auto-refresh: <span style="color:#3fb950;font-weight:600">2s</span></span>
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span id="rep-light" style="font-size:1.1rem;color:#475569">&#x25CF;</span>
+        <span id="rep-light-text" style="font-size:0.85rem;color:#94a3b8">Loading...</span>
+        <span style="font-size:0.75rem;color:#475569;margin-left:auto">Auto-refresh: <span style="color:#10b981;font-weight:600">2s</span></span>
       </div>
       <div class="mon-grid">
         <div class="stat-card"><div class="label">&#x1F3AD; Rolle</div><div class="value" id="r-role" style="font-size:1rem">--</div></div>
@@ -2910,11 +2938,11 @@ td.null-val{color:#484f58;font-style:italic}
         <div class="stat-card"><div class="label">&#x2699; Modus</div><div class="value" id="r-mode" style="font-size:1rem">--</div></div>
       </div>
       <div style="padding:16px;flex:1;overflow-y:auto">
-        <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Replicas</div>
-        <div id="rep-slave-list" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;font-size:0.8rem;color:#8b949e;margin-bottom:16px">Loading...</div>
+        <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Replicas</div>
+        <div id="rep-slave-list" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:10px;font-size:0.8rem;color:#94a3b8;margin-bottom:16px">Loading...</div>
         <div id="rep-replica-detail" style="display:none">
-          <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Replica-Verbindung</div>
-          <div id="rep-replica-info" style="background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;font-size:0.8rem;color:#8b949e"></div>
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Replica-Verbindung</div>
+          <div id="rep-replica-info" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:10px;font-size:0.8rem;color:#94a3b8"></div>
         </div>
       </div>
     </div>
@@ -2928,7 +2956,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v10.3.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v10.3.0</span> &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2954,21 +2982,21 @@ function highlightSQL(text) {
   var s = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // Comments (-- and /* */) — replace with placeholder to protect from further substitution
   var comments = [];
-  s = s.replace(/\/\*[\s\S]*?\*\//g, function(m){ comments.push('<span style="color:#8b949e">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
-  s = s.replace(/--[^\n]*/g, function(m){ comments.push('<span style="color:#8b949e">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
+  s = s.replace(/\/\*[\s\S]*?\*\//g, function(m){ comments.push('<span style="color:#94a3b8">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
+  s = s.replace(/--[^\n]*/g, function(m){ comments.push('<span style="color:#94a3b8">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
   // Strings
   var strings = [];
-  s = s.replace(/'(?:[^'\\]|\\.)*'/g, function(m){ strings.push('<span style="color:#a5d6ff">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
-  s = s.replace(/"(?:[^"\\]|\\.)*"/g, function(m){ strings.push('<span style="color:#a5d6ff">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
+  s = s.replace(/'(?:[^'\\]|\\.)*'/g, function(m){ strings.push('<span style="color:#fbbf24">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
+  s = s.replace(/"(?:[^"\\]|\\.)*"/g, function(m){ strings.push('<span style="color:#fbbf24">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
   // Numbers
-  s = s.replace(/\b(\d+(?:\.\d+)?)\b/g,'<span style="color:#f8c555">$1</span>');
+  s = s.replace(/\b(\d+(?:\.\d+)?)\b/g,'<span style="color:#a78bfa">$1</span>');
   // Functions (before keywords so they match first)
   var fnPat = '\\b(' + SQL_FUNCS.map(escRe).join('|') + ')\\s*(?=\\()';
-  s = s.replace(new RegExp(fnPat,'gi'), function(m){ return '<span style="color:#d2a8ff">'+m+'</span>'; });
+  s = s.replace(new RegExp(fnPat,'gi'), function(m){ return '<span style="color:#c084fc">'+m+'</span>'; });
   // Keywords (longest first to match GROUP BY before GROUP)
   var kwSorted = SQL_KEYWORDS.slice().sort(function(a,b){return b.length-a.length;});
   kwSorted.forEach(function(kw){
-    s = s.replace(new RegExp('\\b'+escRe(kw)+'\\b','gi'), function(m){ return '<span style="color:#ff7b72">'+m+'</span>'; });
+    s = s.replace(new RegExp('\\b'+escRe(kw)+'\\b','gi'), function(m){ return '<span style="color:#00d4ff">'+m+'</span>'; });
   });
   // Restore strings and comments
   s = s.replace(/\x00S(\d+)\x00/g, function(_,i){ return strings[+i]; });
@@ -3089,7 +3117,7 @@ async function runQuery(sql) {
   var q = sql || document.getElementById('sql-editor').value.trim();
   if (!q) return;
   var t0 = performance.now();
-  document.getElementById('result-content').innerHTML = '<div style="color:#8b949e;padding:8px;font-size:0.8rem">Running...</div>';
+  document.getElementById('result-content').innerHTML = '<div style="color:#94a3b8;padding:8px;font-size:0.8rem">Running...</div>';
   document.getElementById('result-header').style.display = 'none';
   clearErrorHighlight();
   try {
@@ -3115,11 +3143,11 @@ function showExecBadge(data) {
   var badge = document.getElementById('exec-badge');
   if (!badge) return;
   if (msUser) {
-    badge.innerHTML = '<span style="color:#3fb950">&#10003;</span> Ausgeführt als: <b>' + escHtml(msUser) + '</b> (id: ' + msUserId + ')';
-    badge.style.color = '#3fb950';
+    badge.innerHTML = '<span style="color:#10b981">&#10003;</span> Ausgeführt als: <b>' + escHtml(msUser) + '</b> (id: ' + msUserId + ')';
+    badge.style.color = '#10b981';
   } else {
-    badge.innerHTML = '<span style="color:#f38ba8">&#9888;</span> Nicht authentifiziert';
-    badge.style.color = '#f38ba8';
+    badge.innerHTML = '<span style="color:#ef4444">&#9888;</span> Nicht authentifiziert';
+    badge.style.color = '#ef4444';
   }
   badge.style.display = 'block';
 }
@@ -3341,18 +3369,18 @@ async function showRlsPolicies() {
       var r = await fetch('/api/rls-policies', {credentials:'include'});
       var data = await r.json();
       var out = document.getElementById('output-area');
-      var html = '<div style="padding:12px"><h3 style="color:#f0a500;margin-bottom:12px">&#x1F6E1; RLS Policies Overview</h3>';
+      var html = '<div style="padding:12px"><h3 style="color:#f59e0b;margin-bottom:12px">&#x1F6E1; RLS Policies Overview</h3>';
       var enabled = data.enabled_tables || [];
-      html += '<div style="color:#8b949e;margin-bottom:8px">Protected tables: <b style="color:#3fb950">' + enabled.length + '</b></div>';
+      html += '<div style="color:#94a3b8;margin-bottom:8px">Protected tables: <b style="color:#10b981">' + enabled.length + '</b></div>';
       if (enabled.length === 0) {
-        html += '<div style="color:#484f58">No tables have RLS enabled.</div>';
+        html += '<div style="color:#475569">No tables have RLS enabled.</div>';
       } else {
         html += '<table><thead><tr><th>Table</th><th>Policies</th><th>Details</th></tr></thead><tbody>';
         for (var i = 0; i < enabled.length; i++) {
           var tbl = enabled[i];
           var pols = (data.policies || {})[tbl] || [];
-          var details = pols.map(function(p) { return '<span style="color:#58a6ff">' + escHtml(p.name) + '</span> (' + p.command + ' TO ' + p.role + ')'; }).join(', ') || '<span style="color:#484f58">none</span>';
-          html += '<tr><td style="color:#cdd6f4;font-weight:600">' + escHtml(tbl) + '</td><td style="text-align:center">' + pols.length + '</td><td>' + details + '</td></tr>';
+          var details = pols.map(function(p) { return '<span style="color:#00d4ff">' + escHtml(p.name) + '</span> (' + p.command + ' TO ' + p.role + ')'; }).join(', ') || '<span style="color:#475569">none</span>';
+          html += '<tr><td style="color:#f8fafc;font-weight:600">' + escHtml(tbl) + '</td><td style="text-align:center">' + pols.length + '</td><td>' + details + '</td></tr>';
         }
         html += '</tbody></table>';
       }
@@ -3366,22 +3394,22 @@ async function showRlsPolicies() {
     var r = await fetch('/api/rls-policies/' + encodeURIComponent(tblName), {credentials:'include'});
     var data = await r.json();
     var out = document.getElementById('output-area');
-    var html = '<div style="padding:12px"><h3 style="color:#f0a500;margin-bottom:12px">&#x1F6E1; RLS Policies: ' + escHtml(tblName) + '</h3>';
-    html += '<div style="margin-bottom:8px;color:#8b949e">RLS Status: ' + (data.rls_enabled ? '<b style="color:#3fb950">ENABLED</b>' : '<b style="color:#f38ba8">DISABLED</b>') + '</div>';
+    var html = '<div style="padding:12px"><h3 style="color:#f59e0b;margin-bottom:12px">&#x1F6E1; RLS Policies: ' + escHtml(tblName) + '</h3>';
+    html += '<div style="margin-bottom:8px;color:#94a3b8">RLS Status: ' + (data.rls_enabled ? '<b style="color:#10b981">ENABLED</b>' : '<b style="color:#ef4444">DISABLED</b>') + '</div>';
     var pols = data.policies || [];
     if (pols.length === 0) {
-      html += '<div style="color:#484f58;margin-bottom:8px">No policies defined.</div>';
-      html += '<div style="color:#8b949e;font-size:0.8rem">Create: <code style="color:#58a6ff">CREATE POLICY name ON ' + escHtml(tblName) + ' FOR ALL TO PUBLIC USING (expr);</code></div>';
+      html += '<div style="color:#475569;margin-bottom:8px">No policies defined.</div>';
+      html += '<div style="color:#94a3b8;font-size:0.8rem">Create: <code style="color:#00d4ff">CREATE POLICY name ON ' + escHtml(tblName) + ' FOR ALL TO PUBLIC USING (expr);</code></div>';
     } else {
       html += '<table><thead><tr><th>Policy</th><th>Command</th><th>Role</th><th>USING</th><th>WITH CHECK</th></tr></thead><tbody>';
       for (var i = 0; i < pols.length; i++) {
         var p = pols[i];
         html += '<tr>';
-        html += '<td style="color:#58a6ff;font-weight:600">' + escHtml(p.name) + '</td>';
-        html += '<td><span style="background:#21262d;padding:2px 6px;border-radius:3px;font-size:0.75rem;color:#f0a500">' + escHtml(p.command) + '</span></td>';
+        html += '<td style="color:#00d4ff;font-weight:600">' + escHtml(p.name) + '</td>';
+        html += '<td><span style="background:#1e2d40;padding:2px 6px;border-radius:3px;font-size:0.75rem;color:#f59e0b">' + escHtml(p.command) + '</span></td>';
         html += '<td>' + escHtml(p.role) + '</td>';
-        html += '<td style="font-family:monospace;font-size:0.8rem;color:#cdd6f4">' + escHtml(p['using']||'') + '</td>';
-        html += '<td style="font-family:monospace;font-size:0.8rem;color:#cdd6f4">' + escHtml(p.with_check||'-') + '</td>';
+        html += '<td style="font-family:monospace;font-size:0.8rem;color:#f8fafc">' + escHtml(p['using']||'') + '</td>';
+        html += '<td style="font-family:monospace;font-size:0.8rem;color:#f8fafc">' + escHtml(p.with_check||'-') + '</td>';
         html += '</tr>';
       }
       html += '</tbody></table>';
@@ -3417,9 +3445,9 @@ function getRlsBadge(tableName) {
   }
   if (!enabled && count === 0) return '';
   if (enabled && count > 0)
-    return '<span style="margin-left:auto;background:#1c3a2a;color:#3fb950;font-size:9px;padding:1px 5px;border-radius:8px;font-weight:600" title="' + count + ' RLS ' + (count===1?'Policy':'Policies') + '">' + count + ' RLS</span>';
+    return '<span style="margin-left:auto;background:rgba(16,185,129,.12);color:#10b981;font-size:9px;padding:1px 5px;border-radius:8px;font-weight:600" title="' + count + ' RLS ' + (count===1?'Policy':'Policies') + '">' + count + ' RLS</span>';
   if (enabled)
-    return '<span style="margin-left:auto;background:#1c3a2a;color:#3fb950;font-size:9px;padding:1px 5px;border-radius:8px" title="RLS enabled (no policies)">RLS</span>';
+    return '<span style="margin-left:auto;background:rgba(16,185,129,.12);color:#10b981;font-size:9px;padding:1px 5px;border-radius:8px" title="RLS enabled (no policies)">RLS</span>';
   return '';
 }
 
@@ -3430,7 +3458,7 @@ async function loadSidebarTables() {
     var data = await r.json();
     var tables = Array.isArray(data) ? data : (data.tables || []);
     var el = document.getElementById('sidebar-tables');
-    if (!tables.length) { el.innerHTML = '<div style="font-size:0.75rem;color:#484f58;padding:4px 8px">No tables</div>'; return; }
+    if (!tables.length) { el.innerHTML = '<div style="font-size:0.75rem;color:#475569;padding:4px 8px">No tables</div>'; return; }
     el.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
       var badge = getRlsBadge(name);
@@ -3458,7 +3486,7 @@ async function loadBrowserTables() {
       var name = typeof t === 'string' ? t : t.name;
       var badge = getRlsBadge(name);
       return '<button class="tbl-btn" style="display:flex;align-items:center" onclick="browseTable(\'' + escAttr(name) + '\',this)"><span>' + escHtml(name) + '</span>' + badge + '</button>';
-    }).join('') || '<div style="font-size:0.75rem;color:#484f58">No tables</div>';
+    }).join('') || '<div style="font-size:0.75rem;color:#475569">No tables</div>';
   } catch(e) {}
 }
 
@@ -3466,7 +3494,7 @@ async function browseTable(name, btn) {
   document.querySelectorAll('.tbl-btn').forEach(function(b){b.classList.remove('active');});
   if (btn) btn.classList.add('active');
   var detail = document.getElementById('browser-tbl-detail');
-  detail.innerHTML = '<div style="color:#8b949e;font-size:0.8rem">Loading...</div>';
+  detail.innerHTML = '<div style="color:#94a3b8;font-size:0.8rem">Loading...</div>';
   try {
     var descR = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DESCRIBE ' + name})});
     var dataR = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SELECT * FROM ' + name + ' LIMIT 50'})});
@@ -3474,7 +3502,7 @@ async function browseTable(name, btn) {
     var data = await dataR.json();
     var html = '<h3 style="margin-bottom:12px">&#x1F4CB; ' + escHtml(name) + '</h3>';
     if (desc.columns && desc.rows) {
-      html += '<div style="font-size:0.75rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
+      html += '<div style="font-size:0.75rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
       html += '<div id="result-table-wrap" style="margin-bottom:16px"><table><thead><tr>';
       desc.columns.forEach(function(c){ html += '<th>' + escHtml(typeof c==='string'?c:(c.name||String(c))) + '</th>'; });
       html += '</tr></thead><tbody>';
@@ -3486,7 +3514,7 @@ async function browseTable(name, btn) {
       html += '</tbody></table></div>';
     }
     var rows = data.rows||[], cols = data.columns||[];
-    html += '<div style="font-size:0.75rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Data (first 50 rows)</div>';
+    html += '<div style="font-size:0.75rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Data (first 50 rows)</div>';
     html += '<div id="result-table-wrap"><table><thead><tr>';
     cols.forEach(function(c){ html += '<th>' + escHtml(typeof c==='string'?c:(c.name||String(c))) + '</th>'; });
     html += '</tr></thead><tbody>';
@@ -3547,10 +3575,10 @@ function drawMonChart() {
   var ctx = canvas.getContext('2d');
   var W = canvas.width, H = canvas.height || 60;
   ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#0d1117';
+  ctx.fillStyle = '#080c18';
   ctx.fillRect(0, 0, W, H);
   var data = monQueryHistory;
-  if (!data.length) { ctx.fillStyle='#484f58'; ctx.font='10px monospace'; ctx.fillText('No data yet',8,H/2+4); return; }
+  if (!data.length) { ctx.fillStyle='#475569'; ctx.font='10px monospace'; ctx.fillText('No data yet',8,H/2+4); return; }
   var maxV = Math.max(1, Math.max.apply(null, data));
   var barW = Math.floor((W - 20) / 10);
   var pad = 4;
@@ -3560,13 +3588,13 @@ function drawMonChart() {
     var y = H - 8 - barH;
     var age = data.length - 1 - i;
     var alpha = 0.4 + 0.6 * (i / Math.max(1, data.length - 1));
-    ctx.fillStyle = 'rgba(63,185,80,' + alpha + ')';
+    ctx.fillStyle = 'rgba(0,212,255,' + alpha + ')';
     ctx.fillRect(x, y, barW, barH);
-    ctx.fillStyle = '#484f58';
+    ctx.fillStyle = '#475569';
     ctx.font = '8px monospace';
     ctx.fillText(data[i], x, H - 1);
   }
-  ctx.fillStyle = '#484f58';
+  ctx.fillStyle = '#475569';
   ctx.font = '9px monospace';
   ctx.fillText('max:'+maxV, W-40, 10);
 }
@@ -3582,12 +3610,12 @@ async function loadSlowQueriesMon() {
       el.textContent = 'No slow queries recorded.'; return;
     }
     var html = '<table style="width:100%;border-collapse:collapse;font-size:0.75rem">';
-    html += '<tr style="color:#636e7b;border-bottom:1px solid #21262d">';
+    html += '<tr style="color:#64748b;border-bottom:1px solid #1e2d40">';
     (d.columns||[]).forEach(function(c){ html += '<th style="text-align:left;padding:3px 6px">'+escHtml(c.name||c)+'</th>'; });
     html += '</tr>';
     d.rows.slice(0,8).forEach(function(row){
-      html += '<tr style="border-bottom:1px solid #161b22">';
-      rowVals(row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#e6edf3">'+escHtml(String(v||''))+'</td>'; });
+      html += '<tr style="border-bottom:1px solid #111827">';
+      rowVals(row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#f8fafc">'+escHtml(String(v||''))+'</td>'; });
       html += '</tr>';
     });
     html += '</table>';
@@ -3653,27 +3681,27 @@ function drawPoolChart(d) {
   var ctx = canvas.getContext('2d');
   var W = canvas.width, H = canvas.height || 90;
   ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#080c18'; ctx.fillRect(0, 0, W, H);
   var max = Math.max(1, d.max || 1);
   var active = d.active || 0, idle = d.idle || 0, waiting = d.waiting || 0;
   var barY = 18, barH = 28, pad = 10, barW = W - 2 * pad;
   // Stacked utilization bar: active | idle | free
   var wActive = Math.round(barW * active / max);
   var wIdle   = Math.round(barW * idle / max);
-  ctx.fillStyle = '#30363d'; ctx.fillRect(pad, barY, barW, barH);
-  ctx.fillStyle = '#3fb950'; ctx.fillRect(pad, barY, wActive, barH);
-  ctx.fillStyle = '#58a6ff'; ctx.fillRect(pad + wActive, barY, wIdle, barH);
-  ctx.fillStyle = '#e6edf3'; ctx.font = '11px monospace';
+  ctx.fillStyle = '#2d4060'; ctx.fillRect(pad, barY, barW, barH);
+  ctx.fillStyle = '#10b981'; ctx.fillRect(pad, barY, wActive, barH);
+  ctx.fillStyle = '#00d4ff'; ctx.fillRect(pad + wActive, barY, wIdle, barH);
+  ctx.fillStyle = '#f8fafc'; ctx.font = '11px monospace';
   var pct = Math.round(100 * active / max);
   ctx.fillText('Auslastung: ' + active + '/' + max + ' (' + pct + '%)', pad, 12);
   // Waiting bar (below, orange)
   if (waiting > 0) {
     var wWait = Math.min(barW, Math.round(barW * waiting / max));
-    ctx.fillStyle = '#f0a500'; ctx.fillRect(pad, barY + barH + 14, wWait, 12);
-    ctx.fillStyle = '#f0a500'; ctx.font = '10px monospace';
+    ctx.fillStyle = '#f59e0b'; ctx.fillRect(pad, barY + barH + 14, wWait, 12);
+    ctx.fillStyle = '#f59e0b'; ctx.font = '10px monospace';
     ctx.fillText(waiting + ' wartend', pad, barY + barH + 12);
   } else {
-    ctx.fillStyle = '#484f58'; ctx.font = '10px monospace';
+    ctx.fillStyle = '#475569'; ctx.font = '10px monospace';
     ctx.fillText('Keine wartenden Requests', pad, barY + barH + 24);
   }
 }
@@ -3715,7 +3743,7 @@ async function fetchVacuumStats() {
     var el = document.getElementById('vacuum-table-list');
     if (!tables.length) { el.textContent = 'Keine Tabellen.'; return; }
     var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">';
-    html += '<tr style="color:#636e7b;border-bottom:1px solid #21262d">'
+    html += '<tr style="color:#64748b;border-bottom:1px solid #1e2d40">'
           + '<th style="text-align:left;padding:5px 8px">Tabelle</th>'
           + '<th style="text-align:right;padding:5px 8px">Dead Tuples</th>'
           + '<th style="text-align:left;padding:5px 8px">Letzter Vacuum</th>'
@@ -3724,11 +3752,11 @@ async function fetchVacuumStats() {
       var name = typeof t === 'string' ? t : t.name;
       var dt = dead[name] != null ? dead[name] : (dead['public.' + name] != null ? dead['public.' + name] : 0);
       var lv = lastVac[name] || lastVac['public.' + name] || '&mdash;';
-      var dtColor = dt > 0 ? '#f0a500' : '#3fb950';
-      html += '<tr style="border-bottom:1px solid #161b22">'
-        + '<td style="padding:5px 8px;color:#e6edf3">' + escHtml(name) + '</td>'
+      var dtColor = dt > 0 ? '#f59e0b' : '#10b981';
+      html += '<tr style="border-bottom:1px solid #111827">'
+        + '<td style="padding:5px 8px;color:#f8fafc">' + escHtml(name) + '</td>'
         + '<td style="padding:5px 8px;text-align:right;color:' + dtColor + ';font-weight:600">' + dt + '</td>'
-        + '<td style="padding:5px 8px;color:#8b949e">' + lv + '</td>'
+        + '<td style="padding:5px 8px;color:#94a3b8">' + lv + '</td>'
         + '<td style="padding:5px 8px;text-align:right"><button class="vac-btn" onclick="runVacuumNow(\'' + escAttr(name) + '\', this)">VACUUM jetzt</button></td>'
         + '</tr>';
     });
@@ -3750,11 +3778,11 @@ async function runVacuumNow(table, btn) {
     var d = await r.json();
     if (msg) {
       msg.textContent = d.success !== false ? ('VACUUM ' + table + ' \u2713 ' + (d.message || '')) : ('Fehler: ' + (d.error || 'unbekannt'));
-      msg.style.color = d.success !== false ? '#3fb950' : '#f38ba8';
+      msg.style.color = d.success !== false ? '#10b981' : '#ef4444';
       setTimeout(function(){ msg.textContent = ''; }, 6000);
     }
   } catch(e) {
-    if (msg) { msg.textContent = 'Netzwerkfehler'; msg.style.color = '#f38ba8'; }
+    if (msg) { msg.textContent = 'Netzwerkfehler'; msg.style.color = '#ef4444'; }
   }
   if (btn) { btn.disabled = false; btn.textContent = 'VACUUM jetzt'; }
   fetchVacuumStats();
@@ -3786,17 +3814,17 @@ async function fetchReplicationStatus() {
     // Traffic light: green = in sync, yellow = lagging, red = disconnected
     var light = document.getElementById('rep-light');
     var text  = document.getElementById('rep-light-text');
-    var color = '#484f58', msg = 'Standalone \u2014 keine Replikation konfiguriert';
+    var color = '#475569', msg = 'Standalone \u2014 keine Replikation konfiguriert';
     if (role === 'replica') {
-      if (rep.master_down || !rep.running) { color = '#f38ba8'; msg = 'MASTER DOWN \u2014 Verbindung verloren (>30s)'; }
-      else if ((rep.lag_ms || 0) > 1000)   { color = '#f0a500'; msg = 'Lag: ' + rep.lag_ms + ' ms \u2014 Replica h\u00e4ngt hinterher'; }
-      else { color = '#3fb950'; msg = 'In Sync \u2014 Lag ' + (rep.lag_ms||0) + ' ms \u00b7 ' + (rep.status||''); }
+      if (rep.master_down || !rep.running) { color = '#ef4444'; msg = 'MASTER DOWN \u2014 Verbindung verloren (>30s)'; }
+      else if ((rep.lag_ms || 0) > 1000)   { color = '#f59e0b'; msg = 'Lag: ' + rep.lag_ms + ' ms \u2014 Replica h\u00e4ngt hinterher'; }
+      else { color = '#10b981'; msg = 'In Sync \u2014 Lag ' + (rep.lag_ms||0) + ' ms \u00b7 ' + (rep.status||''); }
     } else if (role === 'master') {
       var slaves = d.slaves || [];
       var connected = slaves.filter(function(s){ return s.connected; }).length;
-      if (connected === 0 && (d.connected_slaves||0) === 0) { color = '#f38ba8'; msg = 'Keine Replica verbunden'; }
-      else if (d.binlog_pos > d.max_slave_ack_pos) { color = '#f0a500'; msg = 'Replicas h\u00e4ngen hinterher (ack ' + d.max_slave_ack_pos + ' / pos ' + d.binlog_pos + ')'; }
-      else { color = '#3fb950'; msg = 'In Sync \u2014 ' + Math.max(connected, d.connected_slaves||0) + ' Replica(s) aktuell'; }
+      if (connected === 0 && (d.connected_slaves||0) === 0) { color = '#ef4444'; msg = 'Keine Replica verbunden'; }
+      else if (d.binlog_pos > d.max_slave_ack_pos) { color = '#f59e0b'; msg = 'Replicas h\u00e4ngen hinterher (ack ' + d.max_slave_ack_pos + ' / pos ' + d.binlog_pos + ')'; }
+      else { color = '#10b981'; msg = 'In Sync \u2014 ' + Math.max(connected, d.connected_slaves||0) + ' Replica(s) aktuell'; }
     }
     if (light) light.style.color = color;
     if (text) { text.textContent = msg; text.style.color = color; }
@@ -3810,17 +3838,17 @@ async function fetchReplicationStatus() {
         listEl.textContent = 'Keine Replicas registriert.';
       } else {
         var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">'
-          + '<tr style="color:#636e7b;border-bottom:1px solid #21262d">'
+          + '<tr style="color:#64748b;border-bottom:1px solid #1e2d40">'
           + '<th style="text-align:left;padding:5px 8px">Host</th>'
           + '<th style="text-align:right;padding:5px 8px">Ack-Position</th>'
           + '<th style="text-align:right;padding:5px 8px">Zuletzt gesehen</th>'
           + '<th style="text-align:left;padding:5px 8px">Status</th></tr>';
         slaves2.forEach(function(s) {
-          var st = s.connected ? '<span style="color:#3fb950">&#x25CF; verbunden</span>'
-                               : '<span style="color:#f38ba8">&#x25CF; getrennt</span>';
+          var st = s.connected ? '<span style="color:#10b981">&#x25CF; verbunden</span>'
+                               : '<span style="color:#ef4444">&#x25CF; getrennt</span>';
           var seen = s.ms_since_seen < 1000 ? 'gerade eben' : Math.round(s.ms_since_seen/1000) + 's';
-          html += '<tr style="border-bottom:1px solid #161b22">'
-            + '<td style="padding:5px 8px;color:#e6edf3">' + escHtml(s.host||'?') + '</td>'
+          html += '<tr style="border-bottom:1px solid #111827">'
+            + '<td style="padding:5px 8px;color:#f8fafc">' + escHtml(s.host||'?') + '</td>'
             + '<td style="padding:5px 8px;text-align:right">' + (s.ack_pos != null ? s.ack_pos : '--') + '</td>'
             + '<td style="padding:5px 8px;text-align:right">' + seen + '</td>'
             + '<td style="padding:5px 8px">' + st + '</td></tr>';
@@ -3835,10 +3863,10 @@ async function fetchReplicationStatus() {
       if (role === 'replica') {
         det.style.display = '';
         document.getElementById('rep-replica-info').innerHTML =
-          'Master: <b style="color:#e6edf3">' + escHtml(rep.master_host||'?') + ':' + (rep.master_port||'?') + '</b>'
-          + ' &middot; Status: <b style="color:#e6edf3">' + escHtml(rep.status||'?') + '</b>'
-          + ' &middot; Position: <b style="color:#e6edf3">' + (rep.position != null ? rep.position : '?') + '</b>'
-          + ' &middot; Letzter Sync: <b style="color:#e6edf3">' + (rep.ms_since_last_sync >= 0 ? rep.ms_since_last_sync + ' ms' : 'nie') + '</b>';
+          'Master: <b style="color:#f8fafc">' + escHtml(rep.master_host||'?') + ':' + (rep.master_port||'?') + '</b>'
+          + ' &middot; Status: <b style="color:#f8fafc">' + escHtml(rep.status||'?') + '</b>'
+          + ' &middot; Position: <b style="color:#f8fafc">' + (rep.position != null ? rep.position : '?') + '</b>'
+          + ' &middot; Letzter Sync: <b style="color:#f8fafc">' + (rep.ms_since_last_sync >= 0 ? rep.ms_since_last_sync + ' ms' : 'nie') + '</b>';
       } else det.style.display = 'none';
     }
   } catch(e) {
@@ -3859,7 +3887,7 @@ function saveHistory(sql, ms, ok) {
 function renderHistory() {
   var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
   var el = document.getElementById('history-list');
-  if (!hist.length) { el.innerHTML = '<div style="color:#484f58;font-size:0.85rem;padding:8px">No history yet.</div>'; return; }
+  if (!hist.length) { el.innerHTML = '<div style="color:#475569;font-size:0.85rem;padding:8px">No history yet.</div>'; return; }
   el.innerHTML = hist.map(function(h,i) {
     var badge = h.ok !== false
       ? '<span class="hist-badge ok">OK</span>'
@@ -3918,6 +3946,8 @@ async function loadTestBadge() {
     var d = await r.json();
     if (d.test_count != null)
       document.getElementById('test-badge').textContent = d.test_count + ' tests';
+    if (d.version)
+      document.querySelectorAll('.ms-version').forEach(function(el){ el.textContent = 'v' + d.version; });
   } catch(e) {}
 }
 
@@ -3964,10 +3994,10 @@ async function msSubmitLogin() {
   var u=document.getElementById('ms-lu').value.trim();
   var p=document.getElementById('ms-lp').value;
   var err=document.getElementById('ms-lerr');
-  if(!u||!p){err.style.color='#f38ba8';err.textContent='Enter username and password';return;}
-  err.style.color='#a6adc8';err.textContent='Signing in...';
+  if(!u||!p){err.style.color='#ef4444';err.textContent='Enter username and password';return;}
+  err.style.color='#94a3b8';err.textContent='Signing in...';
   var res=await msLogin(u,p);
-  if(res===true){err.textContent='';}else{err.style.color='#f38ba8';err.textContent=res;}
+  if(res===true){err.textContent='';}else{err.style.color='#ef4444';err.textContent=res;}
 }
 function updateUserBadge() {
   var ub=document.getElementById('ms-user-badge');
@@ -3977,15 +4007,15 @@ function updateUserBadge() {
   var rp=document.getElementById('rls-panel');
   if(rp){
     var tables=document.querySelectorAll('#sidebar-tables .tbl-btn');
-    var rlsHtml='<div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
-      +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="color:#3fb950;font-size:9px">●</span><span style="font-size:11px;color:#3fb950;font-weight:600">ACTIVE</span></div>'
-      +'<div style="font-size:10px;color:#8b949e;margin-bottom:3px">User: <b style="color:#cdd6f4">'+escHtml(msUser)+'</b></div>';
+    var rlsHtml='<div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
+      +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="color:#10b981;font-size:9px">●</span><span style="font-size:11px;color:#10b981;font-weight:600">ACTIVE</span></div>'
+      +'<div style="font-size:10px;color:#94a3b8;margin-bottom:3px">User: <b style="color:#f8fafc">'+escHtml(msUser)+'</b></div>';
     var enabledCount = (_rlsPoliciesCache.enabled_tables||[]).length;
     var totalPolicies = 0;
     var pols = _rlsPoliciesCache.policies || {};
     for (var k in pols) totalPolicies += pols[k].length;
-    rlsHtml += '<div style="font-size:10px;color:#8b949e;margin-bottom:2px">Tables: <b style="color:#58a6ff">'+enabledCount+'</b> protected</div>';
-    rlsHtml += '<div style="font-size:10px;color:#8b949e">Policies: <b style="color:#f0a500">'+totalPolicies+'</b> active</div>';
+    rlsHtml += '<div style="font-size:10px;color:#94a3b8;margin-bottom:2px">Tables: <b style="color:#00d4ff">'+enabledCount+'</b> protected</div>';
+    rlsHtml += '<div style="font-size:10px;color:#94a3b8">Policies: <b style="color:#f59e0b">'+totalPolicies+'</b> active</div>';
     rp.innerHTML = rlsHtml;
   }
 }
@@ -4109,7 +4139,7 @@ function drawSchemaLines(fkMap,vis) {
     var ft2=(_schemaData.tables||[]).find(function(t){return t.name===fk.from;});
     var tt2=(_schemaData.tables||[]).find(function(t){return t.name===fk.to;});
     var bothRls=ft2&&tt2&&ft2.rls_enabled&&tt2.rls_enabled;
-    var lc=bothRls?'#ff6b1a':'#30363d';
+    var lc=bothRls?'#00d4ff':'rgba(0,212,255,0.35)';
     var line=document.createElementNS(ns,'line');
     line.setAttribute('x1',fx);line.setAttribute('y1',fy);line.setAttribute('x2',tx);line.setAttribute('y2',ty);
     line.setAttribute('stroke',lc);line.setAttribute('stroke-width','1');line.setAttribute('stroke-dasharray','4,3');
@@ -4117,7 +4147,7 @@ function drawSchemaLines(fkMap,vis) {
     svg.appendChild(line);
     var mx=(fx+tx)/2,my=(fy+ty)/2;
     var text=document.createElementNS(ns,'text');
-    text.setAttribute('x',mx);text.setAttribute('y',my-4);text.setAttribute('fill','#6e7681');
+    text.setAttribute('x',mx);text.setAttribute('y',my-4);text.setAttribute('fill','#64748b');
     text.setAttribute('font-size','9');text.setAttribute('text-anchor','middle');text.setAttribute('font-family','-apple-system,sans-serif');
     text.classList.add('schema-line-label');text.dataset.from=fk.from;text.dataset.to=fk.to;text.style.pointerEvents='none';
     text.textContent=fk.fromCol;svg.appendChild(text);
@@ -4216,7 +4246,7 @@ function updateMinimap() {
   var offX = (mw - cW * scale) / 2, offY = (mh - cH * scale) / 2;
   // Draw FK lines
   var fi = buildFkMap();
-  ctx.strokeStyle = '#21262d';
+  ctx.strokeStyle = '#1e2d40';
   ctx.lineWidth = 0.5;
   fi.fkMap.forEach(function(fk) {
     var fp = _schemaPositions[fk.from], tp = _schemaPositions[fk.to];
@@ -4233,14 +4263,14 @@ function updateMinimap() {
     var rx = offX + (p.x - minX + pad) * scale;
     var ry = offY + (p.y - minY + pad) * scale;
     var rw = 200 * scale, rh = 120 * scale;
-    ctx.fillStyle = '#161b22';
-    ctx.strokeStyle = '#30363d';
+    ctx.fillStyle = '#111827';
+    ctx.strokeStyle = '#2d4060';
     ctx.lineWidth = 0.5;
     ctx.fillRect(rx, ry, rw, rh);
     ctx.strokeRect(rx, ry, rw, rh);
     // RLS dot
     var dotR = Math.max(2, 4 * scale);
-    ctx.fillStyle = t.rls_enabled ? '#3fb950' : '#484f58';
+    ctx.fillStyle = t.rls_enabled ? '#10b981' : '#475569';
     ctx.beginPath();
     ctx.arc(rx + dotR + 2, ry + dotR + 2, dotR, 0, Math.PI * 2);
     ctx.fill();
@@ -4259,7 +4289,7 @@ function updateMinimap() {
     var vry = offY + (vy - minY + pad) * scale;
     var vrw = vw * scale;
     var vrh = vh * scale;
-    ctx.strokeStyle = '#ff6b1a';
+    ctx.strokeStyle = '#00d4ff';
     ctx.lineWidth = 1.5;
     ctx.strokeRect(vrx, vry, vrw, vrh);
   }
@@ -4412,20 +4442,20 @@ async function savePolicyFromEditor(){
   var role=document.getElementById('schema-pe-role').value.trim()||'PUBLIC';
   var ue=document.getElementById('schema-pe-using').value.trim(),ce=document.getElementById('schema-pe-check').value.trim();
   var msg=document.getElementById('schema-pe-msg');
-  if(!name||!ue){msg.style.color='#f85149';msg.textContent='Name and USING required';return;}
+  if(!name||!ue){msg.style.color='#ef4444';msg.textContent='Name and USING required';return;}
   // Phase 173: Validate policy fields to prevent SQL injection
   var idRe=/^[a-zA-Z_][a-zA-Z0-9_]*$/;
-  if(!idRe.test(name)){msg.style.color='#f85149';msg.textContent='Invalid policy name (letters/digits/underscore only)';return;}
-  if(role&&!idRe.test(role)){msg.style.color='#f85149';msg.textContent='Invalid role name';return;}
-  if(ue.indexOf(';')>=0||ce.indexOf(';')>=0){msg.style.color='#f85149';msg.textContent='Semicolons not allowed in expressions';return;}
+  if(!idRe.test(name)){msg.style.color='#ef4444';msg.textContent='Invalid policy name (letters/digits/underscore only)';return;}
+  if(role&&!idRe.test(role)){msg.style.color='#ef4444';msg.textContent='Invalid role name';return;}
+  if(ue.indexOf(';')>=0||ce.indexOf(';')>=0){msg.style.color='#ef4444';msg.textContent='Semicolons not allowed in expressions';return;}
   await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'ALTER TABLE '+tbl+' ENABLE ROW LEVEL SECURITY'})});
   await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DROP POLICY '+name+' ON '+tbl})});
   var sql='CREATE POLICY '+name+' ON '+tbl+' FOR '+cmd+' TO '+role+' USING ('+ue+')';
   if(ce)sql+=' WITH CHECK ('+ce+')';
   try{var r=await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sql})});var data=await r.json();
-    if(data.error){msg.style.color='#f85149';msg.textContent='Error: '+data.error;}
-    else{msg.style.color='#3fb950';msg.textContent='Policy saved!';setTimeout(function(){closePolicyEditor();loadSchemaViz();},800);}
-  }catch(e){msg.style.color='#f85149';msg.textContent='Network error';}
+    if(data.error){msg.style.color='#ef4444';msg.textContent='Error: '+data.error;}
+    else{msg.style.color='#10b981';msg.textContent='Policy saved!';setTimeout(function(){closePolicyEditor();loadSchemaViz();},800);}
+  }catch(e){msg.style.color='#ef4444';msg.textContent='Network error';}
 }
 
 // Patch all fetch calls to include auth token + cookie credentials
@@ -4447,15 +4477,18 @@ window.fetch=function(url,opts){
 // ── Phase 158: Auth check on load ─────────────────────────────
 function showLoginPage(){
   var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='flex';
+  // Karte erst zeigen, wenn Auth-Check "nicht eingeloggt" ergab —
+  // verhindert Login-Flash fuer bereits eingeloggte User.
+  var c=document.getElementById('ms-login-card'); if(c) c.style.visibility='visible';
 }
 function hidLoginPage(){
   var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='none';
 }
 function msShowTab(tab){
-  document.getElementById('ms-tab-login').style.borderBottom=tab==='login'?'2px solid #a6e3a1':'2px solid transparent';
-  document.getElementById('ms-tab-reg').style.borderBottom=tab==='reg'?'2px solid #a6e3a1':'2px solid transparent';
-  document.getElementById('ms-tab-login').style.color=tab==='login'?'#cdd6f4':'#585b70';
-  document.getElementById('ms-tab-reg').style.color=tab==='reg'?'#cdd6f4':'#585b70';
+  document.getElementById('ms-tab-login').style.borderBottom=tab==='login'?'2px solid #00d4ff':'2px solid transparent';
+  document.getElementById('ms-tab-reg').style.borderBottom=tab==='reg'?'2px solid #00d4ff':'2px solid transparent';
+  document.getElementById('ms-tab-login').style.color=tab==='login'?'#f8fafc':'#475569';
+  document.getElementById('ms-tab-reg').style.color=tab==='reg'?'#f8fafc':'#475569';
   document.getElementById('ms-form-login').style.display=tab==='login'?'block':'none';
   document.getElementById('ms-form-reg').style.display=tab==='reg'?'block':'none';
   document.getElementById('ms-lerr').textContent='';
@@ -4476,13 +4509,16 @@ async function msSubmitRegister(){
       document.getElementById('ms-lp').value=p;
       msShowTab('login');
       var lerr=document.getElementById('ms-lerr');
-      if(lerr){lerr.style.color='#a6e3a1';lerr.textContent='Registered! Signing in...';}
+      if(lerr){lerr.style.color='#00d4ff';lerr.textContent='Registered! Signing in...';}
       setTimeout(msSubmitLogin,400);
     } else {
-      err.style.color='#f38ba8'; err.textContent=d.error||'Registration failed';
+      err.style.color='#ef4444'; err.textContent=d.error||'Registration failed';
     }
-  }catch(e){err.style.color='#f38ba8';err.textContent='Network error';}
+  }catch(e){err.style.color='#ef4444';err.textContent='Network error';}
 }
+// Back/Forward-Cache-Guard: Browser restauriert sonst eine eingefrorene
+// (evtl. ausgeloggte/veraltete) Seite aus dem bfcache — dann neu laden.
+window.addEventListener('pageshow', function(e){ if (e.persisted) window.location.reload(); });
 // Start: try cookie-based auto-login (survives page refresh), then show login if not authenticated
 fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/json'}})
   .then(r=>r.json()).then(d=>{
@@ -4494,53 +4530,53 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
   }).catch(()=>{ showLoginPage(); });
 </script>
 <!-- Phase 158: Full-screen Login Page (starts visible, hidden after auth) -->
-<div id="ms-login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:#11111b;z-index:9999;justify-content:center;align-items:center;">
-  <div style="background:#1e1e2e;border:1px solid #313244;border-radius:16px;padding:0;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.7);overflow:hidden">
+<div id="ms-login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(0,212,255,0.06),transparent),radial-gradient(ellipse 60% 50% at 80% 100%,rgba(124,58,237,0.06),transparent),#080c18;z-index:9999;justify-content:center;align-items:center;">
+  <div id="ms-login-card" style="visibility:hidden;background:rgba(17,24,39,0.9);backdrop-filter:blur(20px);border:1px solid #1e2d40;border-radius:16px;padding:0;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.7),0 0 60px rgba(0,212,255,0.08);overflow:hidden">
     <!-- Header -->
-    <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
-      <div style="line-height:0"><svg width="48" height="48" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg></div>
-      <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v10.3.0 &mdash; Multi-User Database</div>
+    <div style="background:rgba(13,18,36,0.8);padding:28px 32px 20px;text-align:center;border-bottom:1px solid #1e2d40">
+      <div><span style="display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#00d4ff,#0090cc);color:#080c18;font-size:26px;font-weight:800;box-shadow:0 0 30px rgba(0,212,255,0.3)">M</span></div>
+      <div style="font-size:22px;font-weight:700;color:#f8fafc;margin-top:10px;letter-spacing:-0.5px">MilanSQL</div>
+      <div style="color:#475569;font-size:11px;margin-top:4px"><span class="ms-version">v10.3.0</span> &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
-    <div style="display:flex;border-bottom:1px solid #313244">
+    <div style="display:flex;border-bottom:1px solid #1e2d40">
       <button id="ms-tab-login" onclick="msShowTab('login')"
-        style="flex:1;background:none;border:none;border-bottom:2px solid #a6e3a1;color:#cdd6f4;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s">Sign In</button>
+        style="flex:1;background:none;border:none;border-bottom:2px solid #00d4ff;color:#f8fafc;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s">Sign In</button>
       <button id="ms-tab-reg" onclick="msShowTab('reg')"
-        style="flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#585b70;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s">Register</button>
+        style="flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#475569;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s">Register</button>
     </div>
     <!-- Login Form -->
     <div id="ms-form-login" style="padding:24px 32px 28px">
       <input id="ms-lu" type="text" placeholder="Username" autocomplete="username"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .15s"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .2s"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'">
       <input id="ms-lp" type="password" placeholder="Password" autocomplete="current-password"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .15s"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'"
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .2s"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'"
         onkeydown="if(event.key==='Enter')msSubmitLogin()">
       <button onclick="msSubmitLogin()"
-        style="width:100%;background:#a6e3a1;color:#1e1e2e;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;letter-spacing:0.3px;transition:background .15s"
-        onmouseover="this.style.background='#94d68f'" onmouseout="this.style.background='#a6e3a1'">Sign In</button>
+        style="width:100%;background:#00d4ff;color:#080c18;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;letter-spacing:0.3px;transition:all .2s"
+        onmouseover="this.style.boxShadow='0 0 30px rgba(0,212,255,0.4)'" onmouseout="this.style.boxShadow='none'">Sign In</button>
       <div id="ms-lerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
-      <div style="margin-top:16px;text-align:center;font-size:11px;color:#45475a">
+      <div style="margin-top:16px;text-align:center;font-size:11px;color:#475569">
         Create an account or sign in to get started
       </div>
     </div>
     <!-- Register Form -->
     <div id="ms-form-reg" style="display:none;padding:24px 32px 28px">
       <input id="ms-ru" type="text" placeholder="Username" autocomplete="username"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'">
       <input id="ms-rp" type="password" placeholder="Password"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'">
       <input id="ms-rp2" type="password" placeholder="Confirm Password"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'"
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'"
         onkeydown="if(event.key==='Enter')msSubmitRegister()">
       <button onclick="msSubmitRegister()"
-        style="width:100%;background:#89b4fa;color:#1e1e2e;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s"
-        onmouseover="this.style.background='#74c7ec'" onmouseout="this.style.background='#89b4fa'">Create Account</button>
+        style="width:100%;background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s"
+        onmouseover="this.style.boxShadow='0 0 30px rgba(124,58,237,0.4)'" onmouseout="this.style.boxShadow='none'">Create Account</button>
       <div id="ms-rerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
     </div>
   </div>
@@ -5202,6 +5238,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         std::string body = "{"
             "\"status\":\"" + std::string(storageOk ? "healthy" : "degraded") + "\","
             "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
+            "\"version\":\"" + std::string(MILANSQL_VERSION) + "\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
                 "\"storage\":" + storageCheck + ","
@@ -5245,9 +5282,14 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(200, "{\"alive\":true}");
     }
 
-    if (req.path == "/webui") {
+    if (req.path == "/webui" || req.path.rfind("/webui/", 0) == 0) {
         std::string html = handleWebUI();
-        return buildHttpResponse(200, html, "text/html");
+        // Cache-Fix 2026-07: Browser cachten die WebUI aggressiv und
+        // zeigten nach Deploys/Login die alte Seite — hart verbieten.
+        return buildHttpResponse(200, html, "text/html",
+               "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+               "Pragma: no-cache\r\n"
+               "Expires: 0\r\n");
     }
 
     // Phase 163: Landing Page at /
@@ -5260,11 +5302,11 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             return "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/html; charset=utf-8\r\n"
                    "Content-Length: " + std::to_string(html.size()) + "\r\n"
-                   "Cache-Control: public, max-age=300\r\n"
+                   "Cache-Control: no-cache, must-revalidate\r\n"
                    "Connection: close\r\n\r\n" + html;
         }
         // Fallback: redirect to admin UI
-        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
     // Impressum (legal requirement for .de domains)
     if (req.path == "/impressum") {
@@ -5277,7 +5319,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(404, R"({"error":"Impressum not found"})");
     }
         if (req.path == "/dashboard") {
-        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
     // Phase 164: JS SDK at /sdk/milansql.js
     if (req.path == "/sdk/milansql.js") {

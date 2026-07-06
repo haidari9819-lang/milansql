@@ -2089,6 +2089,25 @@ public:
         for (auto& jc : joins)
             jc.table = resolveTableName(jc.table);
 
+        // Tenant-Fix: ON-Seiten referenzieren logische Namen
+        // ("demo_orders.id"), physisch heisst die Tabelle bei User-
+        // Isolation aber "u<id>_demo_orders" — Prefix ebenfalls
+        // aufloesen, sonst findet findQualColIdx die Spalte nicht.
+        // Nur ersetzen, wenn die aufgeloeste Tabelle existiert
+        // (Aliase wie "o" bleiben unangetastet).
+        auto resolveOnSide = [&](std::string& side) {
+            auto dot = side.rfind('.');
+            if (dot == std::string::npos) return;
+            std::string pfx = side.substr(0, dot);
+            std::string resolved = resolveTableName(pfx);
+            if (resolved != pfx && tables_.count(resolved))
+                side = resolved + "." + side.substr(dot + 1);
+        };
+        for (auto& jc : joins) {
+            resolveOnSide(jc.onLeft);
+            resolveOnSide(jc.onRight);
+        }
+
         const Table& base = getTable(baseName);
 
         // Startergebnis: Spalten qualifizieren

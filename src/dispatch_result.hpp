@@ -7,6 +7,7 @@
 
 #include "engine/engine.hpp"
 #include "parser/parser.hpp"
+#include "optimizer/table_stats.hpp"  // Optimizer Phase 1: echte Statistiken
 
 namespace milansql {
 
@@ -1219,21 +1220,26 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
-    // ── Phase 149: Advanced Statistics + Optimizer Hints ─────────
+    // ── Phase 149 / Optimizer Phase 1: Advanced Statistics ───────
+    // Konsolidierung: ANALYZE schreibt in den echten TableStatsManager
+    // (g_tableStats), nicht mehr in den Fake-Store engine.statsManager.
     case milansql::CommandType::ANALYZE_TABLE: {
-        // Phase 149: populate statsManager
         std::string tblTarget = !cmd.statsTable.empty() ? cmd.statsTable : cmd.tableName;
         if (!tblTarget.empty() && tblTarget != "*") {
-            try {
-                const auto& tbl = engine.selectAll(tblTarget);
-                std::vector<std::string> cols;
-                for (auto& c : tbl.columns()) cols.push_back(c.name);
-                engine.statsManager.analyzeTable(tblTarget, (long long)tbl.rows().size(), cols);
+            if (engine.tableExists(tblTarget)) {
+                const milansql::Table& tbl =
+                    engine.getTables().at(engine.resolveTableName(tblTarget));
+                milansql::g_tableStats.analyzeTable(tblTarget, tbl);
+                milansql::g_tableStats.saveStats();
                 qr.message = "ANALYZE 1";
-            } catch (...) {
+            } else {
                 qr.error = "Table not found: " + tblTarget;
             }
         } else {
+            // ANALYZE ohne Ziel → alle Tabellen
+            for (const auto& kv : engine.getTables())
+                milansql::g_tableStats.analyzeTable(kv.first, kv.second);
+            milansql::g_tableStats.saveStats();
             qr.message = "ANALYZE 1";
         }
         break;
@@ -1259,14 +1265,22 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // Optimizer Phase 1: liest jetzt aus dem echten TableStatsManager.
+    // Pages = geschätzte 4KB-Seiten aus realer Ø-Row-Breite (avgWidth).
     case milansql::CommandType::SHOW_TABLE_STATS: {
         qr.columns = {milansql::Column{"Table","TEXT"}, milansql::Column{"Rows","INT"},
-                      milansql::Column{"Pages","INT"}, milansql::Column{"LastAnalyzed","TEXT"}};
-        auto& all = engine.statsManager.getAllTableStats();
-        for (auto& [k, v] : all) {
-            if (!cmd.statsTable.empty() && v.tableName != cmd.statsTable) continue;
-            qr.rows.push_back(milansql::Row({v.tableName, std::to_string(v.rowCount),
-                                             std::to_string(v.pageCount), v.lastAnalyzed}));
+                      milansql::Column{"Pages","INT"}, milansql::Column{"LastAnalyzed","TEXT"},
+                      milansql::Column{"DeadRows","INT"}, milansql::Column{"Sampled","TEXT"}};
+        for (const auto& [k, v] : milansql::g_tableStats.all()) {
+            if (!cmd.statsTable.empty() && v.name != cmd.statsTable) continue;
+            double rowWidth = 0.0;
+            for (const auto& ckv : v.cols) rowWidth += ckv.second.avgWidth;
+            long long pages = (long long)((double)v.rowCount * rowWidth / 4096.0) + 1;
+            qr.rows.push_back(milansql::Row({v.name, std::to_string(v.rowCount),
+                                             std::to_string(pages),
+                                             v.lastAnalyzed.empty() ? "never" : v.lastAnalyzed,
+                                             std::to_string(v.deadRowCount),
+                                             v.sampled ? "yes" : "no"}));
         }
         break;
     }

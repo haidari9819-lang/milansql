@@ -3322,6 +3322,10 @@ public:
             // ANALYZE without table name → analyze all tables
             cmd.type = CommandType::ANALYZE_TABLE;
             cmd.tableName = "*";
+        } else if (kw0 == "ANALYZE" && tokens.size() >= 2) {
+            // Optimizer Phase 1: Postgres-Syntax ANALYZE <table>
+            cmd.type = CommandType::ANALYZE_TABLE;
+            cmd.tableName = tokens[1];
 
         // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
         // SET TRANSACTION ISOLATION LEVEL READ COMMITTED

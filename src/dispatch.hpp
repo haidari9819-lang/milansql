@@ -97,8 +97,8 @@ static AdaptiveStats g_adaptiveStats;
 // ── Phase 92: COPY FROM/TO — persistent stats ─────────────────
 static CopyManager g_copyManager;
 
-// ── Phase 86: Table Statistics Manager ───────────────────────
-static TableStatsManager g_tableStats;
+// Phase 86: g_tableStats lebt jetzt als inline-Variable in
+// optimizer/table_stats.hpp (Konsolidierung Optimizer Phase 1).
 
 // ── Phase 59: Replication helpers ────────────────────────────
 // Returns true if the current operation should be blocked (slave read-only)

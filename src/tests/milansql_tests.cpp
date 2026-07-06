@@ -4383,9 +4383,14 @@ static void testGroup61() {
         e("INSERT INTO bigtable VALUES (" + std::to_string(i) + ", 'v" + std::to_string(i) + "')");
     { auto r = e("ANALYZE TABLE bigtable");
       check(r.message == "ANALYZE 1", "ANALYZE bigtable -> ANALYZE 1"); }
+    // Optimizer Phase 1: Pages jetzt aus echter Ø-Row-Breite berechnet
+    // (rows * avgWidth / 4096), nicht mehr Fake-Heuristik rows/100.
+    // 200 Rows x ~5 B passen real in 1 Seite; Rows-Spalte muss exakt sein.
     { auto r = e("SHOW TABLE STATS FOR bigtable");
       int bigpages = (!r.rows.empty()) ? std::stoi(r.rows[0].values[2]) : 0;
-      check(bigpages >= 2, "bigtable pages >= 2 (200 rows / 100)"); }
+      check(bigpages >= 1, "bigtable pages >= 1 (echte Breitenberechnung)");
+      check(!r.rows.empty() && r.rows[0].values[1] == "200",
+            "bigtable SHOW TABLE STATS rowCount == 200 (echt)"); }
 }
 
 static void testGroup62() {
@@ -10484,6 +10489,213 @@ static void testGroup98() {
     }
 }
 
+// ============================================================
+// testGroup99 — Optimizer Phase 1: Statistics Collection
+// ANALYZE, Sampling, Index-Selektivität, Persistenz
+// ============================================================
+static void testGroup99() {
+    std::cout << "\n── testGroup99: Statistics Collection (Optimizer Phase 1) ──\n";
+    using namespace milansql;
+
+    Parser parser;
+    TableStatsManager mgr;
+
+    // ── ST #1: ANALYZE-Parsing (TABLE x / x / ohne Argument) ────
+    {
+        auto c1 = parser.parse("ANALYZE TABLE foo");
+        check(c1.type == CommandType::ANALYZE_TABLE && c1.tableName == "foo",
+              "ST #1a: ANALYZE TABLE foo geparst");
+        auto c2 = parser.parse("ANALYZE foo");
+        check(c2.type == CommandType::ANALYZE_TABLE && c2.tableName == "foo",
+              "ST #1b: ANALYZE foo (Postgres-Syntax) geparst");
+        auto c3 = parser.parse("ANALYZE");
+        check(c3.type == CommandType::ANALYZE_TABLE && c3.tableName == "*",
+              "ST #1c: ANALYZE ohne Argument = alle Tabellen");
+    }
+
+    // ── ST #2: ANALYZE auf leerer Tabelle ───────────────────────
+    {
+        std::vector<Column> cols = { {"id", "INT"}, {"name", "TEXT"} };
+        Table empty("g99_empty", cols);
+        mgr.analyzeTable("g99_empty", empty);
+        const TableStats* ts = mgr.getStats("g99_empty");
+        check(ts != nullptr && ts->rowCount == 0,
+              "ST #2a: leere Tabelle -> rowCount 0, kein Crash");
+        check(ts->cols.at("id").distinctCount == 0 &&
+              ts->cols.at("id").nullFrac == 0.0,
+              "ST #2b: leere Tabelle -> distinct 0, nullFrac 0");
+    }
+
+    // ── ST #3: bekannte Daten -> exakte Zahlen ──────────────────
+    {
+        std::vector<Column> cols = { {"id", "INT"}, {"city", "TEXT"} };
+        Table t("g99_known", cols);
+        // 10 Rows: id 2..11; city: 4x Berlin, 3x Rom, 1x Oslo, 2x NULL
+        const char* cities[10] = { "Berlin","Berlin","Berlin","Berlin",
+                                   "Rom","Rom","Rom","Oslo","NULL","NULL" };
+        for (int i = 0; i < 10; ++i)
+            t.insert(Row({ std::to_string(i + 2), cities[i] }));
+        mgr.analyzeTable("g99_known", t);
+        const TableStats* ts = mgr.getStats("g99_known");
+        check(ts->rowCount == 10, "ST #3a: rowCount == 10");
+        const ColumnStats& city = ts->cols.at("city");
+        check(city.distinctCount == 3, "ST #3b: city distinct == 3 (exakt)");
+        check(city.nullCount == 2 && std::abs(city.nullFrac - 0.2) < 1e-9,
+              "ST #3c: city nullCount 2, nullFrac 0.2");
+        const ColumnStats& id = ts->cols.at("id");
+        check(id.isNumeric && id.minVal == "2" && id.maxVal == "11",
+              "ST #3d: INT Min/Max numerisch (2/11, nicht lexikographisch)");
+        check(std::abs(city.mostCommonVals.at("Berlin") - 0.4) < 1e-9,
+              "ST #3e: MCV Berlin == 40%");
+        check(id.avgWidth > 0.9 && id.avgWidth < 2.1,
+              "ST #3f: avgWidth plausibel (1-2 Bytes fuer '2'..'11')");
+    }
+
+    // ── ST #4: MVCC — tote Rows werden nicht mitgezaehlt ────────
+    {
+        std::vector<Column> cols = { {"v", "INT"} };
+        Table t("g99_mvcc", cols);
+        for (int i = 0; i < 6; ++i) t.insert(Row({ std::to_string(i) }));
+        // 2 Rows als geloescht markieren
+        t.mutableRows()[0].xmax = 42;
+        t.mutableRows()[1].xmax = 42;
+        mgr.analyzeTable("g99_mvcc", t);
+        const TableStats* ts = mgr.getStats("g99_mvcc");
+        check(ts->rowCount == 4 && ts->deadRowCount == 2,
+              "ST #4: MVCC -> 4 live, 2 dead");
+    }
+
+    // ── ST #5: Index-Selektivität ───────────────────────────────
+    {
+        std::vector<Column> cols = { {"uid", "INT"}, {"status", "TEXT"} };
+        Table t("g99_idx", cols);
+        for (int i = 0; i < 100; ++i)
+            t.insert(Row({ std::to_string(i), (i % 2 == 0) ? "on" : "off" }));
+        t.createIndex({"uid"}, "ix_uid");
+        t.createIndex({"status"}, "ix_status");
+        mgr.analyzeTable("g99_idx", t);
+        const TableStats* ts = mgr.getStats("g99_idx");
+        check(ts->indexes.size() == 2, "ST #5a: 2 Index-Statistiken");
+        const IndexStats* iu = nullptr; const IndexStats* is = nullptr;
+        for (const auto& ix : ts->indexes) {
+            if (ix.indexName == "ix_uid")    iu = &ix;
+            if (ix.indexName == "ix_status") is = &ix;
+        }
+        check(iu && iu->distinctKeys == 100 &&
+              std::abs(iu->selectivity - 0.01) < 1e-9,
+              "ST #5b: unique Index -> 100 Keys, Selektivitaet 0.01");
+        check(is && is->distinctKeys == 2 &&
+              std::abs(is->avgRowsPerKey - 50.0) < 1e-9,
+              "ST #5c: 2-Werte-Index -> 2 Keys, ~50 Rows/Key");
+    }
+
+    // ── ST #6: Sampling bei grosser Tabelle (250k Rows) ─────────
+    {
+        std::vector<Column> cols = { {"val", "INT"}, {"opt", "TEXT"} };
+        Table t("g99_big", cols);
+        // val: 997 distinct Werte; opt: jede 5. Row NULL (Periode 5,
+        // teilerfremd zur Sampling-Schrittweite 2 -> kein Aliasing)
+        for (int i = 0; i < 250000; ++i)
+            t.insert(Row({ std::to_string(i % 997),
+                           (i % 5 == 0) ? "NULL" : "x" }));
+        mgr.analyzeTable("g99_big", t);
+        const TableStats* ts = mgr.getStats("g99_big");
+        check(ts->sampled && ts->sampledRows >= 100000 &&
+              ts->sampledRows < 250000,
+              "ST #6a: >100k Rows -> Sampling aktiv (>=100k Sample)");
+        check(ts->rowCount == 250000,
+              "ST #6b: rowCount exakt trotz Sampling");
+        const ColumnStats& val = ts->cols.at("val");
+        check(val.distinctCount >= 950 && val.distinctCount <= 1050,
+              "ST #6c: distinct-Schaetzung 997 +/- 5% (GEE)");
+        const ColumnStats& opt = ts->cols.at("opt");
+        check(opt.nullFrac > 0.18 && opt.nullFrac < 0.22,
+              "ST #6d: nullFrac-Schaetzung ~0.2");
+        // Reproduzierbarkeit: zweites ANALYZE liefert identische Werte
+        size_t d1 = val.distinctCount;
+        mgr.analyzeTable("g99_big", t);
+        check(mgr.getStats("g99_big")->cols.at("val").distinctCount == d1,
+              "ST #6e: ANALYZE deterministisch (gleicher Seed)");
+    }
+
+    // ── ST #7: Persistenz ueber Neustart (save -> neuer Manager) ─
+    {
+        const std::string path = "g99_stats_persist.tmp";
+        mgr.saveStats(path);
+        TableStatsManager mgr2;   // laedt default-Datei
+        mgr2.loadStats(path);     // + unsere Test-Stats
+        const TableStats* ts = mgr2.getStats("g99_known");
+        check(ts != nullptr && ts->rowCount == 10,
+              "ST #7a: rowCount ueberlebt Neustart");
+        check(ts->cols.at("city").distinctCount == 3 &&
+              ts->cols.at("city").nullCount == 2 &&
+              std::abs(ts->cols.at("city").nullFrac - 0.2) < 1e-9,
+              "ST #7b: distinct/null/nullFrac ueberleben Neustart");
+        check(ts->cols.at("id").minVal == "2" &&
+              ts->cols.at("id").maxVal == "11" &&
+              ts->cols.at("id").isNumeric,
+              "ST #7c: Min/Max/isNumeric ueberleben Neustart");
+        const TableStats* ti = mgr2.getStats("g99_idx");
+        bool idxOk = false;
+        for (const auto& ix : ti->indexes)
+            if (ix.indexName == "ix_uid" && ix.distinctKeys == 100 &&
+                std::abs(ix.selectivity - 0.01) < 1e-9) idxOk = true;
+        check(idxOk, "ST #7d: Index-Selektivitaet ueberlebt Neustart");
+        check(mgr2.getStats("g99_big")->sampled,
+              "ST #7e: sampled-Flag ueberlebt Neustart");
+        std::remove(path.c_str());
+    }
+
+    // ── ST #8: Selektivitaetsschaetzung nutzt neue Stats ────────
+    {
+        double sel = mgr.estimateSelectivity("g99_known", "city", "=", "Berlin");
+        check(std::abs(sel - 0.4) < 1e-9,
+              "ST #8a: estimateSelectivity city='Berlin' == 0.4 (MCV)");
+        double seln = mgr.estimateSelectivity("g99_known", "city", "IS NULL", "");
+        check(std::abs(seln - 0.2) < 1e-9,
+              "ST #8b: IS NULL Selektivitaet == nullFrac 0.2");
+    }
+
+    // ── ST #9: Konsolidierung — SHOW TABLE STATS liest echte Stats ─
+    // (Fake-Store aus Phase 149 entfernt; ANALYZE + SHOW TABLE STATS
+    //  laufen jetzt beide ueber g_tableStats)
+    {
+        Engine eng;
+        auto e = [&](const std::string& sql) {
+            return dispatch(parser.parse(sql), eng);
+        };
+        e("CREATE TABLE g99_show (id INT, tag TEXT)");
+        e("INSERT INTO g99_show VALUES (1, 'a')");
+        e("INSERT INTO g99_show VALUES (2, 'a')");
+        e("INSERT INTO g99_show VALUES (3, 'b')");
+        e("INSERT INTO g99_show VALUES (4, NULL)");
+
+        auto r1 = e("ANALYZE TABLE g99_show");
+        check(r1.message == "ANALYZE 1",
+              "ST #9a: ANALYZE TABLE ueber dispatch() -> ANALYZE 1");
+
+        // ANALYZE hat den ECHTEN TableStatsManager befuellt
+        const TableStats* ts = g_tableStats.getStats("g99_show");
+        check(ts != nullptr && ts->rowCount == 4 &&
+              ts->cols.at("tag").distinctCount == 2 &&
+              ts->cols.at("tag").nullCount == 1,
+              "ST #9b: dispatch-ANALYZE befuellt g_tableStats (4 Rows, 2 distinct, 1 NULL)");
+
+        auto r2 = e("SHOW TABLE STATS FOR g99_show");
+        check(!r2.rows.empty() && r2.rows[0].values[0] == "g99_show" &&
+              r2.rows[0].values[1] == "4",
+              "ST #9c: SHOW TABLE STATS zeigt echten rowCount 4");
+        check(!r2.rows.empty() && r2.rows[0].values[3] != "never" &&
+              r2.rows[0].values[3].size() >= 19,
+              "ST #9d: LastAnalyzed = echter Zeitstempel (nicht hardcoded)");
+        check(r2.columns.size() == 6 &&
+              r2.columns[4].name == "DeadRows" && r2.columns[5].name == "Sampled" &&
+              !r2.rows.empty() &&
+              r2.rows[0].values[4] == "0" && r2.rows[0].values[5] == "no",
+              "ST #9e: neue Spalten DeadRows=0, Sampled=no");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -10774,6 +10986,9 @@ int main() {
     }
     try { testGroup98(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 98 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup99(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 99 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

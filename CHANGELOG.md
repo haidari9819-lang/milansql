@@ -2,6 +2,45 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v10.2.0] — 2026-07-06 — "Query Optimizer Phase 1: Statistics Collection"
+
+Foundation for the upcoming cost-based query optimizer.
+
+### Added
+- **Real column statistics** in `TableStatsManager` (src/optimizer/table_stats.hpp):
+  cardinality (n_distinct), null fraction, avg width (bytes), numeric-aware
+  min/max, MCVs, equi-depth histogram — MVCC-correct (dead rows excluded)
+- **Index statistics**: distinct keys, selectivity (1/keys), avg rows per key —
+  including multi-column indexes
+- **Sampling for large tables**: full scan up to 100k rows (exact stats); above
+  that, systematic sampling with n = clamp(N/10, 100k, 1M) and a deterministic
+  seed (reproducible ANALYZE). Distinct counts extrapolated via the GEE
+  estimator; null_frac/MCV frequencies taken as direct sample fractions
+- **`ANALYZE <table>`** (Postgres syntax) in addition to `ANALYZE TABLE x`
+  and bare `ANALYZE` (all tables)
+- Persistence: `database.table_stats` extended with META/IDX records
+  (backward compatible — old files still load)
+- testGroup99: 32 checks (empty table, exact cardinality, MVCC, index
+  selectivity, 250k-row sampling accuracy, determinism, restart persistence,
+  store consolidation)
+
+### Changed
+- **Stats store consolidation**: the Phase-149 fake statistics store
+  (hardcoded estimates in src/stats/statistics_manager.hpp) no longer serves
+  numbers. `ANALYZE` and `SHOW TABLE STATS` now read/write the real
+  `TableStatsManager` exclusively. `StatisticsManager` remains only as the
+  metadata catalog for `CREATE STATISTICS` definitions (pg_statistic_ext
+  analog)
+- `SHOW TABLE STATS`: real row counts, real last-analyzed timestamp, page
+  estimate derived from measured avg row width; new columns DeadRows, Sampled
+
+### Fixed (in statistics collection)
+- Dead MVCC row versions were counted as live rows
+- `"NULL"` literal was not recognized as NULL (only empty string)
+- Min/Max compared lexicographically on numeric columns ("9" > "10")
+
+
+
 ## [v10.1.1] — 2026-07-06 — "Quality & Stability Audit"
 
 Full 5-step audit (test coverage, crash scenarios, ASan leak detection, fuzzing, fixes).

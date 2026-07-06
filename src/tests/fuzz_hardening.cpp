@@ -11,9 +11,12 @@
 #include <sstream>
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
+#include <fstream>
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
 #include "../dispatch_result.hpp"
+#include "../wal/wal_recovery.hpp"
 
 static std::mutex printMtx;
 static std::atomic<int> totalSurvived{0};
@@ -322,6 +325,76 @@ static int runRecoveryChaos() {
     return 2000;
 }
 
+// ─── PART D: WAL Corruption Fuzz (500 Iterationen) ─────────────────────
+// Zufaellig korrumpierte WAL-Dateien duerfen die Recovery niemals crashen.
+// Exceptions werden gezaehlt (Recovery sollte Garbage still verwerfen).
+static int g_walFuzzExceptions = 0;
+static int runWalCorruptionFuzz() {
+    std::mt19937 rng(4242);
+    int survived = 0;
+    const int ITER = 500;
+    for (int it = 0; it < ITER; ++it) {
+        milansql::Engine e;
+        safeExecute(e, "CREATE TABLE wf (id INT, v TEXT)");
+
+        // Gueltiges WAL mit 1-4 committed Transaktionen bauen
+        std::string wal;
+        int txs = 1 + (int)(rng() % 4);
+        for (int t = 1; t <= txs; ++t) {
+            wal += "TX_BEGIN:" + std::to_string(t) + "\n";
+            int ops = 1 + (int)(rng() % 3);
+            for (int o = 0; o < ops; ++o)
+                wal += "OP 0 public.wf\nVAL " + std::to_string(rng() % 1000) +
+                       "\nVAL fuzz" + std::to_string(o) + "\n---\n";
+            std::string cl = "TX_COMMIT:" + std::to_string(t);
+            wal += cl + "\nCRC:" +
+                   std::to_string(milansql::WalRecovery::walCrc32(cl)) + "\n";
+        }
+
+        // Zufaellige Korruption
+        switch (rng() % 6) {
+            case 0:  // Bit-Flips
+                for (int k = 0; k < 5 && !wal.empty(); ++k)
+                    wal[rng() % wal.size()] ^= (char)(1 << (rng() % 8));
+                break;
+            case 1:  // Truncation an beliebiger Stelle
+                wal = wal.substr(0, rng() % (wal.size() + 1));
+                break;
+            case 2:  // Garbage-Zeilen einfuegen
+                wal.insert(rng() % (wal.size() + 1),
+                           "\nOP 99 kaputt\nVAL \x01\x02\nCRC:keinezahl\n");
+                break;
+            case 3:  // Ueberlange Zahlen (stoull-Overflow)
+                wal += "TX_BEGIN:99999999999999999999999\nOP 0 public.wf\n"
+                       "VAL 1\n---\nTX_COMMIT:99999999999999999999999\nCRC:1\n";
+                break;
+            case 4: {  // komplett zufaellige Bytes
+                std::string g;
+                for (int k = 0; k < 200; ++k)
+                    g += (char)(rng() % 256);
+                wal = g;
+                break;
+            }
+            default:  // Duplikation (doppelte TX-IDs, doppelte Commits)
+                wal += wal;
+                break;
+        }
+
+        const std::string path = "fuzz_wal_corrupt.wal";
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << wal; }
+        try {
+            milansql::WalRecovery rec;
+            rec.recover(e, path);
+            ++survived;
+        } catch (...) {
+            ++g_walFuzzExceptions;
+            ++survived;  // Exception ok, Crash nicht
+        }
+        std::remove(path.c_str());
+    }
+    return survived;
+}
+
 // ─── Edge Cases ─────────────────────────────────────────────────────────
 struct EdgeResult { std::string name; bool passed; std::string detail; };
 
@@ -581,6 +654,10 @@ int main() {
     int s5 = runRecoveryChaos();
     std::cout << " done.\n";
 
+    std::cout << "Running WAL Corruption Fuzz (500 WALs)..." << std::flush;
+    int s6 = runWalCorruptionFuzz();
+    std::cout << " done.\n";
+
     // Part B: Edge cases
     std::cout << "Running Edge Cases..." << std::flush;
     auto edgeResults = runEdgeCases();
@@ -599,12 +676,15 @@ int main() {
 
     // Results
     std::cout << "\n============================================\n";
-    bool allPass = (s1==2000 && s2==2000 && s3==2000 && s4==2000 && s5==2000 && edgeFailed==0 && monkeyAlive);
+    bool allPass = (s1==2000 && s2==2000 && s3==2000 && s4==2000 && s5==2000 &&
+                    s6==500 && edgeFailed==0 && monkeyAlive);
     std::cout << "[" << (s1==2000?"PASS":"FAIL") << "] Syntax Chaos:      " << s1 << "/2000 survived\n";
     std::cout << "[" << (s2==2000?"PASS":"FAIL") << "] Type Chaos:        " << s2 << "/2000 survived\n";
     std::cout << "[" << (s3==2000?"PASS":"FAIL") << "] Structure Chaos:   " << s3 << "/2000 survived\n";
     std::cout << "[" << (s4==2000?"PASS":"FAIL") << "] Concurrency Chaos: " << s4 << "/2000, 0 deadlocks\n";
     std::cout << "[" << (s5==2000?"PASS":"FAIL") << "] Recovery Chaos:    " << s5 << "/2000 survived\n";
+    std::cout << "[" << (s6==500?"PASS":"FAIL") << "] WAL Corruption:    " << s6
+              << "/500 survived (" << g_walFuzzExceptions << " exceptions)\n";
     std::cout << "[" << (edgeFailed==0?"PASS":"FAIL") << "] Edge Cases:        " << edgePassed << "/" << edgeResults.size() << " correct\n";
     std::cout << "[" << (monkeyAlive?"PASS":"FAIL") << "] Chaos Monkey:      10s, engine " << (monkeyAlive?"alive":"DEAD") << "\n";
     std::cout << "============================================\n";

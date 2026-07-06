@@ -132,6 +132,24 @@ public:
         return txList;
     }
 
+    // Audit Bug #24: reverse of Engine::walEscape — restores
+    // backslash/newline/CR that appendWal escaped so multi-line
+    // values survive crash recovery intact.
+    static std::string walUnescape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                char n = s[i + 1];
+                if (n == 'n')  { out += '\n'; ++i; continue; }
+                if (n == 'r')  { out += '\r'; ++i; continue; }
+                if (n == '\\') { out += '\\'; ++i; continue; }
+            }
+            out += s[i];
+        }
+        return out;
+    }
+
     // ── Delete WAL file ─────────────────────────────────────────
     void clearWal(const std::string& path) {
         std::remove(path.c_str());
@@ -160,7 +178,7 @@ private:
                 op.tableName = rest.substr(sp + 1);
                 hasOp = true;
             } else if (line.size() > 4 && line.substr(0, 4) == "VAL ") {
-                op.values.push_back(line.substr(4));
+                op.values.push_back(walUnescape(line.substr(4)));
             } else if (line.size() > 4 && line.substr(0, 4) == "SET ") {
                 // SET <col> <rest_is_value>
                 std::string rest = line.substr(4);
@@ -169,7 +187,7 @@ private:
                     op.setCol = rest;
                 } else {
                     op.setCol = rest.substr(0, sp);
-                    op.setVal = rest.substr(sp + 1);
+                    op.setVal = walUnescape(rest.substr(sp + 1));
                 }
             } else if (line.size() > 6 && line.substr(0, 6) == "WHERE ") {
                 // WHERE <col> <rest_is_value>
@@ -179,7 +197,7 @@ private:
                     op.whereCol = rest;
                 } else {
                     op.whereCol = rest.substr(0, sp);
-                    op.whereVal = rest.substr(sp + 1);
+                    op.whereVal = walUnescape(rest.substr(sp + 1));
                 }
             } else if (line.size() > 6 && line.substr(0, 6) == "ALTER ") {
                 std::istringstream ss(line.substr(6));

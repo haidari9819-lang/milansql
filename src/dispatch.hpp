@@ -898,6 +898,13 @@ static inline milansql::Table dispatch_executeSelectToTable(
             for (const auto& tbl : fdwToClean)
                 engine.dropTempTable(tbl);
 
+            // COUNT(*) ueber JOIN-Ergebnis
+            if (cmd.isCount) {
+                milansql::Table cntT("", { {"count", "INT"} });
+                cntT.insert(milansql::Row({ std::to_string(result.rowCount()) }));
+                return cntT;
+            }
+
             // Clean up FDW registrations done, now post-process the JOIN result
 
             // Phase 167: JOIN + GROUP BY — register join result as temp, run groupBy
@@ -3196,6 +3203,13 @@ inline bool dispatchCommand(
                     cmd.whereConds, cmd.whereLogic);
                 for (const auto& tbl : fdwToClean)
                     engine.dropTempTable(tbl);
+
+                // COUNT(*) ueber JOIN-Ergebnis
+                if (cmd.isCount) {
+                    std::cout << "\n  COUNT(*) = " << result.rowCount()
+                              << " (JOIN '" << cmd.tableName << "')\n\n";
+                    break;
+                }
 
                 // Phase 167: JOIN + GROUP BY
                 if (cmd.isGroupBy) {

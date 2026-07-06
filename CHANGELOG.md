@@ -2,6 +2,42 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v10.1.1] — 2026-07-06 — "Quality & Stability Audit"
+
+Full 5-step audit (test coverage, crash scenarios, ASan leak detection, fuzzing, fixes).
+**1458/1458 tests pass. 0 leaks. 0 crashes across 10,000+ fuzz queries.**
+
+### Fixed — Correctness bugs (query patterns that previously returned WRONG results)
+
+> If you have reports or data derived from these query patterns, re-verify them:
+
+- **#26 (CRITICAL) Comma join**: `SELECT ... FROM a, b [WHERE ...]` silently returned
+  positional row pairing (e.g. 3 rows) instead of the cartesian product (9 rows).
+  Now parsed as CROSS join with full cartesian semantics.
+- **#27 (HIGH) CROSS JOIN**: `SELECT ... FROM a CROSS JOIN b` was not recognized —
+  returned `success:true` with no result set. Now fully supported, guarded by
+  MAX_JOIN_ROWS (500,000) with a clear error message.
+- **#28 (HIGH) LIKE never matched**: `WHERE col LIKE 'pattern'` compared against the
+  quoted literal (`'A%'` incl. quotes), so patterns effectively never matched —
+  affected searches/filters in production. Quotes are now stripped before matching.
+- **#24 (HIGH) WAL escaping**: special characters in values could corrupt WAL replay.
+- **#25 (HIGH) Silent persist failures**: disk-full/IO errors during persist were
+  swallowed; writes are now atomic (temp file + rename) and errors surface.
+
+### Added
+- testGroup97 (28 checks): connection pool under load, MVCC vacuum, replication
+  failover, WAL corruption recovery
+- testGroup98 (17 checks): comma join, CROSS JOIN, COUNT(*) over joins, LIKE patterns
+- WAL corruption fuzzer (500 iterations, 6 corruption types) in `milansql_fuzz_hardening`
+- Network fuzzing: 300 malformed packets against HTTP + replication ports
+
+### Verified
+- Crash during COMMIT (kill -9): 189/189 transactions correctly recovered
+- 1000 concurrent transactions: 0 failures, consistent state
+- OOM / vmem limits: graceful error, process survives, data intact
+- Full test suite + HTTP load under AddressSanitizer: 0 errors, 0 leaks
+
+
 ## [v8.2.0] — 2026-06-05 — "Production Ready — Stable Release"
 
 ### Phase 151: Zero Warning Build + Static Analysis

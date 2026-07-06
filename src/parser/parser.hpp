@@ -1087,11 +1087,33 @@ public:
             auto st = tokenize(input);
             // Only route to JOIN parser if the outermost statement is a SELECT
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                bool routeJoin = false;
                 for (const auto& tok : st) {
-                    if (toUpper(tok) == "JOIN") {
-                        parseJoinQuery(input, cmd);
-                        return cmd;
+                    if (toUpper(tok) == "JOIN") { routeJoin = true; break; }
+                }
+                // Bug #26: komma-getrennte FROM-Liste (FROM a, b) = CROSS JOIN.
+                // Nur Kommas auf Klammer-Tiefe 0 innerhalb der FROM-Klausel zaehlen.
+                if (!routeJoin) {
+                    auto ftr = tokenizeFull(input);
+                    int depth = 0; bool inFrom = false;
+                    for (const auto& tok : ftr) {
+                        if (tok == "(") { ++depth; continue; }
+                        if (tok == ")") { --depth; continue; }
+                        if (depth > 0) continue;
+                        std::string u = toUpper(tok);
+                        if (!inFrom) {
+                            if (u == "FROM") inFrom = true;
+                            continue;
+                        }
+                        if (u == "WHERE" || u == "GROUP" || u == "HAVING" ||
+                            u == "ORDER" || u == "LIMIT" || u == "UNION" ||
+                            u == "EXCEPT" || u == "INTERSECT") break;
+                        if (tok == ",") { routeJoin = true; break; }
                     }
+                }
+                if (routeJoin) {
+                    parseJoinQuery(input, cmd);
+                    return cmd;
                 }
             }
         }
@@ -6681,7 +6703,8 @@ private:
             if (next != "INNER" && next != "LEFT" && next != "RIGHT" &&
                 next != "FULL" && next != "JOIN" && next != "ON" &&
                 next != "WHERE" && next != "ORDER" && next != "LIMIT" &&
-                next != "OUTER" && ft[fromPos + 2] != "," &&
+                next != "OUTER" && next != "CROSS" && next != "GROUP" &&
+                next != "HAVING" && ft[fromPos + 2] != "," &&
                 ft[fromPos + 2] != "(" && ft[fromPos + 2] != ")") {
                 cmd.tableAlias = ft[fromPos + 2];
             }
@@ -6711,12 +6734,47 @@ private:
             pushCurJ();
         }
 
+        // COUNT(*) ueber JOIN (ohne GROUP BY): als Count markieren,
+        // statt "COUNT *" als (unprojizierbare) Spalte zu behandeln.
+        if (groupPos == N && cmd.selectColumns.size() == 1) {
+            std::string cu = toUpper(cmd.selectColumns[0]);
+            if (cu == "COUNT *" || cu == "COUNT(*)") {
+                cmd.isCount = true;
+                cmd.selectColumns.clear();
+            }
+        }
+
         // JOIN-Klauseln scannen (zwischen Basistabelle und WHERE/ORDER/LIMIT/GROUP)
         size_t scanEnd = std::min({wherePos, groupPos, orderPos, limitPos, N});
         size_t i = fromPos + 2;
         std::string curType = "INNER";  // Standard-JOIN-Typ
+        int scanDepth = 0;              // Klammer-Tiefe: JOIN/Komma nur auf Ebene 0
+
+        // Hilfsfunktion: Tabelle [alias] ohne ON konsumieren (CROSS/Komma-Join)
+        auto parseCrossEntry = [&](size_t start) -> size_t {
+            if (start >= scanEnd) { cmd.type = CommandType::UNKNOWN; return scanEnd; }
+            JoinClause jc;
+            jc.joinType = "CROSS";
+            jc.table    = ft[start];
+            size_t nx = start + 1;
+            if (nx < scanEnd) {
+                std::string nu = toUpper(ft[nx]);
+                if (nu != "JOIN" && nu != "LEFT" && nu != "INNER" && nu != "RIGHT" &&
+                    nu != "FULL" && nu != "OUTER" && nu != "CROSS" && nu != "ON" &&
+                    ft[nx] != "," && ft[nx] != "(" && ft[nx] != ")") {
+                    jc.tableAlias = ft[nx];
+                    ++nx;
+                }
+            }
+            cmd.joinClauses.push_back(std::move(jc));
+            return nx;
+        };
 
         while (i < scanEnd) {
+            if (ft[i] == "(") { ++scanDepth; ++i; continue; }
+            if (ft[i] == ")") { --scanDepth; ++i; continue; }
+            if (scanDepth > 0) { ++i; continue; }
+
             std::string u = toUpper(ft[i]);
 
             if (u == "LEFT")  { curType = "LEFT";  ++i; continue; }
@@ -6724,8 +6782,24 @@ private:
             if (u == "RIGHT") { curType = "RIGHT"; ++i; continue; }
             if (u == "FULL")  { curType = "FULL";  ++i; continue; }
             if (u == "OUTER") {                    ++i; continue; }  // FULL OUTER JOIN
+            if (u == "CROSS") { curType = "CROSS"; ++i; continue; }
+
+            // Bug #26: Komma-Join (FROM a, b, c) = kartesisches Produkt
+            if (ft[i] == ",") {
+                i = parseCrossEntry(i + 1);
+                if (cmd.type == CommandType::UNKNOWN) return;
+                curType = "INNER";
+                continue;
+            }
 
             if (u == "JOIN") {
+                // Bug #27: CROSS JOIN hat kein ON
+                if (curType == "CROSS") {
+                    i = parseCrossEntry(i + 1);
+                    if (cmd.type == CommandType::UNKNOWN) return;
+                    curType = "INNER";
+                    continue;
+                }
                 // Erwartet: table [alias] ON left = right
                 if (i + 3 >= scanEnd) { cmd.type = CommandType::UNKNOWN; return; }
 

@@ -2186,6 +2186,34 @@ public:
             for (const auto& c : right.columns())
                 newCols.emplace_back(jc.table + "." + c.name, c.type);
 
+            // ── CROSS JOIN: kartesisches Produkt, kein ON ─────────────
+            if (jc.joinType == "CROSS") {
+                // Vorab-Check: Ergebnisgroesse begrenzen (OOM-Schutz)
+                size_t liveRight = 0;
+                for (const auto& rr : right.rows())
+                    if (rr.xmax == 0) ++liveRight;
+                if (liveRight > 0 &&
+                    current.rowCount() > MAX_JOIN_ROWS / liveRight)
+                    throw std::runtime_error(
+                        "CROSS JOIN result exceeds maximum row limit ("
+                        + std::to_string(MAX_JOIN_ROWS)
+                        + " rows). Add WHERE conditions or use LIMIT.");
+
+                Table next("", newCols);
+                for (const auto& lrow : current.rows()) {
+                    for (const auto& rrow : right.rows()) {
+                        if (rrow.xmax != 0) continue;  // dead rows ueberspringen
+                        std::vector<std::string> vals;
+                        vals.reserve(lrow.values.size() + rrow.values.size());
+                        vals.insert(vals.end(), lrow.values.begin(), lrow.values.end());
+                        vals.insert(vals.end(), rrow.values.begin(), rrow.values.end());
+                        next.insert(Row(vals));
+                    }
+                }
+                current = std::move(next);
+                continue;
+            }
+
             // ON-Seiten zuordnen: eine Seite gehört zur rechten Tabelle, die andere
             // zum bisherigen Ergebnis. Seiten ggf. tauschen.
             // For schema-qualified refs like "shop.kunden.id", table = "shop.kunden"
@@ -7235,7 +7263,10 @@ private:
     static bool compareValues(const std::string& a,
                                const std::string& op,
                                const std::string& b) {
-        if (op == "LIKE")        return likeMatch(a, b);
+        // Bug #28: Quotes strippen, sonst matcht das Pattern 'A%' nie
+        if (op == "LIKE")
+            return likeMatch(milansql::dateutils::stripQuotes(a),
+                             milansql::dateutils::stripQuotes(b));
         if (op == "IS NULL")     return a == "NULL";
         if (op == "IS NOT NULL") return a != "NULL";
         // Phase 64: REGEXP / NOT REGEXP
@@ -7557,6 +7588,22 @@ private:
 
     // ── Phase 17: WAL + Transaktion (privat) ─────────────────
 
+    // Audit Bug #24: escape backslash/newline/CR in WAL values.
+    // The WAL is a line-based text format — an unescaped '\n' inside a
+    // value splits one VAL line into two, and WalRecovery silently drops
+    // the second half (data loss after crash recovery).
+    static std::string walEscape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            if      (c == '\\') out += "\\\\";
+            else if (c == '\n') out += "\\n";
+            else if (c == '\r') out += "\\r";
+            else                out += c;
+        }
+        return out;
+    }
+
     // Op an WAL-Datei anhängen (append-only, Text-Format)
     void appendWal(const BufferedOp& op) {
         if (walPath_.empty()) return;
@@ -7565,11 +7612,11 @@ private:
         wal << "OP " << static_cast<int>(op.opType)
             << " " << op.tableName << "\n";
         for (const auto& v : op.values)
-            wal << "VAL " << v << "\n";
+            wal << "VAL " << walEscape(v) << "\n";
         if (!op.setCol.empty())
-            wal << "SET " << op.setCol << " " << op.setVal << "\n";
+            wal << "SET " << op.setCol << " " << walEscape(op.setVal) << "\n";
         if (!op.whereCol.empty())
-            wal << "WHERE " << op.whereCol << " " << op.whereVal << "\n";
+            wal << "WHERE " << op.whereCol << " " << walEscape(op.whereVal) << "\n";
         if (!op.alterOp.empty())
             wal << "ALTER " << op.alterOp
                 << " " << op.alterColName

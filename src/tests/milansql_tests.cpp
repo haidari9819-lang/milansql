@@ -39,6 +39,9 @@
 #include "replication/master_repl.hpp"
 #include "replication/slave_repl.hpp"
 
+// Audit Phase 174: WAL crash recovery tests
+#include "wal/wal_recovery.hpp"
+
 // Phase 154-156: Auth system
 #include "auth/auth_manager.hpp"
 #include "auth/rate_limiter.hpp"
@@ -10022,6 +10025,465 @@ static void testGroup96() {
     }
 }
 
+// ============================================================
+// testGroup97: Quality & Stability Audit (Phase 174)
+//   - WAL Corruption Recovery (crash after COMMIT, CRC, garbage)
+//   - Connection Pool unter anhaltender Last (8×250 Zyklen)
+//   - MVCC Vacuum parallel zu aktiven Transaktionen
+//   - Replication: Master-Ausfall + automatischer Reconnect
+// ============================================================
+
+static void testGroup97() {
+    std::cout << "\n── testGroup97: Quality Audit (Phase 174) ──\n";
+    using namespace milansql;
+
+    auto slurp = [](const std::string& p) -> std::string {
+        std::ifstream f(p, std::ios::binary);
+        std::ostringstream oss; oss << f.rdbuf();
+        return oss.str();
+    };
+    auto dump = [](const std::string& p, const std::string& content) {
+        std::ofstream f(p, std::ios::binary | std::ios::trunc);
+        f << content;
+    };
+    auto commitLines = [](uint64_t txId) -> std::string {
+        std::string cl = "TX_COMMIT:" + std::to_string(txId);
+        return cl + "\nCRC:" + std::to_string(WalRecovery::walCrc32(cl)) + "\n";
+    };
+
+    // ── 1) WAL Recovery: committed tx is replayed after crash ──
+    {
+        const std::string wal = "test_g97_wal1.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:1\nOP 0 public.wr_t\nVAL 1\nVAL alice\n---\n" + commitLines(1));
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.hadWal && rr.recoveredTxCount == 1,
+              "AUD-WAL #1a: committed tx recognized in WAL");
+        check(rr.replayedOpCount == 1, "AUD-WAL #1b: op replayed");
+        check(engine.countRows("wr_t", true) == 1,
+              "AUD-WAL #1c: crash-committed INSERT restored");
+    }
+
+    // ── 2) Uncommitted tx is discarded ─────────────────────────
+    {
+        const std::string wal = "test_g97_wal2.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:2\nOP 0 public.wr_t\nVAL 9\nVAL ghost\n---\n");  // no TX_COMMIT
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.discardedTxCount == 1, "AUD-WAL #2a: uncommitted tx discarded");
+        check(engine.countRows("wr_t", true) == 0,
+              "AUD-WAL #2b: uncommitted data NOT applied");
+    }
+
+    // ── 3) Rolled-back tx is never replayed ────────────────────
+    {
+        const std::string wal = "test_g97_wal3.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:3\nOP 0 public.wr_t\nVAL 7\nVAL rb\n---\nTX_ROLLBACK:3\n");
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.recoveredTxCount == 0 && engine.countRows("wr_t", true) == 0,
+              "AUD-WAL #3a: rolled-back tx not replayed");
+    }
+
+    // ── 4) Corrupted CRC revokes the commit ────────────────────
+    {
+        const std::string wal = "test_g97_wal4.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:4\nOP 0 public.wr_t\nVAL 4\nVAL bad\n---\n"
+                  "TX_COMMIT:4\nCRC:12345\n");   // wrong CRC
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.recoveredTxCount == 0, "AUD-WAL #4a: CRC mismatch revokes commit");
+        check(engine.countRows("wr_t", true) == 0,
+              "AUD-WAL #4b: corrupted commit NOT applied");
+    }
+
+    // ── 5) Garbage / truncated WAL must not crash ──────────────
+    {
+        const std::string wal = "test_g97_wal5.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "\x01\x02\xff garbage\nTX_BEGIN:notanumber\nOP xx\nVAL\n--\n"
+                  "TX_COMMIT:\nCRC:zzz\nhalf line without newline");
+        WalRecovery rec;
+        bool noThrow = true;
+        WalRecovery::RecoveryResult rr;
+        try { rr = rec.recover(engine, wal); } catch (...) { noThrow = false; }
+        check(noThrow && rr.replayedOpCount == 0,
+              "AUD-WAL #5a: garbage WAL survives without crash or replay");
+        std::ifstream gone(wal);
+        check(!gone, "AUD-WAL #5b: WAL cleared after recovery");
+    }
+
+    // ── 6) Op on missing table is skipped, valid ops applied ───
+    {
+        const std::string wal = "test_g97_wal6.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:6\nOP 0 public.missing_tbl\nVAL 1\n---\n"
+                  "OP 0 public.wr_t\nVAL 6\nVAL ok\n---\n" + commitLines(6));
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(engine.countRows("wr_t", true) == 1 && rr.recoveredTxCount == 1,
+              "AUD-WAL #6a: missing-table op skipped, valid op applied");
+    }
+
+    // ── 7) No WAL file → clean no-op ───────────────────────────
+    {
+        Engine engine;
+        WalRecovery rec;
+        auto rr = rec.recover(engine, "test_g97_does_not_exist.wal");
+        check(!rr.hadWal, "AUD-WAL #7a: missing WAL is a clean no-op");
+    }
+
+    // ── 8) Multi-op tx: INSERT + UPDATE (mit escaped Newline) ──
+    {
+        const std::string wal = "test_g97_wal8.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_m (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:8\nOP 0 public.wr_m\nVAL 1\nVAL alpha\n---\n"
+                  "OP 1 public.wr_m\nSET name a\\nb\nWHERE id 1\n---\n" + commitLines(8));
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.replayedOpCount == 2 && engine.countRows("wr_m", true) == 1,
+              "AUD-WAL #8a: multi-op tx replayed in order");
+        auto t = engine.selectAll("wr_m").clone();
+        check(cellVal(t, 0, "name") == "a\nb",
+              "AUD-WAL #8b: escaped newline in SET value restored");
+    }
+
+    // ── 9) Bug #24 repro: value with embedded newline survives ─
+    //      appendWal → crash → recovery roundtrip intact
+    {
+        const std::string walA = "test_g97_wal9a.wal";
+        const std::string walB = "test_g97_wal9b.wal";
+        std::remove(walA.c_str());
+        {
+            Engine e1; Parser parser;
+            execSQL(e1, parser, "CREATE TABLE wr_nl (id INT, name TEXT)");
+            e1.beginTransaction(walA);
+            e1.insertRow("wr_nl", {"1", "line1\nline2"});
+            std::string content = slurp(walA);       // WAL as written pre-crash
+            e1.rollbackTransaction();                 // deletes walA
+
+            // Simulate crash right after COMMIT was fsynced
+            uint64_t txId = 0;
+            auto p = content.find("TX_BEGIN:");
+            if (p != std::string::npos)
+                try { txId = std::stoull(content.substr(p + 9)); } catch (...) {}
+            dump(walB, content + commitLines(txId));
+        }
+        Engine e2; Parser parser2;
+        execSQL(e2, parser2, "CREATE TABLE wr_nl (id INT, name TEXT)");
+        WalRecovery rec;
+        auto rr = rec.recover(e2, walB);
+        check(rr.recoveredTxCount == 1 && e2.countRows("wr_nl", true) == 1,
+              "AUD-WAL #9a: newline-value tx recovered as one row");
+        auto t = e2.selectAll("wr_nl").clone();
+        check(cellVal(t, 0, "name") == "line1\nline2",
+              "AUD-WAL #9b: multi-line value survives crash recovery intact");
+    }
+
+    // ── 10) Connection Pool unter anhaltender Last ─────────────
+    {
+        ConnectionPool pool(4, 16);
+        std::atomic<int>  served{0};
+        std::atomic<bool> anyFail{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&pool, &served, &anyFail]() {
+                for (int i = 0; i < 250; ++i) {
+                    auto c = pool.acquire(5000);
+                    if (!c) { anyFail = true; continue; }
+                    if ((i & 63) == 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    pool.release(c);
+                    ++served;
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+        check(served.load() == 2000 && !anyFail.load(),
+              "AUD-POOL #10a: 2000 acquire/release cycles under load served");
+        check(pool.activeCount() == 0,
+              "AUD-POOL #10b: all connections released after load");
+        check(pool.totalCount() <= 16,
+              "AUD-POOL #10c: pool size bounded by max under load");
+        check(pool.statsJson().find("\"active\":0") != std::string::npos,
+              "AUD-POOL #10d: statsJson consistent after load");
+    }
+
+    // ── 11) MVCC Vacuum parallel zu aktiven Transaktionen ──────
+    {
+        Engine engine; Parser parser;
+        const std::string wal = "test_g97_vac.wal";
+        execSQL(engine, parser, "CREATE TABLE vac_c (id INT)");
+        for (int i = 1; i <= 200; ++i)
+            execSQL(engine, parser, "INSERT INTO vac_c VALUES (" + std::to_string(i) + ")");
+
+        std::mutex em;   // simulates the server's engineMutex_ serialization
+        std::atomic<bool> done{false};
+        std::atomic<bool> vacErr{false};
+        std::thread vac([&]() {
+            while (!done) {
+                {
+                    std::lock_guard<std::mutex> lk(em);
+                    try { engine.vacuumAllTracked(); } catch (...) { vacErr = true; }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+        for (int i = 1; i <= 100; ++i) {
+            {   // tx opened — vacuum may interleave while tx is active
+                std::lock_guard<std::mutex> lk(em);
+                engine.beginTransaction(wal);
+                execSQL(engine, parser,
+                        "DELETE FROM vac_c WHERE id = " + std::to_string(i));
+            }
+            std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lk(em);
+                engine.applyAndCommit();
+            }
+        }
+        done = true;
+        vac.join();
+        engine.vacuumAllTracked();
+        check(!vacErr.load(),
+              "AUD-VAC #11a: concurrent vacuum never threw during active txs");
+        check(engine.countRows("vac_c", true) == 100,
+              "AUD-VAC #11b: live rows correct after 100 tx + concurrent vacuum");
+        check(engine.deadRowCount() == 0,
+              "AUD-VAC #11c: all dead versions cleaned up");
+        std::remove(wal.c_str());
+    }
+
+    // ── 12) Replication: Master-Ausfall + Auto-Reconnect ───────
+    {
+        const char* blPath  = "test_g97_e2e.binlog";
+        const char* tokPath = "test_g97_db.repl_token";
+        std::remove(blPath);
+        std::remove(tokPath);
+        loadOrCreateReplToken("test_g97_db");   // no-op if token already loaded
+        g_replState.slavePos.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+        g_replState.masterDown.store(false);
+        g_replState.lastSyncUnixMs.store(0);
+
+        const int port = 15473;
+        {
+            BinlogWriter bl(blPath);
+            {
+                std::unique_ptr<MasterReplication> master(
+                    new MasterReplication(port, bl));
+                master->start();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                std::mutex mu;
+                std::vector<std::string> received;
+                {
+                    SlaveReplication slave("127.0.0.1", port,
+                        [&](const std::string& sql) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            received.push_back(sql);
+                        });
+                    slave.start();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                    bl.write("INSERT INTO rc VALUES (1)");
+                    replNotifyNewData();
+                    bool got1 = false;
+                    for (int i = 0; i < 200 && !got1; ++i) {
+                        { std::lock_guard<std::mutex> lk(mu); got1 = !received.empty(); }
+                        if (!got1) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(got1, "AUD-REPL #12a: initial streaming works");
+
+                    // Kill the master. Pause the slave first and let the
+                    // pending long-poll (STREAM_WAIT_MS=3000) drain so no
+                    // detached handler touches the dead master object.
+                    slave.stop();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(3600));
+                    master.reset();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                    slave.resume();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                    check(!g_replState.slaveRunning.load(),
+                          "AUD-REPL #12b: replica detects lost master connection");
+
+                    // Restart master on same port — replica must reconnect
+                    master.reset(new MasterReplication(port, bl));
+                    master->start();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                    bl.write("INSERT INTO rc VALUES (2)");
+                    replNotifyNewData();
+                    bool got2 = false;
+                    for (int i = 0; i < 300 && !got2; ++i) {   // ≤15s (5s retry backoff)
+                        { std::lock_guard<std::mutex> lk(mu); got2 = received.size() >= 2; }
+                        if (!got2) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(got2, "AUD-REPL #12c: replica auto-reconnects and resumes streaming");
+                    check(g_replState.slaveRunning.load(),
+                          "AUD-REPL #12d: replica running again after reconnect");
+                    check(!g_replState.masterDown.load(),
+                          "AUD-REPL #12e: masterDown cleared after reconnect");
+                } // slave stops + joins (drains its in-flight poll)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                master.reset();
+            }
+            // Let detached per-slave handler threads drain before bl dies
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        std::remove(blPath);
+        std::remove(tokPath);
+
+        // Reset global replication state for subsequent groups
+        g_replState.isSlave.store(false);
+        g_replState.isMaster.store(false);
+        g_replState.slaveRunning.store(false);
+        g_replState.slavePos.store(0);
+        g_replState.connectedSlaves.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+        g_replState.lastSyncUnixMs.store(0);
+        g_replState.masterDown.store(false);
+        g_replState.syncMode.store(false);
+    }
+}
+
+// ============================================================
+// Test-Gruppe 98: CROSS JOIN + Komma-Join (Bug #26 / #27)
+// ============================================================
+static void testGroup98() {
+    std::cout << "\n── testGroup98: CROSS JOIN / Komma-Join (Bug #26/#27) ──\n";
+    using namespace milansql;
+
+    Engine engine; Parser parser;
+    execSQL(engine, parser, "CREATE TABLE cj1 (id INT, v TEXT)");
+    execSQL(engine, parser, "CREATE TABLE cj2 (id INT, w TEXT)");
+    execSQL(engine, parser, "CREATE TABLE cj3 (id INT)");
+    execSQL(engine, parser, "INSERT INTO cj1 VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    execSQL(engine, parser, "INSERT INTO cj2 VALUES (10, 'x'), (20, 'y'), (30, 'z')");
+    execSQL(engine, parser, "INSERT INTO cj3 VALUES (7), (8), (9)");
+
+    // ── Bug #26: Komma-Join wird als CROSS JOIN geparst ────────
+    {
+        auto cmd = parser.parse("SELECT * FROM cj1 a, cj2 b");
+        check(cmd.type == CommandType::SELECT && cmd.isJoin,
+              "CJ #1a: Komma-FROM wird als JOIN geroutet");
+        check(cmd.joinClauses.size() == 1 &&
+              cmd.joinClauses[0].joinType == "CROSS" &&
+              cmd.joinClauses[0].table == "cj2",
+              "CJ #1b: Komma-Eintrag = CROSS JoinClause");
+        check(cmd.joinClauses[0].tableAlias == "b" && cmd.tableAlias == "a",
+              "CJ #1c: Aliase erkannt");
+
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 9, "CJ #1d: 3 x 3 = 9 Zeilen (kartesisches Produkt)");
+    }
+
+    // ── Bug #26: 3 Tabellen ─────────────────────────────────────
+    {
+        auto cmd = parser.parse("SELECT * FROM cj1, cj2, cj3");
+        check(cmd.isJoin && cmd.joinClauses.size() == 2,
+              "CJ #2a: FROM a, b, c ergibt 2 CROSS-Klauseln");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 27, "CJ #2b: 3 x 3 x 3 = 27 Zeilen");
+    }
+
+    // ── Bug #27: expliziter CROSS JOIN ──────────────────────────
+    {
+        auto cmd = parser.parse("SELECT * FROM cj1 CROSS JOIN cj2");
+        check(cmd.type == CommandType::SELECT && cmd.isJoin &&
+              cmd.joinClauses.size() == 1 &&
+              cmd.joinClauses[0].joinType == "CROSS",
+              "CJ #3a: CROSS JOIN wird geparst (kein UNKNOWN)");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 9, "CJ #3b: CROSS JOIN liefert 9 Zeilen");
+    }
+
+    // ── COUNT(*) ueber Komma-Join ───────────────────────────────
+    {
+        auto cmd = parser.parse("SELECT COUNT(*) FROM cj1 a, cj2 b");
+        check(cmd.isJoin && cmd.isCount,
+              "CJ #4a: COUNT(*) ueber Komma-Join als Count markiert");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 9, "CJ #4b: Count-Basis = 9 Zeilen");
+    }
+
+    // ── CROSS JOIN + WHERE ──────────────────────────────────────
+    {
+        auto cmd = parser.parse(
+            "SELECT * FROM cj1 CROSS JOIN cj2 WHERE cj2.w = 'x'");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 3, "CJ #5: CROSS JOIN + WHERE filtert (3 Zeilen)");
+    }
+
+    // ── Regression: INNER JOIN mit ON unveraendert ──────────────
+    {
+        auto cmd = parser.parse(
+            "SELECT * FROM cj1 JOIN cj2 ON cj1.id = cj2.id");
+        check(cmd.isJoin && cmd.joinClauses.size() == 1 &&
+              cmd.joinClauses[0].joinType == "INNER" &&
+              cmd.joinClauses[0].onLeft == "cj1.id",
+              "CJ #6: normaler JOIN ... ON parst weiterhin als INNER");
+    }
+
+    // ── OOM-Schutz: Row-Limit-Guard ─────────────────────────────
+    {
+        execSQL(engine, parser, "CREATE TABLE cjbig (id INT)");
+        std::string vals = "(0)";
+        for (int i = 1; i < 50; ++i) vals += ", (" + std::to_string(i) + ")";
+        for (int b = 0; b < 15; ++b)
+            execSQL(engine, parser, "INSERT INTO cjbig VALUES " + vals);
+        // 750 x 750 = 562500 > MAX_JOIN_ROWS (500000)
+        auto cmd = parser.parse("SELECT * FROM cjbig a, cjbig b");
+        bool threw = false;
+        try {
+            engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                cmd.whereConds, cmd.whereLogic);
+        } catch (const std::exception& e) {
+            threw = std::string(e.what()).find("row limit") != std::string::npos;
+        }
+        check(threw, "CJ #7: riesiges kartesisches Produkt -> graceful error (Row-Limit)");
+    }
+
+    // ── Bug #28: LIKE matchte nie (Quotes im Pattern) ───────────
+    {
+        execSQL(engine, parser, "CREATE TABLE lk (id INT, name TEXT)");
+        execSQL(engine, parser,
+                "INSERT INTO lk VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
+        auto c1 = parser.parse("SELECT * FROM lk WHERE name LIKE 'A%'");
+        auto r1 = engine.selectWhere(c1.tableName, c1.whereConds, c1.whereLogic);
+        check(r1.table.rowCount() == 1, "LK #8a: LIKE 'A%' findet Alice");
+
+        auto c2 = parser.parse("SELECT * FROM lk WHERE name LIKE '%li%'");
+        auto r2 = engine.selectWhere(c2.tableName, c2.whereConds, c2.whereLogic);
+        check(r2.table.rowCount() == 2, "LK #8b: LIKE '%li%' findet Alice+Charlie");
+
+        auto c3 = parser.parse("SELECT * FROM lk WHERE name LIKE 'B_b'");
+        auto r3 = engine.selectWhere(c3.tableName, c3.whereConds, c3.whereLogic);
+        check(r3.table.rowCount() == 1, "LK #8c: LIKE 'B_b' (Underscore) findet Bob");
+
+        auto c4 = parser.parse("SELECT * FROM lk WHERE name LIKE 'x%'");
+        auto r4 = engine.selectWhere(c4.tableName, c4.whereConds, c4.whereLogic);
+        check(r4.table.rowCount() == 0, "LK #8d: LIKE 'x%' findet nichts");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -10306,6 +10768,12 @@ int main() {
     }
     try { testGroup96(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 96 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup97(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 97 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup98(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 98 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -10696,6 +10696,151 @@ static void testGroup99() {
     }
 }
 
+// ============================================================
+// testGroup100 — Optimizer Phase 2: Cost Model
+// Range-Selektivität (Histogramm/Min-Max), CostModel-Formeln,
+// SHOW COST MODEL
+// ============================================================
+static void testGroup100() {
+    std::cout << "\n── testGroup100: Cost Model (Optimizer Phase 2) ──\n";
+    using namespace milansql;
+
+    Parser parser;
+    TableStatsManager mgr;
+
+    // ── CM #1: Range-Selektivität aus Histogramm (statt 0.33) ───
+    {
+        std::vector<Column> cols = { {"id", "INT"} };
+        Table t("g100_uniform", cols);
+        for (int i = 1; i <= 100; ++i) t.insert(Row({ std::to_string(i) }));
+        mgr.analyzeTable("g100_uniform", t);
+
+        double s1 = mgr.estimateSelectivity("g100_uniform", "id", "<", "50");
+        check(s1 > 0.40 && s1 < 0.60,
+              "CM #1a: id < 50 auf 1..100 -> Sel ~0.5 (Histogramm, nicht 0.33)");
+        double s2 = mgr.estimateSelectivity("g100_uniform", "id", ">", "90");
+        check(s2 > 0.04 && s2 < 0.16,
+              "CM #1b: id > 90 -> Sel ~0.1");
+        double s3 = mgr.estimateSelectivity("g100_uniform", "id", "<=", "100");
+        check(s3 > 0.9,
+              "CM #1c: id <= Max -> Sel ~1.0");
+        double s4 = mgr.estimateSelectivity("g100_uniform", "id", ">", "100");
+        check(s4 < 0.1,
+              "CM #1d: id > Max -> Sel ~0");
+    }
+
+    // ── CM #1e: NULL-Anteil reduziert Range-Selektivität ────────
+    {
+        std::vector<Column> cols = { {"v", "INT"} };
+        Table t("g100_nulls", cols);
+        // 50% NULL, Nicht-NULL-Werte uniform 1..99
+        for (int i = 1; i <= 100; ++i)
+            t.insert(Row({ (i % 2 == 0) ? "NULL" : std::to_string(i) }));
+        mgr.analyzeTable("g100_nulls", t);
+        double s = mgr.estimateSelectivity("g100_nulls", "v", "<", "50");
+        check(s > 0.15 && s < 0.35,
+              "CM #1e: 50% NULL -> Range-Sel ~0.25 (Faktor 1-nullFrac)");
+    }
+
+    // ── CM #1f: Fallback ohne Stats bleibt 0.33 ─────────────────
+    {
+        ColumnStats empty;
+        double s = TableStatsManager::rangeSelectivity(empty, "<", "5");
+        check(std::abs(s - 0.33) < 1e-9,
+              "CM #1f: ohne Histogramm/MinMax -> Fallback 0.33");
+    }
+
+    // ── CM #2: estimateRowCount nutzt Range-Selektivität ────────
+    {
+        std::vector<WhereCondition> conds(1);
+        conds[0].col = "id"; conds[0].op = "<"; conds[0].val = "50";
+        size_t est = mgr.estimateRowCount("g100_uniform", conds);
+        check(est >= 40 && est <= 60,
+              "CM #2a: estimateRowCount id<50 -> ~50 (statt 33)");
+    }
+
+    // ── CM #3: CostModel::tableInput ────────────────────────────
+    {
+        auto in = CostModel::tableInput("g100_gibtsnicht", 500.0, 40.0);
+        check(!in.fromStats && in.rows == 500.0 && in.width == 40.0 &&
+              in.pages >= 1.0,
+              "CM #3a: tableInput ohne Stats -> Fallback rows/width");
+        auto in2 = CostModel::tableInput("g100_uniform", 1.0, 1.0);
+        // Hinweis: liest g_tableStats — dafuer via globalem Manager analysieren
+        (void)in2;
+        std::vector<Column> cols = { {"id", "INT"} };
+        Table t("g100_cm", cols);
+        for (int i = 1; i <= 200; ++i) t.insert(Row({ std::to_string(i) }));
+        g_tableStats.analyzeTable("g100_cm", t);
+        auto in3 = CostModel::tableInput("g100_cm", 1.0, 1.0);
+        check(in3.fromStats && in3.rows == 200.0 && in3.width > 0.0,
+              "CM #3b: tableInput aus g_tableStats (200 Rows, echte Breite)");
+    }
+
+    // ── CM #4: Scan-Kostenformeln ───────────────────────────────
+    {
+        CostModel::TableInput small; small.rows = 1000;   small.width = 50;
+        small.pages = std::ceil(1000.0 * 50 / 4096.0);
+        CostModel::TableInput big;   big.rows   = 100000; big.width   = 50;
+        big.pages   = std::ceil(100000.0 * 50 / 4096.0);
+
+        auto scS = CostModel::seqScan(small, 1, 100.0);
+        auto scB = CostModel::seqScan(big,   1, 100.0);
+        check(scS.startup == 0.0 && scS.total > 0.0,
+              "CM #4a: SeqScan startup 0, Kosten > 0");
+        check(scB.total > scS.total,
+              "CM #4b: SeqScan-Kosten wachsen mit Tabellengroesse");
+
+        auto ixSel   = CostModel::indexScan(big, 0.0001); // ~10 Rows
+        check(ixSel.total < scB.total,
+              "CM #4c: selektiver IndexScan guenstiger als SeqScan");
+        auto ixAll   = CostModel::indexScan(big, 1.0);    // alle Rows
+        check(ixAll.total > scB.total,
+              "CM #4d: unselektiver IndexScan teurer als SeqScan (random_page_cost)");
+    }
+
+    // ── CM #5: Join-Kardinalität + Join-Kosten ──────────────────
+    {
+        double jr = CostModel::joinRows(1000.0, 1000.0, 100.0, 50.0);
+        check(std::abs(jr - 10000.0) < 1e-6,
+              "CM #5a: joinRows |R||S|/max(ndv) = 1000*1000/100 = 10000");
+        double jf = CostModel::joinRows(1000.0, 1000.0, 0.0, 0.0);
+        check(std::abs(jf - 100000.0) < 1e-6,
+              "CM #5b: joinRows ohne ndv -> Fallback-Sel 0.1");
+
+        CostModel::TableInput ti; ti.rows = 1000; ti.width = 50;
+        ti.pages = std::ceil(1000.0 * 50 / 4096.0);
+        auto scan = CostModel::seqScan(ti, 0, ti.rows);
+        auto hj = CostModel::hashJoin(scan, scan, 10000.0);
+        check(std::abs(hj.startup - (scan.total + 1000.0 * 0.0025)) < 1e-6,
+              "CM #5c: HashJoin startup == Build-Kosten (inner)");
+        auto nl = CostModel::nestedLoop(scan, scan, 10000.0);
+        check(nl.total > hj.total,
+              "CM #5d: NestedLoop teurer als HashJoin (1000x1000)");
+    }
+
+    // ── CM #6: SHOW COST MODEL ──────────────────────────────────
+    {
+        auto c = parser.parse("SHOW COST MODEL");
+        check(c.type == CommandType::SHOW_COST_MODEL,
+              "CM #6a: SHOW COST MODEL geparst");
+
+        Engine eng;
+        auto r = dispatch(c, eng);
+        check(r.columns.size() == 3 && r.rows.size() == 6,
+              "CM #6b: SHOW COST MODEL -> 3 Spalten, 6 Parameter");
+        bool seqOk = false, rndOk = false;
+        for (const auto& row : r.rows) {
+            if (row.values[0] == "seq_page_cost" && row.values[1] == "1.0000")
+                seqOk = true;
+            if (row.values[0] == "random_page_cost" && row.values[1] == "4.0000")
+                rndOk = true;
+        }
+        check(seqOk && rndOk,
+              "CM #6c: seq_page_cost 1.0 / random_page_cost 4.0 (Postgres-analog)");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -10989,6 +11134,9 @@ int main() {
     }
     try { testGroup99(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 99 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup100(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 100 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

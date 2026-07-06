@@ -25,6 +25,7 @@
 #include "optimizer/query_rewriter.hpp"
 #include "optimizer/adaptive_stats.hpp"
 #include "optimizer/table_stats.hpp"   // Phase 86: Column Statistics
+#include "optimizer/cost_model.hpp"    // Optimizer Phase 2: Cost Model
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
@@ -2916,26 +2917,27 @@ inline bool dispatchCommand(
             }
             dispatch_printExplain(plan);
 
-            // Phase 102: EXPLAIN (COSTS ON) — show cost estimates
+            // Phase 102 / Optimizer Phase 2: EXPLAIN (COSTS ON)
+            // Echte Schätzungen aus g_tableStats + CostModel statt
+            // hardcodierter Konstanten (rows/100, width=cols·8).
             if (cmd.explainCosts) {
-                // Cost model constants
-                const double seqPageCost = 1.0;  // per page (100 rows)
-                auto seqScanCost = [&](const std::string& tbl) -> double {
+                auto inputFor = [&](const std::string& tbl) {
+                    double fbRows = 1.0, fbWidth = 32.0;
+                    try { fbRows = static_cast<double>(engine.countRows(tbl)); }
+                    catch (...) {}
                     try {
-                        size_t rows = engine.countRows(tbl);
-                        double pages = std::max(1.0, static_cast<double>(rows) / 100.0);
-                        return seqPageCost * pages;
-                    } catch (...) { return 1.0; }
+                        fbWidth = static_cast<double>(
+                            engine.tableColumns(tbl).size()) * 8.0;
+                    } catch (...) {}
+                    return CostModel::tableInput(tbl, fbRows, fbWidth);
                 };
-                auto tableWidth = [&](const std::string& tbl) -> int {
-                    try {
-                        const auto& cols = engine.tableColumns(tbl);
-                        return static_cast<int>(cols.size()) * 8;
-                    } catch (...) { return 32; }
-                };
-                auto rowCount = [&](const std::string& tbl) -> size_t {
-                    try { return engine.countRows(tbl); }
-                    catch (...) { return 1; }
+                // Ausgabe-Rows nach Filter (Phase-1-Selektivität, sonst alle)
+                auto filteredRows = [&](const std::string& tbl, double allRows) {
+                    if (cmd.whereConds.empty()) return allRows;
+                    if (g_tableStats.hasStats(tbl))
+                        return static_cast<double>(
+                            g_tableStats.estimateRowCount(tbl, cmd.whereConds));
+                    return allRows;
                 };
 
                 std::cout << "\n  -- Cost Estimates (COSTS ON) --\n";
@@ -2944,44 +2946,77 @@ inline bool dispatchCommand(
                     ss << std::fixed << std::setprecision(2) << v;
                     return ss.str();
                 };
+                auto fmtRows = [](double v) -> long long {
+                    return static_cast<long long>(v + 0.5);
+                };
 
                 if (cmd.isJoin && !cmd.joinClauses.empty()) {
                     std::string t1 = cmd.tableName;
                     std::string t2 = cmd.joinClauses[0].table;
-                    double sc1 = seqScanCost(t1);
-                    double sc2 = seqScanCost(t2);
-                    // Smaller table is hash-built
-                    std::string hashTbl = sc1 <= sc2 ? t1 : t2;
-                    std::string scanTbl = sc1 <= sc2 ? t2 : t1;
-                    double hashBuild = seqScanCost(hashTbl) * 1.5;
-                    double scanLarger = seqScanCost(scanTbl) * 1.2;
-                    double startCost  = hashBuild;
-                    double totalCost  = hashBuild + scanLarger;
-                    size_t outRows    = (rowCount(t1) + rowCount(t2)) / 2;
-                    int    width      = tableWidth(t1) + tableWidth(t2);
-                    std::cout << "  Hash Join  (cost=" << fmtCost(startCost)
-                              << ".." << fmtCost(totalCost)
-                              << " rows=" << outRows << " width=" << width << ")\n";
+                    auto in1 = inputFor(t1);
+                    auto in2 = inputFor(t2);
+                    auto sc1 = CostModel::seqScan(in1, cmd.whereConds.size(),
+                                                  filteredRows(t1, in1.rows));
+                    auto sc2 = CostModel::seqScan(in2, 0, in2.rows);
+                    // Kleinere Seite wird gehasht (Build), größere probt
+                    const bool swap = sc2.rows < sc1.rows;
+                    const auto& outerC = swap ? sc1 : sc2;
+                    const auto& innerC = swap ? sc2 : sc1;
+                    double outRows = CostModel::joinRows(
+                        sc1.rows, sc2.rows, 0.0, 0.0);
+                    auto hj = CostModel::hashJoin(outerC, innerC, outRows);
+                    std::cout << "  Hash Join  (cost=" << fmtCost(hj.startup)
+                              << ".." << fmtCost(hj.total)
+                              << " rows=" << fmtRows(hj.rows)
+                              << " width=" << fmtRows(hj.width) << ")\n";
                     if (!cmd.whereConds.empty())
                         std::cout << "    Hash Cond / Filter applied\n";
                     std::cout << "    ->  Seq Scan on " << t1
-                              << "  (cost=0.00.." << fmtCost(sc1)
-                              << " rows=" << rowCount(t1)
-                              << " width=" << tableWidth(t1) << ")\n";
+                              << "  (cost=" << fmtCost(sc1.startup)
+                              << ".." << fmtCost(sc1.total)
+                              << " rows=" << fmtRows(sc1.rows)
+                              << " width=" << fmtRows(sc1.width) << ")\n";
                     std::cout << "    ->  Hash\n";
                     std::cout << "          ->  Seq Scan on " << t2
-                              << "  (cost=0.00.." << fmtCost(sc2)
-                              << " rows=" << rowCount(t2)
-                              << " width=" << tableWidth(t2) << ")\n";
+                              << "  (cost=" << fmtCost(sc2.startup)
+                              << ".." << fmtCost(sc2.total)
+                              << " rows=" << fmtRows(sc2.rows)
+                              << " width=" << fmtRows(sc2.width) << ")\n";
                 } else {
-                    double sc = seqScanCost(cmd.tableName);
-                    size_t rows = rowCount(cmd.tableName);
-                    int    width = tableWidth(cmd.tableName);
+                    auto in = inputFor(cmd.tableName);
+                    auto sc = CostModel::seqScan(in, cmd.whereConds.size(),
+                                                 filteredRows(cmd.tableName,
+                                                              in.rows));
                     std::cout << "  Seq Scan on " << cmd.tableName
-                              << "  (cost=0.00.." << fmtCost(sc)
-                              << " rows=" << rows << " width=" << width << ")\n";
+                              << "  (cost=" << fmtCost(sc.startup)
+                              << ".." << fmtCost(sc.total)
+                              << " rows=" << fmtRows(sc.rows)
+                              << " width=" << fmtRows(sc.width) << ")\n";
                     if (!cmd.whereConds.empty())
                         std::cout << "    Filter: (WHERE condition)\n";
+                    // Index-Alternative zeigen, wenn Stats + Index vorhanden
+                    const TableStats* ts = g_tableStats.getStats(cmd.tableName);
+                    if (ts && !ts->indexes.empty() && !cmd.whereConds.empty()) {
+                        for (const auto& is : ts->indexes) {
+                            for (const auto& wc : cmd.whereConds) {
+                                if (is.cols == wc.col && wc.op == "=") {
+                                    auto ix = CostModel::indexScan(
+                                        in, is.selectivity);
+                                    std::cout << "  Index Scan using "
+                                              << is.indexName << " on "
+                                              << cmd.tableName
+                                              << "  (cost=" << fmtCost(ix.startup)
+                                              << ".." << fmtCost(ix.total)
+                                              << " rows=" << fmtRows(ix.rows)
+                                              << " width=" << fmtRows(ix.width)
+                                              << ")"
+                                              << (ix.total < sc.total
+                                                  ? "  <- guenstiger" : "")
+                                              << "\n";
+                                }
+                            }
+                        }
+                    }
                 }
                 {
                     std::ostringstream ptss;
@@ -5467,6 +5502,26 @@ inline bool dispatchCommand(
             std::cout << "  Fehler: SHOW STATISTICS FOR tabellenname\n\n"; break;
         }
         g_tableStats.showStatistics(cmd.tableName);
+        break;
+    }
+
+    // ── Optimizer Phase 2: SHOW COST MODEL ────────────────────
+    case milansql::CommandType::SHOW_COST_MODEL: {
+        const auto& cc = g_costConsts;
+        std::cout << "  Cost Model (Postgres-analog):\n";
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "    seq_page_cost        = " << cc.seq_page_cost
+                  << "   (sequenzielle Page-Lesung)\n";
+        std::cout << "    random_page_cost     = " << cc.random_page_cost
+                  << "   (Random-Access-Page, Index-Heap-Fetch)\n";
+        std::cout << "    cpu_tuple_cost       = " << cc.cpu_tuple_cost
+                  << "   (Verarbeitung einer Row)\n";
+        std::cout << "    cpu_index_tuple_cost = " << cc.cpu_index_tuple_cost
+                  << "   (Verarbeitung eines Index-Eintrags)\n";
+        std::cout << "    cpu_operator_cost    = " << cc.cpu_operator_cost
+                  << "   (Auswertung eines Operators/Filters)\n";
+        std::cout << "    page_size_bytes      = " << cc.page_size_bytes
+                  << "   (angenommene Page-Groesse)\n\n";
         break;
     }
 

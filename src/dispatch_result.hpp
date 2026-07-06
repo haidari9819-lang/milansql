@@ -8,6 +8,7 @@
 #include "engine/engine.hpp"
 #include "parser/parser.hpp"
 #include "optimizer/table_stats.hpp"  // Optimizer Phase 1: echte Statistiken
+#include "optimizer/cost_model.hpp"   // Optimizer Phase 2: Cost Model
 
 namespace milansql {
 
@@ -1282,6 +1283,32 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                                              std::to_string(v.deadRowCount),
                                              v.sampled ? "yes" : "no"}));
         }
+        break;
+    }
+
+    // Optimizer Phase 2: SHOW COST MODEL — Kostenkonstanten anzeigen
+    case milansql::CommandType::SHOW_COST_MODEL: {
+        qr.columns = {milansql::Column{"Parameter","TEXT"},
+                      milansql::Column{"Value","TEXT"},
+                      milansql::Column{"Description","TEXT"}};
+        const auto& c = milansql::g_costConsts;
+        auto fmt = [](double v) {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(4) << v;
+            return ss.str();
+        };
+        qr.rows.push_back(milansql::Row({"seq_page_cost", fmt(c.seq_page_cost),
+            "Kosten sequenzielle Page-Lesung"}));
+        qr.rows.push_back(milansql::Row({"random_page_cost", fmt(c.random_page_cost),
+            "Kosten Random-Access-Page (Index-Heap-Fetch)"}));
+        qr.rows.push_back(milansql::Row({"cpu_tuple_cost", fmt(c.cpu_tuple_cost),
+            "Kosten Verarbeitung einer Row"}));
+        qr.rows.push_back(milansql::Row({"cpu_index_tuple_cost", fmt(c.cpu_index_tuple_cost),
+            "Kosten Verarbeitung eines Index-Eintrags"}));
+        qr.rows.push_back(milansql::Row({"cpu_operator_cost", fmt(c.cpu_operator_cost),
+            "Kosten Auswertung eines Operators/Filters"}));
+        qr.rows.push_back(milansql::Row({"page_size_bytes", fmt(c.page_size_bytes),
+            "Angenommene Page-Groesse in Bytes"}));
         break;
     }
 

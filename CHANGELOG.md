@@ -2,6 +2,31 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v10.3.0] — 2026-07-06 — "Query Optimizer Phase 2: Cost Model"
+
+Unified cost model on top of the Phase-1 statistics.
+
+### Added
+- **Cost model** (`src/optimizer/cost_model.hpp`): Postgres-analog constants
+  (seq_page_cost=1.0, random_page_cost=4.0, cpu_tuple_cost=0.01,
+  cpu_index_tuple_cost=0.005, cpu_operator_cost=0.0025) with cost formulas
+  for Seq Scan, Index Scan (B-tree descent + heap fetches), Hash Join and
+  Nested Loop; join cardinality via |R|*|S| / max(ndv)
+- **`SHOW COST MODEL`**: lists all cost constants (WebUI + QueryResult path)
+- **Index-scan alternative in `EXPLAIN (COSTS ON)`**: when statistics and a
+  matching index exist, the index path is shown with a cost comparison
+- testGroup100: 20 checks (histogram selectivity, NULL factor, fallback,
+  row-count estimation, scan/join cost formulas, SHOW COST MODEL)
+
+### Changed
+- **Range selectivity** (`< <= > >=`) now uses the equi-depth histogram with
+  linear interpolation inside the boundary bucket, falling back to numeric
+  min/max interpolation; NULLs excluded via factor (1 - null_frac).
+  Previously a hardcoded 0.33 constant
+- **`EXPLAIN (COSTS ON)`** uses real estimates from ANALYZE statistics
+  (rows after filter, row width from avg column widths, 4KB pages) instead
+  of hardcoded rows/100 and width = columns * 8
+
 ## [v10.2.0] — 2026-07-06 — "Query Optimizer Phase 1: Statistics Collection"
 
 Foundation for the upcoming cost-based query optimizer.

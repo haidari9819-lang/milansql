@@ -345,6 +345,8 @@ enum class CommandType {
     CREATE_STATISTICS,
     SHOW_STATISTICS,
     SHOW_TABLE_STATS,
+    // Optimizer Phase 2: Cost Model
+    SHOW_COST_MODEL,
     // Phase 150: User-Defined Functions V2
     CREATE_FUNCTION,
     DROP_FUNCTION,
@@ -2823,6 +2825,10 @@ public:
                 cmd.type = CommandType::SHOW_TABLE_STATS;
                 for (int i = 0; i < (int)tokens.size() - 1; i++)
                     if (toUpper(tokens[i]) == "FOR") { cmd.statsTable = tokens[i + 1]; break; }
+            // Optimizer Phase 2: SHOW COST MODEL
+            } else if (kw1 == "COST" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "MODEL") {
+                cmd.type = CommandType::SHOW_COST_MODEL;
             // Phase 150: SHOW FUNCTIONS
             } else if (kw1 == "FUNCTIONS") {
                 cmd.type = CommandType::SHOW_FUNCTIONS;

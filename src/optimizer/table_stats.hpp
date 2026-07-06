@@ -409,6 +409,77 @@ public:
         }
     }
 
+    // ── Range-Selektivität (Optimizer Phase 2: Cost Model) ────────
+    // Ersetzt die alte 0.33-Konstante für < <= > >=:
+    //   1) Equi-Depth-Histogramm: Anteil der Buckets unterhalb val,
+    //      im Grenz-Bucket lineare Interpolation (numerisch) bzw. 0.5
+    //   2) Fallback numerisch: lineare Interpolation zwischen Min/Max
+    //   3) Fallback ohne Stats: 0.33 (alte Konstante)
+    // NULL-Werte matchen Range-Prädikate nie → Faktor (1 - nullFrac).
+    static double rangeSelectivity(const ColumnStats& cs,
+                                   const std::string& op,
+                                   const std::string& val) {
+        const bool lt = (op == "<" || op == "<=");
+        const double notNull = 1.0 - cs.nullFrac;
+
+        auto clamp01 = [](double x) {
+            if (x < 0.0) return 0.0;
+            if (x > 1.0) return 1.0;
+            return x;
+        };
+
+        // 1) Histogramm (equi-depth, aus Nicht-NULL-Werten gebaut)
+        if (!cs.histogram.empty()) {
+            size_t total = 0;
+            for (const auto& b : cs.histogram) total += b.second;
+            if (total > 0) {
+                double below = 0.0;          // geschätzte Rows mit Wert <= val
+                std::string lower = cs.minVal; // Untergrenze aktueller Bucket
+                bool done = false;
+                for (const auto& b : cs.histogram) {
+                    if (!lessVal(val, b.first, cs.isNumeric)) {
+                        below += static_cast<double>(b.second); // Bucket komplett drunter
+                    } else {
+                        // val liegt in diesem Bucket → interpolieren
+                        double frac = 0.5;
+                        if (cs.isNumeric) {
+                            try {
+                                double lo = std::stod(lower);
+                                double hi = std::stod(b.first);
+                                double v  = std::stod(val);
+                                if (hi > lo) frac = (v - lo) / (hi - lo);
+                                else         frac = (v >= hi) ? 1.0 : 0.0;
+                            } catch (...) {}
+                        }
+                        below += static_cast<double>(b.second) * clamp01(frac);
+                        done = true;
+                        break;
+                    }
+                    lower = b.first;
+                }
+                (void)done;
+                double selLe = below / static_cast<double>(total);
+                return clamp01((lt ? selLe : 1.0 - selLe) * notNull);
+            }
+        }
+
+        // 2) Numerische Min/Max-Interpolation
+        if (cs.isNumeric && !cs.minVal.empty() && !cs.maxVal.empty()) {
+            try {
+                double lo = std::stod(cs.minVal);
+                double hi = std::stod(cs.maxVal);
+                double v  = std::stod(val);
+                double frac;
+                if (hi > lo)      frac = clamp01((v - lo) / (hi - lo));
+                else              frac = (v >= hi) ? 1.0 : 0.0;
+                return clamp01((lt ? frac : 1.0 - frac) * notNull);
+            } catch (...) {}
+        }
+
+        // 3) Keine nutzbaren Stats → alte Konstante
+        return 0.33;
+    }
+
     // Estimate selectivity for col op val (returns fraction 0..1)
     double estimateSelectivity(const std::string& tbl,
                                const std::string& col,
@@ -436,8 +507,8 @@ public:
                 : 1.0 / static_cast<double>(cs.distinctCount);
             return 1.0 - eq;
         }
-        if (op == "<" || op == "<=") return 0.33;
-        if (op == ">" || op == ">=") return 0.33;
+        if (op == "<" || op == "<=" || op == ">" || op == ">=")
+            return rangeSelectivity(cs, op, val);  // Phase 2: Histogramm/Min-Max
         if (op == "LIKE")            return 0.05;
         if (op == "IS NULL")
             return cs.rowCount > 0

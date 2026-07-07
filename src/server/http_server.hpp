@@ -59,11 +59,11 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1528;
+static constexpr int MILANSQL_TEST_COUNT = 1568;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "10.5.0";
+static constexpr const char* MILANSQL_VERSION = "10.6.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -2379,7 +2379,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v10.5.0</div>
+  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v10.6.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -2667,7 +2667,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:rgba(16,185,129,.1);color:#10b981;border:1px solid #10b981;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:transparent;color:#94a3b8;border:1px solid #2d4060;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#94a3b8" id="version-label" class="ms-version">v10.5.0</span>
+    <span style="font-size:0.75rem;color:#94a3b8" id="version-label" class="ms-version">v10.6.0</span>
   </div>
 </div>
 
@@ -2712,7 +2712,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.5.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.6.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -2956,7 +2956,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v10.5.0</span> &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v10.6.0</span> &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -4536,7 +4536,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:rgba(13,18,36,0.8);padding:28px 32px 20px;text-align:center;border-bottom:1px solid #1e2d40">
       <div><span style="display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#00d4ff,#0090cc);color:#080c18;font-size:26px;font-weight:800;box-shadow:0 0 30px rgba(0,212,255,0.3)">M</span></div>
       <div style="font-size:22px;font-weight:700;color:#f8fafc;margin-top:10px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#475569;font-size:11px;margin-top:4px"><span class="ms-version">v10.5.0</span> &mdash; Multi-User Database</div>
+      <div style="color:#475569;font-size:11px;margin-top:4px"><span class="ms-version">v10.6.0</span> &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #1e2d40">
@@ -5521,6 +5521,13 @@ inline void MilanHttpServer::run() {
         return engine_.vacuumAllTracked(/*automatic=*/true);
     });
 
+    // Optimizer Phase 3: Auto-ANALYZE thread — analysiert Tabellen,
+    // deren Aenderungszaehler > threshold * rowCount (Postgres-Logik).
+    milansql::g_autoAnalyze().start([this]() -> size_t {
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        return milansql::autoAnalyzeSweep(engine_);
+    });
+
     std::signal(SIGINT,  httpShutdownSignalHandler);
 #ifdef SIGTERM
     std::signal(SIGTERM, httpShutdownSignalHandler);
@@ -5571,6 +5578,7 @@ inline void MilanHttpServer::run() {
     closesocket(srv);
     std::cout << "HTTP Server: Shutdown angefordert — warte auf aktive Queries...\n" << std::flush;
     engine_.vacuumManager().stopAutoVacuum();   // Phase 171
+    milansql::g_autoAnalyze().stop();           // Optimizer Phase 3
     milansql::g_connectionPool.stopHealthChecker();
     bool drained = milansql::g_connectionPool.shutdown(30000);
     threadPool_.reset();   // joins worker threads (in-flight requests finish)

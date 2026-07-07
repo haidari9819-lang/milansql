@@ -3549,7 +3549,9 @@ public:
                         // Phase 149: Optimizer hints
                         "ENABLE_SEQSCAN", "ENABLE_INDEXSCAN", "ENABLE_HASHJOIN", "ENABLE_NESTLOOP",
                         // Optimizer Phase 3 Block 3: Indexed-NL-Grenze
-                        "NL_THRESHOLD"
+                        "NL_THRESHOLD",
+                        // Optimizer Phase 3 Block 4: Auto-ANALYZE
+                        "AUTO_ANALYZE_ENABLED", "AUTO_ANALYZE_THRESHOLD"
                     };
                     for (const auto& kv : knownSetVars) {
                         if (lhs == kv) { cmd.type = CommandType::SET_CACHE; break; }

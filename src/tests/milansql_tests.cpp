@@ -10707,8 +10707,9 @@ static void testGroup99() {
         check(!r2.rows.empty() && r2.rows[0].values[3] != "never" &&
               r2.rows[0].values[3].size() >= 19,
               "ST #9d: LastAnalyzed = echter Zeitstempel (nicht hardcoded)");
-        check(r2.columns.size() == 6 &&
+        check(r2.columns.size() == 7 &&
               r2.columns[4].name == "DeadRows" && r2.columns[5].name == "Sampled" &&
+              r2.columns[6].name == "Changes" &&   // Optimizer Phase 3 Block 4
               !r2.rows.empty() &&
               r2.rows[0].values[4] == "0" && r2.rows[0].values[5] == "no",
               "ST #9e: neue Spalten DeadRows=0, Sampled=no");
@@ -11006,6 +11007,318 @@ static void testGroup101() {
     // ── Cleanup: globale Stats nicht in andere Gruppen leaken ───
     execSQL("DROP TABLE g101_items");
     execSQL("DROP TABLE g101_small");
+}
+
+// testGroup102 — Optimizer Phase 3: Join Enumeration (Selinger-DP),
+// Join-Methoden-Wahl, Auto-ANALYZE, Tenant-Namen, ndv-Selektivität
+// ============================================================
+static void testGroup102() {
+    std::cout << "\n── testGroup102: Join Enumeration + Auto-ANALYZE (Optimizer Phase 3) ──\n";
+    using namespace milansql;
+
+    Engine engine;
+    Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // ── Setup: 3 Tabellen unterschiedlicher Groesse ─────────────
+    execSQL("CREATE TABLE g102_a (id INT, val INT)");
+    for (int i = 1; i <= 1000; ++i)
+        execSQL("INSERT INTO g102_a VALUES (" + std::to_string(i) + ", "
+                + std::to_string(i % 50) + ")");
+    engine.createIndex("g102_a", {"id"}, "idx_g102a_id");
+
+    execSQL("CREATE TABLE g102_b (a_id INT, note TEXT)");
+    for (int i = 1; i <= 100; ++i)
+        execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'n"
+                + std::to_string(i) + "')");
+
+    execSQL("CREATE TABLE g102_c (b_id INT, tag TEXT)");
+    for (int i = 1; i <= 10; ++i)
+        execSQL("INSERT INTO g102_c VALUES (" + std::to_string(i) + ", 't"
+                + std::to_string(i) + "')");
+
+    // Grosse Tabelle (5000 Rows) fuer die Join-Methoden-Wahl:
+    // erst hier lohnt Indexed-NL gegen den Hash-SeqScan.
+    // Batch-INSERTs (100 Rows/Statement) halten das Setup schnell.
+    execSQL("CREATE TABLE g102_big (id INT, grp INT)");
+    for (int b = 0; b < 50; ++b) {
+        std::string sql = "INSERT INTO g102_big VALUES ";
+        for (int i = 1; i <= 100; ++i) {
+            int v = b * 100 + i;
+            if (i > 1) sql += ",";
+            sql += "(" + std::to_string(v) + "," + std::to_string(v % 20) + ")";
+        }
+        execSQL(sql);
+    }
+    engine.createIndex("g102_big", {"id"}, "idx_g102big_id");
+
+    execSQL("ANALYZE g102_a");
+    execSQL("ANALYZE g102_b");
+    execSQL("ANALYZE g102_c");
+    execSQL("ANALYZE g102_big");
+
+    // ── JE #1: 3-Tabellen-DP waehlt die billigere Reihenfolge ───
+    // Basis a (1000), b (100) und c (10) beide an a joinbar:
+    // DP muss c (klein) VOR b anfuegen (kleineres Zwischenergebnis).
+    {
+        std::vector<JoinTableInfo> t(3);
+        t[0].name = "g102_a"; t[0].rowCount = 1000;
+        t[1].name = "g102_b"; t[1].rowCount = 100;
+        t[1].requiredTables = {0};
+        t[1].joinColSelf = "a_id"; t[1].otherIdx = 0; t[1].joinColOther = "id";
+        t[2].name = "g102_c"; t[2].rowCount = 10;
+        t[2].requiredTables = {0};
+        t[2].joinColSelf = "b_id"; t[2].otherIdx = 0; t[2].joinColOther = "id";
+
+        JoinPlan p = g_joinEnumerator().plan(t);
+        check(p.dpUsed && p.joinOrder.size() == 2,
+              "JE #1a: 3-Tabellen-Plan via Selinger-DP (dpUsed)");
+        check(!p.joinOrder.empty() && p.joinOrder[0] == 1,
+              "JE #1b: kleinere Tabelle (g102_c) wird zuerst angefuegt");
+    }
+
+    // ── JE #2: 4 Tabellen — kleinstes Zwischenergebnis zuerst ───
+    {
+        std::vector<JoinTableInfo> t(4);
+        t[0].name = "g102_a"; t[0].rowCount = 1000;
+        t[1].name = "g102_b"; t[1].rowCount = 100; t[1].requiredTables = {0};
+        t[2].name = "g102_c"; t[2].rowCount = 10;  t[2].requiredTables = {0};
+        t[3].name = "g102_d"; t[3].rowCount = 500; t[3].requiredTables = {0};
+
+        JoinPlan p = g_joinEnumerator().plan(t);
+        check(p.dpUsed && p.joinOrder.size() == 3 &&
+              p.joinOrder[0] == 1 && p.joinOrder[1] == 0 && p.joinOrder[2] == 2,
+              "JE #2a: 4 Tabellen -> Reihenfolge c(10), b(100), d(500)");
+        check(p.description.find("Selinger DP") != std::string::npos,
+              "JE #2b: Beschreibung nennt Selinger DP");
+    }
+
+    // ── JE #3: Plan-Cache liefert zweiten Aufruf aus dem Cache ──
+    {
+        std::vector<JoinTableInfo> t(3);
+        t[0].name = "g102_a"; t[0].rowCount = 1000;
+        t[1].name = "g102_b"; t[1].rowCount = 100; t[1].requiredTables = {0};
+        t[2].name = "g102_c"; t[2].rowCount = 10;  t[2].requiredTables = {0};
+        g_joinEnumerator().invalidate();
+        JoinPlan p1 = g_joinEnumerator().plan(t, "g102_a|g102_b|g102_c");
+        JoinPlan p2 = g_joinEnumerator().plan(t, "g102_a|g102_b|g102_c");
+        check(p1.description.find("[cached]") == std::string::npos &&
+              p2.description.find("[cached]") != std::string::npos,
+              "JE #3: zweiter plan()-Aufruf kommt aus dem Plan-Cache");
+    }
+
+    // ── SEL #4: ndv-basierte Join-Selektivitaet statt 0.1 ───────
+    {
+        // a.x = b.y -> sel = 1/max(ndv) = 1/1000 -> 1000*500/1000 = 500
+        double withNdv = CostModel::joinRows(1000.0, 500.0, 1000.0, 500.0);
+        check(std::abs(withNdv - 500.0) < 1.0,
+              "SEL #4a: joinRows mit ndv=1000 -> 500 Rows (1/max(ndv))");
+        // ohne ndv-Info: konservativer Fallback 0.1
+        double fallback = CostModel::joinRows(1000.0, 500.0, 0.0, 0.0);
+        check(std::abs(fallback - 50000.0) < 1.0,
+              "SEL #4b: joinRows ohne ndv -> Fallback 0.1 (50000 Rows)");
+        // ndv kommt nach ANALYZE aus echten Stats
+        double ndv = JoinEnumerator::ndvOf("g102_a", "id");
+        check(ndv >= 900.0 && ndv <= 1100.0,
+              "SEL #4c: ndvOf(g102_a.id) ~1000 nach ANALYZE");
+    }
+
+    // ── JM #5: chooseJoinMethod (Unit) ──────────────────────────
+    {
+        // kleine outer-Seite + Index auf grosser innerer Seite -> Indexed-NL
+        std::string m1 = JoinEnumerator::chooseJoinMethod(
+            "g102_big", "id", 5.0, 5000.0, true);
+        check(m1 == "nested_loop_indexed",
+              "JM #5a: outer=5, inner=5000 indiziert -> nested_loop_indexed");
+        // outer >= NL_THRESHOLD -> Hash
+        std::string m2 = JoinEnumerator::chooseJoinMethod(
+            "g102_big", "id", 5000.0, 5000.0, true);
+        check(m2 == "hash", "JM #5b: outer=5000 >= NL_THRESHOLD -> hash");
+        // kein Index -> Hash (Default fuer Equi-Joins)
+        std::string m3 = JoinEnumerator::chooseJoinMethod(
+            "g102_big", "id", 5.0, 5000.0, false);
+        check(m3 == "hash", "JM #5c: Equi-Join ohne Index -> hash");
+        // unbekannte Tabelle (keine Stats) -> "" = alte Heuristik
+        std::string m4 = JoinEnumerator::chooseJoinMethod(
+            "g102_nostats", "id", 5.0, 1000.0, true);
+        check(m4.empty(), "JM #5d: ohne Stats -> leer (alte Heuristik)");
+    }
+
+    // ── JM #6: join_method im EXPLAIN JSON — Hash ───────────────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g102_b "
+                         "JOIN g102_c ON g102_b.a_id = g102_c.b_id");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        check(js.find("\"join_method\":\"hash\"") != std::string::npos,
+              "JM #6: Equi-Join ohne Index -> join_method=hash im JSON");
+    }
+
+    // ── JM #7: kleiner Outer + Index innen -> Indexed-NL im JSON ─
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g102_c "
+                         "JOIN g102_big ON g102_c.b_id = g102_big.id");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        check(js.find("\"join_method\":\"nested_loop_indexed\"") != std::string::npos,
+              "JM #7: outer=10, Index auf g102_big.id -> nested_loop_indexed");
+    }
+
+    // ── JM #8: Laufzeit-Korrektheit der Methoden-Wahl ───────────
+    {
+        // Indexed-NL-Pfad liefert dasselbe Ergebnis wie Hash
+        auto r1 = execSQL("SELECT * FROM g102_c "
+                          "JOIN g102_big ON g102_c.b_id = g102_big.id");
+        check(r1.error.empty() && r1.rows.size() == 10,
+              "JM #8a: Indexed-NL-Join liefert korrekt 10 Rows");
+        // NL_THRESHOLD = 0 erzwingt Hash — Ergebnis identisch
+        execSQL("SET NL_THRESHOLD = 0");
+        auto r2 = execSQL("SELECT * FROM g102_c "
+                          "JOIN g102_big ON g102_c.b_id = g102_big.id");
+        check(r2.error.empty() && r2.rows.size() == 10,
+              "JM #8b: SET NL_THRESHOLD=0 (Hash-Zwang) -> gleiche 10 Rows");
+        execSQL("SET NL_THRESHOLD = 1000");
+        check(std::abs(g_nlThreshold - 1000.0) < 1e-9,
+              "JM #8c: SET NL_THRESHOLD wirkt auf g_nlThreshold");
+    }
+
+    // ── AA #9: Auto-ANALYZE Trigger-Logik (20 %-Schwelle) ───────
+    {
+        // g102_b: ANALYZE bei 100 Rows -> Schwelle 0.2*100 = 20
+        g_autoAnalyze().resetAfterAnalyze("g102_b", 100);
+        for (int i = 101; i <= 110; ++i)   // 10 Aenderungen (10 <= 20)
+            execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'x')");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #9a: 10 Aenderungen bei 100 Rows (10%) -> KEIN Re-ANALYZE");
+        for (int i = 111; i <= 125; ++i)   // +15 -> 25 > 20
+            execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'x')");
+        check(g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #9b: 25 Aenderungen (25% > 20%) -> Re-ANALYZE noetig");
+        check(g_autoAnalyze().changesFor("g102_b") == 25,
+              "AA #9c: Aenderungszaehler steht auf 25");
+    }
+
+    // ── AA #10: Sweep analysiert + setzt Zaehler zurueck ────────
+    {
+        size_t n = autoAnalyzeSweep(engine);
+        check(n >= 1, "AA #10a: autoAnalyzeSweep analysiert >= 1 Tabelle");
+        const TableStats* ts = g_tableStats.getStats("g102_b");
+        check(ts && ts->rowCount == 125,
+              "AA #10b: Stats nach Sweep aktuell (rowCount=125)");
+        check(g_autoAnalyze().changesFor("g102_b") == 0,
+              "AA #10c: Zaehler nach Sweep zurueckgesetzt");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #10d: needsAnalyze nach Sweep false");
+    }
+
+    // ── AA #11: Threshold konfigurierbar (SET) ──────────────────
+    {
+        for (int i = 126; i <= 155; ++i)   // 30 Aenderungen bei 125 Rows (24%)
+            execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'y')");
+        execSQL("SET AUTO_ANALYZE_THRESHOLD = 0.5");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #11a: 24% Aenderungen < Threshold 0.5 -> kein Trigger");
+        execSQL("SET AUTO_ANALYZE_THRESHOLD = 0.2");
+        check(g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #11b: 24% Aenderungen > Threshold 0.2 -> Trigger");
+    }
+
+    // ── AA #12: Abschaltbar (SET AUTO_ANALYZE_ENABLED) ──────────
+    {
+        execSQL("SET AUTO_ANALYZE_ENABLED = OFF");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #12a: AUTO_ANALYZE_ENABLED=OFF -> kein Trigger");
+        check(autoAnalyzeSweep(engine) == 0,
+              "AA #12b: Sweep bei OFF analysiert nichts");
+        execSQL("SET AUTO_ANALYZE_ENABLED = ON");
+        check(g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #12c: wieder ON -> Trigger aktiv");
+    }
+
+    // ── AA #13: Hintergrund-Thread, nicht blockierend ───────────
+    {
+        g_autoAnalyze().start([&engine]() {
+            return milansql::autoAnalyzeSweep(engine);
+        }, 1);
+        check(g_autoAnalyze().isRunning(),
+              "AA #13a: Hintergrund-Thread laeuft nach start()");
+        // Query waehrend des Hintergrund-Laufs — blockiert nicht
+        auto r = execSQL("SELECT COUNT(*) FROM g102_b");
+        check(!r.rows.empty() && r.rows[0].values[0] == "155",
+              "AA #13b: Query laeuft parallel zum Auto-ANALYZE-Thread");
+        // Warten bis der Sweep die Tabelle analysiert hat (max. 8s)
+        bool swept = false;
+        for (int i = 0; i < 80 && !swept; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            swept = (g_autoAnalyze().changesFor("g102_b") == 0);
+        }
+        check(swept, "AA #13c: Hintergrund-Sweep analysiert g102_b (<8s)");
+        const TableStats* ts = g_tableStats.getStats("g102_b");
+        check(ts && ts->rowCount == 155,
+              "AA #13d: Stats nach Hintergrund-Sweep aktuell (155 Rows)");
+        check(g_autoAnalyze().runs() >= 1,
+              "AA #13e: SHOW-Status zaehlt >= 1 Lauf");
+        g_autoAnalyze().stop();
+        check(!g_autoAnalyze().isRunning(),
+              "AA #13f: Thread nach stop() beendet");
+    }
+
+    // ── AA #14: SHOW TABLE STATS zeigt Changes-Spalte ───────────
+    {
+        execSQL("INSERT INTO g102_c VALUES (99, 'zz')");
+        auto r = execSQL("SHOW TABLE STATS FOR g102_c");
+        bool hasChangesCol = false;
+        for (const auto& c : r.columns)
+            if (c.name == "Changes") hasChangesCol = true;
+        check(hasChangesCol, "AA #14a: SHOW TABLE STATS hat Changes-Spalte");
+        bool rowOk = false;
+        for (const auto& row : r.rows)
+            if (!row.values.empty() && row.values[0] == "g102_c" &&
+                row.values.back() == "1") rowOk = true;
+        check(rowOk, "AA #14b: Changes-Zaehler fuer g102_c = 1");
+    }
+
+    // ── TN #15: Tenant sieht logische Namen im EXPLAIN JSON ─────
+    {
+        // HTTP-Pfad-Simulation: Tabelle liegt physisch als u12_...
+        // 1000 Rows, damit der IndexScan den SeqScan kostenmaessig
+        // schlaegt und der Indexname im JSON auftaucht.
+        execSQL("CREATE TABLE u12_torders (id INT, amount INT)");
+        for (int b = 0; b < 10; ++b) {
+            std::string sql = "INSERT INTO u12_torders VALUES ";
+            for (int i = 1; i <= 100; ++i) {
+                int v = b * 100 + i;
+                if (i > 1) sql += ",";
+                sql += "(" + std::to_string(v) + "," + std::to_string(v * 10) + ")";
+            }
+            execSQL(sql);
+        }
+        engine.createIndex("u12_torders", {"id"}, "u12_idx_tord");
+        execSQL("ANALYZE u12_torders");
+
+        engine.setCurrentUser(12, false);
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM u12_torders WHERE id = 7");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        engine.setCurrentUser(0, true);
+
+        check(js.find("\"table\":\"torders\"") != std::string::npos,
+              "TN #15a: Tenant sieht logischen Tabellennamen (torders)");
+        check(js.find("\"index\":\"idx_tord\"") != std::string::npos,
+              "TN #15b: Tenant sieht logischen Indexnamen (idx_tord)");
+        check(js.find("u12_") == std::string::npos,
+              "TN #15c: kein physisches u12_-Praefix im JSON");
+        execSQL("DROP TABLE u12_torders");
+    }
+
+    // ── Cleanup: globale Zustaende nicht in andere Gruppen leaken ─
+    execSQL("DROP TABLE g102_a");
+    execSQL("DROP TABLE g102_b");
+    execSQL("DROP TABLE g102_c");
+    execSQL("DROP TABLE g102_big");
+    g_joinEnumerator().invalidate();
 }
 
 // MAIN
@@ -11307,6 +11620,9 @@ int main() {
     }
     try { testGroup101(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 101 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup102(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 102 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

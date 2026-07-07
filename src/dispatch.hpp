@@ -3800,6 +3800,21 @@ inline bool dispatchCommand(
                 std::cout << "  Fehler: SET NL_THRESHOLD = <Zahl>\n\n";
             }
         }
+        // Optimizer Phase 3 Block 4: Auto-ANALYZE Konfiguration
+        else if (cmd.varName == "AUTO_ANALYZE_ENABLED") {
+            bool on = (cmd.varValue == "ON" || cmd.varValue == "1" || cmd.varValue == "TRUE");
+            milansql::g_autoAnalyze().enabled = on;
+            std::cout << "  AUTO_ANALYZE_ENABLED = " << (on ? "ON" : "OFF") << "\n\n";
+        }
+        else if (cmd.varName == "AUTO_ANALYZE_THRESHOLD") {
+            try {
+                milansql::g_autoAnalyze().threshold = std::stod(cmd.varValue);
+                std::cout << "  AUTO_ANALYZE_THRESHOLD = "
+                          << milansql::g_autoAnalyze().threshold.load() << "\n\n";
+            } catch (...) {
+                std::cout << "  Fehler: SET AUTO_ANALYZE_THRESHOLD = <Zahl>\n\n";
+            }
+        }
         // Original SET CACHE ON/OFF
         else if (cmd.cacheEnabled == "ON") {
             engine.getQueryCache().setEnabled(true);
@@ -6715,12 +6730,15 @@ inline bool dispatchCommand(
 
     // ── Phase 126: SHOW AUTO ANALYZE STATUS ───────────────────────
     case milansql::CommandType::SHOW_AUTO_ANALYZE_STATUS: {
-        auto& s = engine.autoAnalyzeStatus;
+        // Optimizer Phase 3 Block 4: liest aus g_autoAnalyze()
+        auto& aa = milansql::g_autoAnalyze();
         std::cout << "\n  Auto Analyze Status:\n";
-        std::cout << "  Enabled: " << (s.enabled ? "ON" : "OFF") << "\n";
-        std::cout << "  Interval: " << s.intervalSeconds << "s\n";
-        std::cout << "  Threshold: " << s.changeThresholdPct << "%\n";
-        std::cout << "  Tables Analyzed: " << s.tablesAnalyzed << "\n\n";
+        std::cout << "  Enabled: " << (aa.enabled ? "ON" : "OFF") << "\n";
+        std::cout << "  Interval: " << aa.intervalSeconds() << "s\n";
+        std::cout << "  Threshold: " << static_cast<int>(aa.threshold.load() * 100.0) << "%\n";
+        std::cout << "  Background Running: " << (aa.isRunning() ? "yes" : "no") << "\n";
+        std::cout << "  Runs: " << aa.runs() << "\n";
+        std::cout << "  Tables Analyzed: " << aa.tablesAnalyzed() << "\n\n";
         break;
     }
 

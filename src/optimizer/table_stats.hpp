@@ -4,6 +4,7 @@
 #include <ctime>
 #include <cctype>
 #include <functional>
+#include "auto_analyze.hpp"   // Phase 3 Block 4: Zaehler-Reset nach ANALYZE
 // ============================================================
 // table_stats.hpp — Phase 86: Statistik-basierter Query Planner
 // Echte Spaltenstatistiken: Kardinalität, Min/Max, MCVs,
@@ -314,6 +315,9 @@ public:
                 ts.indexes.push_back(std::move(is));
             }
         }
+
+        // Phase 3 Block 4: Aenderungszaehler nullen, Referenz-Rows merken
+        g_autoAnalyze().resetAfterAnalyze(name, ts.rowCount);
 
         stats_[name] = std::move(ts);
     }

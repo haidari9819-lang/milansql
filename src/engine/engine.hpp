@@ -76,6 +76,7 @@
 #include "../concurrent/rwlock.hpp"         // Phase 112: per-table RwLocks
 #include "../concurrent/atomic_table.hpp"   // Phase 112: lock-free stats
 #include "../optimizer/join_plan_types.hpp" // Phase 3: Join-Enumeration (Typen + Hook)
+#include "../optimizer/auto_analyze.hpp"    // Phase 3 Block 4: Auto-ANALYZE Tracker
 #include "../optimizer/histogram.hpp"       // Phase 113: Histogram Selectivity
 #include "../wal/double_write_buffer.hpp"   // Phase 114: Double-Write Buffer
 #include "../wal/lsn_manager.hpp"           // Phase 114: LSN Manager
@@ -1206,14 +1207,8 @@ public:
     }
     void clearTrace() { optimizerTraceLog.clear(); }
 
-    // ── Phase 126: Auto Analyze Status ───────────────────────────
-    struct AutoAnalyzeStatus {
-        bool enabled = true;
-        int intervalSeconds = 60;
-        int changeThresholdPct = 10;
-        long long lastRunMs = 0;
-        int tablesAnalyzed = 0;
-    } autoAnalyzeStatus;
+    // Phase 126 AutoAnalyzeStatus → abgeloest durch g_autoAnalyze()
+    // (optimizer/auto_analyze.hpp, Optimizer Phase 3 Block 4).
 
     // ── Phase 131: TOAST Large Object Storage ────────────────────
     ToastManager toastManager;
@@ -1386,6 +1381,7 @@ public:
             tableParent_.erase(pit);
         }
         tableChildren_.erase(key);
+        g_autoAnalyze().forget(key);  // Phase 3 Block 4
     }
 
     // AUTO_INCREMENT-Zähler setzen (wird beim Laden aus Datei aufgerufen)
@@ -1485,6 +1481,7 @@ public:
         }
         t.insert(Row(vals));
         bufferPool_.markDirty(tbl);  // Phase 73: mark page dirty
+        g_autoAnalyze().recordChange(tbl);  // Phase 3 Block 4
 
         // Phase 49: Update fulltext indexes for this table
         for (auto& [n, fi] : fulltextIndices_) {
@@ -1542,6 +1539,7 @@ public:
         bool replaced = !conflicts.empty();
         if (replaced) t.eraseByIndices(conflicts);
         t.insert(Row(vals));   // UNIQUE-Check nach Löschung sauber
+        g_autoAnalyze().recordChange(tbl, replaced ? 2 : 1);  // Phase 3 Block 4
         return replaced;
     }
 
@@ -1559,6 +1557,7 @@ public:
         checkInsertFK(tbl, vals);
         if (!t.conflictRows(vals).empty()) return false;  // ignorieren
         t.insert(Row(vals));
+        g_autoAnalyze().recordChange(tbl);  // Phase 3 Block 4
         return true;
     }
 
@@ -2563,6 +2562,7 @@ public:
         Table& t = getTable(tbl);
         auto n = t.updateWhere(colIdx(t, setCol), setVal, colIdx(t, wCol), wVal);
         bufferPool_.markDirty(tbl);  // Phase 73
+        if (n) g_autoAnalyze().recordChange(tbl, n);  // Phase 3 Block 4
         return n;
     }
 
@@ -2586,6 +2586,7 @@ public:
         Table& t = getTable(tbl);
         auto n = t.updateAll(colIdx(t, setCol), setVal);
         bufferPool_.markDirty(tbl);  // Phase 73
+        if (n) g_autoAnalyze().recordChange(tbl, n);  // Phase 3 Block 4
         return n;
     }
 
@@ -2658,6 +2659,7 @@ public:
         Table& t = getTable(tbl);
         std::size_t deleted = t.deleteWhere(colIdx(t, wCol), wVal);
         if (deleted) vacuumMgr_.addDeadTuples(tbl, deleted);  // Phase 85
+        if (deleted) g_autoAnalyze().recordChange(tbl, deleted);  // Phase 3 Block 4
         bufferPool_.markDirty(tbl);  // Phase 73
 
         // Phase 49: Update fulltext indexes for this table
@@ -2790,6 +2792,7 @@ public:
         }
 
         std::size_t n = tblRef.updateWhere(setCIs2, setVals, wCI, wVal);
+        if (n) g_autoAnalyze().recordChange(tbl, n);  // Phase 3 Block 4
 
         // Phase 68: recompute generated cols for affected rows
         for (auto& row : tblRef.mutableRows())
@@ -2851,6 +2854,7 @@ public:
         for (const auto& col : setCols)
             setCIs.push_back(colIdx(t, col));
         std::size_t n = t.updateAll(setCIs, setVals);
+        if (n) g_autoAnalyze().recordChange(tbl, n);  // Phase 3 Block 4
         // Phase 68: recompute generated cols for all rows
         for (auto& row : t.mutableRows())
             applyGeneratedCols(t, row.values);
@@ -2877,7 +2881,9 @@ public:
             txBuffer_.push_back(std::move(op));
             return 0;
         }
-        return getTable(tbl).deleteAll();
+        std::size_t nDel = getTable(tbl).deleteAll();
+        if (nDel) g_autoAnalyze().recordChange(tbl, nDel);  // Phase 3 Block 4
+        return nDel;
     }
 
     // ── Phase 22: TRUNCATE TABLE ─────────────────────────────
@@ -2887,6 +2893,8 @@ public:
     void truncateTable(const std::string& tblRaw) {
         auto tbl = resolveTableName(tblRaw);
         Table& t = getTable(tbl);
+        if (t.rowCount())
+            g_autoAnalyze().recordChange(tbl, t.rowCount());  // Phase 3 Block 4
         t.deleteAll();   // direkte Table-Methode, ohne FK-Check
         for (const auto& col : t.columns())
             if (col.autoIncrement)
@@ -7716,6 +7724,7 @@ private:
 
     // Eine gepufferte Op auf die Tabellen anwenden
     void applyOp(const BufferedOp& op) {
+        g_autoAnalyze().recordChange(op.tableName);  // Phase 3 Block 4
         switch (op.opType) {
             case BufferedOp::Type::INSERT: {
                 Table& t = getTable(op.tableName);

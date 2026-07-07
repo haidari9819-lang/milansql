@@ -882,6 +882,11 @@ int main(int argc, char* argv[]) {
     // ── Phase 85: Start Auto-Vacuum background thread ────────
     engine.startAutoVacuum();
 
+    // ── Optimizer Phase 3: Auto-ANALYZE background thread ────
+    milansql::g_autoAnalyze().start([&engine]() {
+        return milansql::autoAnalyzeSweep(engine);
+    });
+
     // ── Phase 61: Event Scheduler (REPL mode) ────────────────
     auto eventExecFn = [&](const std::string& sql) {
         try {
@@ -999,6 +1004,7 @@ int main(int argc, char* argv[]) {
                     bufferPoolStop.store(true);
                     bufferPoolThread.detach();
                     engine.stopAutoVacuum();
+                    milansql::g_autoAnalyze().stop();
                     return 0;
                 }
                 continue;
@@ -1275,6 +1281,7 @@ int main(int argc, char* argv[]) {
     }
 
     engine.stopAutoVacuum();        // Phase 85: stop background vacuum thread
+    milansql::g_autoAnalyze().stop();  // Optimizer Phase 3: stop Auto-ANALYZE thread
     bufferPoolStop.store(true);
     bufferPoolThread.detach();
     // Phase 106: stop WebSocket server

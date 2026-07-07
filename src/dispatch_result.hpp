@@ -209,6 +209,16 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             try { milansql::g_nlThreshold = std::stod(cmd.varValue); } catch (...) {}
             qr.message = "SET";
         }
+        // Optimizer Phase 3 Block 4: Auto-ANALYZE Konfiguration
+        else if (cmd.varName == "AUTO_ANALYZE_ENABLED") {
+            milansql::g_autoAnalyze().enabled =
+                (cmd.varValue == "ON" || cmd.varValue == "1" || cmd.varValue == "TRUE");
+            qr.message = "SET";
+        }
+        else if (cmd.varName == "AUTO_ANALYZE_THRESHOLD") {
+            try { milansql::g_autoAnalyze().threshold = std::stod(cmd.varValue); } catch (...) {}
+            qr.message = "SET";
+        }
         if (qr.message.empty()) qr.message = "SET";
         break;
 
@@ -260,12 +270,19 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     }
 
     case milansql::CommandType::SHOW_AUTO_ANALYZE_STATUS: {
+        // Optimizer Phase 3 Block 4: liest aus g_autoAnalyze()
         qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
-        auto& s = engine.autoAnalyzeStatus;
-        qr.rows.push_back(milansql::Row({"Enabled", s.enabled ? "ON" : "OFF"}));
-        qr.rows.push_back(milansql::Row({"Interval", std::to_string(s.intervalSeconds) + "s"}));
-        qr.rows.push_back(milansql::Row({"Threshold", std::to_string(s.changeThresholdPct) + "%"}));
-        qr.rows.push_back(milansql::Row({"Tables Analyzed", std::to_string(s.tablesAnalyzed)}));
+        auto& aa = milansql::g_autoAnalyze();
+        qr.rows.push_back(milansql::Row({"Enabled", aa.enabled ? "ON" : "OFF"}));
+        qr.rows.push_back(milansql::Row({"Interval", std::to_string(aa.intervalSeconds()) + "s"}));
+        {
+            std::ostringstream th;
+            th << std::fixed << std::setprecision(0) << (aa.threshold.load() * 100.0);
+            qr.rows.push_back(milansql::Row({"Threshold", th.str() + "%"}));
+        }
+        qr.rows.push_back(milansql::Row({"Background Running", aa.isRunning() ? "yes" : "no"}));
+        qr.rows.push_back(milansql::Row({"Runs", std::to_string(aa.runs())}));
+        qr.rows.push_back(milansql::Row({"Tables Analyzed", std::to_string(aa.tablesAnalyzed())}));
         break;
     }
 
@@ -1289,7 +1306,8 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     case milansql::CommandType::SHOW_TABLE_STATS: {
         qr.columns = {milansql::Column{"Table","TEXT"}, milansql::Column{"Rows","INT"},
                       milansql::Column{"Pages","INT"}, milansql::Column{"LastAnalyzed","TEXT"},
-                      milansql::Column{"DeadRows","INT"}, milansql::Column{"Sampled","TEXT"}};
+                      milansql::Column{"DeadRows","INT"}, milansql::Column{"Sampled","TEXT"},
+                      milansql::Column{"Changes","INT"}};   // Optimizer Phase 3 Block 4
         for (const auto& [k, v] : milansql::g_tableStats.all()) {
             if (!cmd.statsTable.empty() && v.name != cmd.statsTable) continue;
             double rowWidth = 0.0;
@@ -1299,7 +1317,8 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                                              std::to_string(pages),
                                              v.lastAnalyzed.empty() ? "never" : v.lastAnalyzed,
                                              std::to_string(v.deadRowCount),
-                                             v.sampled ? "yes" : "no"}));
+                                             v.sampled ? "yes" : "no",
+                                             std::to_string(milansql::g_autoAnalyze().changesFor(v.name))}));
         }
         break;
     }

@@ -373,6 +373,28 @@ inline JoinEnumerator& g_joinEnumerator() {
     return e;
 }
 
+// ── Block 4: Auto-ANALYZE Sweep ────────────────────────────────
+// Analysiert alle Tabellen, deren Aenderungszaehler seit dem
+// letzten ANALYZE ueber auto_analyze_threshold * rowCount liegt
+// (g_autoAnalyze().needsAnalyze). Template, damit dieser Header
+// keine Engine-Abhaengigkeit bekommt; aufgerufen aus dem
+// Hintergrund-Thread (main.cpp / http_server.hpp).
+template <typename EngineT>
+inline size_t autoAnalyzeSweep(EngineT& engine) {
+    if (!g_autoAnalyze().enabled) return 0;
+    size_t analyzed = 0;
+    for (const auto& kv : engine.getTables()) {
+        // Stats-Konvention: "public."-Praefix gestrippt (wie ANALYZE)
+        const std::string key = AutoAnalyzeTracker::normKey(kv.first);
+        if (!g_autoAnalyze().needsAnalyze(key)) continue;
+        g_tableStats.analyzeTable(key, kv.second);  // inkl. Zaehler-Reset
+        g_joinEnumerator().invalidate(key);         // Plan-Cache stale
+        ++analyzed;
+    }
+    if (analyzed) g_tableStats.saveStats();
+    return analyzed;
+}
+
 // ── Hook-Installation (Muster wie g_indexPathAdvisor) ──────────
 inline const bool g_joinPlanHookInstalled = []() {
     g_joinPlanHook = [](const std::vector<JoinTableInfo>& tables,

@@ -1,16 +1,20 @@
 #pragma once
 // ============================================================
 // optimizer.hpp — Cost-Based Query Optimizer for MilanSQL
-// Phase 48: Join-Reihenfolge, Index-Auswahl, Predicate Pushdown
+// Phase 48: Join-Reihenfolge, Index-Auswahl
+// Optimizer Phase 3 (Konsolidierung): alle Kosten kommen aus
+// cost_model.hpp; Zeilen-/Selektivitaetsschaetzungen aus
+// g_tableStats (Phase 1/2). Die alte sqrt(rowCount)-Heuristik
+// und die Kartesisch-Produkt-Kosten sind entfernt.
 // ============================================================
 
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <cmath>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
+#include "plan_selector.hpp"   // bringt cost_model.hpp + table_stats.hpp mit
 
 namespace milansql {
 
@@ -46,10 +50,14 @@ public:
         return notes;
     }
 
-    // Estimate row count for a table (returns 1000 as default if unknown)
+    // Estimate row count for a table: echte Stats (ANALYZE) zuerst,
+    // sonst tatsaechlicher rowCount, sonst 1000.
     static size_t estimateRowCount(const std::string& tableName, Engine& engine) {
         try {
-            auto it = engine.tables_.find(tableName);
+            std::string key = engine.resolveTableName(tableName);
+            const TableStats* ts = g_tableStats.getStats(key);
+            if (ts && ts->rowCount > 0) return ts->rowCount;
+            auto it = engine.tables_.find(key);
             if (it == engine.tables_.end()) return 1000;
             return it->second.rowCount();
         } catch (...) {
@@ -59,6 +67,8 @@ public:
 
     // Optimize join order: swap main table and first INNER JOIN table
     // if the joined table is smaller (fewer rows = smaller outer loop).
+    // Kosten in der Note kommen aus dem CostModel (SeqScan beider
+    // Seiten + HashJoin), nicht mehr aus |R|·|S|.
     static OptimizationNote optimizeJoinOrder(ParsedCommand& cmd, Engine& engine) {
         OptimizationNote note;
         if (cmd.joinClauses.empty()) return note;
@@ -72,10 +82,37 @@ public:
         // Only swap if the join table is strictly smaller
         if (joinCount >= mainCount) return note;
 
+        // CostModel-Kosten beider Reihenfolgen (HashJoin, Build auf inner)
+        std::string keyMain = engine.resolveTableName(cmd.tableName);
+        std::string keyJoin = engine.resolveTableName(cmd.joinClauses[0].table);
+        auto inM = CostModel::tableInput(keyMain,
+            static_cast<double>(mainCount), 64.0);
+        auto inJ = CostModel::tableInput(keyJoin,
+            static_cast<double>(joinCount), 64.0);
+        CostEstimate sM = CostModel::seqScan(inM, 0, inM.rows);
+        CostEstimate sJ = CostModel::seqScan(inJ, 0, inJ.rows);
+
+        // Join-Selektivitaet aus ndv der ON-Spalten (1/max(ndv)),
+        // ohne Stats Fallback 0.1 (CostModel::joinRows).
+        auto colOf = [](const std::string& s) -> std::string {
+            auto p = s.rfind('.');
+            return p != std::string::npos ? s.substr(p + 1) : s;
+        };
+        auto ndvOf = [](const std::string& tbl, const std::string& col) -> double {
+            const TableStats* ts = g_tableStats.getStats(tbl);
+            if (!ts) return 0.0;
+            auto it = ts->cols.find(col);
+            return it != ts->cols.end()
+                ? static_cast<double>(it->second.distinctCount) : 0.0;
+        };
+        double ndvL = ndvOf(keyMain, colOf(cmd.joinClauses[0].onLeft));
+        double ndvR = ndvOf(keyJoin, colOf(cmd.joinClauses[0].onRight));
+        double outRows = CostModel::joinRows(sM.rows, sJ.rows, ndvL, ndvR);
+
         // Record original state
         note.step       = "Join-Reihenfolge";
         note.original   = cmd.tableName + " -> " + cmd.joinClauses[0].table;
-        note.costBefore = static_cast<double>(mainCount) * static_cast<double>(joinCount);
+        note.costBefore = CostModel::hashJoin(sM, sJ, outRows).total;
 
         std::string oldMain = cmd.tableName;
         std::string oldJoin = cmd.joinClauses[0].table;
@@ -88,7 +125,7 @@ public:
         std::swap(cmd.joinClauses[0].onLeft, cmd.joinClauses[0].onRight);
 
         note.optimized  = cmd.tableName + " -> " + cmd.joinClauses[0].table;
-        note.costAfter  = static_cast<double>(joinCount) * static_cast<double>(mainCount);
+        note.costAfter  = CostModel::hashJoin(sJ, sM, outRows).total;
         note.optimized += " (" + cmd.tableName + ": " + std::to_string(joinCount) +
                           " Zeilen, " + cmd.joinClauses[0].table + ": " +
                           std::to_string(mainCount) + " Zeilen)";
@@ -97,73 +134,43 @@ public:
     }
 
     // Select best index for WHERE conditions on the main table.
-    // Chooses the index with the highest estimated selectivity.
+    // Phase 3: kostenbasiert via PlanSelector/CostModel — nur wenn
+    // echte Stats (ANALYZE) vorliegen; die sqrt-Heuristik ist weg.
     static OptimizationNote selectBestIndex(ParsedCommand& cmd, Engine& engine) {
         OptimizationNote note;
         if (cmd.whereConds.empty()) return note;
         if (cmd.tableName.empty())  return note;
 
-        auto it = engine.tables_.find(cmd.tableName);
-        if (it == engine.tables_.end()) return note;
-        const Table& tbl = it->second;
+        std::string key = engine.resolveTableName(cmd.tableName);
+        const TableStats* ts = g_tableStats.getStats(key);
+        if (!ts || ts->rowCount == 0) return note;  // ohne Stats keine Kostenbasis
 
-        size_t rowCount = tbl.rowCount();
-        if (rowCount == 0) return note;
-
-        // Find WHERE conditions that have an index on the main table
-        std::string bestCol;
-        std::string bestIdxName;
-        double      bestSelectivity = 2.0; // lower is better (1.0 = full scan, <1.0 = selective)
-
-        for (const auto& wc : cmd.whereConds) {
-            if (wc.op != "=") continue;  // only equality for index lookup
-
-            // Strip table prefix if present (e.g. "gross.klein_id" -> "klein_id")
-            std::string colName = wc.col;
-            auto dotPos = colName.find('.');
+        // Tabellen-Prefix von Spalten strippen ("gross.klein_id" -> "klein_id")
+        std::vector<WhereCondition> conds = cmd.whereConds;
+        for (auto& wc : conds) {
+            auto dotPos = wc.col.find('.');
             if (dotPos != std::string::npos)
-                colName = colName.substr(dotPos + 1);
-
-            if (!tbl.hasIndex(colName)) continue;
-
-            // Estimate selectivity: distinct values / row count
-            // Use sqrt(rowCount) as a heuristic for distinct values
-            size_t distinctEst = std::max(static_cast<size_t>(1),
-                                          static_cast<size_t>(std::sqrt(static_cast<double>(rowCount))));
-            double selectivity = static_cast<double>(distinctEst) /
-                                 static_cast<double>(rowCount);
-
-            if (selectivity < bestSelectivity) {
-                bestSelectivity = selectivity;
-                bestCol         = colName;
-                // Find the index name for this column
-                for (const auto& info : tbl.getIndexes()) {
-                    std::string leading = info.colName;
-                    auto comma = leading.find(',');
-                    if (comma != std::string::npos)
-                        leading = leading.substr(0, comma);
-                    // trim spaces
-                    while (!leading.empty() && leading.front() == ' ') leading.erase(leading.begin());
-                    while (!leading.empty() && leading.back()  == ' ') leading.pop_back();
-                    if (leading == colName) {
-                        bestIdxName = info.indexName;
-                        break;
-                    }
-                }
-            }
+                wc.col = wc.col.substr(dotPos + 1);
         }
 
-        if (bestCol.empty() || bestIdxName.empty()) return note;
+        auto candidates = PlanSelector::indexesFromStats(key);
+        if (candidates.empty()) return note;
 
-        // Only report when we actually have an index to use
+        PlanChoice pc = PlanSelector::choose(key, conds, candidates);
+        if (pc.planType == "SeqScan" || pc.indexName.empty()) return note;
+
+        auto in = CostModel::tableInput(key,
+            static_cast<double>(ts->rowCount), 64.0);
+        CostEstimate seq = CostModel::seqScan(in, conds.size(), pc.estimatedRows);
+
         note.step       = "Index-Auswahl";
         note.original   = "FULL SCAN auf " + cmd.tableName;
-        note.costBefore = static_cast<double>(rowCount);
-        note.optimized  = bestIdxName + " auf " + cmd.tableName +
-                          " (Spalte: " + bestCol +
+        note.costBefore = seq.total;
+        note.optimized  = pc.indexName + " auf " + cmd.tableName +
+                          " (Spalte: " + pc.indexCol +
                           ", Selektivitaet: " +
-                          std::to_string(static_cast<int>(bestSelectivity * 100)) + "%)";
-        note.costAfter  = bestSelectivity * static_cast<double>(rowCount);
+                          std::to_string(static_cast<int>(pc.selectivity * 100)) + "%)";
+        note.costAfter  = pc.estimatedCost;
 
         return note;
     }

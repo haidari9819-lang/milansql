@@ -45,7 +45,7 @@
 #include "ssl/tls_context.hpp"               // Phase 110: SSL/TLS
 #include "index/hnsw_index.hpp"              // Phase 111: pgvector HNSW
 #include "types/vector_type.hpp"             // Phase 111: VectorType
-#include "optimizer/dp_planner.hpp"          // Phase 113: DP Join Order Optimizer
+#include "optimizer/join_enumerator.hpp"     // Phase 3: Selinger Join Enumeration
 #include "optimizer/histogram.hpp"           // Phase 113: Histogram Selectivity
 
 // Phase 106: WebSocket notification callback
@@ -3791,6 +3791,15 @@ inline bool dispatchCommand(
             engine.optimizerTraceEnabled = (cmd.varValue == "ON" || cmd.varValue == "1");
             engine.clearTrace();
         }
+        // Optimizer Phase 3 Block 3: Indexed-NL nur wenn outer < NL_THRESHOLD
+        else if (cmd.varName == "NL_THRESHOLD") {
+            try {
+                milansql::g_nlThreshold = std::stod(cmd.varValue);
+                std::cout << "  NL_THRESHOLD = " << milansql::g_nlThreshold << "\n\n";
+            } catch (...) {
+                std::cout << "  Fehler: SET NL_THRESHOLD = <Zahl>\n\n";
+            }
+        }
         // Original SET CACHE ON/OFF
         else if (cmd.cacheEnabled == "ON") {
             engine.getQueryCache().setEnabled(true);
@@ -5035,7 +5044,7 @@ inline bool dispatchCommand(
             }
             g_tableStats.saveStats();
             g_adaptiveStats.saveStats();
-            milansql::g_dpPlanner().invalidate();
+            milansql::g_joinEnumerator().invalidate();
             std::cout << "  ANALYZE: " << tables.size()
                       << " Tabelle(n) — Statistiken aktualisiert.\n";
         }
@@ -5478,12 +5487,12 @@ inline bool dispatchCommand(
         g_adaptiveStats.showStats();
         // Phase 113: DP Planner stats
         const auto& dps = milansql::g_dpStats();
-        std::cout << "\n--- DP Query Planner (Phase 113) ---\n";
+        std::cout << "\n--- Join Enumerator (Phase 3, Selinger DP) ---\n";
         std::cout << "  Queries planned (DP):   " << dps.queriesPlanned.load()   << "\n";
         std::cout << "  Plan cache hits:        " << dps.planCacheHits.load()    << "\n";
         std::cout << "  Plan cache misses:      " << dps.planCacheMisses.load()  << "\n";
         std::cout << "  Total subsets evaluated:" << dps.totalSubsetsEval.load() << "\n";
-        std::cout << "  Plan cache size:        " << milansql::g_dpPlanner().cacheSize() << "\n";
+        std::cout << "  Plan cache size:        " << milansql::g_joinEnumerator().cacheSize() << "\n";
         std::cout << "\n";
         break;
     }
@@ -5507,12 +5516,12 @@ inline bool dispatchCommand(
             }
             g_tableStats.saveStats();
             g_adaptiveStats.saveStats();
-            milansql::g_dpPlanner().invalidate();  // Phase 113: stats changed
+            milansql::g_joinEnumerator().invalidate();  // Phase 113: stats changed
             std::cout << "  ANALYZE: " << count << " Tabelle(n) analysiert.\n\n";
         } else {
             // ANALYZE TABLE name
             g_adaptiveStats.analyzeTable(cmd.tableName);
-            milansql::g_dpPlanner().invalidate(cmd.tableName);  // Phase 113
+            milansql::g_joinEnumerator().invalidate(cmd.tableName);  // Phase 113
             if (engine.tableExists(cmd.tableName)) {
                 const Table& tbl = engine.getTables().at(cmd.tableName);
                 g_tableStats.analyzeTable(cmd.tableName, tbl);

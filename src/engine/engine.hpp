@@ -75,7 +75,7 @@
 #include "../fdw/foreign_data_wrapper.hpp"  // Phase 89: FDW base
 #include "../concurrent/rwlock.hpp"         // Phase 112: per-table RwLocks
 #include "../concurrent/atomic_table.hpp"   // Phase 112: lock-free stats
-#include "../optimizer/dp_planner.hpp"      // Phase 113: DP Join Order Optimizer
+#include "../optimizer/join_plan_types.hpp" // Phase 3: Join-Enumeration (Typen + Hook)
 #include "../optimizer/histogram.hpp"       // Phase 113: Histogram Selectivity
 #include "../wal/double_write_buffer.hpp"   // Phase 114: Double-Write Buffer
 #include "../wal/lsn_manager.hpp"           // Phase 114: LSN Manager
@@ -1109,6 +1109,7 @@ private:
 // Phase 83: Join Algorithms (included here inside namespace milansql so they see Row/Table/Column)
 #include "../executor/join_planner.hpp"
 #include "../executor/hash_join.hpp"
+#include "../executor/indexed_nested_loop.hpp"
 #include "../executor/merge_join.hpp"
 
 // Phase 84: Page-based I/O (included here so they see Row/Table/Column)
@@ -2168,23 +2169,37 @@ public:
                 return -1;  // unknown (likely base table alias)
             };
 
-            // Compute requiredTables (connectivity) for each join table
+            // Compute requiredTables (connectivity) + join predicate
+            // columns (Phase 3: ndv-based join selectivity) per table
+            auto colOf113 = [](const std::string& s) -> std::string {
+                auto p = s.rfind('.');
+                return p != std::string::npos ? s.substr(p + 1) : s;
+            };
             for (size_t ji = 1; ji < dpTables.size(); ++ji) {
                 const JoinClause& jc2 = joins[ji - 1];
                 std::string leftPfx   = tblOf113(jc2.onLeft);
                 std::string rightPfx  = tblOf113(jc2.onRight);
+                int lIdx = findIdx113(leftPfx);
+                int rIdx = findIdx113(rightPfx);
+                if (lIdx < 0) lIdx = 0;  // unknown alias → assume base table
+                if (rIdx < 0) rIdx = 0;
 
                 std::set<int> req;
-                for (const std::string& pfx : {leftPfx, rightPfx}) {
-                    int idx = findIdx113(pfx);
-                    if (idx < 0) {
-                        req.insert(0);  // unknown alias → assume base table
-                    } else if (idx != static_cast<int>(ji)) {
-                        req.insert(idx);
-                    }
-                }
+                if (lIdx != static_cast<int>(ji)) req.insert(lIdx);
+                if (rIdx != static_cast<int>(ji)) req.insert(rIdx);
                 if (req.empty()) req.insert(0);
                 dpTables[ji].requiredTables.assign(req.begin(), req.end());
+
+                // Which ON side belongs to this table?
+                if (lIdx == static_cast<int>(ji)) {
+                    dpTables[ji].joinColSelf  = colOf113(jc2.onLeft);
+                    dpTables[ji].otherIdx     = rIdx;
+                    dpTables[ji].joinColOther = colOf113(jc2.onRight);
+                } else if (rIdx == static_cast<int>(ji)) {
+                    dpTables[ji].joinColSelf  = colOf113(jc2.onRight);
+                    dpTables[ji].otherIdx     = lIdx;
+                    dpTables[ji].joinColOther = colOf113(jc2.onLeft);
+                }
             }
 
             // Build cache key from sorted table names
@@ -2194,8 +2209,11 @@ public:
             std::sort(tNames.begin(), tNames.end());
             for (const auto& n : tNames) cacheKey += n + ",";
 
-            // Run DP planner
-            auto dpResult = milansql::g_dpPlanner().plan(dpTables, cacheKey);
+            // Run join enumerator (Phase 3; via hook — no hook installed
+            // means dpUsed=false → original order)
+            milansql::JoinPlan dpResult;
+            if (milansql::g_joinPlanHook)
+                dpResult = milansql::g_joinPlanHook(dpTables, cacheKey);
             lastJoinPlan_ = dpResult;
 
             // Reorder joins if DP found a valid plan
@@ -2280,10 +2298,34 @@ public:
             JoinStrategy strategy83 = JoinPlanner::choose(
                 current.rowCount(), right.rowCount(), leftHasIdx83, rightHasIdx83);
 
+            // ── Optimizer Phase 3 (Block 3): kostenbasierte Methoden-Wahl.
+            // Nur mit echten Stats (Advisor liefert sonst "") — dann
+            // uebersteuert sie die alte Groessen-Heuristik.
+            std::string method3;
+            if (milansql::g_joinMethodAdvisor) {
+                method3 = milansql::g_joinMethodAdvisor(
+                    resolveTableName(jc.table), rightColBare83,
+                    static_cast<double>(current.rowCount()),
+                    static_cast<double>(right.rowCount()), rightHasIdx83);
+            }
+            if (method3 == "nested_loop_indexed" &&
+                (jc.joinType == "INNER" || jc.joinType == "LEFT")) {
+                addTrace("Chose INDEXED_NESTED_LOOP (cost-based): left=" +
+                    std::to_string(current.rowCount()) + " rows, right=" +
+                    std::to_string(right.rowCount()) + " rows, index on " +
+                    jc.table + "." + rightColBare83);
+                current = IndexedNestedLoop::execute(
+                    current, right, leftCI, rightCI,
+                    rightColBare83, jc.joinType, newCols);
+                continue;
+            }
+            if (method3 == "hash") strategy83 = JoinStrategy::HASH_JOIN;
+
             // Phase 126: Optimizer trace — log chosen join strategy
             {
                 std::string stratName = JoinPlanner::name(strategy83);
-                addTrace("Chose " + stratName + ": left=" +
+                addTrace("Chose " + stratName + (method3 == "hash"
+                    ? " (cost-based)" : "") + ": left=" +
                     std::to_string(current.rowCount()) + " rows, right=" +
                     std::to_string(right.rowCount()) + " rows");
             }
@@ -7804,9 +7846,11 @@ public:
                 std::sort(tn.begin(), tn.end());
                 for (const auto& n : tn) ck += n + ",";
 
-                auto dp = milansql::g_dpPlanner().plan(dpTbl, ck);
+                milansql::JoinPlan dp;
+                if (milansql::g_joinPlanHook)
+                    dp = milansql::g_joinPlanHook(dpTbl, ck);
                 addStep("DP_PLAN", "-",
-                    "DP Planner: " + dp.description, "-");
+                    "Join Enumerator: " + dp.description, "-");
                 // Show optimal order
                 if (dp.dpUsed) {
                     std::string orderStr = dpTbl[0].name;
@@ -7838,8 +7882,23 @@ public:
                 size_t rightSz83 = tables_.count(rTbl83) ? tables_.at(rTbl83).rowCount() : 0;
                 JoinStrategy strat83 = JoinPlanner::choose(
                     leftSz83, rightSz83, leftHasIdx83, rightHasIdx83);
+                std::string stratDesc =
+                    JoinPlanner::description(strat83, leftSz83, rightSz83);
+                // Optimizer Phase 3 (Block 3): kostenbasierte Wahl (Stats)
+                if (milansql::g_joinMethodAdvisor) {
+                    std::string m3 = milansql::g_joinMethodAdvisor(
+                        rTbl83, rightCol83,
+                        static_cast<double>(leftSz83),
+                        static_cast<double>(rightSz83), rightHasIdx83);
+                    if (m3 == "nested_loop_indexed" &&
+                        (jc.joinType == "INNER" || jc.joinType == "LEFT"))
+                        stratDesc = "Indexed Nested Loop (cost-based, index on " +
+                                    rightCol83 + ")";
+                    else if (m3 == "hash")
+                        stratDesc = "Hash Join (cost-based)";
+                }
                 std::string det = jc.joinType + " JOIN ON " + jc.onLeft + " = " + jc.onRight +
-                    "  [" + JoinPlanner::description(strat83, leftSz83, rightSz83) + "]";
+                    "  [" + stratDesc + "]";
                 addStep("JOIN", jc.table, det, "-");
             }
             // WHERE nach dem JOIN

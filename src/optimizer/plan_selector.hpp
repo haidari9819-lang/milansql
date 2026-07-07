@@ -2,9 +2,11 @@
 #include <string>
 #include <vector>
 #include <cctype>
+#include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include "cost_model.hpp"
+#include "join_enumerator.hpp"   // Block 3: chooseJoinMethod fuer EXPLAIN JSON
 // ============================================================
 // plan_selector.hpp — Optimizer-Roadmap Phase 2: Plan Selector
 //
@@ -39,6 +41,7 @@ struct PlanChoice {
     double selectivity   = 1.0;        // kombinierte Selektivitaet aller Conds
     std::string filter;                // z.B. "price > 100 AND stock > 0"
     bool fromStats = false;            // Entscheidung basiert auf ANALYZE-Stats
+    std::string joinMethod;            // Block 3: "hash"|"nested_loop"|"nested_loop_indexed"
 };
 
 class PlanSelector {
@@ -215,6 +218,8 @@ public:
            << ",\"filter\":";
         if (pc.filter.empty()) ss << "null";
         else ss << "\"" << jsonEscape(pc.filter) << "\"";
+        if (!pc.joinMethod.empty())
+            ss << ",\"join_method\":\"" << jsonEscape(pc.joinMethod) << "\"";
         ss << "}";
         return ss.str();
     }
@@ -260,9 +265,31 @@ public:
             }
         }
 
+        // Phase 3 Block 5 (Tenant-Fix): Der HTTP-Pfad praefixiert
+        // Tabellennamen VOR dem Dispatch physisch ("u<id>_x") —
+        // r.logical ist dort also schon physisch. Fuer die Anzeige
+        // das Tenant-Praefix des aktuellen Users strippen (table
+        // UND index), sonst leakt das interne Praefix ins JSON.
+        auto displayName = [&](const std::string& n) -> std::string {
+            int uid = engine.getCurrentUserId();
+            if (uid <= 0) return n;
+            std::string pf = "u" + std::to_string(uid) + "_";
+            std::string head, bare = n;
+            auto dot = n.rfind('.');
+            if (dot != std::string::npos) {
+                head = n.substr(0, dot + 1);   // Schema-Praefix behalten
+                bare = n.substr(dot + 1);
+            }
+            if (bare.size() > pf.size() && bare.compare(0, pf.size(), pf) == 0)
+                bare = bare.substr(pf.size());
+            return head + bare;
+        };
+
         // WHERE-Bedingungen den Tabellen zuordnen:
         // "alias.col"/"table.col" → passende Tabelle (Praefix strippen),
-        // unpraefixiert → Basistabelle.
+        // unpraefixiert → Basistabelle. Tenant: der User schreibt den
+        // logischen Namen ("demo_products.price"), refs[i].logical ist
+        // auf dem HTTP-Pfad aber physisch → auch gegen displayName matchen.
         for (const auto& wc : cmd.whereConds) {
             std::string col = wc.col;
             size_t dot = col.find('.');
@@ -270,7 +297,8 @@ public:
             if (dot != std::string::npos) {
                 std::string pre = col.substr(0, dot);
                 for (size_t i = 0; i < refs.size(); ++i)
-                    if (pre == refs[i].alias || pre == refs[i].logical) {
+                    if (pre == refs[i].alias || pre == refs[i].logical ||
+                        pre == displayName(refs[i].logical)) {
                         target = i;
                         col = col.substr(dot + 1);
                         break;
@@ -298,7 +326,9 @@ public:
             PlanChoice pc = choose(r.statsKey, r.conds,
                                    indexesFromStats(r.statsKey),
                                    fbRows, fbWidth);
-            pc.table = r.logical;  // logischen Namen berichten
+            pc.table = displayName(r.logical);  // logischen Namen berichten
+            if (!pc.indexName.empty())
+                pc.indexName = displayName(pc.indexName);
             return pc;
         };
 
@@ -316,10 +346,67 @@ public:
             ji.push_back(j);
         }
         std::vector<size_t> order = joinOrder(ji);
+
+        // ── Block 3: join_method pro Element (ab dem zweiten in
+        // der Ausgabereihenfolge), gleiche Kostenlogik wie
+        // executeJoins (JoinEnumerator::chooseJoinMethod).
+        auto bareCol = [](const std::string& s) -> std::string {
+            auto p = s.rfind('.');
+            return p != std::string::npos ? s.substr(p + 1) : s;
+        };
+        auto sideMatches = [&](const std::string& side, size_t refIdx) {
+            auto p = side.rfind('.');
+            if (p == std::string::npos) return false;
+            std::string pre = side.substr(0, p);
+            return pre == refs[refIdx].alias || pre == refs[refIdx].logical ||
+                   pre == displayName(refs[refIdx].logical);
+        };
+        // Join-Spalte der Tabelle refIdx aus ihrer ON-Klausel
+        auto joinColFor = [&](size_t refIdx) -> std::string {
+            if (refIdx >= 1) {
+                const auto& jc = cmd.joinClauses[refIdx - 1];
+                if (sideMatches(jc.onLeft, refIdx))  return bareCol(jc.onLeft);
+                if (sideMatches(jc.onRight, refIdx)) return bareCol(jc.onRight);
+                return bareCol(jc.onRight);
+            }
+            // Basistabelle: erste Klausel, deren eine Seite auf sie zeigt
+            for (const auto& jc : cmd.joinClauses) {
+                if (sideMatches(jc.onLeft, 0))  return bareCol(jc.onLeft);
+                if (sideMatches(jc.onRight, 0)) return bareCol(jc.onRight);
+            }
+            return "";
+        };
+
         std::string out = "[";
+        double cumRows = 0.0;
         for (size_t k = 0; k < order.size(); ++k) {
+            PlanChoice pc = planFor(refs[order[k]]);
+            if (k == 0) {
+                cumRows = pc.estimatedRows;
+            } else {
+                std::string col = joinColFor(order[k]);
+                if (col.empty()) {
+                    pc.joinMethod = "nested_loop";  // Cross-Product
+                    cumRows *= std::max(1.0, pc.estimatedRows);
+                } else {
+                    const std::string& sk = refs[order[k]].statsKey;
+                    bool hasIdx = false;
+                    for (const auto& ic : indexesFromStats(sk))
+                        if (ic.colName == col) { hasIdx = true; break; }
+                    pc.joinMethod = JoinEnumerator::chooseJoinMethod(
+                        sk, col, cumRows, pc.estimatedRows, hasIdx);
+                    if (pc.joinMethod.empty())
+                        // Ohne Stats: alte Heuristik (JoinPlanner) angenaehert
+                        pc.joinMethod = (cumRows < 10.0 &&
+                                         pc.estimatedRows < 10.0)
+                                          ? "nested_loop" : "hash";
+                    double ndv = JoinEnumerator::ndvOf(sk, col);
+                    cumRows = CostModel::joinRows(
+                        cumRows, pc.estimatedRows, ndv, ndv);
+                }
+            }
             if (k) out += ",";
-            out += toJson(planFor(refs[order[k]]));
+            out += toJson(pc);
         }
         out += "]";
         return out;

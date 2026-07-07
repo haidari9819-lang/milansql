@@ -10,6 +10,7 @@
 #include "optimizer/table_stats.hpp"  // Optimizer Phase 1: echte Statistiken
 #include "optimizer/cost_model.hpp"   // Optimizer Phase 2: Cost Model
 #include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
+#include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
 
 namespace milansql {
 
@@ -201,6 +202,11 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         else if (cmd.varName == "ENABLE_SEQSCAN" || cmd.varName == "ENABLE_INDEXSCAN" ||
                  cmd.varName == "ENABLE_HASHJOIN" || cmd.varName == "ENABLE_NESTLOOP") {
             engine.optimizerHints[cmd.varName] = cmd.varValue;
+            qr.message = "SET";
+        }
+        // Optimizer Phase 3 Block 3: Indexed-NL nur wenn outer < NL_THRESHOLD
+        else if (cmd.varName == "NL_THRESHOLD") {
+            try { milansql::g_nlThreshold = std::stod(cmd.varValue); } catch (...) {}
             qr.message = "SET";
         }
         if (qr.message.empty()) qr.message = "SET";
@@ -1242,6 +1248,7 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
                     engine.getTables().at(engine.resolveTableName(tblTarget));
                 milansql::g_tableStats.analyzeTable(tblTarget, tbl);
                 milansql::g_tableStats.saveStats();
+                milansql::g_joinEnumerator().invalidate(tblTarget);  // Phase 3: Stats geaendert
                 qr.message = "ANALYZE 1";
             } else {
                 qr.error = "Table not found: " + tblTarget;
@@ -1251,6 +1258,7 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             for (const auto& kv : engine.getTables())
                 milansql::g_tableStats.analyzeTable(kv.first, kv.second);
             milansql::g_tableStats.saveStats();
+            milansql::g_joinEnumerator().invalidate();  // Phase 3: Stats geaendert
             qr.message = "ANALYZE 1";
         }
         break;

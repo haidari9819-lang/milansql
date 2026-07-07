@@ -26,6 +26,7 @@
 #include "optimizer/adaptive_stats.hpp"
 #include "optimizer/table_stats.hpp"   // Phase 86: Column Statistics
 #include "optimizer/cost_model.hpp"    // Optimizer Phase 2: Cost Model
+#include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
@@ -2870,6 +2871,14 @@ inline bool dispatchCommand(
             std::cout << "\n";
             // Also print actual result
             dispatch_printTable(result, cmd.limit, cmd.limitOffset);
+            break;
+        }
+
+        // Optimizer Phase 2: EXPLAIN (FORMAT JSON) — kostenbasierter
+        // Plan via PlanSelector als JSON; fuehrt die Query NICHT aus.
+        if (cmd.isExplain && cmd.explainJson) {
+            std::cout << milansql::PlanSelector::explainJson(engine, cmd)
+                      << "\n";
             break;
         }
 

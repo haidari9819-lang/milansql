@@ -10860,6 +10860,154 @@ static void testGroup100() {
     }
 }
 
+// ============================================================
+// testGroup101 — Optimizer Phase 2: Plan Selector + EXPLAIN JSON
+// Kostenbasierte Index-Wahl, EXPLAIN (FORMAT JSON),
+// IN/LIKE-Selektivität, Greedy-Join-Reihenfolge
+// ============================================================
+static void testGroup101() {
+    std::cout << "\n── testGroup101: Plan Selector + EXPLAIN JSON (Optimizer Phase 2) ──\n";
+    using namespace milansql;
+
+    Engine engine;
+    Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+    // JSON-Feld extrahieren (einfacher String-Parser fuers Testen)
+    auto jsonNum = [](const std::string& js, const std::string& key) -> double {
+        auto p = js.find("\"" + key + "\":");
+        if (p == std::string::npos) return -1.0;
+        p += key.size() + 3;
+        try { return std::stod(js.substr(p)); } catch (...) { return -1.0; }
+    };
+
+    // ── Setup: 1000 Rows, Index auf id, KEIN Index auf price ────
+    execSQL("CREATE TABLE g101_items (id INT, price INT, name TEXT)");
+    for (int i = 1; i <= 1000; ++i)
+        execSQL("INSERT INTO g101_items VALUES (" + std::to_string(i) + ", "
+                + std::to_string(i) + ", 'item" + std::to_string(i) + "')");
+    // dispatch_result hat keinen CREATE_INDEX-Handler → direkt via Engine
+    engine.createIndex("g101_items", {"id"}, "idx_g101_id");
+    execSQL("ANALYZE g101_items");
+
+    // ── PS #1: Equality auf indizierter Spalte → IndexScan ──────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id = 500");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"IndexScan\"") != std::string::npos,
+              "PS #1a: id = 500 (Index, sel 1/1000) -> IndexScan");
+        check(js.find("\"index\":\"idx_g101_id\"") != std::string::npos,
+              "PS #1b: gewaehlter Index = idx_g101_id");
+    }
+
+    // ── PS #2: selektive Range auf Index → IndexRangeScan ───────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id > 990");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"IndexRangeScan\"") != std::string::npos,
+              "PS #2: id > 990 (sel ~0.01) -> IndexRangeScan");
+    }
+
+    // ── PS #3: nicht-indizierte Spalte → SeqScan, index null ────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE price > 100");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"SeqScan\"") != std::string::npos,
+              "PS #3a: price > 100 (kein Index) -> SeqScan");
+        check(js.find("\"index\":null") != std::string::npos,
+              "PS #3b: SeqScan -> index: null");
+    }
+
+    // ── PS #4: JSON enthaelt alle Spec-Felder ───────────────────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE price > 100");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        bool allFields =
+            js.find("\"plan\":")           != std::string::npos &&
+            js.find("\"table\":\"g101_items\"") != std::string::npos &&
+            js.find("\"index\":")          != std::string::npos &&
+            js.find("\"estimated_rows\":") != std::string::npos &&
+            js.find("\"estimated_cost\":") != std::string::npos &&
+            js.find("\"selectivity\":")    != std::string::npos &&
+            js.find("\"filter\":\"price > 100\"") != std::string::npos;
+        check(allFields && js.front() == '{' && js.back() == '}',
+              "PS #4: EXPLAIN JSON enthaelt plan/table/index/rows/cost/sel/filter");
+    }
+
+    // ── PS #5: Selektivitaet ±20% nach ANALYZE ──────────────────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id < 500");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        double rows = jsonNum(js, "estimated_rows");
+        check(rows >= 400.0 && rows <= 600.0,
+              "PS #5: id < 500 -> estimated_rows ~500 (+-20%, Histogramm)");
+    }
+
+    // ── PS #6: unselektive Range → SeqScan TROTZ Index ──────────
+    // (Cost Model: random_page_cost macht Index-Scan auf ~99% der
+    //  Rows teurer als SeqScan — der Advisor lehnt den Index ab)
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id > 5");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"SeqScan\"") != std::string::npos,
+              "PS #6a: id > 5 (sel ~0.995) -> SeqScan trotz Index (Cost Model)");
+        // Laufzeit-Korrektheit: Ergebnis bleibt identisch (995 Rows)
+        auto r2 = execSQL("SELECT COUNT(*) FROM g101_items WHERE id > 5");
+        bool ok = !r2.rows.empty() && !r2.rows[0].values.empty() &&
+                  r2.rows[0].values[0] == "995";
+        check(ok, "PS #6b: SELECT id > 5 liefert weiterhin 995 Rows");
+    }
+
+    // ── PS #7: JOIN → Array, kleinste Tabelle zuerst ────────────
+    {
+        execSQL("CREATE TABLE g101_small (item_id INT, tag TEXT)");
+        for (int i = 1; i <= 10; ++i)
+            execSQL("INSERT INTO g101_small VALUES (" + std::to_string(i)
+                    + ", 'tag" + std::to_string(i) + "')");
+        execSQL("ANALYZE g101_small");
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items "
+                         "JOIN g101_small ON g101_items.id = g101_small.item_id");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(!js.empty() && js.front() == '[' && js.back() == ']',
+              "PS #7a: JOIN -> EXPLAIN JSON ist Array");
+        auto pSmall = js.find("\"table\":\"g101_small\"");
+        auto pBig   = js.find("\"table\":\"g101_items\"");
+        check(pSmall != std::string::npos && pBig != std::string::npos &&
+              pSmall < pBig,
+              "PS #7b: kleinere Tabelle (10 Rows) steht im Plan zuerst (Greedy)");
+    }
+
+    // ── PS #8: IN- und LIKE-Selektivitaet (Spec) ────────────────
+    {
+        WhereCondition inC;
+        inC.col = "id"; inC.op = "IN";
+        inC.inList = {"1", "2", "3", "4", "5"};
+        double sIn = g_tableStats.conditionSelectivity("g101_items", inC);
+        check(sIn > 0.003 && sIn < 0.008,
+              "PS #8a: IN (5 Werte) auf 1000 distinct -> Sel ~0.005");
+        double sLike = g_tableStats.estimateSelectivity(
+            "g101_items", "name", "LIKE", "'item%'");
+        check(std::abs(sLike - 0.1) < 1e-9,
+              "PS #8b: LIKE -> Sel 0.1 (konservativ, Spec)");
+    }
+
+    // ── PS #9: joinOrder-Unit-Test (Greedy, kleinste zuerst) ────
+    {
+        std::vector<PlanSelector::JoinInput> ji(2);
+        ji[0].table = "g101_items";   // 1000 Rows
+        ji[1].table = "g101_small";   // 10 Rows
+        auto order = PlanSelector::joinOrder(ji);
+        check(order.size() == 2 && order[0] == 1 && order[1] == 0,
+              "PS #9: joinOrder -> kleinste Tabelle (Index 1) zuerst");
+    }
+
+    // ── Cleanup: globale Stats nicht in andere Gruppen leaken ───
+    execSQL("DROP TABLE g101_items");
+    execSQL("DROP TABLE g101_small");
+}
+
 // MAIN
 // ============================================================
 
@@ -11156,6 +11304,9 @@ int main() {
     }
     try { testGroup100(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 100 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup101(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 101 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

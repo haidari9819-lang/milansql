@@ -276,6 +276,16 @@ struct WhereCondition {
         : col(std::move(c)), op(std::move(o)), val(std::move(v)) {}
 };
 
+// ── Optimizer Phase 2: Laufzeit-Hook fuer kostenbasierte Index-Wahl ──
+// Wird von plan_selector.hpp installiert (engine.hpp kann die Optimizer-
+// Header nicht direkt einziehen — zirkulaere Abhaengigkeit ueber
+// WhereCondition). Rueckgabe false = SeqScan erzwingen, obwohl ein
+// Index existiert (Cost Model: unselektiver Index-Zugriff ist wegen
+// random_page_cost teurer). Nicht gesetzt / true = altes Verhalten.
+inline std::function<bool(const std::string& /*physischer Tabellenname*/,
+                          const std::vector<WhereCondition>&)>
+    g_indexPathAdvisor;
+
 // ── SELECT-Listen-Eintrag (Phase 10 / Phase 31 / Phase 32) ───
 struct SelectItem {
     bool        isAgg   = false;
@@ -1625,9 +1635,12 @@ public:
         }
 
         // Phase 173: Index for single-condition queries (=, >, <, >=, <=, BETWEEN)
+        // Optimizer Phase 2: g_indexPathAdvisor kann den Index-Pfad
+        // kostenbasiert ablehnen (unselektiver Scan → SeqScan billiger).
         if (conds.size() == 1 && src.hasIndex(conds[0].col) &&
             (conds[0].op == "=" || conds[0].op == ">" || conds[0].op == ">=" ||
-             conds[0].op == "<" || conds[0].op == "<=" || conds[0].op == "BETWEEN")) {
+             conds[0].op == "<" || conds[0].op == "<=" || conds[0].op == "BETWEEN") &&
+            (!g_indexPathAdvisor || g_indexPathAdvisor(tblName, conds))) {
             usedIndex = true;
             const std::string idxSearchVal = milansql::dateutils::stripQuotes(conds[0].val);
             std::vector<size_t> idxResults;

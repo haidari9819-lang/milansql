@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <cctype>
@@ -509,7 +510,7 @@ public:
         }
         if (op == "<" || op == "<=" || op == ">" || op == ">=")
             return rangeSelectivity(cs, op, val);  // Phase 2: Histogramm/Min-Max
-        if (op == "LIKE")            return 0.05;
+        if (op == "LIKE")            return 0.1;   // konservativ (Phase 2 Spec)
         if (op == "IS NULL")
             return cs.rowCount > 0
                 ? static_cast<double>(cs.nullCount) / static_cast<double>(cs.rowCount)
@@ -519,6 +520,38 @@ public:
                 ? 1.0 - static_cast<double>(cs.nullCount) / static_cast<double>(cs.rowCount)
                 : 1.0;
         return 0.1;
+    }
+
+    // Selektivität einer vollständigen WHERE-Bedingung (inkl. IN/BETWEEN,
+    // die col/op/val allein nicht abbilden können). Phase 2 Spec.
+    double conditionSelectivity(const std::string& tbl,
+                                const WhereCondition& wc) const {
+        auto clamp01 = [](double x) {
+            return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+        };
+        std::string op = wc.op;
+        for (auto& c : op) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+
+        if (op == "IN" || op == "NOT IN") {
+            auto it = stats_.find(tbl);
+            if (it == stats_.end()) return 0.1;
+            auto ci = it->second.cols.find(wc.col);
+            if (ci == it->second.cols.end()) return 0.1;
+            const ColumnStats& cs = ci->second;
+            if (cs.distinctCount == 0) return 1.0;
+            double sel = std::min(
+                static_cast<double>(wc.inList.size()) /
+                static_cast<double>(cs.distinctCount), 1.0);
+            return (op == "IN") ? sel : clamp01(1.0 - sel);
+        }
+        if (op == "BETWEEN" || op == "NOT BETWEEN") {
+            // sel(low <= x <= high) = sel(x >= low) + sel(x <= high) - 1
+            double geLow  = estimateSelectivity(tbl, wc.col, ">=", wc.betweenLow);
+            double leHigh = estimateSelectivity(tbl, wc.col, "<=", wc.betweenHigh);
+            double sel = clamp01(geLow + leHigh - 1.0);
+            return (op == "BETWEEN") ? sel : clamp01(1.0 - sel);
+        }
+        return estimateSelectivity(tbl, wc.col, wc.op, wc.val);
     }
 
     // Estimate result row count given WHERE conditions
@@ -531,7 +564,7 @@ public:
 
         double sel = 1.0;
         for (const auto& wc : conds)
-            sel *= estimateSelectivity(tbl, wc.col, wc.op, wc.val);
+            sel *= conditionSelectivity(tbl, wc);
 
         return static_cast<size_t>(static_cast<double>(total) * sel + 0.5);
     }

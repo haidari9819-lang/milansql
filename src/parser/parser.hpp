@@ -467,6 +467,8 @@ struct ParsedCommand {
     bool isExplainAnalyze = false;
     // Phase 102: EXPLAIN (COSTS ON) — show cost estimates
     bool explainCosts = false;
+    // Optimizer Phase 2: EXPLAIN (FORMAT JSON) — Plan als JSON-Objekt
+    bool explainJson = false;
     // Phase 54A: SET CACHE ON/OFF
     std::string cacheEnabled;  // "ON" or "OFF"
 
@@ -892,6 +894,8 @@ public:
                 bool isAnalyze = false;
                 // Phase 102: check for (COSTS ON) or (COSTS OFF) modifier
                 bool isCosts = false;
+                // Optimizer Phase 2: (FORMAT JSON) modifier
+                bool isJson = false;
                 std::string upRest;
                 for (size_t i = rest; i < input.size(); ++i)
                     upRest += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
@@ -910,11 +914,18 @@ public:
                     rest += 11;
                     while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
                         ++rest;
+                } else if (upRest.size() >= 13 && upRest.substr(0, 13) == "(FORMAT JSON)") {
+                    // Optimizer Phase 2: EXPLAIN (FORMAT JSON) SELECT ...
+                    isJson = true;
+                    rest += 13;
+                    while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
+                        ++rest;
                 }
                 ParsedCommand inner = parse(input.substr(rest));
                 inner.isExplain = true;
                 if (isAnalyze) inner.isExplainAnalyze = true;
                 if (isCosts)   inner.explainCosts = true;
+                if (isJson)    inner.explainJson = true;
                 return inner;
             }
         }

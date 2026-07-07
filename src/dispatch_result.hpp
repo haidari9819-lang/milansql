@@ -9,6 +9,7 @@
 #include "parser/parser.hpp"
 #include "optimizer/table_stats.hpp"  // Optimizer Phase 1: echte Statistiken
 #include "optimizer/cost_model.hpp"   // Optimizer Phase 2: Cost Model
+#include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 
 namespace milansql {
 
@@ -132,6 +133,15 @@ struct QueryResult {
 
 inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engine) {
     QueryResult qr;
+
+    // Optimizer Phase 2: EXPLAIN (FORMAT JSON) — kostenbasierter Plan
+    // via PlanSelector als JSON in einer Zeile; fuehrt NICHT aus.
+    if (cmd.isExplain && cmd.explainJson) {
+        qr.columns.push_back({"QUERY PLAN", "TEXT"});
+        qr.rows.push_back(milansql::Row(
+            { milansql::PlanSelector::explainJson(engine, cmd) }));
+        return qr;
+    }
 
     switch (cmd.type) {
     case milansql::CommandType::SET_CACHE:

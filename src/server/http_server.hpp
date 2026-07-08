@@ -1813,6 +1813,25 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             milansql::Parser p;
             auto cmd = p.parse(oneSQL);
 
+            // Phase 173+: Block service accounts from accessing tenant-prefixed tables.
+            // Service accounts (svc_N) operate on root-level tables with RLS.
+            // u{N}_* tables are tenant namespaces and must remain inaccessible.
+            {
+                auto isTenantTbl = [](const std::string& t) {
+                    return t.size() > 2 && t[0] == 'u' && std::isdigit((unsigned char)t[1]);
+                };
+                if (isService && !isRoot && isTenantTbl(cmd.tableName)) {
+                    std::cout.rdbuf(old);
+                    return "{\"success\":false,\"error\":\"Access denied: service accounts cannot access tenant tables\"}";
+                }
+                for (const auto& jc : cmd.joinClauses) {
+                    if (isService && !isRoot && isTenantTbl(jc.table)) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: service accounts cannot access tenant tables\"}";
+                    }
+                }
+            }
+
             // Phase 154: Table name prefixing for user isolation
             if (!prefix.empty()) {
                 // Block system table access

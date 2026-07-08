@@ -5030,13 +5030,21 @@ public:
     std::string getRlsPoliciesJsonForUser(int userId, bool isRoot) const {
         if (isRoot || userId <= 0) return getRlsPoliciesJson();
         std::string userPrefix = "u" + std::to_string(userId) + "_";
+        // Phase 173+: Include own tenant tables AND root-level tables (no u{N}_ prefix).
+        // Skip other tenants' tables (u{otherN}_*).
+        auto isOtherTenant = [&](const std::string& bareName) {
+            if (bareName.substr(0, userPrefix.size()) == userPrefix) return false; // own
+            if (bareName.size() > 2 && bareName[0] == 'u' &&
+                std::isdigit((unsigned char)bareName[1])) return true;  // other tenant
+            return false;  // root-level table
+        };
         std::string json = "{\"enabled_tables\":[";
         bool first = true;
         for (const auto& tbl : rlsEnabled_) {
             std::string bareName = tbl;
             auto dot = tbl.find('.');
             if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
-            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (isOtherTenant(bareName)) continue;
             if (!first) json += ",";
             json += "\"" + tbl + "\"";
             first = false;
@@ -5047,7 +5055,7 @@ public:
             std::string bareName = tbl;
             auto dot = tbl.find('.');
             if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
-            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (isOtherTenant(bareName)) continue;
             if (!first) json += ",";
             json += "\"" + tbl + "\":[";
             for (size_t pi = 0; pi < pols.size(); ++pi) {

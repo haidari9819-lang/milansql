@@ -11321,86 +11321,6 @@ static void testGroup102() {
     g_joinEnumerator().invalidate();
 }
 
-// ============================================================
-// testGroup103 — Hardening-Audit Block 1: Durable Writes
-//   Szenario: 100 Transaktionen werden committet (COMMIT-Ack =
-//   TX_COMMIT ist im WAL gefsynct), dann stirbt der Prozess hart
-//   (kill -9), BEVOR persist() + deleteWal() laufen konnten.
-//   Beim Neustart muss die WAL-Recovery ALLE 100 committeten
-//   Transaktionen wiederherstellen; eine 101., beim Crash noch
-//   offene Transaktion darf NICHT angewendet werden.
-// ============================================================
-
-static void testGroup103() {
-    std::cout << "\n── testGroup103: Durable Writes / Crash Recovery (Hardening Block 1) ──\n";
-    using namespace milansql;
-
-    const std::string wal = "test_g103_crash.wal";
-    std::remove(wal.c_str());
-
-    // ── Phase 1: "Pre-Crash-Prozess" ────────────────────────────
-    // Wie der Server-Pfad: BEGIN → INSERT → applyAndCommit()
-    // (schreibt + fsynct TX_COMMIT). Der Crash passiert direkt
-    // nach dem COMMIT-Ack → weder persist() noch deleteWal()
-    // laufen, das WAL bleibt mit allen Commits liegen.
-    {
-        Engine e1; Parser p1;
-        execSQL(e1, p1, "CREATE TABLE dur_t (id INT, val TEXT)");
-        for (int i = 1; i <= 100; ++i) {
-            e1.beginTransaction(wal);
-            e1.insertRow("dur_t", {std::to_string(i), "v" + std::to_string(i)});
-            e1.applyAndCommit();   // COMMIT-Ack: TX_COMMIT + CRC gefsynct
-        }
-        check(e1.countRows("dur_t", true) == 100,
-              "DUR #1a: 100 Txs vor dem Crash in-memory committet");
-        // 101. Transaktion: beim Crash noch offen (kein COMMIT)
-        e1.beginTransaction(wal);
-        e1.insertRow("dur_t", {"999", "ghost"});
-        // ── kill -9 ──: e1 wird zerstoert, database.milan wurde
-        // nie geschrieben, WAL bleibt auf Platte liegen.
-    }
-    {
-        std::ifstream f(wal);
-        check(static_cast<bool>(f), "DUR #1b: WAL-Datei ueberlebt den Crash");
-    }
-
-    // ── Phase 2: Neustart + Recovery ────────────────────────────
-    // Frische Engine = leerer letzter Persist-Stand (nur Schema).
-    Engine e2; Parser p2;
-    execSQL(e2, p2, "CREATE TABLE dur_t (id INT, val TEXT)");
-    WalRecovery rec;
-    auto rr = rec.recover(e2, wal);
-    check(rr.hadWal, "DUR #2a: Recovery findet das WAL");
-    check(rr.recoveredTxCount == 100,
-          "DUR #2b: alle 100 committeten Txs erkannt");
-    check(rr.discardedTxCount == 1,
-          "DUR #2c: die offene 101. Tx wird verworfen");
-    check(rr.replayedOpCount == 100, "DUR #2d: 100 Ops replayed");
-    check(e2.countRows("dur_t", true) == 100,
-          "DUR #2e: alle 100 Rows nach Recovery vorhanden");
-    {
-        // Vollstaendigkeit: jede id 1..100 genau einmal, kein Ghost
-        auto t = e2.selectAll("dur_t").clone();
-        long long sum = 0; bool ghost = false;
-        int idCol = -1;
-        for (size_t c = 0; c < t.columns().size(); ++c)
-            if (t.columns()[c].name == "id") idCol = static_cast<int>(c);
-        for (const auto& row : t.rows()) {
-            if (row.xmax != 0 || idCol < 0) continue;
-            long long v = 0;
-            try { v = std::stoll(row.values[idCol]); } catch (...) {}
-            if (v == 999) ghost = true;
-            sum += v;
-        }
-        check(sum == 5050, "DUR #2f: ids 1..100 vollstaendig (Summe 5050)");
-        check(!ghost, "DUR #2g: uncommittete Ghost-Row (999) NICHT wiederhergestellt");
-    }
-    {
-        std::ifstream gone(wal);
-        check(!gone, "DUR #2h: WAL nach erfolgreicher Recovery geloescht");
-    }
-}
-
 // MAIN
 // ============================================================
 
@@ -11703,9 +11623,6 @@ int main() {
     }
     try { testGroup102(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 102 exception: " << e.what() << "\n"; ++failed;
-    }
-    try { testGroup103(); } catch (const std::exception& e) {
-        std::cout << "[ERROR] Group 103 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

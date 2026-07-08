@@ -7,6 +7,10 @@
 
 #include "engine/engine.hpp"
 #include "parser/parser.hpp"
+#include "optimizer/table_stats.hpp"  // Optimizer Phase 1: echte Statistiken
+#include "optimizer/cost_model.hpp"   // Optimizer Phase 2: Cost Model
+#include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
+#include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
 
 namespace milansql {
 
@@ -131,6 +135,15 @@ struct QueryResult {
 inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engine) {
     QueryResult qr;
 
+    // Optimizer Phase 2: EXPLAIN (FORMAT JSON) — kostenbasierter Plan
+    // via PlanSelector als JSON in einer Zeile; fuehrt NICHT aus.
+    if (cmd.isExplain && cmd.explainJson) {
+        qr.columns.push_back({"QUERY PLAN", "TEXT"});
+        qr.rows.push_back(milansql::Row(
+            { milansql::PlanSelector::explainJson(engine, cmd) }));
+        return qr;
+    }
+
     switch (cmd.type) {
     case milansql::CommandType::SET_CACHE:
         // Phase 125: SET ROUTING = AUTO/MASTER/SLAVE
@@ -191,6 +204,21 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             engine.optimizerHints[cmd.varName] = cmd.varValue;
             qr.message = "SET";
         }
+        // Optimizer Phase 3 Block 3: Indexed-NL nur wenn outer < NL_THRESHOLD
+        else if (cmd.varName == "NL_THRESHOLD") {
+            try { milansql::g_nlThreshold = std::stod(cmd.varValue); } catch (...) {}
+            qr.message = "SET";
+        }
+        // Optimizer Phase 3 Block 4: Auto-ANALYZE Konfiguration
+        else if (cmd.varName == "AUTO_ANALYZE_ENABLED") {
+            milansql::g_autoAnalyze().enabled =
+                (cmd.varValue == "ON" || cmd.varValue == "1" || cmd.varValue == "TRUE");
+            qr.message = "SET";
+        }
+        else if (cmd.varName == "AUTO_ANALYZE_THRESHOLD") {
+            try { milansql::g_autoAnalyze().threshold = std::stod(cmd.varValue); } catch (...) {}
+            qr.message = "SET";
+        }
         if (qr.message.empty()) qr.message = "SET";
         break;
 
@@ -242,12 +270,19 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     }
 
     case milansql::CommandType::SHOW_AUTO_ANALYZE_STATUS: {
+        // Optimizer Phase 3 Block 4: liest aus g_autoAnalyze()
         qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
-        auto& s = engine.autoAnalyzeStatus;
-        qr.rows.push_back(milansql::Row({"Enabled", s.enabled ? "ON" : "OFF"}));
-        qr.rows.push_back(milansql::Row({"Interval", std::to_string(s.intervalSeconds) + "s"}));
-        qr.rows.push_back(milansql::Row({"Threshold", std::to_string(s.changeThresholdPct) + "%"}));
-        qr.rows.push_back(milansql::Row({"Tables Analyzed", std::to_string(s.tablesAnalyzed)}));
+        auto& aa = milansql::g_autoAnalyze();
+        qr.rows.push_back(milansql::Row({"Enabled", aa.enabled ? "ON" : "OFF"}));
+        qr.rows.push_back(milansql::Row({"Interval", std::to_string(aa.intervalSeconds()) + "s"}));
+        {
+            std::ostringstream th;
+            th << std::fixed << std::setprecision(0) << (aa.threshold.load() * 100.0);
+            qr.rows.push_back(milansql::Row({"Threshold", th.str() + "%"}));
+        }
+        qr.rows.push_back(milansql::Row({"Background Running", aa.isRunning() ? "yes" : "no"}));
+        qr.rows.push_back(milansql::Row({"Runs", std::to_string(aa.runs())}));
+        qr.rows.push_back(milansql::Row({"Tables Analyzed", std::to_string(aa.tablesAnalyzed())}));
         break;
     }
 
@@ -1219,21 +1254,28 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
-    // ── Phase 149: Advanced Statistics + Optimizer Hints ─────────
+    // ── Phase 149 / Optimizer Phase 1: Advanced Statistics ───────
+    // Konsolidierung: ANALYZE schreibt in den echten TableStatsManager
+    // (g_tableStats), nicht mehr in den Fake-Store engine.statsManager.
     case milansql::CommandType::ANALYZE_TABLE: {
-        // Phase 149: populate statsManager
         std::string tblTarget = !cmd.statsTable.empty() ? cmd.statsTable : cmd.tableName;
         if (!tblTarget.empty() && tblTarget != "*") {
-            try {
-                const auto& tbl = engine.selectAll(tblTarget);
-                std::vector<std::string> cols;
-                for (auto& c : tbl.columns()) cols.push_back(c.name);
-                engine.statsManager.analyzeTable(tblTarget, (long long)tbl.rows().size(), cols);
+            if (engine.tableExists(tblTarget)) {
+                const milansql::Table& tbl =
+                    engine.getTables().at(engine.resolveTableName(tblTarget));
+                milansql::g_tableStats.analyzeTable(tblTarget, tbl);
+                milansql::g_tableStats.saveStats();
+                milansql::g_joinEnumerator().invalidate(tblTarget);  // Phase 3: Stats geaendert
                 qr.message = "ANALYZE 1";
-            } catch (...) {
+            } else {
                 qr.error = "Table not found: " + tblTarget;
             }
         } else {
+            // ANALYZE ohne Ziel → alle Tabellen
+            for (const auto& kv : engine.getTables())
+                milansql::g_tableStats.analyzeTable(kv.first, kv.second);
+            milansql::g_tableStats.saveStats();
+            milansql::g_joinEnumerator().invalidate();  // Phase 3: Stats geaendert
             qr.message = "ANALYZE 1";
         }
         break;
@@ -1259,15 +1301,51 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // Optimizer Phase 1: liest jetzt aus dem echten TableStatsManager.
+    // Pages = geschätzte 4KB-Seiten aus realer Ø-Row-Breite (avgWidth).
     case milansql::CommandType::SHOW_TABLE_STATS: {
         qr.columns = {milansql::Column{"Table","TEXT"}, milansql::Column{"Rows","INT"},
-                      milansql::Column{"Pages","INT"}, milansql::Column{"LastAnalyzed","TEXT"}};
-        auto& all = engine.statsManager.getAllTableStats();
-        for (auto& [k, v] : all) {
-            if (!cmd.statsTable.empty() && v.tableName != cmd.statsTable) continue;
-            qr.rows.push_back(milansql::Row({v.tableName, std::to_string(v.rowCount),
-                                             std::to_string(v.pageCount), v.lastAnalyzed}));
+                      milansql::Column{"Pages","INT"}, milansql::Column{"LastAnalyzed","TEXT"},
+                      milansql::Column{"DeadRows","INT"}, milansql::Column{"Sampled","TEXT"},
+                      milansql::Column{"Changes","INT"}};   // Optimizer Phase 3 Block 4
+        for (const auto& [k, v] : milansql::g_tableStats.all()) {
+            if (!cmd.statsTable.empty() && v.name != cmd.statsTable) continue;
+            double rowWidth = 0.0;
+            for (const auto& ckv : v.cols) rowWidth += ckv.second.avgWidth;
+            long long pages = (long long)((double)v.rowCount * rowWidth / 4096.0) + 1;
+            qr.rows.push_back(milansql::Row({v.name, std::to_string(v.rowCount),
+                                             std::to_string(pages),
+                                             v.lastAnalyzed.empty() ? "never" : v.lastAnalyzed,
+                                             std::to_string(v.deadRowCount),
+                                             v.sampled ? "yes" : "no",
+                                             std::to_string(milansql::g_autoAnalyze().changesFor(v.name))}));
         }
+        break;
+    }
+
+    // Optimizer Phase 2: SHOW COST MODEL — Kostenkonstanten anzeigen
+    case milansql::CommandType::SHOW_COST_MODEL: {
+        qr.columns = {milansql::Column{"Parameter","TEXT"},
+                      milansql::Column{"Value","TEXT"},
+                      milansql::Column{"Description","TEXT"}};
+        const auto& c = milansql::g_costConsts;
+        auto fmt = [](double v) {
+            std::ostringstream ss;
+            ss << std::fixed << std::setprecision(4) << v;
+            return ss.str();
+        };
+        qr.rows.push_back(milansql::Row({"seq_page_cost", fmt(c.seq_page_cost),
+            "Kosten sequenzielle Page-Lesung"}));
+        qr.rows.push_back(milansql::Row({"random_page_cost", fmt(c.random_page_cost),
+            "Kosten Random-Access-Page (Index-Heap-Fetch)"}));
+        qr.rows.push_back(milansql::Row({"cpu_tuple_cost", fmt(c.cpu_tuple_cost),
+            "Kosten Verarbeitung einer Row"}));
+        qr.rows.push_back(milansql::Row({"cpu_index_tuple_cost", fmt(c.cpu_index_tuple_cost),
+            "Kosten Verarbeitung eines Index-Eintrags"}));
+        qr.rows.push_back(milansql::Row({"cpu_operator_cost", fmt(c.cpu_operator_cost),
+            "Kosten Auswertung eines Operators/Filters"}));
+        qr.rows.push_back(milansql::Row({"page_size_bytes", fmt(c.page_size_bytes),
+            "Angenommene Page-Groesse in Bytes"}));
         break;
     }
 

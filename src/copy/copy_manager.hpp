@@ -34,6 +34,12 @@ public:
                          char delimiter,
                          bool hasHeader)
     {
+        // Prevent path traversal and access to sensitive files
+        if (fileName.find("..") != std::string::npos)
+            throw std::runtime_error("COPY: Path traversal blocked");
+        if (fileName[0] == '/' && fileName.find("/tmp/") != 0 && fileName.find("/opt/milansql/") != 0)
+            throw std::runtime_error("COPY FROM: Only /tmp/ and /opt/milansql/ paths allowed");
+
         if (format == "BINARY") {
             return doBinaryFrom(engine, tableName, fileName);
         } else {
@@ -65,6 +71,12 @@ public:
                        char delimiter,
                        bool hasHeader)
     {
+        // Prevent path traversal and writing to sensitive locations
+        if (fileName.find("..") != std::string::npos)
+            throw std::runtime_error("COPY: Path traversal blocked");
+        if (fileName[0] == '/' && fileName.find("/tmp/") != 0 && fileName.find("/opt/milansql/") != 0)
+            throw std::runtime_error("COPY TO: Only /tmp/ and /opt/milansql/ paths allowed");
+
         if (format == "BINARY") {
             return doBinaryTo(engine, tableName, fileName);
         } else {
@@ -150,6 +162,7 @@ private:
         uint32_t len = 0;
         if (!readU32(f, len)) return false;
         if (len == 0xFFFFFFFFU) { s.clear(); return true; } // NULL sentinel
+        if (len > 67108864U) return false; // Max 64MB per field — prevent OOM from crafted files
         s.resize(len);
         if (len > 0 && !f.read(&s[0], static_cast<std::streamsize>(len))) return false;
         return true;

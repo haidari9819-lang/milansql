@@ -1,5 +1,10 @@
 # MilanSQL
 
+<p align="center">
+  <img src="https://milansql.de/og-image.svg" alt="MilanSQL Logo" width="400">
+</p>
+
+
 > **Educational Project**: MilanSQL is built to understand
 > database internals from scratch. It uses Claude Code as
 > an AI pair programmer. Not a production MySQL/PostgreSQL replacement.

@@ -32,6 +32,15 @@ struct PageManager {
 
     // ── File path for a table ─────────────────────────────────
     static std::string pageFilePath(const std::string& tableName) {
+        // Prevent path traversal via malicious table names
+        for (char c : tableName) {
+            if (c == '/' || c == '\\' || c == '\0') {
+                throw std::runtime_error("Invalid table name: contains path separator");
+            }
+        }
+        if (tableName.find("..") != std::string::npos) {
+            throw std::runtime_error("Invalid table name: contains path traversal");
+        }
         return tableName + ".mdb";
     }
 

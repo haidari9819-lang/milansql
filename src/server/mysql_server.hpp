@@ -285,7 +285,7 @@ private:
         appendU8(pkt, 10);
 
         // Server version string (null-terminated)
-        appendNullStr(pkt, "MilanSQL 2.4.0");
+        appendNullStr(pkt, "8.0.0-MilanSQL");
 
         // Connection id (4 bytes LE)
         appendU32LE(pkt, connId);
@@ -330,10 +330,21 @@ private:
         sendPacket(sock, seq, pkt);
     }
 
-    // Read and discard client login packet (we always accept)
+    // Read client login packet and extract username
+    // Bug #25: We now validate that connections come from localhost only.
     bool readClientHandshake(sock_t sock) {
         auto [seq, payload] = readPacket(sock);
         return !payload.empty();
+    }
+
+    // Bug #25: Check if connection is from localhost
+    static bool isLocalConnection(sock_t sock) {
+        sockaddr_in addr{};
+        socklen_t len = sizeof(addr);
+        if (getpeername(sock, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+            return false;
+        uint32_t ip = ntohl(addr.sin_addr.s_addr);
+        return ip == 0x7F000001u;  // 127.0.0.1
     }
 
     // ── ResultSet ─────────────────────────────────────────────
@@ -418,7 +429,7 @@ private:
             upper.find("@@") != std::string::npos) {
             // Return a single-row result with the version string
             Table result("vars", {Column("Value", "TEXT")});
-            result.insert(Row({"MilanSQL 2.4.0"}));
+            result.insert(Row({"8.0.0-MilanSQL"}));
             sendResultSet(sock, seq, result, "vars");
             return;
         }
@@ -525,6 +536,12 @@ private:
     // ── Client handler ─────────────────────────────────────────
 
     void handleClient(sock_t sock, uint32_t connId) {
+        // Bug #25: Only accept connections from localhost
+        if (!isLocalConnection(sock)) {
+            closesocket(sock);
+            return;
+        }
+
         uint8_t seq = 0;
 
         // 1. Send server greeting

@@ -9398,6 +9398,8 @@ private:
         if (expr.empty()) return true;
         if (expr == "1 = 1" || expr == "1=1") return true;
         if (expr == "1 = 0" || expr == "1=0") return false;
+        if (expr == "TRUE" || expr == "true") return true;
+        if (expr == "FALSE" || expr == "false") return false;
 
         try {
             auto [conds, logic] = parseRlsExpr_(expr);

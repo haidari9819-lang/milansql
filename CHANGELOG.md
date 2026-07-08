@@ -2,6 +2,106 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v10.3.0] — 2026-07-06 — "Query Optimizer Phase 2: Cost Model"
+
+Unified cost model on top of the Phase-1 statistics.
+
+### Added
+- **Cost model** (`src/optimizer/cost_model.hpp`): Postgres-analog constants
+  (seq_page_cost=1.0, random_page_cost=4.0, cpu_tuple_cost=0.01,
+  cpu_index_tuple_cost=0.005, cpu_operator_cost=0.0025) with cost formulas
+  for Seq Scan, Index Scan (B-tree descent + heap fetches), Hash Join and
+  Nested Loop; join cardinality via |R|*|S| / max(ndv)
+- **`SHOW COST MODEL`**: lists all cost constants (WebUI + QueryResult path)
+- **Index-scan alternative in `EXPLAIN (COSTS ON)`**: when statistics and a
+  matching index exist, the index path is shown with a cost comparison
+- testGroup100: 20 checks (histogram selectivity, NULL factor, fallback,
+  row-count estimation, scan/join cost formulas, SHOW COST MODEL)
+
+### Changed
+- **Range selectivity** (`< <= > >=`) now uses the equi-depth histogram with
+  linear interpolation inside the boundary bucket, falling back to numeric
+  min/max interpolation; NULLs excluded via factor (1 - null_frac).
+  Previously a hardcoded 0.33 constant
+- **`EXPLAIN (COSTS ON)`** uses real estimates from ANALYZE statistics
+  (rows after filter, row width from avg column widths, 4KB pages) instead
+  of hardcoded rows/100 and width = columns * 8
+
+## [v10.2.0] — 2026-07-06 — "Query Optimizer Phase 1: Statistics Collection"
+
+Foundation for the upcoming cost-based query optimizer.
+
+### Added
+- **Real column statistics** in `TableStatsManager` (src/optimizer/table_stats.hpp):
+  cardinality (n_distinct), null fraction, avg width (bytes), numeric-aware
+  min/max, MCVs, equi-depth histogram — MVCC-correct (dead rows excluded)
+- **Index statistics**: distinct keys, selectivity (1/keys), avg rows per key —
+  including multi-column indexes
+- **Sampling for large tables**: full scan up to 100k rows (exact stats); above
+  that, systematic sampling with n = clamp(N/10, 100k, 1M) and a deterministic
+  seed (reproducible ANALYZE). Distinct counts extrapolated via the GEE
+  estimator; null_frac/MCV frequencies taken as direct sample fractions
+- **`ANALYZE <table>`** (Postgres syntax) in addition to `ANALYZE TABLE x`
+  and bare `ANALYZE` (all tables)
+- Persistence: `database.table_stats` extended with META/IDX records
+  (backward compatible — old files still load)
+- testGroup99: 32 checks (empty table, exact cardinality, MVCC, index
+  selectivity, 250k-row sampling accuracy, determinism, restart persistence,
+  store consolidation)
+
+### Changed
+- **Stats store consolidation**: the Phase-149 fake statistics store
+  (hardcoded estimates in src/stats/statistics_manager.hpp) no longer serves
+  numbers. `ANALYZE` and `SHOW TABLE STATS` now read/write the real
+  `TableStatsManager` exclusively. `StatisticsManager` remains only as the
+  metadata catalog for `CREATE STATISTICS` definitions (pg_statistic_ext
+  analog)
+- `SHOW TABLE STATS`: real row counts, real last-analyzed timestamp, page
+  estimate derived from measured avg row width; new columns DeadRows, Sampled
+
+### Fixed (in statistics collection)
+- Dead MVCC row versions were counted as live rows
+- `"NULL"` literal was not recognized as NULL (only empty string)
+- Min/Max compared lexicographically on numeric columns ("9" > "10")
+
+
+
+## [v10.1.1] — 2026-07-06 — "Quality & Stability Audit"
+
+Full 5-step audit (test coverage, crash scenarios, ASan leak detection, fuzzing, fixes).
+**1458/1458 tests pass. 0 leaks. 0 crashes across 10,000+ fuzz queries.**
+
+### Fixed — Correctness bugs (query patterns that previously returned WRONG results)
+
+> If you have reports or data derived from these query patterns, re-verify them:
+
+- **#26 (CRITICAL) Comma join**: `SELECT ... FROM a, b [WHERE ...]` silently returned
+  positional row pairing (e.g. 3 rows) instead of the cartesian product (9 rows).
+  Now parsed as CROSS join with full cartesian semantics.
+- **#27 (HIGH) CROSS JOIN**: `SELECT ... FROM a CROSS JOIN b` was not recognized —
+  returned `success:true` with no result set. Now fully supported, guarded by
+  MAX_JOIN_ROWS (500,000) with a clear error message.
+- **#28 (HIGH) LIKE never matched**: `WHERE col LIKE 'pattern'` compared against the
+  quoted literal (`'A%'` incl. quotes), so patterns effectively never matched —
+  affected searches/filters in production. Quotes are now stripped before matching.
+- **#24 (HIGH) WAL escaping**: special characters in values could corrupt WAL replay.
+- **#25 (HIGH) Silent persist failures**: disk-full/IO errors during persist were
+  swallowed; writes are now atomic (temp file + rename) and errors surface.
+
+### Added
+- testGroup97 (28 checks): connection pool under load, MVCC vacuum, replication
+  failover, WAL corruption recovery
+- testGroup98 (17 checks): comma join, CROSS JOIN, COUNT(*) over joins, LIKE patterns
+- WAL corruption fuzzer (500 iterations, 6 corruption types) in `milansql_fuzz_hardening`
+- Network fuzzing: 300 malformed packets against HTTP + replication ports
+
+### Verified
+- Crash during COMMIT (kill -9): 189/189 transactions correctly recovered
+- 1000 concurrent transactions: 0 failures, consistent state
+- OOM / vmem limits: graceful error, process survives, data intact
+- Full test suite + HTTP load under AddressSanitizer: 0 errors, 0 leaks
+
+
 ## [v8.2.0] — 2026-06-05 — "Production Ready — Stable Release"
 
 ### Phase 151: Zero Warning Build + Static Analysis

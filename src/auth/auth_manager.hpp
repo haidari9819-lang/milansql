@@ -19,6 +19,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+#include "../utils/date_utils.hpp"
 
 // ── SHA-256 (pure C++, NIST FIPS 180-4) ─────────────────────
 
@@ -372,6 +376,15 @@ public:
         return (it != nameIndex_.end()) ? it->second : -1;
     }
 
+    // Set a user's role (root, user, service, etc.)
+    bool setUserRole(int userId, const std::string& role) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = users_.find(userId);
+        if (it == users_.end()) return false;
+        it->second.role = role;
+        return true;
+    }
+
     bool logout(const std::string& token) {
         std::lock_guard<std::mutex> lk(mutex_);
         auto it = sessions_.find(token);
@@ -511,8 +524,8 @@ public:
         // Root has everything
         auto uit = users_.find(userId);
         if (uit != users_.end() && uit->second.role == "root") return true;
-        // Owner (userId <= 0 = anonymous = root-like)
-        if (userId <= 0) return true;
+        // Anonymous users (userId <= 0) have no implicit permissions
+        if (userId <= 0) return false;
 
         for (const auto& p : permissions_) {
             if (p.userId != userId) continue;
@@ -773,12 +786,33 @@ public:
 
     // ── JWT ───────────────────────────────────────────────────
 
+    // Escape string for safe JSON embedding (prevent injection)
+    static std::string jsonEscape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+                        out += buf;
+                    } else out += c;
+            }
+        }
+        return out;
+    }
+
     std::string encodeJWT(int userId, const std::string& username, const std::string& role) {
         std::string hdr = base64urlEncode("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
         std::string nonce = generateRandom(8);  // unique per token
         std::string pay = base64urlEncode(
             "{\"user_id\":" + std::to_string(userId) +
-            ",\"username\":\"" + username + "\",\"role\":\"" + role +
+            ",\"username\":\"" + jsonEscape(username) + "\",\"role\":\"" + jsonEscape(role) +
             "\",\"exp\":" + std::to_string(nowSeconds() + 86400) +
             ",\"jti\":\"" + nonce + "\"}");
         std::string data = hdr + "." + pay;
@@ -807,9 +841,12 @@ public:
         std::string data = token.substr(0, dot2);
         std::string sig  = token.substr(dot2+1);
 
-        // Verify signature
+        // Verify signature (constant-time comparison to prevent timing attacks)
         std::string expected = base64urlEncodeBytes(hmacSha256Bytes(jwtSecret_, data));
-        if (sig != expected) return {};
+        if (sig.size() != expected.size()) return {};
+        volatile uint8_t diff = 0;
+        for (size_t i = 0; i < sig.size(); ++i) diff |= sig[i] ^ expected[i];
+        if (diff != 0) return {};
 
         // Decode payload
         std::string payload = base64urlDecode(token.substr(dot1+1, dot2-dot1-1));
@@ -862,16 +899,17 @@ private:
     }
     static std::string nowStr() {
         time_t t = (time_t)nowSeconds();
-        char buf[32]; struct tm* tm = std::gmtime(&t);
-        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm);
+        char buf[32]; std::tm tm = milansql::safe_gmtime(&t);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
         return buf;
     }
     static std::string generateRandom(size_t bytes) {
         static const char* hex = "0123456789abcdef";
-        std::mt19937_64 rng(std::random_device{}());
+        // Use CSPRNG — std::random_device directly for each byte
+        std::random_device rd;
         std::string out; out.reserve(bytes*2);
         for (size_t i=0;i<bytes;++i) {
-            uint8_t b = (uint8_t)(rng() & 0xff);
+            uint8_t b = (uint8_t)(rd() & 0xff);
             out += hex[b>>4]; out += hex[b&0xf];
         }
         return out;
@@ -920,16 +958,16 @@ private:
     void writeJwtSecretFile(const std::string& secret) {
         if (jwtSecretPath_.empty()) return;
 #ifndef _WIN32
-        // Ensure directory exists
-        std::system("mkdir -p /etc/milansql 2>/dev/null");
+        // Ensure directory exists (safe — no std::system())
+        ::mkdir("/etc/milansql", 0700);
 #endif
         std::ofstream f(jwtSecretPath_);
         if (f) {
             f << secret << "\n";
             f.close();
 #ifndef _WIN32
-            // chmod 600 — owner read/write only
-            std::system(("chmod 600 " + jwtSecretPath_).c_str());
+            // chmod 600 — owner read/write only (safe — no std::system())
+            ::chmod(jwtSecretPath_.c_str(), 0600);
 #endif
         }
     }

@@ -2376,6 +2376,28 @@ inline bool dispatchCommand(
             engine.getTimeSeriesManager().define(std::move(tsDef));
         }
         persistFn();
+        // Phase 174: Auto-RLS for tenant tables (u{N}_*)
+        {
+            const auto& tn = cmd.tableName;
+            if (tn.size() > 2 && tn[0] == 'u' && std::isdigit((unsigned char)tn[1])) {
+                size_t i = 1;
+                while (i < tn.size() && std::isdigit((unsigned char)tn[i])) ++i;
+                if (i < tn.size() && tn[i] == '_') {
+                    if (!engine.isRlsEnabled(tn)) {
+                        engine.enableRls(tn);
+                        milansql::Engine::RlsPolicy pol;
+                        pol.name = tn + "_tenant_policy";
+                        pol.table = tn;
+                        pol.command = "ALL";
+                        pol.role = "PUBLIC";
+                        pol.usingExpr = "TRUE";
+                        pol.withCheckExpr = "TRUE";
+                        engine.createRlsPolicy(pol);
+                        persistFn();
+                    }
+                }
+            }
+        }
         dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
         // Phase 78: if INHERITS, invalidate parent table cache too

@@ -83,10 +83,32 @@ private:
         }
     }
 
+    // Block SSRF to private/internal networks
+    static bool isPrivateHost(const std::string& host) {
+        if (host == "localhost" || host == "127.0.0.1" || host == "::1") return true;
+        if (host.substr(0, 3) == "10.") return true;
+        if (host.substr(0, 8) == "192.168.") return true;
+        if (host.substr(0, 4) == "172.") {
+            try { int oct2 = std::stoi(host.substr(4)); if (oct2 >= 16 && oct2 <= 31) return true; } catch (...) {}
+        }
+        if (host.substr(0, 8) == "169.254.") return true;  // link-local / cloud metadata
+        if (host == "metadata.google.internal") return true;
+        // MEDIUM-11: Block IPv6 private ranges + IPv4-mapped IPv6
+        if (host == "0.0.0.0" || host == "0" || host == "[::1]") return true;
+        if (host.size() >= 4 && (host.substr(0, 4) == "fc00" || host.substr(0, 4) == "fd00")) return true;
+        if (host.size() >= 3 && host.substr(0, 2) == "fe" && (host[2] == '8' || host[2] == '9' || host[2] == 'a' || host[2] == 'b')) return true;
+        if (host.find("::ffff:127.") != std::string::npos) return true;
+        if (host.find("::ffff:10.") != std::string::npos) return true;
+        if (host.find("::ffff:192.168.") != std::string::npos) return true;
+        if (host.find("::ffff:0.0.0.0") != std::string::npos) return true;
+        return false;
+    }
+
     static std::string httpGet(const std::string& url) {
         std::string host, path;
         int port = 80;
         parseUrl(url, host, path, port);
+        if (isPrivateHost(host)) return "{\"error\":\"SSRF blocked: private network access denied\"}";
 
 #ifdef _WIN32
         WSADATA wsa;

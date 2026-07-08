@@ -857,6 +857,36 @@ inline void MilanHttpServer::initEngine() {
     milansql::g_fortress().loadBanList(dbPath_ + ".banlist");
     // Phase 173: Load RLS policies (was only loaded in REPL mode before)
     engine_.loadRls(dbPath_ + ".rls");
+
+    // Phase 174: Retrofit existing tenant tables with auto-RLS
+    {
+        bool changed = false;
+        for (const auto& tn : engine_.getAllTableNamesInternal()) {
+            // Strip schema prefix (e.g. "public.u2_sites" -> "u2_sites")
+            std::string bare = tn;
+            auto dot = bare.find('.');
+            if (dot != std::string::npos) bare = bare.substr(dot + 1);
+            if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1])) {
+                size_t i = 1;
+                while (i < bare.size() && std::isdigit((unsigned char)bare[i])) ++i;
+                if (i < bare.size() && bare[i] == '_') {
+                    if (!engine_.isRlsEnabled(tn)) {
+                        engine_.enableRls(tn);
+                        milansql::Engine::RlsPolicy pol;
+                        pol.name = bare + "_tenant_policy";
+                        pol.table = tn;
+                        pol.command = "ALL";
+                        pol.role = "PUBLIC";
+                        pol.usingExpr = "TRUE";
+                        pol.withCheckExpr = "TRUE";
+                        engine_.createRlsPolicy(pol);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) engine_.saveRls(dbPath_ + ".rls");
+    }
 }
 
 // ── Auth helpers ─────────────────────────────────────────────
@@ -4004,6 +4034,7 @@ async function msLogin(u, p) {
       msToken=d.token||''; msUser=d.username||u; msUserId=d.user_id||0;
       // No localStorage — token is in httpOnly cookie set by server
       hidLoginPage();
+      await loadSidebarTables();
       updateUserBadge();
       return true;
     }
@@ -4551,7 +4582,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     if(d.success){
       msUser=d.username||msUser; msUserId=d.user_id||0;
       if(d.token) msToken=d.token;
-      hidLoginPage(); updateUserBadge();
+      hidLoginPage(); loadSidebarTables().then(function(){ updateUserBadge(); });
     } else { showLoginPage(); }
   }).catch(()=>{ showLoginPage(); });
 </script>

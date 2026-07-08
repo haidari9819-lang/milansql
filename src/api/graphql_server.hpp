@@ -406,7 +406,13 @@ private:
                 for (const auto& [col, val] : gq.whereArgs) {
                     if (!first) sql += " AND ";
                     first = false;
-                    sql += col + " = '" + val + "'";
+                    // Escape single quotes to prevent SQL injection
+                    std::string escaped;
+                    for (char c : val) {
+                        if (c == '\'') escaped += "''";
+                        else escaped += c;
+                    }
+                    sql += col + " = '" + escaped + "'";
                 }
             }
 

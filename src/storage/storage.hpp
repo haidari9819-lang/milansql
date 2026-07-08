@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #ifdef _WIN32
 #  include <io.h>      // _get_osfhandle
@@ -36,6 +37,55 @@
 namespace milansql {
 
 // ------------------------------------------------------------
+// Audit Bug #25: atomarer Datei-Write (tmp + fsync + rename).
+// Vorher wurde database.milan direkt überschrieben — bei ENOSPC
+// (Disk voll) oder Crash mitten im save() blieb eine halb
+// geschriebene, korrupte Datei zurück und der alte Zustand war
+// zerstört. Schreibfehler wurden zudem nie geprüft.
+// ------------------------------------------------------------
+inline void atomicWriteFile(const std::string& path, const std::string& data) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("Kann nicht schreiben: " + tmp);
+        f.write(data.data(), static_cast<std::streamsize>(data.size()));
+        f.flush();
+        if (!f) {
+            f.close();
+            std::remove(tmp.c_str());
+            throw std::runtime_error(
+                "Schreibfehler (Disk voll?): " + tmp);
+        }
+    }
+    // fsync der tmp-Datei: Daten müssen auf Platte sein, BEVOR
+    // das rename sie zur "echten" Datei macht
+#ifdef _WIN32
+    {
+        HANDLE hf = CreateFileA(tmp.c_str(), GENERIC_WRITE,
+                                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(hf);
+            CloseHandle(hf);
+        }
+    }
+    if (!MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        std::remove(tmp.c_str());
+        throw std::runtime_error("Rename fehlgeschlagen: " + path);
+    }
+#else
+    {
+        int fd = ::open(tmp.c_str(), O_RDONLY);
+        if (fd >= 0) { ::fsync(fd); ::close(fd); }
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        throw std::runtime_error("Rename fehlgeschlagen: " + path);
+    }
+#endif
+}
+
+// ------------------------------------------------------------
 // StorageEngine: abstrakte Basisklasse
 // Ermöglicht später weitere Backends (BinaryStorage, etc.)
 // ------------------------------------------------------------
@@ -59,29 +109,10 @@ public:
     std::string name() const override { return "MilanStorage"; }
 
     // ── Alle Tabellen in JSON-Datei schreiben ─────────────────
+    // Audit Bug #25: atomar (tmp + fsync + rename) statt direktem
+    // Überschreiben — schützt vor Korruption bei Disk-voll/Crash.
     void save(const Engine& engine) override {
-        std::ofstream f(filepath_);
-        if (!f) throw std::runtime_error("Kann nicht schreiben: " + filepath_);
-        f << toJson(engine);
-        f.flush();
-        // fsync: ensure data survives a crash (flush OS page cache → disk)
-        f.close();
-#ifdef _WIN32
-        {
-            HANDLE hf = CreateFileA(filepath_.c_str(), GENERIC_WRITE,
-                                    FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hf != INVALID_HANDLE_VALUE) {
-                FlushFileBuffers(hf);
-                CloseHandle(hf);
-            }
-        }
-#else
-        {
-            int fd = ::open(filepath_.c_str(), O_RDONLY);
-            if (fd >= 0) { ::fsync(fd); ::close(fd); }
-        }
-#endif
+        atomicWriteFile(filepath_, toJson(engine));
     }
 
     // ── JSON-Datei lesen und Engine befüllen ──────────────────
@@ -447,20 +478,17 @@ public:
         // 2. Checksumme über Data-Section berechnen
         uint16_t cs = checksum(data);
 
-        // 3. Datei schreiben (binär)
-        std::ofstream f(filepath_, std::ios::binary | std::ios::trunc);
-        if (!f) throw std::runtime_error("Kann nicht schreiben: " + filepath_);
-
+        // 3. Datei atomar schreiben (Audit Bug #25: tmp + rename)
+        std::ostringstream out;
         // File Header (genau 16 Bytes)
-        f.write(MAGIC, 8);                           // Magic
-        writeU16(f, FORMAT_VERSION);                 // Version
-        writeU32(f, 1u);                             // Page Count = 1
-        writeU16(f, cs);                             // Checksum
-
+        out.write(MAGIC, 8);                         // Magic
+        writeU16(out, FORMAT_VERSION);               // Version
+        writeU32(out, 1u);                           // Page Count = 1
+        writeU16(out, cs);                           // Checksum
         // Data Section
-        f.write(data.data(), static_cast<std::streamsize>(data.size()));
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
 
-        if (!f) throw std::runtime_error("Schreibfehler: " + filepath_);
+        atomicWriteFile(filepath_, out.str());
     }
 
     // ── Lesen ─────────────────────────────────────────────────

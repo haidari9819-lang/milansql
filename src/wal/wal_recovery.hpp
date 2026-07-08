@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
+#include <map>
 
 // ============================================================
 // wal_recovery.hpp — Phase 72: WAL Crash Recovery
@@ -46,6 +47,20 @@ public:
         int  replayedOpCount  = 0;  // total ops applied
     };
 
+    // Bug #21: CRC32 for WAL integrity verification
+    static uint32_t walCrc32(const std::string& s) {
+        uint32_t crc = 0xFFFFFFFFu;
+        for (unsigned char c : s) {
+            for (int k = 0; k < 8; ++k) {
+                bool xorBit = ((crc ^ c) & 1) != 0;
+                crc >>= 1;
+                if (xorBit) crc ^= 0xEDB88320u;
+                c >>= 1;
+            }
+        }
+        return crc ^ 0xFFFFFFFFu;
+    }
+
     // ── Scan WAL file into WalTxEntry list ─────────────────────
     std::vector<WalTxEntry> scanWal(const std::string& path) {
         std::vector<WalTxEntry> txList;
@@ -54,6 +69,8 @@ public:
 
         WalTxEntry* current = nullptr;
         std::vector<std::string> block;
+        // Bug #21: track pending commit lines for CRC verification
+        std::map<uint64_t, std::string> pendingCommitLines;
 
         std::string line;
         while (std::getline(f, line)) {
@@ -71,10 +88,29 @@ public:
             } else if (line.size() > 10 && line.substr(0, 10) == "TX_COMMIT:") {
                 uint64_t id = 0;
                 try { id = std::stoull(line.substr(10)); } catch (...) {}
+                // Store the commit line for CRC verification
+                pendingCommitLines[id] = line;
+                // Mark as committed (may be reverted if CRC fails)
                 for (auto& tx : txList)
                     if (tx.txId == id) { tx.committed = true; break; }
                 current = nullptr;
                 block.clear();
+            } else if (line.size() > 4 && line.substr(0, 4) == "CRC:") {
+                // Bug #21: Verify CRC of the preceding TX_COMMIT line
+                uint32_t expectedCrc = 0;
+                try { expectedCrc = static_cast<uint32_t>(std::stoul(line.substr(4))); } catch (...) {}
+                // Find the last pending commit and verify
+                if (!pendingCommitLines.empty()) {
+                    auto last = pendingCommitLines.rbegin();
+                    uint32_t actualCrc = walCrc32(last->second);
+                    if (actualCrc != expectedCrc) {
+                        // CRC mismatch: revoke the commit
+                        uint64_t badId = last->first;
+                        for (auto& tx : txList)
+                            if (tx.txId == badId) { tx.committed = false; break; }
+                    }
+                    pendingCommitLines.erase(last->first);
+                }
             } else if (line.size() > 12 && line.substr(0, 12) == "TX_ROLLBACK:") {
                 uint64_t id = 0;
                 try { id = std::stoull(line.substr(12)); } catch (...) {}
@@ -94,6 +130,24 @@ public:
             }
         }
         return txList;
+    }
+
+    // Audit Bug #24: reverse of Engine::walEscape — restores
+    // backslash/newline/CR that appendWal escaped so multi-line
+    // values survive crash recovery intact.
+    static std::string walUnescape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                char n = s[i + 1];
+                if (n == 'n')  { out += '\n'; ++i; continue; }
+                if (n == 'r')  { out += '\r'; ++i; continue; }
+                if (n == '\\') { out += '\\'; ++i; continue; }
+            }
+            out += s[i];
+        }
+        return out;
     }
 
     // ── Delete WAL file ─────────────────────────────────────────
@@ -124,7 +178,7 @@ private:
                 op.tableName = rest.substr(sp + 1);
                 hasOp = true;
             } else if (line.size() > 4 && line.substr(0, 4) == "VAL ") {
-                op.values.push_back(line.substr(4));
+                op.values.push_back(walUnescape(line.substr(4)));
             } else if (line.size() > 4 && line.substr(0, 4) == "SET ") {
                 // SET <col> <rest_is_value>
                 std::string rest = line.substr(4);
@@ -133,7 +187,7 @@ private:
                     op.setCol = rest;
                 } else {
                     op.setCol = rest.substr(0, sp);
-                    op.setVal = rest.substr(sp + 1);
+                    op.setVal = walUnescape(rest.substr(sp + 1));
                 }
             } else if (line.size() > 6 && line.substr(0, 6) == "WHERE ") {
                 // WHERE <col> <rest_is_value>
@@ -143,7 +197,7 @@ private:
                     op.whereCol = rest;
                 } else {
                     op.whereCol = rest.substr(0, sp);
-                    op.whereVal = rest.substr(sp + 1);
+                    op.whereVal = walUnescape(rest.substr(sp + 1));
                 }
             } else if (line.size() > 6 && line.substr(0, 6) == "ALTER ") {
                 std::istringstream ss(line.substr(6));

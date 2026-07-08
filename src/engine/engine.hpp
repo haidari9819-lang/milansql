@@ -54,8 +54,32 @@
   #define MILAN_FSYNC(fd) _commit(fd)
 #else
   #include <unistd.h>
+  #include <fcntl.h>
   #define MILAN_FSYNC(fd) ::fdatasync(fd)
 #endif
+
+namespace milansql {
+// Hardening-Audit Block 1: Verzeichnis-fsync.
+// fsync auf eine Datei macht nur ihren INHALT dauerhaft — der
+// VERZEICHNISEINTRAG (neu angelegte Datei, atomarer rename) lebt
+// im Verzeichnis-Inode und braucht ein eigenes fsync auf das
+// Verzeichnis. Ohne das kann nach einem Crash eine frisch
+// erzeugte WAL-Datei oder ein gerade renamter Datenbestand
+// verschwinden, obwohl der Inhalt gesynct war.
+// Windows/NTFS journaled Metadaten selbst → no-op.
+inline void milanFsyncDir(const std::string& filePath) {
+#ifndef _WIN32
+    std::string dir = ".";
+    auto slash = filePath.find_last_of('/');
+    if (slash != std::string::npos && slash > 0)
+        dir = filePath.substr(0, slash);
+    int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+#else
+    (void)filePath;
+#endif
+}
+} // namespace milansql
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
@@ -2961,6 +2985,11 @@ public:
                 MILAN_FSYNC(fileno(wf));
                 std::fclose(wf);
             }
+            // Hardening-Audit Block 1: Die WAL-Datei wurde ggf. erst
+            // bei TX_BEGIN neu angelegt — ohne Verzeichnis-fsync kann
+            // ihr Verzeichniseintrag den Crash nicht überleben und die
+            // committete Transaktion wäre trotz Datei-fsync weg.
+            milanFsyncDir(walPath_);
         }
         // Phase 85: track committed transaction for checkpointing
         checkpointMgr_.onCommit();
@@ -5001,13 +5030,21 @@ public:
     std::string getRlsPoliciesJsonForUser(int userId, bool isRoot) const {
         if (isRoot || userId <= 0) return getRlsPoliciesJson();
         std::string userPrefix = "u" + std::to_string(userId) + "_";
+        // Phase 173+: Include own tenant tables AND root-level tables (no u{N}_ prefix).
+        // Skip other tenants' tables (u{otherN}_*).
+        auto isOtherTenant = [&](const std::string& bareName) {
+            if (bareName.substr(0, userPrefix.size()) == userPrefix) return false; // own
+            if (bareName.size() > 2 && bareName[0] == 'u' &&
+                std::isdigit((unsigned char)bareName[1])) return true;  // other tenant
+            return false;  // root-level table
+        };
         std::string json = "{\"enabled_tables\":[";
         bool first = true;
         for (const auto& tbl : rlsEnabled_) {
             std::string bareName = tbl;
             auto dot = tbl.find('.');
             if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
-            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (isOtherTenant(bareName)) continue;
             if (!first) json += ",";
             json += "\"" + tbl + "\"";
             first = false;
@@ -5018,7 +5055,7 @@ public:
             std::string bareName = tbl;
             auto dot = tbl.find('.');
             if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
-            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (isOtherTenant(bareName)) continue;
             if (!first) json += ",";
             json += "\"" + tbl + "\":[";
             for (size_t pi = 0; pi < pols.size(); ++pi) {
@@ -9142,11 +9179,28 @@ private:
         return parts;
     }
 
+    // Phase 173: Helper to extract numeric app-user-id from service-account name.
+    // "svc_1" -> "1",  "alice" -> "alice" (fallback)
+    std::string appUserIdStr_() const {
+        if (currentUser_.size() > 4 && currentUser_.substr(0, 4) == "svc_")
+            return currentUser_.substr(4);
+        return currentUser_;
+    }
+
     // Phase 170: Substitute CURRENT_USER_ID() / current_user in RLS expression
     std::string rlsSubstituteVars_(const std::string& expr) const {
         std::string e = expr;
-        // Replace CURRENT_USER_ID() with current user name
+        // Phase 173: CURRENT_APP_USER_ID() -> numeric suffix of svc_ accounts
         size_t p;
+        while ((p = e.find("CURRENT_APP_USER_ID()")) != std::string::npos)
+            e.replace(p, 21, appUserIdStr_());
+        while ((p = e.find("current_app_user_id()")) != std::string::npos)
+            e.replace(p, 21, appUserIdStr_());
+        // Replace CURRENT_USER_ID() with current user name
+        while ((p = e.find("CURRENT_USER_ID()")) != std::string::npos)
+            e.replace(p, 17, currentUser_);
+        while ((p = e.find("current_user_id()")) != std::string::npos)
+            e.replace(p, 17, currentUser_);
         while ((p = e.find("CURRENT_USER_ID()")) != std::string::npos)
             e.replace(p, 17, currentUser_);
         while ((p = e.find("current_user_id()")) != std::string::npos)
@@ -9344,6 +9398,8 @@ private:
         if (expr.empty()) return true;
         if (expr == "1 = 1" || expr == "1=1") return true;
         if (expr == "1 = 0" || expr == "1=0") return false;
+        if (expr == "TRUE" || expr == "true") return true;
+        if (expr == "FALSE" || expr == "false") return false;
 
         try {
             auto [conds, logic] = parseRlsExpr_(expr);

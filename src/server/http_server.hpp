@@ -59,7 +59,7 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1568;
+static constexpr int MILANSQL_TEST_COUNT = 1578;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
@@ -855,6 +855,38 @@ inline void MilanHttpServer::initEngine() {
     // ══ FORTRESS: Load whitelist + persistent ban list ═══════
     milansql::g_fortress().loadWhitelist(dbPath_ + ".whitelist");
     milansql::g_fortress().loadBanList(dbPath_ + ".banlist");
+    // Phase 173: Load RLS policies (was only loaded in REPL mode before)
+    engine_.loadRls(dbPath_ + ".rls");
+
+    // Phase 174: Retrofit existing tenant tables with auto-RLS
+    {
+        bool changed = false;
+        for (const auto& tn : engine_.getAllTableNamesInternal()) {
+            // Strip schema prefix (e.g. "public.u2_sites" -> "u2_sites")
+            std::string bare = tn;
+            auto dot = bare.find('.');
+            if (dot != std::string::npos) bare = bare.substr(dot + 1);
+            if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1])) {
+                size_t i = 1;
+                while (i < bare.size() && std::isdigit((unsigned char)bare[i])) ++i;
+                if (i < bare.size() && bare[i] == '_') {
+                    if (!engine_.isRlsEnabled(tn)) {
+                        engine_.enableRls(tn);
+                        milansql::Engine::RlsPolicy pol;
+                        pol.name = bare + "_tenant_policy";
+                        pol.table = tn;
+                        pol.command = "ALL";
+                        pol.role = "PUBLIC";
+                        pol.usingExpr = "TRUE";
+                        pol.withCheckExpr = "TRUE";
+                        engine_.createRlsPolicy(pol);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) engine_.saveRls(dbPath_ + ".rls");
+    }
 }
 
 // ── Auth helpers ─────────────────────────────────────────────
@@ -1505,6 +1537,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         // Commits waren nach Neustart weg (silent data loss).
         try {
             storage_.save(engine_);
+            engine_.saveRls(dbPath_ + ".rls");  // Phase 173
             lastPersistError_.clear();
         } catch (const std::exception& e) {
             lastPersistError_ = e.what();
@@ -1535,9 +1568,13 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     };
 
     // Phase 157: Set current user in engine so USER()/CURRENT_USER() work
+    // Phase 173: Service accounts get their real username (e.g. "svc_1") so
+    //            CURRENT_APP_USER_ID() in RLS USING expressions strips the
+    //            prefix and returns the numeric app-user-id. Root-level table
+    //            access (no u{id}_ prefix) is controlled by isRootUser_ below.
     {
         std::string uname = "root";
-        if (!isRoot && !isService && userId > 0) {
+        if (userId > 0) {
             const AuthUser* au = authMgr_.getUserById(userId);
             if (au) uname = au->username;
         }
@@ -1805,6 +1842,25 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         try {
             milansql::Parser p;
             auto cmd = p.parse(oneSQL);
+
+            // Phase 173+: Block service accounts from accessing tenant-prefixed tables.
+            // Service accounts (svc_N) operate on root-level tables with RLS.
+            // u{N}_* tables are tenant namespaces and must remain inaccessible.
+            {
+                auto isTenantTbl = [](const std::string& t) {
+                    return t.size() > 2 && t[0] == 'u' && std::isdigit((unsigned char)t[1]);
+                };
+                if (isService && !isRoot && isTenantTbl(cmd.tableName)) {
+                    std::cout.rdbuf(old);
+                    return "{\"success\":false,\"error\":\"Access denied: service accounts cannot access tenant tables\"}";
+                }
+                for (const auto& jc : cmd.joinClauses) {
+                    if (isService && !isRoot && isTenantTbl(jc.table)) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: service accounts cannot access tenant tables\"}";
+                    }
+                }
+            }
 
             // Phase 154: Table name prefixing for user isolation
             if (!prefix.empty()) {
@@ -3978,6 +4034,7 @@ async function msLogin(u, p) {
       msToken=d.token||''; msUser=d.username||u; msUserId=d.user_id||0;
       // No localStorage — token is in httpOnly cookie set by server
       hidLoginPage();
+      await loadSidebarTables();
       updateUserBadge();
       return true;
     }
@@ -4525,7 +4582,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     if(d.success){
       msUser=d.username||msUser; msUserId=d.user_id||0;
       if(d.token) msToken=d.token;
-      hidLoginPage(); updateUserBadge();
+      hidLoginPage(); loadSidebarTables().then(function(){ updateUserBadge(); });
     } else { showLoginPage(); }
   }).catch(()=>{ showLoginPage(); });
 </script>

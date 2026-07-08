@@ -10339,8 +10339,13 @@ static void testGroup97() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
                     slave.resume();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                    check(!g_replState.slaveRunning.load(),
+                    // Windows TCP connect timeout can be ~3-6s; wait long enough
+                    bool detected = false;
+                    for (int i = 0; i < 200 && !detected; ++i) {
+                        detected = !g_replState.slaveRunning.load();
+                        if (!detected) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(detected,
                           "AUD-REPL #12b: replica detects lost master connection");
 
                     // Restart master on same port — replica must reconnect

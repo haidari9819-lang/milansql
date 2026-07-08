@@ -28,6 +28,10 @@
   #include <ws2tcpip.h>
   using slave_sock_t = SOCKET;
   static inline void slave_closesock(slave_sock_t s) { closesocket(s); }
+  static inline void slave_ensureWinsock() {
+      static bool done = false;
+      if (!done) { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); done = true; }
+  }
 #else
   #include <sys/socket.h>
   #include <netinet/in.h>
@@ -39,6 +43,7 @@
   #define INVALID_SOCKET (-1)
   #endif
   static inline void slave_closesock(slave_sock_t s) { ::close(s); }
+  static inline void slave_ensureWinsock() {} // no-op on Unix
 #endif
 
 namespace milansql {
@@ -132,6 +137,7 @@ private:
     // Connect to master, request sync, replay received statements.
     // Returns true on success (even if up-to-date), false on error.
     bool trySync() {
+        slave_ensureWinsock();
         slave_sock_t sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock == INVALID_SOCKET) return false;
 

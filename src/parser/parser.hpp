@@ -43,6 +43,7 @@ enum class CommandType {
     CREATE_TRIGGER,
     DROP_TRIGGER,
     SHOW_TRIGGERS,
+    SHOW_VIEWS,
     // Phase 44: Stored Procedures
     CREATE_PROCEDURE,
     DROP_PROCEDURE,
@@ -344,6 +345,8 @@ enum class CommandType {
     CREATE_STATISTICS,
     SHOW_STATISTICS,
     SHOW_TABLE_STATS,
+    // Optimizer Phase 2: Cost Model
+    SHOW_COST_MODEL,
     // Phase 150: User-Defined Functions V2
     CREATE_FUNCTION,
     DROP_FUNCTION,
@@ -464,6 +467,8 @@ struct ParsedCommand {
     bool isExplainAnalyze = false;
     // Phase 102: EXPLAIN (COSTS ON) — show cost estimates
     bool explainCosts = false;
+    // Optimizer Phase 2: EXPLAIN (FORMAT JSON) — Plan als JSON-Objekt
+    bool explainJson = false;
     // Phase 54A: SET CACHE ON/OFF
     std::string cacheEnabled;  // "ON" or "OFF"
 
@@ -586,6 +591,7 @@ struct ParsedCommand {
     std::string policyCommand;
     std::string policyUser;
     std::string policyUsingExpr;
+    std::string policyWithCheckExpr;  // Phase 170
 
     // Phase 76: LISTEN / NOTIFY / UNLISTEN
     std::string channelName;
@@ -888,6 +894,8 @@ public:
                 bool isAnalyze = false;
                 // Phase 102: check for (COSTS ON) or (COSTS OFF) modifier
                 bool isCosts = false;
+                // Optimizer Phase 2: (FORMAT JSON) modifier
+                bool isJson = false;
                 std::string upRest;
                 for (size_t i = rest; i < input.size(); ++i)
                     upRest += static_cast<char>(std::toupper(static_cast<unsigned char>(input[i])));
@@ -906,11 +914,18 @@ public:
                     rest += 11;
                     while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
                         ++rest;
+                } else if (upRest.size() >= 13 && upRest.substr(0, 13) == "(FORMAT JSON)") {
+                    // Optimizer Phase 2: EXPLAIN (FORMAT JSON) SELECT ...
+                    isJson = true;
+                    rest += 13;
+                    while (rest < input.size() && (input[rest] == ' ' || input[rest] == '\t'))
+                        ++rest;
                 }
                 ParsedCommand inner = parse(input.substr(rest));
                 inner.isExplain = true;
                 if (isAnalyze) inner.isExplainAnalyze = true;
                 if (isCosts)   inner.explainCosts = true;
+                if (isJson)    inner.explainJson = true;
                 return inner;
             }
         }
@@ -1085,11 +1100,33 @@ public:
             auto st = tokenize(input);
             // Only route to JOIN parser if the outermost statement is a SELECT
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
+                bool routeJoin = false;
                 for (const auto& tok : st) {
-                    if (toUpper(tok) == "JOIN") {
-                        parseJoinQuery(input, cmd);
-                        return cmd;
+                    if (toUpper(tok) == "JOIN") { routeJoin = true; break; }
+                }
+                // Bug #26: komma-getrennte FROM-Liste (FROM a, b) = CROSS JOIN.
+                // Nur Kommas auf Klammer-Tiefe 0 innerhalb der FROM-Klausel zaehlen.
+                if (!routeJoin) {
+                    auto ftr = tokenizeFull(input);
+                    int depth = 0; bool inFrom = false;
+                    for (const auto& tok : ftr) {
+                        if (tok == "(") { ++depth; continue; }
+                        if (tok == ")") { --depth; continue; }
+                        if (depth > 0) continue;
+                        std::string u = toUpper(tok);
+                        if (!inFrom) {
+                            if (u == "FROM") inFrom = true;
+                            continue;
+                        }
+                        if (u == "WHERE" || u == "GROUP" || u == "HAVING" ||
+                            u == "ORDER" || u == "LIMIT" || u == "UNION" ||
+                            u == "EXCEPT" || u == "INTERSECT") break;
+                        if (tok == ",") { routeJoin = true; break; }
                     }
+                }
+                if (routeJoin) {
+                    parseJoinQuery(input, cmd);
+                    return cmd;
                 }
             }
         }
@@ -2651,6 +2688,9 @@ public:
             // Phase 44: SHOW PROCEDURES
             } else if (kw1 == "PROCEDURES") {
                 cmd.type = CommandType::SHOW_PROCEDURES;
+            // SHOW VIEWS (nur Views, nicht Tabellen)
+            } else if (kw1 == "VIEWS") {
+                cmd.type = CommandType::SHOW_VIEWS;
             // Phase 45: SHOW PREPARED (but not SHOW PREPARED TRANSACTIONS which is Phase 148)
             } else if (kw1 == "PREPARED" && !(tokens.size() >= 3 && toUpper(tokens[2]) == "TRANSACTIONS")) {
                 cmd.type = CommandType::SHOW_PREPARED;
@@ -2796,6 +2836,10 @@ public:
                 cmd.type = CommandType::SHOW_TABLE_STATS;
                 for (int i = 0; i < (int)tokens.size() - 1; i++)
                     if (toUpper(tokens[i]) == "FOR") { cmd.statsTable = tokens[i + 1]; break; }
+            // Optimizer Phase 2: SHOW COST MODEL
+            } else if (kw1 == "COST" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "MODEL") {
+                cmd.type = CommandType::SHOW_COST_MODEL;
             // Phase 150: SHOW FUNCTIONS
             } else if (kw1 == "FUNCTIONS") {
                 cmd.type = CommandType::SHOW_FUNCTIONS;
@@ -3079,6 +3123,46 @@ public:
                         cmd.policyUsingExpr.pop_back();
                 }
             }
+            // Phase 170: Extract WITH CHECK expression
+            {
+                std::string upIn = input;
+                for (auto& c : upIn) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                auto wcpos = upIn.find("WITH CHECK");
+                if (wcpos != std::string::npos) {
+                    std::string after = input.substr(wcpos + 10);  // skip "WITH CHECK"
+                    size_t start = 0;
+                    while (start < after.size() && after[start] == ' ') ++start;
+                    if (start < after.size() && after[start] == '(') {
+                        int depth = 0; size_t end = start;
+                        for (size_t k = start; k < after.size(); ++k) {
+                            if (after[k] == '(') ++depth;
+                            else if (after[k] == ')') { --depth; if (depth == 0) { end = k; break; } }
+                        }
+                        cmd.policyWithCheckExpr = after.substr(start + 1, end - start - 1);
+                    } else {
+                        cmd.policyWithCheckExpr = after.substr(start);
+                    }
+                    while (!cmd.policyWithCheckExpr.empty() && cmd.policyWithCheckExpr.front() == ' ')
+                        cmd.policyWithCheckExpr.erase(cmd.policyWithCheckExpr.begin());
+                    while (!cmd.policyWithCheckExpr.empty() && cmd.policyWithCheckExpr.back() == ' ')
+                        cmd.policyWithCheckExpr.pop_back();
+                    // If USING expr accidentally captured WITH CHECK, trim it
+                    auto wcInUsing = cmd.policyUsingExpr.find("WITH CHECK");
+                    if (wcInUsing == std::string::npos) {
+                        // Also check uppercase version
+                        std::string usingUp = cmd.policyUsingExpr;
+                        for (auto& c : usingUp) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        wcInUsing = usingUp.find("WITH CHECK");
+                    }
+                    if (wcInUsing != std::string::npos) {
+                        cmd.policyUsingExpr = cmd.policyUsingExpr.substr(0, wcInUsing);
+                        while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.back() == ' ')
+                            cmd.policyUsingExpr.pop_back();
+                        while (!cmd.policyUsingExpr.empty() && cmd.policyUsingExpr.back() == ')')
+                            cmd.policyUsingExpr.pop_back();
+                    }
+                }
+            }
 
         // ── Phase 75: DROP POLICY name ON table ──────────────────
         } else if (kw0 == "DROP" && kw1 == "POLICY") {
@@ -3255,6 +3339,10 @@ public:
             // ANALYZE without table name → analyze all tables
             cmd.type = CommandType::ANALYZE_TABLE;
             cmd.tableName = "*";
+        } else if (kw0 == "ANALYZE" && tokens.size() >= 2) {
+            // Optimizer Phase 1: Postgres-Syntax ANALYZE <table>
+            cmd.type = CommandType::ANALYZE_TABLE;
+            cmd.tableName = tokens[1];
 
         // ── Phase 71: SET TRANSACTION ISOLATION LEVEL ────────────
         // SET TRANSACTION ISOLATION LEVEL READ COMMITTED
@@ -3459,7 +3547,11 @@ public:
                         "PASSWORD_MIN_LENGTH", "PASSWORD_REQUIRE_SPECIAL",
                         "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT",
                         // Phase 149: Optimizer hints
-                        "ENABLE_SEQSCAN", "ENABLE_INDEXSCAN", "ENABLE_HASHJOIN", "ENABLE_NESTLOOP"
+                        "ENABLE_SEQSCAN", "ENABLE_INDEXSCAN", "ENABLE_HASHJOIN", "ENABLE_NESTLOOP",
+                        // Optimizer Phase 3 Block 3: Indexed-NL-Grenze
+                        "NL_THRESHOLD",
+                        // Optimizer Phase 3 Block 4: Auto-ANALYZE
+                        "AUTO_ANALYZE_ENABLED", "AUTO_ANALYZE_THRESHOLD"
                     };
                     for (const auto& kv : knownSetVars) {
                         if (lhs == kv) { cmd.type = CommandType::SET_CACHE; break; }
@@ -6636,7 +6728,8 @@ private:
             if (next != "INNER" && next != "LEFT" && next != "RIGHT" &&
                 next != "FULL" && next != "JOIN" && next != "ON" &&
                 next != "WHERE" && next != "ORDER" && next != "LIMIT" &&
-                next != "OUTER" && ft[fromPos + 2] != "," &&
+                next != "OUTER" && next != "CROSS" && next != "GROUP" &&
+                next != "HAVING" && ft[fromPos + 2] != "," &&
                 ft[fromPos + 2] != "(" && ft[fromPos + 2] != ")") {
                 cmd.tableAlias = ft[fromPos + 2];
             }
@@ -6666,12 +6759,47 @@ private:
             pushCurJ();
         }
 
+        // COUNT(*) ueber JOIN (ohne GROUP BY): als Count markieren,
+        // statt "COUNT *" als (unprojizierbare) Spalte zu behandeln.
+        if (groupPos == N && cmd.selectColumns.size() == 1) {
+            std::string cu = toUpper(cmd.selectColumns[0]);
+            if (cu == "COUNT *" || cu == "COUNT(*)") {
+                cmd.isCount = true;
+                cmd.selectColumns.clear();
+            }
+        }
+
         // JOIN-Klauseln scannen (zwischen Basistabelle und WHERE/ORDER/LIMIT/GROUP)
         size_t scanEnd = std::min({wherePos, groupPos, orderPos, limitPos, N});
         size_t i = fromPos + 2;
         std::string curType = "INNER";  // Standard-JOIN-Typ
+        int scanDepth = 0;              // Klammer-Tiefe: JOIN/Komma nur auf Ebene 0
+
+        // Hilfsfunktion: Tabelle [alias] ohne ON konsumieren (CROSS/Komma-Join)
+        auto parseCrossEntry = [&](size_t start) -> size_t {
+            if (start >= scanEnd) { cmd.type = CommandType::UNKNOWN; return scanEnd; }
+            JoinClause jc;
+            jc.joinType = "CROSS";
+            jc.table    = ft[start];
+            size_t nx = start + 1;
+            if (nx < scanEnd) {
+                std::string nu = toUpper(ft[nx]);
+                if (nu != "JOIN" && nu != "LEFT" && nu != "INNER" && nu != "RIGHT" &&
+                    nu != "FULL" && nu != "OUTER" && nu != "CROSS" && nu != "ON" &&
+                    ft[nx] != "," && ft[nx] != "(" && ft[nx] != ")") {
+                    jc.tableAlias = ft[nx];
+                    ++nx;
+                }
+            }
+            cmd.joinClauses.push_back(std::move(jc));
+            return nx;
+        };
 
         while (i < scanEnd) {
+            if (ft[i] == "(") { ++scanDepth; ++i; continue; }
+            if (ft[i] == ")") { --scanDepth; ++i; continue; }
+            if (scanDepth > 0) { ++i; continue; }
+
             std::string u = toUpper(ft[i]);
 
             if (u == "LEFT")  { curType = "LEFT";  ++i; continue; }
@@ -6679,8 +6807,24 @@ private:
             if (u == "RIGHT") { curType = "RIGHT"; ++i; continue; }
             if (u == "FULL")  { curType = "FULL";  ++i; continue; }
             if (u == "OUTER") {                    ++i; continue; }  // FULL OUTER JOIN
+            if (u == "CROSS") { curType = "CROSS"; ++i; continue; }
+
+            // Bug #26: Komma-Join (FROM a, b, c) = kartesisches Produkt
+            if (ft[i] == ",") {
+                i = parseCrossEntry(i + 1);
+                if (cmd.type == CommandType::UNKNOWN) return;
+                curType = "INNER";
+                continue;
+            }
 
             if (u == "JOIN") {
+                // Bug #27: CROSS JOIN hat kein ON
+                if (curType == "CROSS") {
+                    i = parseCrossEntry(i + 1);
+                    if (cmd.type == CommandType::UNKNOWN) return;
+                    curType = "INNER";
+                    continue;
+                }
                 // Erwartet: table [alias] ON left = right
                 if (i + 3 >= scanEnd) { cmd.type = CommandType::UNKNOWN; return; }
 

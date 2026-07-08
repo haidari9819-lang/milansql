@@ -13,6 +13,9 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cmath>
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 #include "engine/engine.hpp"
 #include "engine/btree.hpp"
@@ -28,6 +31,16 @@
 #include "timeseries/continuous_aggregate.hpp"
 #include "transaction/distributed_tx.hpp"
 #include "lock/distributed_lock.hpp"
+#include "pool/connection_pool.hpp"   // Phase 170: real connection pool
+
+// Phase 172: Streaming Replication
+#include "replication/binlog.hpp"
+#include "replication/repl_state.hpp"
+#include "replication/master_repl.hpp"
+#include "replication/slave_repl.hpp"
+
+// Audit Phase 174: WAL crash recovery tests
+#include "wal/wal_recovery.hpp"
 
 // Phase 154-156: Auth system
 #include "auth/auth_manager.hpp"
@@ -4370,9 +4383,14 @@ static void testGroup61() {
         e("INSERT INTO bigtable VALUES (" + std::to_string(i) + ", 'v" + std::to_string(i) + "')");
     { auto r = e("ANALYZE TABLE bigtable");
       check(r.message == "ANALYZE 1", "ANALYZE bigtable -> ANALYZE 1"); }
+    // Optimizer Phase 1: Pages jetzt aus echter Ø-Row-Breite berechnet
+    // (rows * avgWidth / 4096), nicht mehr Fake-Heuristik rows/100.
+    // 200 Rows x ~5 B passen real in 1 Seite; Rows-Spalte muss exakt sein.
     { auto r = e("SHOW TABLE STATS FOR bigtable");
       int bigpages = (!r.rows.empty()) ? std::stoi(r.rows[0].values[2]) : 0;
-      check(bigpages >= 2, "bigtable pages >= 2 (200 rows / 100)"); }
+      check(bigpages >= 1, "bigtable pages >= 1 (echte Breitenberechnung)");
+      check(!r.rows.empty() && r.rows[0].values[1] == "200",
+            "bigtable SHOW TABLE STATS rowCount == 200 (echt)"); }
 }
 
 static void testGroup62() {
@@ -5038,8 +5056,8 @@ static void testGroup68() {
     };
 
     // ── SCHRITT 1: System-Info-Funktionen ──────────────────────
-    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v9.9.0",
-          "version() returns MilanSQL v9.9.0");
+    check(engine.evalFuncPublic("VERSION", {}) == "MilanSQL v10.1.0",
+          "version() returns MilanSQL v10.1.0");
     check(engine.evalFuncPublic("DATABASE", {}) == "public",
           "database() returns 'public'");
     check(engine.evalFuncPublic("USER", {}) == "root",
@@ -5966,8 +5984,27 @@ static void testGroup72() {
     // 15. Version v9.2.0
     {
         milansql::Engine eng;
-        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v9.9.0",
-              "Isolation #15: version() returns MilanSQL v9.9.0");
+        check(eng.evalFuncPublic("VERSION", {}) == "MilanSQL v10.1.0",
+              "Isolation #15: version() returns MilanSQL v10.1.0");
+    }
+
+    // 16-18. Tenant-JOIN: logische ON-Namen auf u<id>_-Tabellen (Bug 2026-07)
+    {
+        milansql::Engine eng;
+        exec(eng, "CREATE TABLE u12_demo_products (id INT, name TEXT, price INT)");
+        exec(eng, "INSERT INTO u12_demo_products VALUES (1, 'Laptop', 1200)");
+        exec(eng, "INSERT INTO u12_demo_products VALUES (2, 'Monitor', 450)");
+        exec(eng, "CREATE TABLE u12_demo_orders (id INT, product_id INT, qty INT)");
+        exec(eng, "INSERT INTO u12_demo_orders VALUES (1, 1, 2)");
+        exec(eng, "INSERT INTO u12_demo_orders VALUES (2, 2, 5)");
+
+        eng.setCurrentUser(12, false);
+        auto r = exec(eng, "SELECT o.id, p.name, o.qty FROM demo_orders o "
+                           "JOIN demo_products p ON o.product_id = p.id");
+        check(r.find("ERROR:") == std::string::npos, "Isolation #16: tenant JOIN with alias runs without error");
+        check(r.find("Laptop") != std::string::npos, "Isolation #17: tenant JOIN returns row 1 (Laptop)");
+        check(r.find("Monitor") != std::string::npos, "Isolation #18: tenant JOIN returns row 2 (Monitor)");
+        eng.setCurrentUser(0, true);
     }
 }
 
@@ -7315,15 +7352,15 @@ static void testGroup78() {
         check(allOk, "RateTier #4: ANONYMOUS allows 60 requests");
         check(!rl.allow("anon1"), "RateTier #5: ANONYMOUS blocks at 61");
     }
-    // 6. FREE: allows 200, blocks at 201
+    // 6. FREE: allows 600, blocks at 601
     {
         RateLimiter rl;
         rl.setTier("free1", RateTier::FREE);
         bool allOk = true;
-        for (int i = 0; i < 200; ++i)
+        for (int i = 0; i < 600; ++i)
             if (!rl.allow("free1")) allOk = false;
-        check(allOk, "RateTier #6: FREE allows 200 requests");
-        check(!rl.allow("free1"), "RateTier #7: FREE blocks at 201");
+        check(allOk, "RateTier #6: FREE allows 600 requests");
+        check(!rl.allow("free1"), "RateTier #7: FREE blocks at 601");
     }
     // 8. ADMIN: truly unlimited — 500k requests without blocking
     {
@@ -7337,9 +7374,9 @@ static void testGroup78() {
     // 9. Different keys have independent buckets
     {
         RateLimiter rl;
-        rl.setTier("a", RateTier::FREE);   // 200 capacity
+        rl.setTier("a", RateTier::FREE);   // 600 capacity
         rl.setTier("b", RateTier::FREE);
-        for (int i = 0; i < 200; ++i) rl.allow("a");
+        for (int i = 0; i < 600; ++i) rl.allow("a");
         check(!rl.allow("a"), "RateTier #9: key a exhausted");
         check(rl.allow("b"),  "RateTier #10: key b still has tokens");
     }
@@ -7384,10 +7421,10 @@ static void testGroup78() {
     // 18. remaining() reflects tokens left
     {
         RateLimiter rl;
-        rl.setTier("rem1", RateTier::FREE); // 200 capacity
+        rl.setTier("rem1", RateTier::FREE); // 600 capacity
         rl.allow("rem1");
         double rem = rl.remaining("rem1");
-        check(rem >= 198.0 && rem <= 200.0, "RateTier #18: remaining ~199 after 1 allow");
+        check(rem >= 598.0 && rem <= 600.0, "RateTier #18: remaining ~199 after 1 allow");
     }
     // 19. retryAfterSeconds returns positive
     {
@@ -9488,6 +9525,1882 @@ static void testGroup93() {
     }
 }
 
+// ============================================================
+// Group 94: Connection Pool (Phase 170 — real pool)
+// ============================================================
+
+static void testGroup94() {
+    std::cout << "\n── testGroup94: Connection Pool (Phase 170) ──\n";
+
+    using milansql::ConnectionPool;
+    using milansql::PoolLease;
+
+    // Test 1: Prewarm to min
+    {
+        ConnectionPool pool(5, 20);
+        check(pool.idleCount() == 5,  "POOL #1a: prewarm creates min (5) idle conns");
+        check(pool.totalCount() == 5, "POOL #1b: total == min after prewarm");
+        check(pool.activeCount() == 0, "POOL #1c: no active conns initially");
+    }
+
+    // Test 2: Acquire reuses idle connection (connection reuse)
+    {
+        ConnectionPool pool(2, 10);
+        auto c1 = pool.acquire(100);
+        check(c1 != nullptr, "POOL #2a: acquire returns connection");
+        check(pool.activeCount() == 1, "POOL #2b: active == 1 after acquire");
+        uint64_t firstId = c1->id;
+        pool.release(c1);
+        check(pool.activeCount() == 0, "POOL #2c: active == 0 after release");
+        auto c2 = pool.acquire(100);
+        // idle deque is FIFO: after release, c1 is at the back; front is the
+        // other prewarmed conn. Acquire both to verify c1's id is reused.
+        auto c3 = pool.acquire(100);
+        bool reused = (c2->id == firstId) || (c3->id == firstId);
+        check(reused, "POOL #2d: released connection is reused (no new conn)");
+        check(pool.totalCount() == 2, "POOL #2e: pool did not grow beyond min");
+        pool.release(c2); pool.release(c3);
+    }
+
+    // Test 3: Pool grows up to max, then acquire times out
+    {
+        ConnectionPool pool(1, 3);
+        auto a = pool.acquire(50);
+        auto b = pool.acquire(50);
+        auto c = pool.acquire(50);
+        check(a && b && c, "POOL #3a: pool grows to max (3)");
+        check(pool.totalCount() == 3, "POOL #3b: total == max");
+        auto t0 = std::chrono::steady_clock::now();
+        auto d = pool.acquire(200);   // exhausted → wait → timeout
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        check(d == nullptr, "POOL #3c: acquire on exhausted pool times out");
+        check(ms >= 180, "POOL #3d: timeout respected (waited >= ~200ms)");
+        check(pool.timeoutCount() == 1, "POOL #3e: timeout counter incremented");
+        pool.release(a); pool.release(b); pool.release(c);
+    }
+
+    // Test 4: Waiting client gets connection when one is released
+    {
+        ConnectionPool pool(1, 1);
+        auto a = pool.acquire(50);
+        check(a != nullptr, "POOL #4a: single connection acquired");
+        std::atomic<bool> gotIt{false};
+        std::thread waiter([&pool, &gotIt]() {
+            auto c = pool.acquire(5000);   // waits in queue
+            if (c) { gotIt = true; pool.release(c); }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        check(pool.waitingCount() == 1, "POOL #4b: waiter is queued");
+        pool.release(a);                   // → waiter is served
+        waiter.join();
+        check(gotIt.load(), "POOL #4c: queued waiter got the released conn");
+    }
+
+    // Test 5: Health check replaces dead connections and tops up to min
+    {
+        ConnectionPool pool(3, 10);
+        auto c = pool.acquire(100);
+        c->markUnhealthy();               // simulate dead connection
+        pool.release(c);                  // dead conn is dropped on release
+        check(pool.deadReplacedCount() >= 1, "POOL #5a: dead conn detected on release");
+        size_t replaced = pool.runHealthCheck();
+        (void)replaced;
+        check(pool.totalCount() >= 3, "POOL #5b: health check topped up to min");
+        check(pool.idleCount() >= 3, "POOL #5c: replacements are idle and usable");
+        auto c2 = pool.acquire(100);
+        check(c2 && c2->healthy.load(), "POOL #5d: acquired conn is healthy");
+        pool.release(c2);
+    }
+
+    // Test 6: Graceful shutdown waits for active connections
+    {
+        ConnectionPool pool(1, 2);
+        auto a = pool.acquire(50);
+        std::thread worker([&pool, a]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            pool.release(a);              // "query finishes" after 300ms
+        });
+        auto t0 = std::chrono::steady_clock::now();
+        bool drained = pool.shutdown(5000);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        worker.join();
+        check(drained, "POOL #6a: graceful shutdown drained all active conns");
+        check(ms >= 250, "POOL #6b: shutdown waited for the active query");
+        check(pool.acquire(50) == nullptr, "POOL #6c: no new conns after shutdown");
+    }
+
+    // Test 7: Shutdown timeout when a query never finishes
+    {
+        ConnectionPool pool(1, 1);
+        auto a = pool.acquire(50);        // never released
+        bool drained = pool.shutdown(200);
+        check(!drained, "POOL #7a: shutdown reports timeout if query still active");
+        pool.release(a);                  // cleanup
+    }
+
+    // Test 8: PoolLease RAII
+    {
+        ConnectionPool pool(2, 5);
+        {
+            PoolLease lease(pool, 100);
+            check((bool)lease, "POOL #8a: lease acquires connection");
+            check(pool.activeCount() == 1, "POOL #8b: active == 1 with lease held");
+        }
+        check(pool.activeCount() == 0, "POOL #8c: lease released on scope exit");
+    }
+
+    // Test 9: Legacy API (SHOW POOL STATUS / SET POOL_* commands)
+    {
+        ConnectionPool pool(1, 4);
+        pool.setMode("transaction");
+        check(pool.getMode() == milansql::PoolMode::TRANSACTION,
+              "POOL #9a: setMode(transaction) works");
+        pool.setMaxConnections(8);
+        check(pool.getMaxConnections() == 8, "POOL #9b: setMaxConnections works");
+        pool.setMaxWait(1234);
+        check(pool.getMaxWaitMs() == 1234, "POOL #9c: setMaxWait works");
+        std::string st = pool.showStatus();
+        check(st.find("Max Connections:     8") != std::string::npos,
+              "POOL #9d: showStatus shows max connections");
+        check(st.find("transaction") != std::string::npos,
+              "POOL #9e: showStatus shows pool mode");
+    }
+
+    // Test 10: statsJson for /pool/stats endpoint
+    {
+        ConnectionPool pool(2, 6);
+        auto a = pool.acquire(100);
+        std::string js = pool.statsJson();
+        check(js.find("\"active\":1") != std::string::npos,
+              "POOL #10a: statsJson reports active=1");
+        check(js.find("\"min\":2") != std::string::npos &&
+              js.find("\"max\":6") != std::string::npos,
+              "POOL #10b: statsJson reports min/max");
+        check(js.find("\"waiting\":0") != std::string::npos,
+              "POOL #10c: statsJson reports waiting=0");
+        pool.release(a);
+    }
+
+    // Test 11: Concurrent stress — 50 threads through pool of 5
+    {
+        ConnectionPool pool(2, 5);
+        std::atomic<int> success{0};
+        std::atomic<int> maxSeen{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 50; ++i) {
+            threads.emplace_back([&pool, &success, &maxSeen]() {
+                auto c = pool.acquire(5000);
+                if (!c) return;
+                int act = pool.activeCount();
+                int prev = maxSeen.load();
+                while (act > prev && !maxSeen.compare_exchange_weak(prev, act)) {}
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                pool.release(c);
+                success++;
+            });
+        }
+        for (auto& t : threads) t.join();
+        check(success.load() == 50, "POOL #11a: all 50 concurrent requests served");
+        check(maxSeen.load() <= 5, "POOL #11b: active never exceeded max (5)");
+        check(pool.activeCount() == 0, "POOL #11c: all conns returned to pool");
+        check(pool.totalCount() <= 5, "POOL #11d: pool size bounded by max");
+    }
+}
+
+// ============================================================
+// testGroup95: MVCC Vacuum / GC (Phase 171)
+// ============================================================
+
+static void testGroup95() {
+    std::cout << "\n── testGroup95: MVCC Vacuum GC (Phase 171) ──\n";
+
+    // ── 1) TransactionManager: minActiveTxId horizon ─────────
+    {
+        milansql::TransactionManager tm;
+        uint64_t base = tm.minActiveTxId();
+        check(base >= 1, "VAC #1a: horizon starts >= 1 with no active txs");
+        uint64_t t1 = tm.beginTx();
+        uint64_t t2 = tm.beginTx();
+        check(t2 > t1, "VAC #1b: tx ids monotonically increasing");
+        check(tm.minActiveTxId() == t1, "VAC #1c: horizon = oldest active tx");
+        tm.commitTx(t2);
+        check(tm.minActiveTxId() == t1, "VAC #1d: horizon unchanged while older tx active");
+        tm.commitTx(t1);
+        check(tm.minActiveTxId() > t2, "VAC #1e: horizon advances after all commits");
+        check(tm.isCommitted(t1) && tm.isCommitted(t2), "VAC #1f: committed txs recognized");
+    }
+
+    // ── 2) Table::vacuum respects the horizon ─────────────────
+    {
+        milansql::TransactionManager tm;
+        std::vector<milansql::Column> cols;
+        cols.emplace_back("id", "INT");
+        milansql::Table tbl("vac_t", cols);
+        tbl.insert(milansql::Row({"1"}));
+        tbl.insert(milansql::Row({"2"}));
+        tbl.insert(milansql::Row({"3"}));
+
+        uint64_t oldTx = tm.beginTx();          // stays active (snapshot reader)
+        uint64_t delTx = tm.beginTx();          // deletes row 2
+        tbl.stampDeleteWhere(0, "2", delTx);
+        tm.commitTx(delTx);
+
+        check(tbl.deadRowCount() == 1, "VAC #2a: one dead row after stamped delete");
+
+        auto isCom = [&tm](uint64_t id) { return tm.isCommitted(id); };
+        // horizon = oldTx: delTx > oldTx → version must be KEPT
+        size_t removed = tbl.vacuum(isCom, tm.minActiveTxId());
+        check(removed == 0, "VAC #2b: active older tx blocks vacuum (horizon)");
+        check(tbl.rowCount() == 3, "VAC #2c: row physically retained for old snapshot");
+
+        tm.commitTx(oldTx);                     // horizon advances past delTx
+        size_t freedBytes = 0;
+        removed = tbl.vacuum(isCom, tm.minActiveTxId(), &freedBytes);
+        check(removed == 1, "VAC #2d: vacuum removes version after horizon advances");
+        check(tbl.rowCount() == 2, "VAC #2e: physical row count reduced");
+        check(freedBytes > 0, "VAC #2f: freed bytes reported > 0");
+        check(tbl.deadRowCount() == 0, "VAC #2g: no dead rows left");
+    }
+
+    // ── 3) Uncommitted delete is never vacuumed ───────────────
+    {
+        milansql::TransactionManager tm;
+        std::vector<milansql::Column> cols;
+        cols.emplace_back("id", "INT");
+        milansql::Table tbl("vac_u", cols);
+        tbl.insert(milansql::Row({"1"}));
+        uint64_t t = tm.beginTx();
+        tbl.stampDeleteWhere(0, "1", t);        // delete NOT committed
+        auto isCom = [&tm](uint64_t id) { return tm.isCommitted(id); };
+        size_t removed = tbl.vacuum(isCom, UINT64_MAX);
+        check(removed == 0, "VAC #3a: uncommitted delete survives vacuum");
+        tm.rollbackTx(t);
+    }
+
+    // ── 4) VacuumManager: run statistics + statsJson ─────────
+    {
+        milansql::VacuumManager vm;
+        vm.addDeadTuples("orders", 42);
+        vm.addDeadTuples("users", 8);
+        check(vm.getDeadTupleCount("orders") == 42, "VAC #4a: dead tuple tracking per table");
+        check(vm.getTotalDeadTuples() == 50, "VAC #4b: total dead tuples aggregated");
+
+        vm.recordVacuumRun(50, 4096, false);
+        check(vm.getVacuumRuns() == 1, "VAC #4c: run counter incremented");
+        check(vm.getTotalFreedRows() == 50, "VAC #4d: freed rows accumulated");
+        check(vm.getTotalFreedBytes() == 4096, "VAC #4e: freed bytes accumulated");
+        vm.recordVacuumRun(10, 512, true);
+        check(vm.getTotalFreedRows() == 60, "VAC #4f: totals accumulate over runs");
+        check(!vm.getLastRunTime().empty(), "VAC #4g: last run timestamp set");
+
+        std::string js = vm.statsJson();
+        check(js.find("\"runs_total\":2") != std::string::npos, "VAC #4h: statsJson runs_total");
+        check(js.find("\"auto_runs\":1") != std::string::npos, "VAC #4i: statsJson auto_runs");
+        check(js.find("\"total_freed_rows\":60") != std::string::npos, "VAC #4j: statsJson total_freed_rows");
+        check(js.find("\"total_freed_bytes\":4608") != std::string::npos, "VAC #4k: statsJson total_freed_bytes");
+        check(js.find("\"last_freed_rows\":10") != std::string::npos, "VAC #4l: statsJson last_freed_rows");
+        check(js.find("\"pending_dead_tuples\":50") != std::string::npos, "VAC #4m: statsJson pending dead tuples");
+        check(js.find("\"orders\":42") != std::string::npos, "VAC #4n: statsJson per-table counts");
+        check(js.find("\"interval_seconds\":60") != std::string::npos, "VAC #4o: statsJson 60s interval");
+        check(js.find("\"seconds_since_last_run\":") != std::string::npos, "VAC #4p: statsJson seconds_since_last_run");
+    }
+
+    // ── 5) VacuumManager: auto-vacuum background thread ──────
+    {
+        milansql::VacuumManager vm;
+        std::atomic<int> calls{0};
+        vm.startAutoVacuum([&calls]() -> size_t { ++calls; return 1; }, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        vm.stopAutoVacuum();
+        int c = calls.load();
+        check(c >= 1, "VAC #5a: auto-vacuum thread ran at interval");
+        check(c <= 4, "VAC #5b: auto-vacuum did not spin");
+        // disabled → no more calls
+        milansql::VacuumManager vm2;
+        std::atomic<int> calls2{0};
+        vm2.setAutoVacuumEnabled(false);
+        vm2.startAutoVacuum([&calls2]() -> size_t { ++calls2; return 1; }, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        vm2.stopAutoVacuum();
+        check(calls2.load() == 0, "VAC #5c: disabled auto-vacuum never fires");
+    }
+
+    // ── 6) Engine end-to-end: BEGIN → DELETE → COMMIT → VACUUM ─
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        const std::string wal = "test_vacuum_g95.wal";
+        execSQL(engine, parser, "CREATE TABLE vac_e2e (id INT, name TEXT)");
+        for (int i = 1; i <= 5; ++i)
+            execSQL(engine, parser,
+                "INSERT INTO vac_e2e VALUES (" + std::to_string(i) + ", 'n" + std::to_string(i) + "')");
+
+        engine.beginTransaction(wal);
+        execSQL(engine, parser, "DELETE FROM vac_e2e WHERE id = 2");
+        execSQL(engine, parser, "DELETE FROM vac_e2e WHERE id = 4");
+        engine.applyAndCommit();
+
+        check(engine.deadRowCount() == 2, "VAC #6a: committed tx leaves 2 dead versions");
+        check(engine.vacuumManager().getDeadTupleCount("public.vac_e2e") == 2,
+              "VAC #6b: VacuumManager tracked dead tuples from tx delete");
+
+        size_t cleaned = engine.vacuumAllTracked();
+        check(cleaned == 2, "VAC #6c: vacuumAllTracked removes 2 dead versions");
+        check(engine.deadRowCount() == 0, "VAC #6d: no dead rows after vacuum");
+        check(engine.countRows("vac_e2e", true) == 3, "VAC #6e: live rows intact");
+        check(engine.vacuumManager().getDeadTupleCount("public.vac_e2e") == 0,
+              "VAC #6f: dead tuple counter reset after vacuum");
+        check(engine.vacuumManager().getTotalFreedRows() >= 2, "VAC #6g: freed rows recorded");
+        check(engine.vacuumManager().getTotalFreedBytes() > 0, "VAC #6h: freed bytes recorded");
+        check(engine.vacuumManager().getVacuumRuns() >= 1, "VAC #6i: vacuum run recorded");
+        std::remove(wal.c_str());
+    }
+
+    // ── 7) Engine: vacuumTableTracked single table ────────────
+    {
+        milansql::Engine engine;
+        milansql::Parser parser;
+        const std::string wal = "test_vacuum_g95b.wal";
+        execSQL(engine, parser, "CREATE TABLE vac_one (id INT)");
+        execSQL(engine, parser, "CREATE TABLE vac_two (id INT)");
+        execSQL(engine, parser, "INSERT INTO vac_one VALUES (1)");
+        execSQL(engine, parser, "INSERT INTO vac_two VALUES (1)");
+
+        engine.beginTransaction(wal);
+        execSQL(engine, parser, "DELETE FROM vac_one WHERE id = 1");
+        execSQL(engine, parser, "DELETE FROM vac_two WHERE id = 1");
+        engine.applyAndCommit();
+
+        size_t cleaned = engine.vacuumTableTracked("vac_one");
+        check(cleaned == 1, "VAC #7a: vacuumTableTracked cleans target table");
+        check(engine.deadRowCount() == 1, "VAC #7b: other table untouched");
+        check(engine.vacuumManager().getDeadTupleCount("public.vac_two") == 1,
+              "VAC #7c: other table counter untouched");
+        std::remove(wal.c_str());
+    }
+}
+
+// ============================================================
+// testGroup96: Streaming Replication (Phase 172)
+// ============================================================
+
+static void testGroup96() {
+    std::cout << "\n── testGroup96: Streaming Replication (Phase 172) ──\n";
+    using namespace milansql;
+
+    // ── 1) BinlogWriter: write / incremental read ─────────────
+    {
+        const char* path = "test_g96.binlog";
+        std::remove(path);
+        BinlogWriter bl(path);
+        check(bl.getCurrentPos() == 0, "REPL #1a: fresh binlog at pos 0");
+        long long p1 = bl.write("INSERT INTO t VALUES (1)");
+        long long p2 = bl.write("INSERT INTO t VALUES (2)");
+        check(p1 == 1 && p2 == 2, "REPL #1b: positions increase");
+        auto all = bl.readFrom(0);
+        check(all.size() == 2 && all[1].sql == "INSERT INTO t VALUES (2)",
+              "REPL #1c: readFrom(0) returns all entries");
+        auto tail = bl.readFrom(1);
+        check(tail.size() == 1 && tail[0].pos == 2,
+              "REPL #1d: readFrom(pos) is incremental");
+        std::remove(path);
+    }
+
+    // ── 2) Slave-ack tracking + sync-mode wait ────────────────
+    {
+        g_replState.maxSlaveAckPos.store(0);
+        replRecordAck(5);
+        replRecordAck(3);   // must not regress
+        check(g_replState.maxSlaveAckPos.load() == 5, "REPL #2a: ack pos monotonic");
+        check(replWaitForAck(5, 100), "REPL #2b: already-acked pos returns immediately");
+        long long t0 = replNowMs();
+        bool ok = replWaitForAck(10, 200);
+        long long dt = replNowMs() - t0;
+        check(!ok && dt >= 150, "REPL #2c: unacked pos times out");
+        std::thread notifier([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            replRecordAck(10);
+        });
+        ok = replWaitForAck(10, 3000);
+        notifier.join();
+        check(ok, "REPL #2d: ack from another thread wakes sync waiter");
+        g_replState.maxSlaveAckPos.store(0);
+    }
+
+    // ── 3) Failover detection (master >30s unreachable) ───────
+    {
+        g_replState.isSlave.store(true);
+        g_replState.lastSyncUnixMs.store(replNowMs());
+        check(!replCheckFailover(), "REPL #3a: fresh sync — master up");
+        g_replState.lastSyncUnixMs.store(replNowMs() - 31000);
+        check(replCheckFailover(), "REPL #3b: >30s silence — master down");
+        check(g_replState.masterDown.load(), "REPL #3c: masterDown flag set");
+        std::string js = replicationStatusJson();
+        check(js.find("\"master_down\":true") != std::string::npos,
+              "REPL #3d: status JSON reports failover");
+        check(js.find("\"role\":\"replica\"") != std::string::npos,
+              "REPL #3e: status JSON reports replica role");
+        check(js.find("\"lag_ms\":") != std::string::npos,
+              "REPL #3f: status JSON contains lag_ms");
+        g_replState.isSlave.store(false);
+        g_replState.masterDown.store(false);
+        g_replState.lastSyncUnixMs.store(0);
+        std::string js2 = replicationStatusJson();
+        check(js2.find("\"role\":\"standalone\"") != std::string::npos,
+              "REPL #3g: standalone role when no replication");
+    }
+
+    // ── 4) Read-only replica enforcement ─────────────────────
+    {
+        g_replState.isSlave.store(true);
+        check(dispatch_slaveReadOnly(), "REPL #4a: writes blocked on replica");
+        milansql::tl_binlogReplay = true;
+        check(!dispatch_slaveReadOnly(), "REPL #4b: binlog replay bypasses read-only");
+        milansql::tl_binlogReplay = false;
+        g_replState.isSlave.store(false);
+        check(!dispatch_slaveReadOnly(), "REPL #4c: writes allowed when not replica");
+    }
+
+    // ── 5) End-to-end: master streams to replica (localhost) ──
+    {
+        const char* blPath  = "test_g96_e2e.binlog";
+        const char* tokPath = "test_g96_db.repl_token";
+        std::remove(blPath);
+        std::remove(tokPath);
+        loadOrCreateReplToken("test_g96_db");
+        g_replState.slavePos.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+
+        const int port = 15472;
+        {
+            BinlogWriter bl(blPath);
+            {
+                MasterReplication master(port, bl);
+                master.start();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                std::mutex mu;
+                std::vector<std::string> received;
+                {
+                    SlaveReplication slave("127.0.0.1", port,
+                        [&](const std::string& sql) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            received.push_back(sql);
+                        });
+                    slave.start();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                    long long p = bl.write("INSERT INTO r VALUES (42)");
+                    replNotifyNewData();
+
+                    bool got = false;
+                    for (int i = 0; i < 100 && !got; ++i) {
+                        { std::lock_guard<std::mutex> lk(mu); got = !received.empty(); }
+                        if (!got) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(got, "REPL #5a: statement streamed to replica");
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        check(!received.empty() &&
+                              received[0] == "INSERT INTO r VALUES (42)",
+                              "REPL #5b: statement replayed verbatim");
+                    }
+                    check(g_replState.slavePos.load() == p,
+                          "REPL #5c: replica position advanced");
+                    long long lag = g_replState.slaveLagMs.load();
+                    check(lag >= 0 && lag < 5000, "REPL #5d: lag_ms measured");
+                    check(g_replState.slaveRunning.load(), "REPL #5e: replica running");
+
+                    // Ack propagates via the next poll's FROM_POS
+                    bool acked = false;
+                    for (int i = 0; i < 100 && !acked; ++i) {
+                        acked = g_replState.maxSlaveAckPos.load() >= p;
+                        if (!acked) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(acked, "REPL #5f: master received replica ack");
+
+                    // Sync mode: write is acknowledged within timeout
+                    g_replState.syncMode.store(true);
+                    long long p2 = bl.write("INSERT INTO r VALUES (43)");
+                    replNotifyNewData();
+                    bool syncOk = replWaitForAck(p2, 5000);
+                    check(syncOk, "REPL #5g: sync-mode write acked by replica");
+                    g_replState.syncMode.store(false);
+                } // slave stops + joins
+            }     // master stops + joins accept thread
+            // Let detached per-slave handler threads drain before bl dies
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        std::remove(blPath);
+        std::remove(tokPath);
+
+        // Reset global replication state for subsequent groups
+        g_replState.isSlave.store(false);
+        g_replState.isMaster.store(false);
+        g_replState.slaveRunning.store(false);
+        g_replState.slavePos.store(0);
+        g_replState.connectedSlaves.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+        g_replState.lastSyncUnixMs.store(0);
+        g_replState.masterDown.store(false);
+        g_replState.syncMode.store(false);
+    }
+}
+
+// ============================================================
+// testGroup97: Quality & Stability Audit (Phase 174)
+//   - WAL Corruption Recovery (crash after COMMIT, CRC, garbage)
+//   - Connection Pool unter anhaltender Last (8×250 Zyklen)
+//   - MVCC Vacuum parallel zu aktiven Transaktionen
+//   - Replication: Master-Ausfall + automatischer Reconnect
+// ============================================================
+
+static void testGroup97() {
+    std::cout << "\n── testGroup97: Quality Audit (Phase 174) ──\n";
+    using namespace milansql;
+
+    auto slurp = [](const std::string& p) -> std::string {
+        std::ifstream f(p, std::ios::binary);
+        std::ostringstream oss; oss << f.rdbuf();
+        return oss.str();
+    };
+    auto dump = [](const std::string& p, const std::string& content) {
+        std::ofstream f(p, std::ios::binary | std::ios::trunc);
+        f << content;
+    };
+    auto commitLines = [](uint64_t txId) -> std::string {
+        std::string cl = "TX_COMMIT:" + std::to_string(txId);
+        return cl + "\nCRC:" + std::to_string(WalRecovery::walCrc32(cl)) + "\n";
+    };
+
+    // ── 1) WAL Recovery: committed tx is replayed after crash ──
+    {
+        const std::string wal = "test_g97_wal1.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:1\nOP 0 public.wr_t\nVAL 1\nVAL alice\n---\n" + commitLines(1));
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.hadWal && rr.recoveredTxCount == 1,
+              "AUD-WAL #1a: committed tx recognized in WAL");
+        check(rr.replayedOpCount == 1, "AUD-WAL #1b: op replayed");
+        check(engine.countRows("wr_t", true) == 1,
+              "AUD-WAL #1c: crash-committed INSERT restored");
+    }
+
+    // ── 2) Uncommitted tx is discarded ─────────────────────────
+    {
+        const std::string wal = "test_g97_wal2.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:2\nOP 0 public.wr_t\nVAL 9\nVAL ghost\n---\n");  // no TX_COMMIT
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.discardedTxCount == 1, "AUD-WAL #2a: uncommitted tx discarded");
+        check(engine.countRows("wr_t", true) == 0,
+              "AUD-WAL #2b: uncommitted data NOT applied");
+    }
+
+    // ── 3) Rolled-back tx is never replayed ────────────────────
+    {
+        const std::string wal = "test_g97_wal3.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:3\nOP 0 public.wr_t\nVAL 7\nVAL rb\n---\nTX_ROLLBACK:3\n");
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.recoveredTxCount == 0 && engine.countRows("wr_t", true) == 0,
+              "AUD-WAL #3a: rolled-back tx not replayed");
+    }
+
+    // ── 4) Corrupted CRC revokes the commit ────────────────────
+    {
+        const std::string wal = "test_g97_wal4.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:4\nOP 0 public.wr_t\nVAL 4\nVAL bad\n---\n"
+                  "TX_COMMIT:4\nCRC:12345\n");   // wrong CRC
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.recoveredTxCount == 0, "AUD-WAL #4a: CRC mismatch revokes commit");
+        check(engine.countRows("wr_t", true) == 0,
+              "AUD-WAL #4b: corrupted commit NOT applied");
+    }
+
+    // ── 5) Garbage / truncated WAL must not crash ──────────────
+    {
+        const std::string wal = "test_g97_wal5.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "\x01\x02\xff garbage\nTX_BEGIN:notanumber\nOP xx\nVAL\n--\n"
+                  "TX_COMMIT:\nCRC:zzz\nhalf line without newline");
+        WalRecovery rec;
+        bool noThrow = true;
+        WalRecovery::RecoveryResult rr;
+        try { rr = rec.recover(engine, wal); } catch (...) { noThrow = false; }
+        check(noThrow && rr.replayedOpCount == 0,
+              "AUD-WAL #5a: garbage WAL survives without crash or replay");
+        std::ifstream gone(wal);
+        check(!gone, "AUD-WAL #5b: WAL cleared after recovery");
+    }
+
+    // ── 6) Op on missing table is skipped, valid ops applied ───
+    {
+        const std::string wal = "test_g97_wal6.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_t (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:6\nOP 0 public.missing_tbl\nVAL 1\n---\n"
+                  "OP 0 public.wr_t\nVAL 6\nVAL ok\n---\n" + commitLines(6));
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(engine.countRows("wr_t", true) == 1 && rr.recoveredTxCount == 1,
+              "AUD-WAL #6a: missing-table op skipped, valid op applied");
+    }
+
+    // ── 7) No WAL file → clean no-op ───────────────────────────
+    {
+        Engine engine;
+        WalRecovery rec;
+        auto rr = rec.recover(engine, "test_g97_does_not_exist.wal");
+        check(!rr.hadWal, "AUD-WAL #7a: missing WAL is a clean no-op");
+    }
+
+    // ── 8) Multi-op tx: INSERT + UPDATE (mit escaped Newline) ──
+    {
+        const std::string wal = "test_g97_wal8.wal";
+        Engine engine; Parser parser;
+        execSQL(engine, parser, "CREATE TABLE wr_m (id INT, name TEXT)");
+        dump(wal, "TX_BEGIN:8\nOP 0 public.wr_m\nVAL 1\nVAL alpha\n---\n"
+                  "OP 1 public.wr_m\nSET name a\\nb\nWHERE id 1\n---\n" + commitLines(8));
+        WalRecovery rec;
+        auto rr = rec.recover(engine, wal);
+        check(rr.replayedOpCount == 2 && engine.countRows("wr_m", true) == 1,
+              "AUD-WAL #8a: multi-op tx replayed in order");
+        auto t = engine.selectAll("wr_m").clone();
+        check(cellVal(t, 0, "name") == "a\nb",
+              "AUD-WAL #8b: escaped newline in SET value restored");
+    }
+
+    // ── 9) Bug #24 repro: value with embedded newline survives ─
+    //      appendWal → crash → recovery roundtrip intact
+    {
+        const std::string walA = "test_g97_wal9a.wal";
+        const std::string walB = "test_g97_wal9b.wal";
+        std::remove(walA.c_str());
+        {
+            Engine e1; Parser parser;
+            execSQL(e1, parser, "CREATE TABLE wr_nl (id INT, name TEXT)");
+            e1.beginTransaction(walA);
+            e1.insertRow("wr_nl", {"1", "line1\nline2"});
+            std::string content = slurp(walA);       // WAL as written pre-crash
+            e1.rollbackTransaction();                 // deletes walA
+
+            // Simulate crash right after COMMIT was fsynced
+            uint64_t txId = 0;
+            auto p = content.find("TX_BEGIN:");
+            if (p != std::string::npos)
+                try { txId = std::stoull(content.substr(p + 9)); } catch (...) {}
+            dump(walB, content + commitLines(txId));
+        }
+        Engine e2; Parser parser2;
+        execSQL(e2, parser2, "CREATE TABLE wr_nl (id INT, name TEXT)");
+        WalRecovery rec;
+        auto rr = rec.recover(e2, walB);
+        check(rr.recoveredTxCount == 1 && e2.countRows("wr_nl", true) == 1,
+              "AUD-WAL #9a: newline-value tx recovered as one row");
+        auto t = e2.selectAll("wr_nl").clone();
+        check(cellVal(t, 0, "name") == "line1\nline2",
+              "AUD-WAL #9b: multi-line value survives crash recovery intact");
+    }
+
+    // ── 10) Connection Pool unter anhaltender Last ─────────────
+    {
+        ConnectionPool pool(4, 16);
+        std::atomic<int>  served{0};
+        std::atomic<bool> anyFail{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&pool, &served, &anyFail]() {
+                for (int i = 0; i < 250; ++i) {
+                    auto c = pool.acquire(5000);
+                    if (!c) { anyFail = true; continue; }
+                    if ((i & 63) == 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    pool.release(c);
+                    ++served;
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+        check(served.load() == 2000 && !anyFail.load(),
+              "AUD-POOL #10a: 2000 acquire/release cycles under load served");
+        check(pool.activeCount() == 0,
+              "AUD-POOL #10b: all connections released after load");
+        check(pool.totalCount() <= 16,
+              "AUD-POOL #10c: pool size bounded by max under load");
+        check(pool.statsJson().find("\"active\":0") != std::string::npos,
+              "AUD-POOL #10d: statsJson consistent after load");
+    }
+
+    // ── 11) MVCC Vacuum parallel zu aktiven Transaktionen ──────
+    {
+        Engine engine; Parser parser;
+        const std::string wal = "test_g97_vac.wal";
+        execSQL(engine, parser, "CREATE TABLE vac_c (id INT)");
+        for (int i = 1; i <= 200; ++i)
+            execSQL(engine, parser, "INSERT INTO vac_c VALUES (" + std::to_string(i) + ")");
+
+        std::mutex em;   // simulates the server's engineMutex_ serialization
+        std::atomic<bool> done{false};
+        std::atomic<bool> vacErr{false};
+        std::thread vac([&]() {
+            while (!done) {
+                {
+                    std::lock_guard<std::mutex> lk(em);
+                    try { engine.vacuumAllTracked(); } catch (...) { vacErr = true; }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+        for (int i = 1; i <= 100; ++i) {
+            {   // tx opened — vacuum may interleave while tx is active
+                std::lock_guard<std::mutex> lk(em);
+                engine.beginTransaction(wal);
+                execSQL(engine, parser,
+                        "DELETE FROM vac_c WHERE id = " + std::to_string(i));
+            }
+            std::this_thread::yield();
+            {
+                std::lock_guard<std::mutex> lk(em);
+                engine.applyAndCommit();
+            }
+        }
+        done = true;
+        vac.join();
+        engine.vacuumAllTracked();
+        check(!vacErr.load(),
+              "AUD-VAC #11a: concurrent vacuum never threw during active txs");
+        check(engine.countRows("vac_c", true) == 100,
+              "AUD-VAC #11b: live rows correct after 100 tx + concurrent vacuum");
+        check(engine.deadRowCount() == 0,
+              "AUD-VAC #11c: all dead versions cleaned up");
+        std::remove(wal.c_str());
+    }
+
+    // ── 12) Replication: Master-Ausfall + Auto-Reconnect ───────
+    {
+        const char* blPath  = "test_g97_e2e.binlog";
+        const char* tokPath = "test_g97_db.repl_token";
+        std::remove(blPath);
+        std::remove(tokPath);
+        loadOrCreateReplToken("test_g97_db");   // no-op if token already loaded
+        g_replState.slavePos.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+        g_replState.masterDown.store(false);
+        g_replState.lastSyncUnixMs.store(0);
+
+        const int port = 15473;
+        {
+            BinlogWriter bl(blPath);
+            {
+                std::unique_ptr<MasterReplication> master(
+                    new MasterReplication(port, bl));
+                master->start();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                std::mutex mu;
+                std::vector<std::string> received;
+                {
+                    SlaveReplication slave("127.0.0.1", port,
+                        [&](const std::string& sql) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            received.push_back(sql);
+                        });
+                    slave.start();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                    bl.write("INSERT INTO rc VALUES (1)");
+                    replNotifyNewData();
+                    bool got1 = false;
+                    for (int i = 0; i < 200 && !got1; ++i) {
+                        { std::lock_guard<std::mutex> lk(mu); got1 = !received.empty(); }
+                        if (!got1) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(got1, "AUD-REPL #12a: initial streaming works");
+
+                    // Kill the master. Pause the slave first and let the
+                    // pending long-poll (STREAM_WAIT_MS=3000) drain so no
+                    // detached handler touches the dead master object.
+                    slave.stop();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(3600));
+                    master.reset();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                    slave.resume();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                    check(!g_replState.slaveRunning.load(),
+                          "AUD-REPL #12b: replica detects lost master connection");
+
+                    // Restart master on same port — replica must reconnect
+                    master.reset(new MasterReplication(port, bl));
+                    master->start();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+                    bl.write("INSERT INTO rc VALUES (2)");
+                    replNotifyNewData();
+                    bool got2 = false;
+                    for (int i = 0; i < 300 && !got2; ++i) {   // ≤15s (5s retry backoff)
+                        { std::lock_guard<std::mutex> lk(mu); got2 = received.size() >= 2; }
+                        if (!got2) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(got2, "AUD-REPL #12c: replica auto-reconnects and resumes streaming");
+                    check(g_replState.slaveRunning.load(),
+                          "AUD-REPL #12d: replica running again after reconnect");
+                    check(!g_replState.masterDown.load(),
+                          "AUD-REPL #12e: masterDown cleared after reconnect");
+                } // slave stops + joins (drains its in-flight poll)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                master.reset();
+            }
+            // Let detached per-slave handler threads drain before bl dies
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        std::remove(blPath);
+        std::remove(tokPath);
+
+        // Reset global replication state for subsequent groups
+        g_replState.isSlave.store(false);
+        g_replState.isMaster.store(false);
+        g_replState.slaveRunning.store(false);
+        g_replState.slavePos.store(0);
+        g_replState.connectedSlaves.store(0);
+        g_replState.maxSlaveAckPos.store(0);
+        g_replState.lastSyncUnixMs.store(0);
+        g_replState.masterDown.store(false);
+        g_replState.syncMode.store(false);
+    }
+}
+
+// ============================================================
+// Test-Gruppe 98: CROSS JOIN + Komma-Join (Bug #26 / #27)
+// ============================================================
+static void testGroup98() {
+    std::cout << "\n── testGroup98: CROSS JOIN / Komma-Join (Bug #26/#27) ──\n";
+    using namespace milansql;
+
+    Engine engine; Parser parser;
+    execSQL(engine, parser, "CREATE TABLE cj1 (id INT, v TEXT)");
+    execSQL(engine, parser, "CREATE TABLE cj2 (id INT, w TEXT)");
+    execSQL(engine, parser, "CREATE TABLE cj3 (id INT)");
+    execSQL(engine, parser, "INSERT INTO cj1 VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    execSQL(engine, parser, "INSERT INTO cj2 VALUES (10, 'x'), (20, 'y'), (30, 'z')");
+    execSQL(engine, parser, "INSERT INTO cj3 VALUES (7), (8), (9)");
+
+    // ── Bug #26: Komma-Join wird als CROSS JOIN geparst ────────
+    {
+        auto cmd = parser.parse("SELECT * FROM cj1 a, cj2 b");
+        check(cmd.type == CommandType::SELECT && cmd.isJoin,
+              "CJ #1a: Komma-FROM wird als JOIN geroutet");
+        check(cmd.joinClauses.size() == 1 &&
+              cmd.joinClauses[0].joinType == "CROSS" &&
+              cmd.joinClauses[0].table == "cj2",
+              "CJ #1b: Komma-Eintrag = CROSS JoinClause");
+        check(cmd.joinClauses[0].tableAlias == "b" && cmd.tableAlias == "a",
+              "CJ #1c: Aliase erkannt");
+
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 9, "CJ #1d: 3 x 3 = 9 Zeilen (kartesisches Produkt)");
+    }
+
+    // ── Bug #26: 3 Tabellen ─────────────────────────────────────
+    {
+        auto cmd = parser.parse("SELECT * FROM cj1, cj2, cj3");
+        check(cmd.isJoin && cmd.joinClauses.size() == 2,
+              "CJ #2a: FROM a, b, c ergibt 2 CROSS-Klauseln");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 27, "CJ #2b: 3 x 3 x 3 = 27 Zeilen");
+    }
+
+    // ── Bug #27: expliziter CROSS JOIN ──────────────────────────
+    {
+        auto cmd = parser.parse("SELECT * FROM cj1 CROSS JOIN cj2");
+        check(cmd.type == CommandType::SELECT && cmd.isJoin &&
+              cmd.joinClauses.size() == 1 &&
+              cmd.joinClauses[0].joinType == "CROSS",
+              "CJ #3a: CROSS JOIN wird geparst (kein UNKNOWN)");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 9, "CJ #3b: CROSS JOIN liefert 9 Zeilen");
+    }
+
+    // ── COUNT(*) ueber Komma-Join ───────────────────────────────
+    {
+        auto cmd = parser.parse("SELECT COUNT(*) FROM cj1 a, cj2 b");
+        check(cmd.isJoin && cmd.isCount,
+              "CJ #4a: COUNT(*) ueber Komma-Join als Count markiert");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 9, "CJ #4b: Count-Basis = 9 Zeilen");
+    }
+
+    // ── CROSS JOIN + WHERE ──────────────────────────────────────
+    {
+        auto cmd = parser.parse(
+            "SELECT * FROM cj1 CROSS JOIN cj2 WHERE cj2.w = 'x'");
+        auto res = engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                       cmd.whereConds, cmd.whereLogic);
+        check(res.rowCount() == 3, "CJ #5: CROSS JOIN + WHERE filtert (3 Zeilen)");
+    }
+
+    // ── Regression: INNER JOIN mit ON unveraendert ──────────────
+    {
+        auto cmd = parser.parse(
+            "SELECT * FROM cj1 JOIN cj2 ON cj1.id = cj2.id");
+        check(cmd.isJoin && cmd.joinClauses.size() == 1 &&
+              cmd.joinClauses[0].joinType == "INNER" &&
+              cmd.joinClauses[0].onLeft == "cj1.id",
+              "CJ #6: normaler JOIN ... ON parst weiterhin als INNER");
+    }
+
+    // ── OOM-Schutz: Row-Limit-Guard ─────────────────────────────
+    {
+        execSQL(engine, parser, "CREATE TABLE cjbig (id INT)");
+        std::string vals = "(0)";
+        for (int i = 1; i < 50; ++i) vals += ", (" + std::to_string(i) + ")";
+        for (int b = 0; b < 15; ++b)
+            execSQL(engine, parser, "INSERT INTO cjbig VALUES " + vals);
+        // 750 x 750 = 562500 > MAX_JOIN_ROWS (500000)
+        auto cmd = parser.parse("SELECT * FROM cjbig a, cjbig b");
+        bool threw = false;
+        try {
+            engine.executeJoins(cmd.tableName, cmd.joinClauses,
+                                cmd.whereConds, cmd.whereLogic);
+        } catch (const std::exception& e) {
+            threw = std::string(e.what()).find("row limit") != std::string::npos;
+        }
+        check(threw, "CJ #7: riesiges kartesisches Produkt -> graceful error (Row-Limit)");
+    }
+
+    // ── Bug #28: LIKE matchte nie (Quotes im Pattern) ───────────
+    {
+        execSQL(engine, parser, "CREATE TABLE lk (id INT, name TEXT)");
+        execSQL(engine, parser,
+                "INSERT INTO lk VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
+        auto c1 = parser.parse("SELECT * FROM lk WHERE name LIKE 'A%'");
+        auto r1 = engine.selectWhere(c1.tableName, c1.whereConds, c1.whereLogic);
+        check(r1.table.rowCount() == 1, "LK #8a: LIKE 'A%' findet Alice");
+
+        auto c2 = parser.parse("SELECT * FROM lk WHERE name LIKE '%li%'");
+        auto r2 = engine.selectWhere(c2.tableName, c2.whereConds, c2.whereLogic);
+        check(r2.table.rowCount() == 2, "LK #8b: LIKE '%li%' findet Alice+Charlie");
+
+        auto c3 = parser.parse("SELECT * FROM lk WHERE name LIKE 'B_b'");
+        auto r3 = engine.selectWhere(c3.tableName, c3.whereConds, c3.whereLogic);
+        check(r3.table.rowCount() == 1, "LK #8c: LIKE 'B_b' (Underscore) findet Bob");
+
+        auto c4 = parser.parse("SELECT * FROM lk WHERE name LIKE 'x%'");
+        auto r4 = engine.selectWhere(c4.tableName, c4.whereConds, c4.whereLogic);
+        check(r4.table.rowCount() == 0, "LK #8d: LIKE 'x%' findet nichts");
+    }
+}
+
+// ============================================================
+// testGroup99 — Optimizer Phase 1: Statistics Collection
+// ANALYZE, Sampling, Index-Selektivität, Persistenz
+// ============================================================
+static void testGroup99() {
+    std::cout << "\n── testGroup99: Statistics Collection (Optimizer Phase 1) ──\n";
+    using namespace milansql;
+
+    Parser parser;
+    TableStatsManager mgr;
+
+    // ── ST #1: ANALYZE-Parsing (TABLE x / x / ohne Argument) ────
+    {
+        auto c1 = parser.parse("ANALYZE TABLE foo");
+        check(c1.type == CommandType::ANALYZE_TABLE && c1.tableName == "foo",
+              "ST #1a: ANALYZE TABLE foo geparst");
+        auto c2 = parser.parse("ANALYZE foo");
+        check(c2.type == CommandType::ANALYZE_TABLE && c2.tableName == "foo",
+              "ST #1b: ANALYZE foo (Postgres-Syntax) geparst");
+        auto c3 = parser.parse("ANALYZE");
+        check(c3.type == CommandType::ANALYZE_TABLE && c3.tableName == "*",
+              "ST #1c: ANALYZE ohne Argument = alle Tabellen");
+    }
+
+    // ── ST #2: ANALYZE auf leerer Tabelle ───────────────────────
+    {
+        std::vector<Column> cols = { {"id", "INT"}, {"name", "TEXT"} };
+        Table empty("g99_empty", cols);
+        mgr.analyzeTable("g99_empty", empty);
+        const TableStats* ts = mgr.getStats("g99_empty");
+        check(ts != nullptr && ts->rowCount == 0,
+              "ST #2a: leere Tabelle -> rowCount 0, kein Crash");
+        check(ts->cols.at("id").distinctCount == 0 &&
+              ts->cols.at("id").nullFrac == 0.0,
+              "ST #2b: leere Tabelle -> distinct 0, nullFrac 0");
+    }
+
+    // ── ST #3: bekannte Daten -> exakte Zahlen ──────────────────
+    {
+        std::vector<Column> cols = { {"id", "INT"}, {"city", "TEXT"} };
+        Table t("g99_known", cols);
+        // 10 Rows: id 2..11; city: 4x Berlin, 3x Rom, 1x Oslo, 2x NULL
+        const char* cities[10] = { "Berlin","Berlin","Berlin","Berlin",
+                                   "Rom","Rom","Rom","Oslo","NULL","NULL" };
+        for (int i = 0; i < 10; ++i)
+            t.insert(Row({ std::to_string(i + 2), cities[i] }));
+        mgr.analyzeTable("g99_known", t);
+        const TableStats* ts = mgr.getStats("g99_known");
+        check(ts->rowCount == 10, "ST #3a: rowCount == 10");
+        const ColumnStats& city = ts->cols.at("city");
+        check(city.distinctCount == 3, "ST #3b: city distinct == 3 (exakt)");
+        check(city.nullCount == 2 && std::abs(city.nullFrac - 0.2) < 1e-9,
+              "ST #3c: city nullCount 2, nullFrac 0.2");
+        const ColumnStats& id = ts->cols.at("id");
+        check(id.isNumeric && id.minVal == "2" && id.maxVal == "11",
+              "ST #3d: INT Min/Max numerisch (2/11, nicht lexikographisch)");
+        check(std::abs(city.mostCommonVals.at("Berlin") - 0.4) < 1e-9,
+              "ST #3e: MCV Berlin == 40%");
+        check(id.avgWidth > 0.9 && id.avgWidth < 2.1,
+              "ST #3f: avgWidth plausibel (1-2 Bytes fuer '2'..'11')");
+    }
+
+    // ── ST #4: MVCC — tote Rows werden nicht mitgezaehlt ────────
+    {
+        std::vector<Column> cols = { {"v", "INT"} };
+        Table t("g99_mvcc", cols);
+        for (int i = 0; i < 6; ++i) t.insert(Row({ std::to_string(i) }));
+        // 2 Rows als geloescht markieren
+        t.mutableRows()[0].xmax = 42;
+        t.mutableRows()[1].xmax = 42;
+        mgr.analyzeTable("g99_mvcc", t);
+        const TableStats* ts = mgr.getStats("g99_mvcc");
+        check(ts->rowCount == 4 && ts->deadRowCount == 2,
+              "ST #4: MVCC -> 4 live, 2 dead");
+    }
+
+    // ── ST #5: Index-Selektivität ───────────────────────────────
+    {
+        std::vector<Column> cols = { {"uid", "INT"}, {"status", "TEXT"} };
+        Table t("g99_idx", cols);
+        for (int i = 0; i < 100; ++i)
+            t.insert(Row({ std::to_string(i), (i % 2 == 0) ? "on" : "off" }));
+        t.createIndex({"uid"}, "ix_uid");
+        t.createIndex({"status"}, "ix_status");
+        mgr.analyzeTable("g99_idx", t);
+        const TableStats* ts = mgr.getStats("g99_idx");
+        check(ts->indexes.size() == 2, "ST #5a: 2 Index-Statistiken");
+        const IndexStats* iu = nullptr; const IndexStats* is = nullptr;
+        for (const auto& ix : ts->indexes) {
+            if (ix.indexName == "ix_uid")    iu = &ix;
+            if (ix.indexName == "ix_status") is = &ix;
+        }
+        check(iu && iu->distinctKeys == 100 &&
+              std::abs(iu->selectivity - 0.01) < 1e-9,
+              "ST #5b: unique Index -> 100 Keys, Selektivitaet 0.01");
+        check(is && is->distinctKeys == 2 &&
+              std::abs(is->avgRowsPerKey - 50.0) < 1e-9,
+              "ST #5c: 2-Werte-Index -> 2 Keys, ~50 Rows/Key");
+    }
+
+    // ── ST #6: Sampling bei grosser Tabelle (250k Rows) ─────────
+    {
+        std::vector<Column> cols = { {"val", "INT"}, {"opt", "TEXT"} };
+        Table t("g99_big", cols);
+        // val: 997 distinct Werte; opt: jede 5. Row NULL (Periode 5,
+        // teilerfremd zur Sampling-Schrittweite 2 -> kein Aliasing)
+        for (int i = 0; i < 250000; ++i)
+            t.insert(Row({ std::to_string(i % 997),
+                           (i % 5 == 0) ? "NULL" : "x" }));
+        mgr.analyzeTable("g99_big", t);
+        const TableStats* ts = mgr.getStats("g99_big");
+        check(ts->sampled && ts->sampledRows >= 100000 &&
+              ts->sampledRows < 250000,
+              "ST #6a: >100k Rows -> Sampling aktiv (>=100k Sample)");
+        check(ts->rowCount == 250000,
+              "ST #6b: rowCount exakt trotz Sampling");
+        const ColumnStats& val = ts->cols.at("val");
+        check(val.distinctCount >= 950 && val.distinctCount <= 1050,
+              "ST #6c: distinct-Schaetzung 997 +/- 5% (GEE)");
+        const ColumnStats& opt = ts->cols.at("opt");
+        check(opt.nullFrac > 0.18 && opt.nullFrac < 0.22,
+              "ST #6d: nullFrac-Schaetzung ~0.2");
+        // Reproduzierbarkeit: zweites ANALYZE liefert identische Werte
+        size_t d1 = val.distinctCount;
+        mgr.analyzeTable("g99_big", t);
+        check(mgr.getStats("g99_big")->cols.at("val").distinctCount == d1,
+              "ST #6e: ANALYZE deterministisch (gleicher Seed)");
+    }
+
+    // ── ST #7: Persistenz ueber Neustart (save -> neuer Manager) ─
+    {
+        const std::string path = "g99_stats_persist.tmp";
+        mgr.saveStats(path);
+        TableStatsManager mgr2;   // laedt default-Datei
+        mgr2.loadStats(path);     // + unsere Test-Stats
+        const TableStats* ts = mgr2.getStats("g99_known");
+        check(ts != nullptr && ts->rowCount == 10,
+              "ST #7a: rowCount ueberlebt Neustart");
+        check(ts->cols.at("city").distinctCount == 3 &&
+              ts->cols.at("city").nullCount == 2 &&
+              std::abs(ts->cols.at("city").nullFrac - 0.2) < 1e-9,
+              "ST #7b: distinct/null/nullFrac ueberleben Neustart");
+        check(ts->cols.at("id").minVal == "2" &&
+              ts->cols.at("id").maxVal == "11" &&
+              ts->cols.at("id").isNumeric,
+              "ST #7c: Min/Max/isNumeric ueberleben Neustart");
+        const TableStats* ti = mgr2.getStats("g99_idx");
+        bool idxOk = false;
+        for (const auto& ix : ti->indexes)
+            if (ix.indexName == "ix_uid" && ix.distinctKeys == 100 &&
+                std::abs(ix.selectivity - 0.01) < 1e-9) idxOk = true;
+        check(idxOk, "ST #7d: Index-Selektivitaet ueberlebt Neustart");
+        check(mgr2.getStats("g99_big")->sampled,
+              "ST #7e: sampled-Flag ueberlebt Neustart");
+        std::remove(path.c_str());
+    }
+
+    // ── ST #8: Selektivitaetsschaetzung nutzt neue Stats ────────
+    {
+        double sel = mgr.estimateSelectivity("g99_known", "city", "=", "Berlin");
+        check(std::abs(sel - 0.4) < 1e-9,
+              "ST #8a: estimateSelectivity city='Berlin' == 0.4 (MCV)");
+        double seln = mgr.estimateSelectivity("g99_known", "city", "IS NULL", "");
+        check(std::abs(seln - 0.2) < 1e-9,
+              "ST #8b: IS NULL Selektivitaet == nullFrac 0.2");
+    }
+
+    // ── ST #9: Konsolidierung — SHOW TABLE STATS liest echte Stats ─
+    // (Fake-Store aus Phase 149 entfernt; ANALYZE + SHOW TABLE STATS
+    //  laufen jetzt beide ueber g_tableStats)
+    {
+        Engine eng;
+        auto e = [&](const std::string& sql) {
+            return dispatch(parser.parse(sql), eng);
+        };
+        e("CREATE TABLE g99_show (id INT, tag TEXT)");
+        e("INSERT INTO g99_show VALUES (1, 'a')");
+        e("INSERT INTO g99_show VALUES (2, 'a')");
+        e("INSERT INTO g99_show VALUES (3, 'b')");
+        e("INSERT INTO g99_show VALUES (4, NULL)");
+
+        auto r1 = e("ANALYZE TABLE g99_show");
+        check(r1.message == "ANALYZE 1",
+              "ST #9a: ANALYZE TABLE ueber dispatch() -> ANALYZE 1");
+
+        // ANALYZE hat den ECHTEN TableStatsManager befuellt
+        const TableStats* ts = g_tableStats.getStats("g99_show");
+        check(ts != nullptr && ts->rowCount == 4 &&
+              ts->cols.at("tag").distinctCount == 2 &&
+              ts->cols.at("tag").nullCount == 1,
+              "ST #9b: dispatch-ANALYZE befuellt g_tableStats (4 Rows, 2 distinct, 1 NULL)");
+
+        auto r2 = e("SHOW TABLE STATS FOR g99_show");
+        check(!r2.rows.empty() && r2.rows[0].values[0] == "g99_show" &&
+              r2.rows[0].values[1] == "4",
+              "ST #9c: SHOW TABLE STATS zeigt echten rowCount 4");
+        check(!r2.rows.empty() && r2.rows[0].values[3] != "never" &&
+              r2.rows[0].values[3].size() >= 19,
+              "ST #9d: LastAnalyzed = echter Zeitstempel (nicht hardcoded)");
+        check(r2.columns.size() == 7 &&
+              r2.columns[4].name == "DeadRows" && r2.columns[5].name == "Sampled" &&
+              r2.columns[6].name == "Changes" &&   // Optimizer Phase 3 Block 4
+              !r2.rows.empty() &&
+              r2.rows[0].values[4] == "0" && r2.rows[0].values[5] == "no",
+              "ST #9e: neue Spalten DeadRows=0, Sampled=no");
+    }
+}
+
+// ============================================================
+// testGroup100 — Optimizer Phase 2: Cost Model
+// Range-Selektivität (Histogramm/Min-Max), CostModel-Formeln,
+// SHOW COST MODEL
+// ============================================================
+static void testGroup100() {
+    std::cout << "\n── testGroup100: Cost Model (Optimizer Phase 2) ──\n";
+    using namespace milansql;
+
+    Parser parser;
+    TableStatsManager mgr;
+
+    // ── CM #1: Range-Selektivität aus Histogramm (statt 0.33) ───
+    {
+        std::vector<Column> cols = { {"id", "INT"} };
+        Table t("g100_uniform", cols);
+        for (int i = 1; i <= 100; ++i) t.insert(Row({ std::to_string(i) }));
+        mgr.analyzeTable("g100_uniform", t);
+
+        double s1 = mgr.estimateSelectivity("g100_uniform", "id", "<", "50");
+        check(s1 > 0.40 && s1 < 0.60,
+              "CM #1a: id < 50 auf 1..100 -> Sel ~0.5 (Histogramm, nicht 0.33)");
+        double s2 = mgr.estimateSelectivity("g100_uniform", "id", ">", "90");
+        check(s2 > 0.04 && s2 < 0.16,
+              "CM #1b: id > 90 -> Sel ~0.1");
+        double s3 = mgr.estimateSelectivity("g100_uniform", "id", "<=", "100");
+        check(s3 > 0.9,
+              "CM #1c: id <= Max -> Sel ~1.0");
+        double s4 = mgr.estimateSelectivity("g100_uniform", "id", ">", "100");
+        check(s4 < 0.1,
+              "CM #1d: id > Max -> Sel ~0");
+    }
+
+    // ── CM #1e: NULL-Anteil reduziert Range-Selektivität ────────
+    {
+        std::vector<Column> cols = { {"v", "INT"} };
+        Table t("g100_nulls", cols);
+        // 50% NULL, Nicht-NULL-Werte uniform 1..99
+        for (int i = 1; i <= 100; ++i)
+            t.insert(Row({ (i % 2 == 0) ? "NULL" : std::to_string(i) }));
+        mgr.analyzeTable("g100_nulls", t);
+        double s = mgr.estimateSelectivity("g100_nulls", "v", "<", "50");
+        check(s > 0.15 && s < 0.35,
+              "CM #1e: 50% NULL -> Range-Sel ~0.25 (Faktor 1-nullFrac)");
+    }
+
+    // ── CM #1f: Fallback ohne Stats bleibt 0.33 ─────────────────
+    {
+        ColumnStats empty;
+        double s = TableStatsManager::rangeSelectivity(empty, "<", "5");
+        check(std::abs(s - 0.33) < 1e-9,
+              "CM #1f: ohne Histogramm/MinMax -> Fallback 0.33");
+    }
+
+    // ── CM #2: estimateRowCount nutzt Range-Selektivität ────────
+    {
+        std::vector<WhereCondition> conds(1);
+        conds[0].col = "id"; conds[0].op = "<"; conds[0].val = "50";
+        size_t est = mgr.estimateRowCount("g100_uniform", conds);
+        check(est >= 40 && est <= 60,
+              "CM #2a: estimateRowCount id<50 -> ~50 (statt 33)");
+    }
+
+    // ── CM #3: CostModel::tableInput ────────────────────────────
+    {
+        auto in = CostModel::tableInput("g100_gibtsnicht", 500.0, 40.0);
+        check(!in.fromStats && in.rows == 500.0 && in.width == 40.0 &&
+              in.pages >= 1.0,
+              "CM #3a: tableInput ohne Stats -> Fallback rows/width");
+        auto in2 = CostModel::tableInput("g100_uniform", 1.0, 1.0);
+        // Hinweis: liest g_tableStats — dafuer via globalem Manager analysieren
+        (void)in2;
+        std::vector<Column> cols = { {"id", "INT"} };
+        Table t("g100_cm", cols);
+        for (int i = 1; i <= 200; ++i) t.insert(Row({ std::to_string(i) }));
+        g_tableStats.analyzeTable("g100_cm", t);
+        auto in3 = CostModel::tableInput("g100_cm", 1.0, 1.0);
+        check(in3.fromStats && in3.rows == 200.0 && in3.width > 0.0,
+              "CM #3b: tableInput aus g_tableStats (200 Rows, echte Breite)");
+    }
+
+    // ── CM #4: Scan-Kostenformeln ───────────────────────────────
+    {
+        CostModel::TableInput small; small.rows = 1000;   small.width = 50;
+        small.pages = std::ceil(1000.0 * 50 / 4096.0);
+        CostModel::TableInput big;   big.rows   = 100000; big.width   = 50;
+        big.pages   = std::ceil(100000.0 * 50 / 4096.0);
+
+        auto scS = CostModel::seqScan(small, 1, 100.0);
+        auto scB = CostModel::seqScan(big,   1, 100.0);
+        check(scS.startup == 0.0 && scS.total > 0.0,
+              "CM #4a: SeqScan startup 0, Kosten > 0");
+        check(scB.total > scS.total,
+              "CM #4b: SeqScan-Kosten wachsen mit Tabellengroesse");
+
+        auto ixSel   = CostModel::indexScan(big, 0.0001); // ~10 Rows
+        check(ixSel.total < scB.total,
+              "CM #4c: selektiver IndexScan guenstiger als SeqScan");
+        auto ixAll   = CostModel::indexScan(big, 1.0);    // alle Rows
+        check(ixAll.total > scB.total,
+              "CM #4d: unselektiver IndexScan teurer als SeqScan (random_page_cost)");
+    }
+
+    // ── CM #5: Join-Kardinalität + Join-Kosten ──────────────────
+    {
+        double jr = CostModel::joinRows(1000.0, 1000.0, 100.0, 50.0);
+        check(std::abs(jr - 10000.0) < 1e-6,
+              "CM #5a: joinRows |R||S|/max(ndv) = 1000*1000/100 = 10000");
+        double jf = CostModel::joinRows(1000.0, 1000.0, 0.0, 0.0);
+        check(std::abs(jf - 100000.0) < 1e-6,
+              "CM #5b: joinRows ohne ndv -> Fallback-Sel 0.1");
+
+        CostModel::TableInput ti; ti.rows = 1000; ti.width = 50;
+        ti.pages = std::ceil(1000.0 * 50 / 4096.0);
+        auto scan = CostModel::seqScan(ti, 0, ti.rows);
+        auto hj = CostModel::hashJoin(scan, scan, 10000.0);
+        check(std::abs(hj.startup - (scan.total + 1000.0 * 0.0025)) < 1e-6,
+              "CM #5c: HashJoin startup == Build-Kosten (inner)");
+        auto nl = CostModel::nestedLoop(scan, scan, 10000.0);
+        check(nl.total > hj.total,
+              "CM #5d: NestedLoop teurer als HashJoin (1000x1000)");
+    }
+
+    // ── CM #6: SHOW COST MODEL ──────────────────────────────────
+    {
+        auto c = parser.parse("SHOW COST MODEL");
+        check(c.type == CommandType::SHOW_COST_MODEL,
+              "CM #6a: SHOW COST MODEL geparst");
+
+        Engine eng;
+        auto r = dispatch(c, eng);
+        check(r.columns.size() == 3 && r.rows.size() == 6,
+              "CM #6b: SHOW COST MODEL -> 3 Spalten, 6 Parameter");
+        bool seqOk = false, rndOk = false;
+        for (const auto& row : r.rows) {
+            if (row.values[0] == "seq_page_cost" && row.values[1] == "1.0000")
+                seqOk = true;
+            if (row.values[0] == "random_page_cost" && row.values[1] == "4.0000")
+                rndOk = true;
+        }
+        check(seqOk && rndOk,
+              "CM #6c: seq_page_cost 1.0 / random_page_cost 4.0 (Postgres-analog)");
+    }
+}
+
+// ============================================================
+// testGroup101 — Optimizer Phase 2: Plan Selector + EXPLAIN JSON
+// Kostenbasierte Index-Wahl, EXPLAIN (FORMAT JSON),
+// IN/LIKE-Selektivität, Greedy-Join-Reihenfolge
+// ============================================================
+static void testGroup101() {
+    std::cout << "\n── testGroup101: Plan Selector + EXPLAIN JSON (Optimizer Phase 2) ──\n";
+    using namespace milansql;
+
+    Engine engine;
+    Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+    // JSON-Feld extrahieren (einfacher String-Parser fuers Testen)
+    auto jsonNum = [](const std::string& js, const std::string& key) -> double {
+        auto p = js.find("\"" + key + "\":");
+        if (p == std::string::npos) return -1.0;
+        p += key.size() + 3;
+        try { return std::stod(js.substr(p)); } catch (...) { return -1.0; }
+    };
+
+    // ── Setup: 1000 Rows, Index auf id, KEIN Index auf price ────
+    execSQL("CREATE TABLE g101_items (id INT, price INT, name TEXT)");
+    for (int i = 1; i <= 1000; ++i)
+        execSQL("INSERT INTO g101_items VALUES (" + std::to_string(i) + ", "
+                + std::to_string(i) + ", 'item" + std::to_string(i) + "')");
+    // dispatch_result hat keinen CREATE_INDEX-Handler → direkt via Engine
+    engine.createIndex("g101_items", {"id"}, "idx_g101_id");
+    execSQL("ANALYZE g101_items");
+
+    // ── PS #1: Equality auf indizierter Spalte → IndexScan ──────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id = 500");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"IndexScan\"") != std::string::npos,
+              "PS #1a: id = 500 (Index, sel 1/1000) -> IndexScan");
+        check(js.find("\"index\":\"idx_g101_id\"") != std::string::npos,
+              "PS #1b: gewaehlter Index = idx_g101_id");
+    }
+
+    // ── PS #2: selektive Range auf Index → IndexRangeScan ───────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id > 990");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"IndexRangeScan\"") != std::string::npos,
+              "PS #2: id > 990 (sel ~0.01) -> IndexRangeScan");
+    }
+
+    // ── PS #3: nicht-indizierte Spalte → SeqScan, index null ────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE price > 100");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"SeqScan\"") != std::string::npos,
+              "PS #3a: price > 100 (kein Index) -> SeqScan");
+        check(js.find("\"index\":null") != std::string::npos,
+              "PS #3b: SeqScan -> index: null");
+    }
+
+    // ── PS #4: JSON enthaelt alle Spec-Felder ───────────────────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE price > 100");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        bool allFields =
+            js.find("\"plan\":")           != std::string::npos &&
+            js.find("\"table\":\"g101_items\"") != std::string::npos &&
+            js.find("\"index\":")          != std::string::npos &&
+            js.find("\"estimated_rows\":") != std::string::npos &&
+            js.find("\"estimated_cost\":") != std::string::npos &&
+            js.find("\"selectivity\":")    != std::string::npos &&
+            js.find("\"filter\":\"price > 100\"") != std::string::npos;
+        check(allFields && js.front() == '{' && js.back() == '}',
+              "PS #4: EXPLAIN JSON enthaelt plan/table/index/rows/cost/sel/filter");
+    }
+
+    // ── PS #5: Selektivitaet ±20% nach ANALYZE ──────────────────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id < 500");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        double rows = jsonNum(js, "estimated_rows");
+        check(rows >= 400.0 && rows <= 600.0,
+              "PS #5: id < 500 -> estimated_rows ~500 (+-20%, Histogramm)");
+    }
+
+    // ── PS #6: unselektive Range → SeqScan TROTZ Index ──────────
+    // (Cost Model: random_page_cost macht Index-Scan auf ~99% der
+    //  Rows teurer als SeqScan — der Advisor lehnt den Index ab)
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items WHERE id > 5");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(js.find("\"plan\":\"SeqScan\"") != std::string::npos,
+              "PS #6a: id > 5 (sel ~0.995) -> SeqScan trotz Index (Cost Model)");
+        // Laufzeit-Korrektheit: Ergebnis bleibt identisch (995 Rows)
+        auto r2 = execSQL("SELECT COUNT(*) FROM g101_items WHERE id > 5");
+        bool ok = !r2.rows.empty() && !r2.rows[0].values.empty() &&
+                  r2.rows[0].values[0] == "995";
+        check(ok, "PS #6b: SELECT id > 5 liefert weiterhin 995 Rows");
+    }
+
+    // ── PS #7: JOIN → Array, kleinste Tabelle zuerst ────────────
+    {
+        execSQL("CREATE TABLE g101_small (item_id INT, tag TEXT)");
+        for (int i = 1; i <= 10; ++i)
+            execSQL("INSERT INTO g101_small VALUES (" + std::to_string(i)
+                    + ", 'tag" + std::to_string(i) + "')");
+        execSQL("ANALYZE g101_small");
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g101_items "
+                         "JOIN g101_small ON g101_items.id = g101_small.item_id");
+        std::string js = (!r.rows.empty()) ? r.rows[0].values[0] : "";
+        check(!js.empty() && js.front() == '[' && js.back() == ']',
+              "PS #7a: JOIN -> EXPLAIN JSON ist Array");
+        auto pSmall = js.find("\"table\":\"g101_small\"");
+        auto pBig   = js.find("\"table\":\"g101_items\"");
+        check(pSmall != std::string::npos && pBig != std::string::npos &&
+              pSmall < pBig,
+              "PS #7b: kleinere Tabelle (10 Rows) steht im Plan zuerst (Greedy)");
+    }
+
+    // ── PS #8: IN- und LIKE-Selektivitaet (Spec) ────────────────
+    {
+        WhereCondition inC;
+        inC.col = "id"; inC.op = "IN";
+        inC.inList = {"1", "2", "3", "4", "5"};
+        double sIn = g_tableStats.conditionSelectivity("g101_items", inC);
+        check(sIn > 0.003 && sIn < 0.008,
+              "PS #8a: IN (5 Werte) auf 1000 distinct -> Sel ~0.005");
+        double sLike = g_tableStats.estimateSelectivity(
+            "g101_items", "name", "LIKE", "'item%'");
+        check(std::abs(sLike - 0.1) < 1e-9,
+              "PS #8b: LIKE -> Sel 0.1 (konservativ, Spec)");
+    }
+
+    // ── PS #9: joinOrder-Unit-Test (Greedy, kleinste zuerst) ────
+    {
+        std::vector<PlanSelector::JoinInput> ji(2);
+        ji[0].table = "g101_items";   // 1000 Rows
+        ji[1].table = "g101_small";   // 10 Rows
+        auto order = PlanSelector::joinOrder(ji);
+        check(order.size() == 2 && order[0] == 1 && order[1] == 0,
+              "PS #9: joinOrder -> kleinste Tabelle (Index 1) zuerst");
+    }
+
+    // ── Cleanup: globale Stats nicht in andere Gruppen leaken ───
+    execSQL("DROP TABLE g101_items");
+    execSQL("DROP TABLE g101_small");
+}
+
+// testGroup102 — Optimizer Phase 3: Join Enumeration (Selinger-DP),
+// Join-Methoden-Wahl, Auto-ANALYZE, Tenant-Namen, ndv-Selektivität
+// ============================================================
+static void testGroup102() {
+    std::cout << "\n── testGroup102: Join Enumeration + Auto-ANALYZE (Optimizer Phase 3) ──\n";
+    using namespace milansql;
+
+    Engine engine;
+    Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return milansql::dispatch(parser.parse(sql), engine);
+    };
+
+    // ── Setup: 3 Tabellen unterschiedlicher Groesse ─────────────
+    execSQL("CREATE TABLE g102_a (id INT, val INT)");
+    for (int i = 1; i <= 1000; ++i)
+        execSQL("INSERT INTO g102_a VALUES (" + std::to_string(i) + ", "
+                + std::to_string(i % 50) + ")");
+    engine.createIndex("g102_a", {"id"}, "idx_g102a_id");
+
+    execSQL("CREATE TABLE g102_b (a_id INT, note TEXT)");
+    for (int i = 1; i <= 100; ++i)
+        execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'n"
+                + std::to_string(i) + "')");
+
+    execSQL("CREATE TABLE g102_c (b_id INT, tag TEXT)");
+    for (int i = 1; i <= 10; ++i)
+        execSQL("INSERT INTO g102_c VALUES (" + std::to_string(i) + ", 't"
+                + std::to_string(i) + "')");
+
+    // Grosse Tabelle (5000 Rows) fuer die Join-Methoden-Wahl:
+    // erst hier lohnt Indexed-NL gegen den Hash-SeqScan.
+    // Batch-INSERTs (100 Rows/Statement) halten das Setup schnell.
+    execSQL("CREATE TABLE g102_big (id INT, grp INT)");
+    for (int b = 0; b < 50; ++b) {
+        std::string sql = "INSERT INTO g102_big VALUES ";
+        for (int i = 1; i <= 100; ++i) {
+            int v = b * 100 + i;
+            if (i > 1) sql += ",";
+            sql += "(" + std::to_string(v) + "," + std::to_string(v % 20) + ")";
+        }
+        execSQL(sql);
+    }
+    engine.createIndex("g102_big", {"id"}, "idx_g102big_id");
+
+    execSQL("ANALYZE g102_a");
+    execSQL("ANALYZE g102_b");
+    execSQL("ANALYZE g102_c");
+    execSQL("ANALYZE g102_big");
+
+    // ── JE #1: 3-Tabellen-DP waehlt die billigere Reihenfolge ───
+    // Basis a (1000), b (100) und c (10) beide an a joinbar:
+    // DP muss c (klein) VOR b anfuegen (kleineres Zwischenergebnis).
+    {
+        std::vector<JoinTableInfo> t(3);
+        t[0].name = "g102_a"; t[0].rowCount = 1000;
+        t[1].name = "g102_b"; t[1].rowCount = 100;
+        t[1].requiredTables = {0};
+        t[1].joinColSelf = "a_id"; t[1].otherIdx = 0; t[1].joinColOther = "id";
+        t[2].name = "g102_c"; t[2].rowCount = 10;
+        t[2].requiredTables = {0};
+        t[2].joinColSelf = "b_id"; t[2].otherIdx = 0; t[2].joinColOther = "id";
+
+        JoinPlan p = g_joinEnumerator().plan(t);
+        check(p.dpUsed && p.joinOrder.size() == 2,
+              "JE #1a: 3-Tabellen-Plan via Selinger-DP (dpUsed)");
+        check(!p.joinOrder.empty() && p.joinOrder[0] == 1,
+              "JE #1b: kleinere Tabelle (g102_c) wird zuerst angefuegt");
+    }
+
+    // ── JE #2: 4 Tabellen — kleinstes Zwischenergebnis zuerst ───
+    {
+        std::vector<JoinTableInfo> t(4);
+        t[0].name = "g102_a"; t[0].rowCount = 1000;
+        t[1].name = "g102_b"; t[1].rowCount = 100; t[1].requiredTables = {0};
+        t[2].name = "g102_c"; t[2].rowCount = 10;  t[2].requiredTables = {0};
+        t[3].name = "g102_d"; t[3].rowCount = 500; t[3].requiredTables = {0};
+
+        JoinPlan p = g_joinEnumerator().plan(t);
+        check(p.dpUsed && p.joinOrder.size() == 3 &&
+              p.joinOrder[0] == 1 && p.joinOrder[1] == 0 && p.joinOrder[2] == 2,
+              "JE #2a: 4 Tabellen -> Reihenfolge c(10), b(100), d(500)");
+        check(p.description.find("Selinger DP") != std::string::npos,
+              "JE #2b: Beschreibung nennt Selinger DP");
+    }
+
+    // ── JE #3: Plan-Cache liefert zweiten Aufruf aus dem Cache ──
+    {
+        std::vector<JoinTableInfo> t(3);
+        t[0].name = "g102_a"; t[0].rowCount = 1000;
+        t[1].name = "g102_b"; t[1].rowCount = 100; t[1].requiredTables = {0};
+        t[2].name = "g102_c"; t[2].rowCount = 10;  t[2].requiredTables = {0};
+        g_joinEnumerator().invalidate();
+        JoinPlan p1 = g_joinEnumerator().plan(t, "g102_a|g102_b|g102_c");
+        JoinPlan p2 = g_joinEnumerator().plan(t, "g102_a|g102_b|g102_c");
+        check(p1.description.find("[cached]") == std::string::npos &&
+              p2.description.find("[cached]") != std::string::npos,
+              "JE #3: zweiter plan()-Aufruf kommt aus dem Plan-Cache");
+    }
+
+    // ── SEL #4: ndv-basierte Join-Selektivitaet statt 0.1 ───────
+    {
+        // a.x = b.y -> sel = 1/max(ndv) = 1/1000 -> 1000*500/1000 = 500
+        double withNdv = CostModel::joinRows(1000.0, 500.0, 1000.0, 500.0);
+        check(std::abs(withNdv - 500.0) < 1.0,
+              "SEL #4a: joinRows mit ndv=1000 -> 500 Rows (1/max(ndv))");
+        // ohne ndv-Info: konservativer Fallback 0.1
+        double fallback = CostModel::joinRows(1000.0, 500.0, 0.0, 0.0);
+        check(std::abs(fallback - 50000.0) < 1.0,
+              "SEL #4b: joinRows ohne ndv -> Fallback 0.1 (50000 Rows)");
+        // ndv kommt nach ANALYZE aus echten Stats
+        double ndv = JoinEnumerator::ndvOf("g102_a", "id");
+        check(ndv >= 900.0 && ndv <= 1100.0,
+              "SEL #4c: ndvOf(g102_a.id) ~1000 nach ANALYZE");
+    }
+
+    // ── JM #5: chooseJoinMethod (Unit) ──────────────────────────
+    {
+        // kleine outer-Seite + Index auf grosser innerer Seite -> Indexed-NL
+        std::string m1 = JoinEnumerator::chooseJoinMethod(
+            "g102_big", "id", 5.0, 5000.0, true);
+        check(m1 == "nested_loop_indexed",
+              "JM #5a: outer=5, inner=5000 indiziert -> nested_loop_indexed");
+        // outer >= NL_THRESHOLD -> Hash
+        std::string m2 = JoinEnumerator::chooseJoinMethod(
+            "g102_big", "id", 5000.0, 5000.0, true);
+        check(m2 == "hash", "JM #5b: outer=5000 >= NL_THRESHOLD -> hash");
+        // kein Index -> Hash (Default fuer Equi-Joins)
+        std::string m3 = JoinEnumerator::chooseJoinMethod(
+            "g102_big", "id", 5.0, 5000.0, false);
+        check(m3 == "hash", "JM #5c: Equi-Join ohne Index -> hash");
+        // unbekannte Tabelle (keine Stats) -> "" = alte Heuristik
+        std::string m4 = JoinEnumerator::chooseJoinMethod(
+            "g102_nostats", "id", 5.0, 1000.0, true);
+        check(m4.empty(), "JM #5d: ohne Stats -> leer (alte Heuristik)");
+    }
+
+    // ── JM #6: join_method im EXPLAIN JSON — Hash ───────────────
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g102_b "
+                         "JOIN g102_c ON g102_b.a_id = g102_c.b_id");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        check(js.find("\"join_method\":\"hash\"") != std::string::npos,
+              "JM #6: Equi-Join ohne Index -> join_method=hash im JSON");
+    }
+
+    // ── JM #7: kleiner Outer + Index innen -> Indexed-NL im JSON ─
+    {
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM g102_c "
+                         "JOIN g102_big ON g102_c.b_id = g102_big.id");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        check(js.find("\"join_method\":\"nested_loop_indexed\"") != std::string::npos,
+              "JM #7: outer=10, Index auf g102_big.id -> nested_loop_indexed");
+    }
+
+    // ── JM #8: Laufzeit-Korrektheit der Methoden-Wahl ───────────
+    {
+        // Indexed-NL-Pfad liefert dasselbe Ergebnis wie Hash
+        auto r1 = execSQL("SELECT * FROM g102_c "
+                          "JOIN g102_big ON g102_c.b_id = g102_big.id");
+        check(r1.error.empty() && r1.rows.size() == 10,
+              "JM #8a: Indexed-NL-Join liefert korrekt 10 Rows");
+        // NL_THRESHOLD = 0 erzwingt Hash — Ergebnis identisch
+        execSQL("SET NL_THRESHOLD = 0");
+        auto r2 = execSQL("SELECT * FROM g102_c "
+                          "JOIN g102_big ON g102_c.b_id = g102_big.id");
+        check(r2.error.empty() && r2.rows.size() == 10,
+              "JM #8b: SET NL_THRESHOLD=0 (Hash-Zwang) -> gleiche 10 Rows");
+        execSQL("SET NL_THRESHOLD = 1000");
+        check(std::abs(g_nlThreshold - 1000.0) < 1e-9,
+              "JM #8c: SET NL_THRESHOLD wirkt auf g_nlThreshold");
+    }
+
+    // ── AA #9: Auto-ANALYZE Trigger-Logik (20 %-Schwelle) ───────
+    {
+        // g102_b: ANALYZE bei 100 Rows -> Schwelle 0.2*100 = 20
+        g_autoAnalyze().resetAfterAnalyze("g102_b", 100);
+        for (int i = 101; i <= 110; ++i)   // 10 Aenderungen (10 <= 20)
+            execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'x')");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #9a: 10 Aenderungen bei 100 Rows (10%) -> KEIN Re-ANALYZE");
+        for (int i = 111; i <= 125; ++i)   // +15 -> 25 > 20
+            execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'x')");
+        check(g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #9b: 25 Aenderungen (25% > 20%) -> Re-ANALYZE noetig");
+        check(g_autoAnalyze().changesFor("g102_b") == 25,
+              "AA #9c: Aenderungszaehler steht auf 25");
+    }
+
+    // ── AA #10: Sweep analysiert + setzt Zaehler zurueck ────────
+    {
+        size_t n = autoAnalyzeSweep(engine);
+        check(n >= 1, "AA #10a: autoAnalyzeSweep analysiert >= 1 Tabelle");
+        const TableStats* ts = g_tableStats.getStats("g102_b");
+        check(ts && ts->rowCount == 125,
+              "AA #10b: Stats nach Sweep aktuell (rowCount=125)");
+        check(g_autoAnalyze().changesFor("g102_b") == 0,
+              "AA #10c: Zaehler nach Sweep zurueckgesetzt");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #10d: needsAnalyze nach Sweep false");
+    }
+
+    // ── AA #11: Threshold konfigurierbar (SET) ──────────────────
+    {
+        for (int i = 126; i <= 155; ++i)   // 30 Aenderungen bei 125 Rows (24%)
+            execSQL("INSERT INTO g102_b VALUES (" + std::to_string(i) + ", 'y')");
+        execSQL("SET AUTO_ANALYZE_THRESHOLD = 0.5");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #11a: 24% Aenderungen < Threshold 0.5 -> kein Trigger");
+        execSQL("SET AUTO_ANALYZE_THRESHOLD = 0.2");
+        check(g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #11b: 24% Aenderungen > Threshold 0.2 -> Trigger");
+    }
+
+    // ── AA #12: Abschaltbar (SET AUTO_ANALYZE_ENABLED) ──────────
+    {
+        execSQL("SET AUTO_ANALYZE_ENABLED = OFF");
+        check(!g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #12a: AUTO_ANALYZE_ENABLED=OFF -> kein Trigger");
+        check(autoAnalyzeSweep(engine) == 0,
+              "AA #12b: Sweep bei OFF analysiert nichts");
+        execSQL("SET AUTO_ANALYZE_ENABLED = ON");
+        check(g_autoAnalyze().needsAnalyze("g102_b"),
+              "AA #12c: wieder ON -> Trigger aktiv");
+    }
+
+    // ── AA #13: Hintergrund-Thread, nicht blockierend ───────────
+    {
+        g_autoAnalyze().start([&engine]() {
+            return milansql::autoAnalyzeSweep(engine);
+        }, 1);
+        check(g_autoAnalyze().isRunning(),
+              "AA #13a: Hintergrund-Thread laeuft nach start()");
+        // Query waehrend des Hintergrund-Laufs — blockiert nicht
+        auto r = execSQL("SELECT COUNT(*) FROM g102_b");
+        check(!r.rows.empty() && r.rows[0].values[0] == "155",
+              "AA #13b: Query laeuft parallel zum Auto-ANALYZE-Thread");
+        // Warten bis der Sweep die Tabelle analysiert hat (max. 8s)
+        bool swept = false;
+        for (int i = 0; i < 80 && !swept; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            swept = (g_autoAnalyze().changesFor("g102_b") == 0);
+        }
+        check(swept, "AA #13c: Hintergrund-Sweep analysiert g102_b (<8s)");
+        const TableStats* ts = g_tableStats.getStats("g102_b");
+        check(ts && ts->rowCount == 155,
+              "AA #13d: Stats nach Hintergrund-Sweep aktuell (155 Rows)");
+        check(g_autoAnalyze().runs() >= 1,
+              "AA #13e: SHOW-Status zaehlt >= 1 Lauf");
+        g_autoAnalyze().stop();
+        check(!g_autoAnalyze().isRunning(),
+              "AA #13f: Thread nach stop() beendet");
+    }
+
+    // ── AA #14: SHOW TABLE STATS zeigt Changes-Spalte ───────────
+    {
+        execSQL("INSERT INTO g102_c VALUES (99, 'zz')");
+        auto r = execSQL("SHOW TABLE STATS FOR g102_c");
+        bool hasChangesCol = false;
+        for (const auto& c : r.columns)
+            if (c.name == "Changes") hasChangesCol = true;
+        check(hasChangesCol, "AA #14a: SHOW TABLE STATS hat Changes-Spalte");
+        bool rowOk = false;
+        for (const auto& row : r.rows)
+            if (!row.values.empty() && row.values[0] == "g102_c" &&
+                row.values.back() == "1") rowOk = true;
+        check(rowOk, "AA #14b: Changes-Zaehler fuer g102_c = 1");
+    }
+
+    // ── TN #15: Tenant sieht logische Namen im EXPLAIN JSON ─────
+    {
+        // HTTP-Pfad-Simulation: Tabelle liegt physisch als u12_...
+        // 1000 Rows, damit der IndexScan den SeqScan kostenmaessig
+        // schlaegt und der Indexname im JSON auftaucht.
+        execSQL("CREATE TABLE u12_torders (id INT, amount INT)");
+        for (int b = 0; b < 10; ++b) {
+            std::string sql = "INSERT INTO u12_torders VALUES ";
+            for (int i = 1; i <= 100; ++i) {
+                int v = b * 100 + i;
+                if (i > 1) sql += ",";
+                sql += "(" + std::to_string(v) + "," + std::to_string(v * 10) + ")";
+            }
+            execSQL(sql);
+        }
+        engine.createIndex("u12_torders", {"id"}, "u12_idx_tord");
+        execSQL("ANALYZE u12_torders");
+
+        engine.setCurrentUser(12, false);
+        auto r = execSQL("EXPLAIN (FORMAT JSON) SELECT * FROM u12_torders WHERE id = 7");
+        std::string js = (!r.rows.empty() && !r.rows[0].values.empty())
+                         ? r.rows[0].values[0] : "";
+        engine.setCurrentUser(0, true);
+
+        check(js.find("\"table\":\"torders\"") != std::string::npos,
+              "TN #15a: Tenant sieht logischen Tabellennamen (torders)");
+        check(js.find("\"index\":\"idx_tord\"") != std::string::npos,
+              "TN #15b: Tenant sieht logischen Indexnamen (idx_tord)");
+        check(js.find("u12_") == std::string::npos,
+              "TN #15c: kein physisches u12_-Praefix im JSON");
+        execSQL("DROP TABLE u12_torders");
+    }
+
+    // ── Cleanup: globale Zustaende nicht in andere Gruppen leaken ─
+    execSQL("DROP TABLE g102_a");
+    execSQL("DROP TABLE g102_b");
+    execSQL("DROP TABLE g102_c");
+    execSQL("DROP TABLE g102_big");
+    g_joinEnumerator().invalidate();
+}
+
+// ============================================================
+// testGroup103 — Hardening-Audit Block 1: Durable Writes
+//   Szenario: 100 Transaktionen werden committet (COMMIT-Ack =
+//   TX_COMMIT ist im WAL gefsynct), dann stirbt der Prozess hart
+//   (kill -9), BEVOR persist() + deleteWal() laufen konnten.
+//   Beim Neustart muss die WAL-Recovery ALLE 100 committeten
+//   Transaktionen wiederherstellen; eine 101., beim Crash noch
+//   offene Transaktion darf NICHT angewendet werden.
+// ============================================================
+
+static void testGroup103() {
+    std::cout << "\n── testGroup103: Durable Writes / Crash Recovery (Hardening Block 1) ──\n";
+    using namespace milansql;
+
+    const std::string wal = "test_g103_crash.wal";
+    std::remove(wal.c_str());
+
+    // ── Phase 1: "Pre-Crash-Prozess" ────────────────────────────
+    // Wie der Server-Pfad: BEGIN → INSERT → applyAndCommit()
+    // (schreibt + fsynct TX_COMMIT). Der Crash passiert direkt
+    // nach dem COMMIT-Ack → weder persist() noch deleteWal()
+    // laufen, das WAL bleibt mit allen Commits liegen.
+    {
+        Engine e1; Parser p1;
+        execSQL(e1, p1, "CREATE TABLE dur_t (id INT, val TEXT)");
+        for (int i = 1; i <= 100; ++i) {
+            e1.beginTransaction(wal);
+            e1.insertRow("dur_t", {std::to_string(i), "v" + std::to_string(i)});
+            e1.applyAndCommit();   // COMMIT-Ack: TX_COMMIT + CRC gefsynct
+        }
+        check(e1.countRows("dur_t", true) == 100,
+              "DUR #1a: 100 Txs vor dem Crash in-memory committet");
+        // 101. Transaktion: beim Crash noch offen (kein COMMIT)
+        e1.beginTransaction(wal);
+        e1.insertRow("dur_t", {"999", "ghost"});
+        // ── kill -9 ──: e1 wird zerstoert, database.milan wurde
+        // nie geschrieben, WAL bleibt auf Platte liegen.
+    }
+    {
+        std::ifstream f(wal);
+        check(static_cast<bool>(f), "DUR #1b: WAL-Datei ueberlebt den Crash");
+    }
+
+    // ── Phase 2: Neustart + Recovery ────────────────────────────
+    // Frische Engine = leerer letzter Persist-Stand (nur Schema).
+    Engine e2; Parser p2;
+    execSQL(e2, p2, "CREATE TABLE dur_t (id INT, val TEXT)");
+    WalRecovery rec;
+    auto rr = rec.recover(e2, wal);
+    check(rr.hadWal, "DUR #2a: Recovery findet das WAL");
+    check(rr.recoveredTxCount == 100,
+          "DUR #2b: alle 100 committeten Txs erkannt");
+    check(rr.discardedTxCount == 1,
+          "DUR #2c: die offene 101. Tx wird verworfen");
+    check(rr.replayedOpCount == 100, "DUR #2d: 100 Ops replayed");
+    check(e2.countRows("dur_t", true) == 100,
+          "DUR #2e: alle 100 Rows nach Recovery vorhanden");
+    {
+        // Vollstaendigkeit: jede id 1..100 genau einmal, kein Ghost
+        auto t = e2.selectAll("dur_t").clone();
+        long long sum = 0; bool ghost = false;
+        int idCol = -1;
+        for (size_t c = 0; c < t.columns().size(); ++c)
+            if (t.columns()[c].name == "id") idCol = static_cast<int>(c);
+        for (const auto& row : t.rows()) {
+            if (row.xmax != 0 || idCol < 0) continue;
+            long long v = 0;
+            try { v = std::stoll(row.values[idCol]); } catch (...) {}
+            if (v == 999) ghost = true;
+            sum += v;
+        }
+        check(sum == 5050, "DUR #2f: ids 1..100 vollstaendig (Summe 5050)");
+        check(!ghost, "DUR #2g: uncommittete Ghost-Row (999) NICHT wiederhergestellt");
+    }
+    {
+        std::ifstream gone(wal);
+        check(!gone, "DUR #2h: WAL nach erfolgreicher Recovery geloescht");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -9763,6 +11676,36 @@ int main() {
     }
     try { testGroup93(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 93 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup95(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 95 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup94(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 94 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup96(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 96 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup97(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 97 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup98(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 98 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup99(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 99 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup100(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 100 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup101(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 101 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup102(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 102 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup103(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 103 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

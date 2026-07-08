@@ -25,6 +25,8 @@
 #include "optimizer/query_rewriter.hpp"
 #include "optimizer/adaptive_stats.hpp"
 #include "optimizer/table_stats.hpp"   // Phase 86: Column Statistics
+#include "optimizer/cost_model.hpp"    // Optimizer Phase 2: Cost Model
+#include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 #include "backup/backup.hpp"
 #include "server/pool_stats.hpp"
 #include "replication/repl_state.hpp"
@@ -43,7 +45,7 @@
 #include "ssl/tls_context.hpp"               // Phase 110: SSL/TLS
 #include "index/hnsw_index.hpp"              // Phase 111: pgvector HNSW
 #include "types/vector_type.hpp"             // Phase 111: VectorType
-#include "optimizer/dp_planner.hpp"          // Phase 113: DP Join Order Optimizer
+#include "optimizer/join_enumerator.hpp"     // Phase 3: Selinger Join Enumeration
 #include "optimizer/histogram.hpp"           // Phase 113: Histogram Selectivity
 
 // Phase 106: WebSocket notification callback
@@ -51,6 +53,20 @@
 // The callback is set by main.cpp when --ws is active.
 #include <functional>
 namespace milansql {
+
+// LOW-02: Sanitize user input before logging to prevent log injection
+static std::string sanitizeForLog(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c == '\n') { r += "\\n"; }
+        else if (c == '\r') { r += "\\r"; }
+        else if (c < 0x20 && c != '\t') { r += "?"; }
+        else { r += static_cast<char>(c); }
+    }
+    if (r.size() > 200) r = r.substr(0, 200) + "...";
+    return r;
+}
 // Callback type: (tableName, op, colNames, values)
 using WsNotifyFn = std::function<void(const std::string&, const std::string&,
                                       const std::vector<std::string>&,
@@ -63,8 +79,9 @@ inline WsNotifyFn& g_wsNotifyFn() {
 
 namespace milansql {
 
-// ── Phase 94: Global Connection Pool ─────────────────────────
-static ConnectionPool g_connectionPool;
+// ── Phase 94/170: Global Connection Pool ─────────────────────
+// g_connectionPool is now an inline global in pool/connection_pool.hpp
+// (shared between SQL commands and the HTTP server).
 
 // ── Phase 93: Global Statement Cache ─────────────────────────
 static StatementCache g_stmtCache;
@@ -82,8 +99,8 @@ static AdaptiveStats g_adaptiveStats;
 // ── Phase 92: COPY FROM/TO — persistent stats ─────────────────
 static CopyManager g_copyManager;
 
-// ── Phase 86: Table Statistics Manager ───────────────────────
-static TableStatsManager g_tableStats;
+// Phase 86: g_tableStats lebt jetzt als inline-Variable in
+// optimizer/table_stats.hpp (Konsolidierung Optimizer Phase 1).
 
 // ── Phase 59: Replication helpers ────────────────────────────
 // Returns true if the current operation should be blocked (slave read-only)
@@ -354,6 +371,7 @@ static inline milansql::Table dispatch_materializeView(milansql::Engine& engine,
 static inline milansql::Table dispatch_executeSelectToTable(milansql::Engine& engine, milansql::Parser& parser,
     milansql::ParsedCommand cmd);
 
+static inline bool dispatch_executeLiteralSelect(const std::string& sql, milansql::Table& result);
 // Forward declarations for expression projection (Phase 167)
 static inline bool dispatch_hasExprColumns(const std::vector<std::string>& cols);
 static inline milansql::Table dispatch_projectExprs(
@@ -763,7 +781,15 @@ static inline milansql::Table dispatch_materializeView(
     }
 
     milansql::Table base;
-    if (!vc.whereConds.empty()) {
+    if (vc.tableName.empty()) {
+        // Phase 173: FROM-less SELECT (e.g., SELECT 1 AS val, SELECT expression)
+        milansql::Table litResult("", {});
+        if (dispatch_executeLiteralSelect(vsql, litResult)) {
+            base = std::move(litResult);
+        } else {
+            base = dispatch_executeSelectToTable(engine, parser, vc);
+        }
+    } else if (!vc.whereConds.empty()) {
         auto qr = engine.selectWhere(vc.tableName, vc.whereConds, vc.whereLogic);
         base = std::move(qr.table);
     } else {
@@ -779,12 +805,55 @@ static inline milansql::Table dispatch_materializeView(
     return base;
 }
 
+// ── JOIN-Alias-Aufloesung ─────────────────────────────────────
+// Ersetzt User-Aliase ("o" aus FROM demo_orders o) durch die echten
+// Tabellennamen in den ON-Klauseln, damit executeJoins sie
+// qualifiziert aufloesen kann (Tenant-Prefixe u<id>_ loest
+// executeJoins selbst via resolveTableName auf).
+// SELECT/WHERE/ORDER BY bleiben unangetastet — deren Aufloesung
+// uebernimmt dispatch_evalExprAtom per aliasMap/Suffix-Matching.
+static inline void dispatch_resolveJoinAliases(milansql::ParsedCommand& cmd) {
+    std::map<std::string, std::string> aliasMap;
+    if (!cmd.tableAlias.empty()) aliasMap[cmd.tableAlias] = cmd.tableName;
+    for (const auto& jc : cmd.joinClauses)
+        if (!jc.tableAlias.empty()) aliasMap[jc.tableAlias] = jc.table;
+    if (aliasMap.empty()) return;
+    auto repl = [&](std::string& s) {
+        auto dot = s.find('.');
+        if (dot == std::string::npos) return;
+        auto it = aliasMap.find(s.substr(0, dot));
+        if (it != aliasMap.end()) s = it->second + s.substr(dot);
+    };
+    for (auto& jc : cmd.joinClauses) { repl(jc.onLeft); repl(jc.onRight); }
+}
+
 // ── executeSelectToTable ──────────────────────────────────────
 static inline milansql::Table dispatch_executeSelectToTable(
         milansql::Engine& engine,
         milansql::Parser& parser,
         milansql::ParsedCommand cmd)
 {
+    // Phase 173: Handle FROM-less SELECT (e.g., SELECT 1 AS val)
+    if (cmd.tableName.empty() && !cmd.isSetOp && !cmd.isJoin) {
+        // Build the SQL string back and use literal select
+        std::string literalSql = "SELECT ";
+        for (size_t i = 0; i < cmd.selectColumns.size(); ++i) {
+            if (i > 0) literalSql += ", ";
+            literalSql += cmd.selectColumns[i];
+        }
+        milansql::Table result("", {});
+        if (dispatch_executeLiteralSelect(literalSql, result))
+            return result;
+        // If literal select fails, create a single-row table with empty values
+        std::vector<milansql::Column> cols;
+        for (const auto& sc : cmd.selectColumns)
+            cols.push_back({sc, "TEXT"});
+        milansql::Table fallback("", cols);
+        std::vector<std::string> vals(cols.size(), "");
+        fallback.insert(milansql::Row(vals));
+        return fallback;
+    }
+
     for (const auto& sq : cmd.subqueries) {
         if (sq.condIdx < cmd.whereConds.size()) {
             cmd.whereConds[sq.condIdx].inList =
@@ -827,6 +896,7 @@ static inline milansql::Table dispatch_executeSelectToTable(
     }
 
     if (cmd.isJoin) {
+        dispatch_resolveJoinAliases(cmd);
         // Phase 89: Register any foreign tables as temp tables before join
         {
             std::vector<std::string> fdwToClean;
@@ -852,6 +922,13 @@ static inline milansql::Table dispatch_executeSelectToTable(
             // Clean up foreign table temp registrations
             for (const auto& tbl : fdwToClean)
                 engine.dropTempTable(tbl);
+
+            // COUNT(*) ueber JOIN-Ergebnis
+            if (cmd.isCount) {
+                milansql::Table cntT("", { {"count", "INT"} });
+                cntT.insert(milansql::Row({ std::to_string(result.rowCount()) }));
+                return cntT;
+            }
 
             // Clean up FDW registrations done, now post-process the JOIN result
 
@@ -1318,7 +1395,7 @@ struct ProcExec {
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
             persistFn();
         } else {
-            std::cout << "  [CALL] Unbekannter Befehl: '" << sql << "'\n\n";
+            std::cout << "  [CALL] Unbekannter Befehl: '" << sanitizeForLog(sql) << "'\n\n";
         }
     }
 
@@ -2797,6 +2874,14 @@ inline bool dispatchCommand(
             break;
         }
 
+        // Optimizer Phase 2: EXPLAIN (FORMAT JSON) — kostenbasierter
+        // Plan via PlanSelector als JSON; fuehrt die Query NICHT aus.
+        if (cmd.isExplain && cmd.explainJson) {
+            std::cout << milansql::PlanSelector::explainJson(engine, cmd)
+                      << "\n";
+            break;
+        }
+
         if (cmd.isExplain) {
             // Phase 48: Run optimizer on a copy of cmd to collect notes
             milansql::ParsedCommand cmdOpt = cmd;
@@ -2864,26 +2949,27 @@ inline bool dispatchCommand(
             }
             dispatch_printExplain(plan);
 
-            // Phase 102: EXPLAIN (COSTS ON) — show cost estimates
+            // Phase 102 / Optimizer Phase 2: EXPLAIN (COSTS ON)
+            // Echte Schätzungen aus g_tableStats + CostModel statt
+            // hardcodierter Konstanten (rows/100, width=cols·8).
             if (cmd.explainCosts) {
-                // Cost model constants
-                const double seqPageCost = 1.0;  // per page (100 rows)
-                auto seqScanCost = [&](const std::string& tbl) -> double {
+                auto inputFor = [&](const std::string& tbl) {
+                    double fbRows = 1.0, fbWidth = 32.0;
+                    try { fbRows = static_cast<double>(engine.countRows(tbl)); }
+                    catch (...) {}
                     try {
-                        size_t rows = engine.countRows(tbl);
-                        double pages = std::max(1.0, static_cast<double>(rows) / 100.0);
-                        return seqPageCost * pages;
-                    } catch (...) { return 1.0; }
+                        fbWidth = static_cast<double>(
+                            engine.tableColumns(tbl).size()) * 8.0;
+                    } catch (...) {}
+                    return CostModel::tableInput(tbl, fbRows, fbWidth);
                 };
-                auto tableWidth = [&](const std::string& tbl) -> int {
-                    try {
-                        const auto& cols = engine.tableColumns(tbl);
-                        return static_cast<int>(cols.size()) * 8;
-                    } catch (...) { return 32; }
-                };
-                auto rowCount = [&](const std::string& tbl) -> size_t {
-                    try { return engine.countRows(tbl); }
-                    catch (...) { return 1; }
+                // Ausgabe-Rows nach Filter (Phase-1-Selektivität, sonst alle)
+                auto filteredRows = [&](const std::string& tbl, double allRows) {
+                    if (cmd.whereConds.empty()) return allRows;
+                    if (g_tableStats.hasStats(tbl))
+                        return static_cast<double>(
+                            g_tableStats.estimateRowCount(tbl, cmd.whereConds));
+                    return allRows;
                 };
 
                 std::cout << "\n  -- Cost Estimates (COSTS ON) --\n";
@@ -2892,44 +2978,77 @@ inline bool dispatchCommand(
                     ss << std::fixed << std::setprecision(2) << v;
                     return ss.str();
                 };
+                auto fmtRows = [](double v) -> long long {
+                    return static_cast<long long>(v + 0.5);
+                };
 
                 if (cmd.isJoin && !cmd.joinClauses.empty()) {
                     std::string t1 = cmd.tableName;
                     std::string t2 = cmd.joinClauses[0].table;
-                    double sc1 = seqScanCost(t1);
-                    double sc2 = seqScanCost(t2);
-                    // Smaller table is hash-built
-                    std::string hashTbl = sc1 <= sc2 ? t1 : t2;
-                    std::string scanTbl = sc1 <= sc2 ? t2 : t1;
-                    double hashBuild = seqScanCost(hashTbl) * 1.5;
-                    double scanLarger = seqScanCost(scanTbl) * 1.2;
-                    double startCost  = hashBuild;
-                    double totalCost  = hashBuild + scanLarger;
-                    size_t outRows    = (rowCount(t1) + rowCount(t2)) / 2;
-                    int    width      = tableWidth(t1) + tableWidth(t2);
-                    std::cout << "  Hash Join  (cost=" << fmtCost(startCost)
-                              << ".." << fmtCost(totalCost)
-                              << " rows=" << outRows << " width=" << width << ")\n";
+                    auto in1 = inputFor(t1);
+                    auto in2 = inputFor(t2);
+                    auto sc1 = CostModel::seqScan(in1, cmd.whereConds.size(),
+                                                  filteredRows(t1, in1.rows));
+                    auto sc2 = CostModel::seqScan(in2, 0, in2.rows);
+                    // Kleinere Seite wird gehasht (Build), größere probt
+                    const bool swap = sc2.rows < sc1.rows;
+                    const auto& outerC = swap ? sc1 : sc2;
+                    const auto& innerC = swap ? sc2 : sc1;
+                    double outRows = CostModel::joinRows(
+                        sc1.rows, sc2.rows, 0.0, 0.0);
+                    auto hj = CostModel::hashJoin(outerC, innerC, outRows);
+                    std::cout << "  Hash Join  (cost=" << fmtCost(hj.startup)
+                              << ".." << fmtCost(hj.total)
+                              << " rows=" << fmtRows(hj.rows)
+                              << " width=" << fmtRows(hj.width) << ")\n";
                     if (!cmd.whereConds.empty())
                         std::cout << "    Hash Cond / Filter applied\n";
                     std::cout << "    ->  Seq Scan on " << t1
-                              << "  (cost=0.00.." << fmtCost(sc1)
-                              << " rows=" << rowCount(t1)
-                              << " width=" << tableWidth(t1) << ")\n";
+                              << "  (cost=" << fmtCost(sc1.startup)
+                              << ".." << fmtCost(sc1.total)
+                              << " rows=" << fmtRows(sc1.rows)
+                              << " width=" << fmtRows(sc1.width) << ")\n";
                     std::cout << "    ->  Hash\n";
                     std::cout << "          ->  Seq Scan on " << t2
-                              << "  (cost=0.00.." << fmtCost(sc2)
-                              << " rows=" << rowCount(t2)
-                              << " width=" << tableWidth(t2) << ")\n";
+                              << "  (cost=" << fmtCost(sc2.startup)
+                              << ".." << fmtCost(sc2.total)
+                              << " rows=" << fmtRows(sc2.rows)
+                              << " width=" << fmtRows(sc2.width) << ")\n";
                 } else {
-                    double sc = seqScanCost(cmd.tableName);
-                    size_t rows = rowCount(cmd.tableName);
-                    int    width = tableWidth(cmd.tableName);
+                    auto in = inputFor(cmd.tableName);
+                    auto sc = CostModel::seqScan(in, cmd.whereConds.size(),
+                                                 filteredRows(cmd.tableName,
+                                                              in.rows));
                     std::cout << "  Seq Scan on " << cmd.tableName
-                              << "  (cost=0.00.." << fmtCost(sc)
-                              << " rows=" << rows << " width=" << width << ")\n";
+                              << "  (cost=" << fmtCost(sc.startup)
+                              << ".." << fmtCost(sc.total)
+                              << " rows=" << fmtRows(sc.rows)
+                              << " width=" << fmtRows(sc.width) << ")\n";
                     if (!cmd.whereConds.empty())
                         std::cout << "    Filter: (WHERE condition)\n";
+                    // Index-Alternative zeigen, wenn Stats + Index vorhanden
+                    const TableStats* ts = g_tableStats.getStats(cmd.tableName);
+                    if (ts && !ts->indexes.empty() && !cmd.whereConds.empty()) {
+                        for (const auto& is : ts->indexes) {
+                            for (const auto& wc : cmd.whereConds) {
+                                if (is.cols == wc.col && wc.op == "=") {
+                                    auto ix = CostModel::indexScan(
+                                        in, is.selectivity);
+                                    std::cout << "  Index Scan using "
+                                              << is.indexName << " on "
+                                              << cmd.tableName
+                                              << "  (cost=" << fmtCost(ix.startup)
+                                              << ".." << fmtCost(ix.total)
+                                              << " rows=" << fmtRows(ix.rows)
+                                              << " width=" << fmtRows(ix.width)
+                                              << ")"
+                                              << (ix.total < sc.total
+                                                  ? "  <- guenstiger" : "")
+                                              << "\n";
+                                }
+                            }
+                        }
+                    }
                 }
                 {
                     std::ostringstream ptss;
@@ -3128,6 +3247,7 @@ inline bool dispatchCommand(
                              "FROM t1 [LEFT|INNER] JOIN t2 ON t1.col = t2.col\n";
                 break;
             }
+            dispatch_resolveJoinAliases(cmd);
             // Phase 89: Register any foreign tables as temp tables before join
             {
                 std::vector<std::string> fdwToClean;
@@ -3151,6 +3271,13 @@ inline bool dispatchCommand(
                     cmd.whereConds, cmd.whereLogic);
                 for (const auto& tbl : fdwToClean)
                     engine.dropTempTable(tbl);
+
+                // COUNT(*) ueber JOIN-Ergebnis
+                if (cmd.isCount) {
+                    std::cout << "\n  COUNT(*) = " << result.rowCount()
+                              << " (JOIN '" << cmd.tableName << "')\n\n";
+                    break;
+                }
 
                 // Phase 167: JOIN + GROUP BY
                 if (cmd.isGroupBy) {
@@ -3664,6 +3791,30 @@ inline bool dispatchCommand(
             engine.optimizerTraceEnabled = (cmd.varValue == "ON" || cmd.varValue == "1");
             engine.clearTrace();
         }
+        // Optimizer Phase 3 Block 3: Indexed-NL nur wenn outer < NL_THRESHOLD
+        else if (cmd.varName == "NL_THRESHOLD") {
+            try {
+                milansql::g_nlThreshold = std::stod(cmd.varValue);
+                std::cout << "  NL_THRESHOLD = " << milansql::g_nlThreshold << "\n\n";
+            } catch (...) {
+                std::cout << "  Fehler: SET NL_THRESHOLD = <Zahl>\n\n";
+            }
+        }
+        // Optimizer Phase 3 Block 4: Auto-ANALYZE Konfiguration
+        else if (cmd.varName == "AUTO_ANALYZE_ENABLED") {
+            bool on = (cmd.varValue == "ON" || cmd.varValue == "1" || cmd.varValue == "TRUE");
+            milansql::g_autoAnalyze().enabled = on;
+            std::cout << "  AUTO_ANALYZE_ENABLED = " << (on ? "ON" : "OFF") << "\n\n";
+        }
+        else if (cmd.varName == "AUTO_ANALYZE_THRESHOLD") {
+            try {
+                milansql::g_autoAnalyze().threshold = std::stod(cmd.varValue);
+                std::cout << "  AUTO_ANALYZE_THRESHOLD = "
+                          << milansql::g_autoAnalyze().threshold.load() << "\n\n";
+            } catch (...) {
+                std::cout << "  Fehler: SET AUTO_ANALYZE_THRESHOLD = <Zahl>\n\n";
+            }
+        }
         // Original SET CACHE ON/OFF
         else if (cmd.cacheEnabled == "ON") {
             engine.getQueryCache().setEnabled(true);
@@ -3776,11 +3927,13 @@ inline bool dispatchCommand(
         // Phase 75: RLS enable/disable via ALTER TABLE
         if (cmd.alterOp == "ENABLE_RLS") {
             engine.enableRls(cmd.tableName);
+            persistFn();  // Phase 173: persist RLS state
             std::cout << "  RLS enabled on " << cmd.tableName << ".\n\n";
             break;
         } else if (cmd.alterOp == "DISABLE_RLS") {
             engine.disableRls(cmd.tableName);
             std::cout << "  RLS disabled on " << cmd.tableName << ".\n\n";
+            persistFn();  // Phase 173: persist RLS state
             break;
         }
         engine.alterTable(cmd.tableName, cmd.alterOp,
@@ -3957,21 +4110,29 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::SHOW_TRIGGERS: {
         auto triggers = engine.showTriggers(cmd.showTriggersTable);
-        if (triggers.empty()) {
-            std::cout << "  Keine Trigger";
-            if (!cmd.showTriggersTable.empty())
-                std::cout << " auf '" << cmd.showTriggersTable << "'";
-            std::cout << ".\n\n";
-        } else {
-            std::cout << "\n";
-            for (const auto& t : triggers) {
-                std::string gran = t.granularity.empty() ? "ROW" : t.granularity;
-                std::cout << "  " << t.name << " | " << t.timing
-                          << " " << t.event << " ON " << t.tableName
-                          << " | FOR EACH " << gran << "\n";
-            }
-            std::cout << "\n  " << triggers.size() << " Trigger\n\n";
+        // User-Isolation: Nicht-Root sieht nur eigene Trigger (u<id>_-Praefix)
+        std::string trgPf;
+        if (engine.getCurrentUserId() > 0 && !engine.isRootUser())
+            trgPf = "u" + std::to_string(engine.getCurrentUserId()) + "_";
+        auto trgStrip = [&trgPf](const std::string& n) {
+            return (!trgPf.empty() && n.rfind(trgPf, 0) == 0)
+                ? n.substr(trgPf.size()) : n;
+        };
+        std::cout << "\n";
+        milansql::Table tt("", {milansql::Column("Trigger","TEXT"),
+                                milansql::Column("Timing","TEXT"),
+                                milansql::Column("Event","TEXT"),
+                                milansql::Column("Tabelle","TEXT"),
+                                milansql::Column("Granularitaet","TEXT"),
+                                milansql::Column("Body","TEXT")});
+        for (const auto& t : triggers) {
+            if (!trgPf.empty() && t.name.rfind(trgPf, 0) != 0 &&
+                t.tableName.rfind(trgPf, 0) != 0) continue;
+            std::string gran = t.granularity.empty() ? "ROW" : t.granularity;
+            tt.insert(milansql::Row({trgStrip(t.name), t.timing, t.event,
+                                     trgStrip(t.tableName), gran, t.body}));
         }
+        dispatch_printTable(tt, -1, 0);
         break;
     }
 
@@ -4002,20 +4163,50 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::SHOW_PROCEDURES: {
         auto procs = engine.showProcedures();
-        if (procs.empty()) {
-            std::cout << "  Keine Procedures.\n\n";
-        } else {
-            std::cout << "\n";
-            for (const auto& p : procs) {
-                std::string paramStr;
-                for (size_t pi = 0; pi < p.params.size(); ++pi) {
-                    if (pi > 0) paramStr += ", ";
-                    paramStr += p.params[pi].first + " " + p.params[pi].second;
-                }
-                std::cout << "  " << p.name << "(" << paramStr << ")\n";
+        // User-Isolation: Nicht-Root sieht nur eigene Procedures
+        std::string prcPf;
+        if (engine.getCurrentUserId() > 0 && !engine.isRootUser())
+            prcPf = "u" + std::to_string(engine.getCurrentUserId()) + "_";
+        std::cout << "\n";
+        milansql::Table pt("", {milansql::Column("Procedure","TEXT"),
+                                milansql::Column("Parameter","TEXT"),
+                                milansql::Column("Body","TEXT")});
+        for (const auto& p : procs) {
+            std::string display = p.name;
+            if (!prcPf.empty()) {
+                if (p.name.rfind(prcPf, 0) != 0) continue;
+                display = p.name.substr(prcPf.size());
             }
-            std::cout << "\n  " << procs.size() << " Procedure(n)\n\n";
+            std::string paramStr;
+            for (size_t pi = 0; pi < p.params.size(); ++pi) {
+                if (pi > 0) paramStr += ", ";
+                paramStr += p.params[pi].first;
+                if (!p.params[pi].second.empty())
+                    paramStr += " " + p.params[pi].second;
+            }
+            pt.insert(milansql::Row({display, paramStr, p.body}));
         }
+        dispatch_printTable(pt, -1, 0);
+        break;
+    }
+
+    case milansql::CommandType::SHOW_VIEWS: {
+        // User-Isolation: Nicht-Root sieht nur eigene Views
+        std::string vwPf;
+        if (engine.getCurrentUserId() > 0 && !engine.isRootUser())
+            vwPf = "u" + std::to_string(engine.getCurrentUserId()) + "_";
+        std::cout << "\n";
+        milansql::Table vt("", {milansql::Column("View","TEXT"),
+                                milansql::Column("Definition","TEXT")});
+        for (const auto& vname : engine.getAllViewNames()) {
+            std::string display = vname;
+            if (!vwPf.empty()) {
+                if (vname.rfind(vwPf, 0) != 0) continue;
+                display = vname.substr(vwPf.size());
+            }
+            vt.insert(milansql::Row({display, engine.getViewSql(vname)}));
+        }
+        dispatch_printTable(vt, -1, 0);
         break;
     }
 
@@ -4861,8 +5052,19 @@ inline bool dispatchCommand(
     case milansql::CommandType::VACUUM_ANALYZE: {
         size_t cleaned = engine.vacuumAllTracked();
         std::cout << "  VACUUM: " << cleaned << " alte Version(en) bereinigt.\n";
-        if (cmd.type == milansql::CommandType::VACUUM_ANALYZE)
-            std::cout << "  ANALYZE: Tabellenstatistiken aktualisiert.\n";
+        if (cmd.type == milansql::CommandType::VACUUM_ANALYZE) {
+            // Phase 171: really refresh optimizer statistics after vacuum
+            const auto& tables = engine.getTables();
+            for (const auto& kv : tables) {
+                g_tableStats.analyzeTable(kv.first, kv.second);
+                g_adaptiveStats.analyzeTable(kv.first);
+            }
+            g_tableStats.saveStats();
+            g_adaptiveStats.saveStats();
+            milansql::g_joinEnumerator().invalidate();
+            std::cout << "  ANALYZE: " << tables.size()
+                      << " Tabelle(n) — Statistiken aktualisiert.\n";
+        }
         std::cout << "\n";
         persistFn();
         break;
@@ -5130,18 +5332,21 @@ inline bool dispatchCommand(
     // ── Phase 75: Row-Level Security ─────────────────────────
     case milansql::CommandType::CREATE_POLICY: {
         milansql::Engine::RlsPolicy p;
-        p.name      = cmd.policyName;
-        p.table     = cmd.tableName;
-        p.command   = cmd.policyCommand.empty() ? "ALL" : cmd.policyCommand;
-        p.role      = cmd.policyUser.empty()    ? "PUBLIC" : cmd.policyUser;
-        p.usingExpr = cmd.policyUsingExpr;
+        p.name           = cmd.policyName;
+        p.table          = cmd.tableName;
+        p.command        = cmd.policyCommand.empty() ? "ALL" : cmd.policyCommand;
+        p.role           = cmd.policyUser.empty()    ? "PUBLIC" : cmd.policyUser;
+        p.usingExpr      = cmd.policyUsingExpr;
+        p.withCheckExpr  = cmd.policyWithCheckExpr;  // Phase 170
         engine.createRlsPolicy(p);
         std::cout << "  Policy " << p.name << " created.\n\n";
+        persistFn();  // Phase 173: persist RLS policies
         break;
     }
     case milansql::CommandType::DROP_POLICY:
         engine.dropRlsPolicy(cmd.policyName, cmd.tableName);
         std::cout << "  Policy " << cmd.policyName << " dropped.\n\n";
+        persistFn();  // Phase 173: persist RLS policies
         break;
     case milansql::CommandType::SHOW_POLICIES_ON:
         engine.showPolicies(cmd.tableName);
@@ -5301,12 +5506,12 @@ inline bool dispatchCommand(
         g_adaptiveStats.showStats();
         // Phase 113: DP Planner stats
         const auto& dps = milansql::g_dpStats();
-        std::cout << "\n--- DP Query Planner (Phase 113) ---\n";
+        std::cout << "\n--- Join Enumerator (Phase 3, Selinger DP) ---\n";
         std::cout << "  Queries planned (DP):   " << dps.queriesPlanned.load()   << "\n";
         std::cout << "  Plan cache hits:        " << dps.planCacheHits.load()    << "\n";
         std::cout << "  Plan cache misses:      " << dps.planCacheMisses.load()  << "\n";
         std::cout << "  Total subsets evaluated:" << dps.totalSubsetsEval.load() << "\n";
-        std::cout << "  Plan cache size:        " << milansql::g_dpPlanner().cacheSize() << "\n";
+        std::cout << "  Plan cache size:        " << milansql::g_joinEnumerator().cacheSize() << "\n";
         std::cout << "\n";
         break;
     }
@@ -5330,12 +5535,12 @@ inline bool dispatchCommand(
             }
             g_tableStats.saveStats();
             g_adaptiveStats.saveStats();
-            milansql::g_dpPlanner().invalidate();  // Phase 113: stats changed
+            milansql::g_joinEnumerator().invalidate();  // Phase 113: stats changed
             std::cout << "  ANALYZE: " << count << " Tabelle(n) analysiert.\n\n";
         } else {
             // ANALYZE TABLE name
             g_adaptiveStats.analyzeTable(cmd.tableName);
-            milansql::g_dpPlanner().invalidate(cmd.tableName);  // Phase 113
+            milansql::g_joinEnumerator().invalidate(cmd.tableName);  // Phase 113
             if (engine.tableExists(cmd.tableName)) {
                 const Table& tbl = engine.getTables().at(cmd.tableName);
                 g_tableStats.analyzeTable(cmd.tableName, tbl);
@@ -5358,6 +5563,26 @@ inline bool dispatchCommand(
             std::cout << "  Fehler: SHOW STATISTICS FOR tabellenname\n\n"; break;
         }
         g_tableStats.showStatistics(cmd.tableName);
+        break;
+    }
+
+    // ── Optimizer Phase 2: SHOW COST MODEL ────────────────────
+    case milansql::CommandType::SHOW_COST_MODEL: {
+        const auto& cc = g_costConsts;
+        std::cout << "  Cost Model (Postgres-analog):\n";
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "    seq_page_cost        = " << cc.seq_page_cost
+                  << "   (sequenzielle Page-Lesung)\n";
+        std::cout << "    random_page_cost     = " << cc.random_page_cost
+                  << "   (Random-Access-Page, Index-Heap-Fetch)\n";
+        std::cout << "    cpu_tuple_cost       = " << cc.cpu_tuple_cost
+                  << "   (Verarbeitung einer Row)\n";
+        std::cout << "    cpu_index_tuple_cost = " << cc.cpu_index_tuple_cost
+                  << "   (Verarbeitung eines Index-Eintrags)\n";
+        std::cout << "    cpu_operator_cost    = " << cc.cpu_operator_cost
+                  << "   (Auswertung eines Operators/Filters)\n";
+        std::cout << "    page_size_bytes      = " << cc.page_size_bytes
+                  << "   (angenommene Page-Groesse)\n\n";
         break;
     }
 
@@ -6509,12 +6734,15 @@ inline bool dispatchCommand(
 
     // ── Phase 126: SHOW AUTO ANALYZE STATUS ───────────────────────
     case milansql::CommandType::SHOW_AUTO_ANALYZE_STATUS: {
-        auto& s = engine.autoAnalyzeStatus;
+        // Optimizer Phase 3 Block 4: liest aus g_autoAnalyze()
+        auto& aa = milansql::g_autoAnalyze();
         std::cout << "\n  Auto Analyze Status:\n";
-        std::cout << "  Enabled: " << (s.enabled ? "ON" : "OFF") << "\n";
-        std::cout << "  Interval: " << s.intervalSeconds << "s\n";
-        std::cout << "  Threshold: " << s.changeThresholdPct << "%\n";
-        std::cout << "  Tables Analyzed: " << s.tablesAnalyzed << "\n\n";
+        std::cout << "  Enabled: " << (aa.enabled ? "ON" : "OFF") << "\n";
+        std::cout << "  Interval: " << aa.intervalSeconds() << "s\n";
+        std::cout << "  Threshold: " << static_cast<int>(aa.threshold.load() * 100.0) << "%\n";
+        std::cout << "  Background Running: " << (aa.isRunning() ? "yes" : "no") << "\n";
+        std::cout << "  Runs: " << aa.runs() << "\n";
+        std::cout << "  Tables Analyzed: " << aa.tablesAnalyzed() << "\n\n";
         break;
     }
 

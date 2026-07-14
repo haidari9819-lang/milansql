@@ -53,6 +53,7 @@
 // Phase 157: dispatch.hpp for recursive CTE tests
 #include "dispatch.hpp"
 #include "utils/json_utils.hpp"
+#include "nl/nl_query.hpp"  // Block 7: NL Query tests
 
 // ── Statistik ──────────────────────────────────────────────────
 static int passed = 0;
@@ -3970,6 +3971,8 @@ static void testGroup57() {
 
     // 1. SET AUDIT_LOG = ON
     { auto r = execSQL("SET AUDIT_LOG = ON"); check(r.error.empty(), "SET AUDIT_LOG ON -> no error"); }
+    // 1b. SET AUDIT_LEVEL = ALL (so SELECT is also logged)
+    execSQL("SET AUDIT_LEVEL = ALL");
     // 2. Setup: table + operations
     execSQL("CREATE TABLE audit_test (id INT, val TEXT)");
     execSQL("INSERT INTO audit_test VALUES (1, 'hello')");
@@ -4008,11 +4011,11 @@ static void testGroup57() {
     // 15. SET MAX_CONNECTIONS_PER_IP
     { auto r = execSQL("SET MAX_CONNECTIONS_PER_IP = 10"); check(r.error.empty(), "SET MAX_CONNECTIONS_PER_IP -> no error"); }
     // 16. AuditLogger direct API
-    { milansql::AuditLogger logger; logger.setEnabled(true);
+    { milansql::AuditLogger logger; logger.setEnabled(true); logger.setLevel(milansql::AuditLevel::ALL);
       milansql::AuditEntry e; e.op = "SELECT"; e.table = "t"; e.user = "root"; e.ip = "127.0.0.1"; logger.log(e);
       check(!logger.getEntries().empty(), "AuditLogger direct log -> entry stored"); }
     // 17. AuditLogger filter by op
-    { milansql::AuditLogger logger; logger.setEnabled(true);
+    { milansql::AuditLogger logger; logger.setEnabled(true); logger.setLevel(milansql::AuditLevel::ALL);
       milansql::AuditEntry e1; e1.op="SELECT"; e1.table="t"; e1.user="u"; e1.ip="127.0.0.1";
       milansql::AuditEntry e2; e2.op="DELETE"; e2.table="t"; e2.user="u"; e2.ip="127.0.0.1";
       logger.log(e1); logger.log(e2);
@@ -10339,8 +10342,13 @@ static void testGroup97() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
                     slave.resume();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                    check(!g_replState.slaveRunning.load(),
+                    // Windows TCP connect timeout can be ~3-6s; wait long enough
+                    bool detected = false;
+                    for (int i = 0; i < 200 && !detected; ++i) {
+                        detected = !g_replState.slaveRunning.load();
+                        if (!detected) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    check(detected,
                           "AUD-REPL #12b: replica detects lost master connection");
 
                     // Restart master on same port — replica must reconnect
@@ -11321,6 +11329,260 @@ static void testGroup102() {
     g_joinEnumerator().invalidate();
 }
 
+// ============================================================
+// testGroup105 — Block 7: Natural Language SQL (NL Query)
+// Tests schema context builder, safety validator, SQL extraction,
+// and NL config commands. Does NOT test actual LLM API calls.
+// ============================================================
+
+static void testGroup105() {
+    std::cout << "\n-- testGroup105: Natural Language SQL (Block 7) --\n";
+    using namespace milansql;
+
+    Engine engine;
+    Parser parser;
+    auto execSQL = [&](const std::string& sql) {
+        return dispatch(parser.parse(sql), engine);
+    };
+
+    // ── 1. Schema Context Builder ───────────────────────────────
+    {
+        std::vector<nl::TableSchema> schemas;
+        nl::TableSchema ts1;
+        ts1.name = "users";
+        ts1.columns = {{"id", "INT"}, {"name", "TEXT"}, {"age", "INT"}};
+        ts1.sampleRows = {{"1", "Alice", "30"}, {"2", "Bob", "25"}};
+        schemas.push_back(ts1);
+
+        nl::TableSchema ts2;
+        ts2.name = "orders";
+        ts2.columns = {{"id", "INT"}, {"user_id", "INT"}, {"total", "DECIMAL"}};
+        schemas.push_back(ts2);
+
+        std::string ctx = nl::buildSchemaContext(schemas);
+        check(ctx.find("Table \"users\"") != std::string::npos,
+              "NL: schema context contains table name 'users'");
+        check(ctx.find("id INT") != std::string::npos,
+              "NL: schema context contains column 'id INT'");
+        check(ctx.find("name TEXT") != std::string::npos,
+              "NL: schema context contains column 'name TEXT'");
+        check(ctx.find("Alice") != std::string::npos,
+              "NL: schema context contains sample data 'Alice'");
+        check(ctx.find("Table \"orders\"") != std::string::npos,
+              "NL: schema context contains table name 'orders'");
+        check(ctx.find("total DECIMAL") != std::string::npos,
+              "NL: schema context contains column 'total DECIMAL'");
+    }
+
+    // ── 2. Safety Validator ─────────────────────────────────────
+    {
+        // Safe queries
+        auto r1 = nl::validateSafety("SELECT * FROM users WHERE age > 30");
+        check(r1.safe, "NL safety: SELECT allowed");
+
+        auto r2 = nl::validateSafety("INSERT INTO users VALUES (1, 'test', 25)");
+        check(r2.safe, "NL safety: INSERT allowed");
+
+        auto r3 = nl::validateSafety("UPDATE users SET name = 'Alice' WHERE id = 1");
+        check(r3.safe, "NL safety: UPDATE allowed");
+
+        auto r4 = nl::validateSafety("DELETE FROM users WHERE id = 1");
+        check(r4.safe, "NL safety: DELETE allowed");
+
+        auto r5 = nl::validateSafety("WITH cte AS (SELECT * FROM users) SELECT * FROM cte");
+        check(r5.safe, "NL safety: CTE (WITH) allowed");
+
+        // Dangerous queries
+        auto d1 = nl::validateSafety("DROP DATABASE production");
+        check(!d1.safe, "NL safety: DROP DATABASE blocked");
+        check(d1.reason.find("DROP DATABASE") != std::string::npos,
+              "NL safety: DROP DATABASE reason correct");
+
+        auto d2 = nl::validateSafety("DROP TABLE users");
+        check(!d2.safe, "NL safety: DROP TABLE blocked");
+
+        auto d3 = nl::validateSafety("TRUNCATE TABLE users");
+        check(!d3.safe, "NL safety: TRUNCATE blocked");
+
+        auto d4 = nl::validateSafety("CREATE TABLE evil (id INT)");
+        check(!d4.safe, "NL safety: CREATE TABLE blocked (not in allowed list)");
+
+        auto d5 = nl::validateSafety("ALTER TABLE users ADD COLUMN x INT");
+        check(!d5.safe, "NL safety: ALTER TABLE blocked");
+
+        auto d6 = nl::validateSafety("SELECT * FROM SYS_USERS");
+        check(!d6.safe, "NL safety: system table access blocked");
+
+        auto d7 = nl::validateSafety("SELECT * FROM users; DROP TABLE users");
+        check(!d7.safe, "NL safety: multiple statements blocked (semicolon)");
+
+        auto d8 = nl::validateSafety("");
+        check(!d8.safe, "NL safety: empty SQL blocked");
+
+        // Semicolons in string literals should be OK
+        auto s1 = nl::validateSafety("SELECT * FROM users WHERE name = 'a;b'");
+        check(s1.safe, "NL safety: semicolon in string literal allowed");
+    }
+
+    // ── 3. SQL Extraction from LLM response ─────────────────────
+    {
+        // Plain SQL
+        auto e1 = nl::extractSqlFromResponse("SELECT * FROM users WHERE age > 30");
+        check(e1 == "SELECT * FROM users WHERE age > 30",
+              "NL extract: plain SQL");
+
+        // With markdown code fence
+        auto e2 = nl::extractSqlFromResponse("```sql\nSELECT * FROM orders\n```");
+        check(e2 == "SELECT * FROM orders",
+              "NL extract: SQL in code fence");
+
+        // With generic code fence
+        auto e3 = nl::extractSqlFromResponse("```\nSELECT COUNT(*) FROM users\n```");
+        check(e3 == "SELECT COUNT(*) FROM users",
+              "NL extract: SQL in generic code fence");
+
+        // With "SQL:" prefix
+        auto e4 = nl::extractSqlFromResponse("SQL: SELECT id FROM users");
+        check(e4 == "SELECT id FROM users",
+              "NL extract: SQL with 'SQL:' prefix");
+
+        // With trailing semicolons and whitespace
+        auto e5 = nl::extractSqlFromResponse("  SELECT 1 ;  \n");
+        check(e5 == "SELECT 1",
+              "NL extract: trailing semicolons stripped");
+
+        // With explanation text before code fence
+        auto e6 = nl::extractSqlFromResponse("Here is the query:\n```sql\nSELECT name FROM users\n```\nThis returns all names.");
+        check(e6 == "SELECT name FROM users",
+              "NL extract: SQL extracted from response with surrounding text");
+    }
+
+    // ── 4. LLM API request body builder ─────────────────────────
+    {
+        std::string body = nl::buildApiRequestBody("test prompt", "llama-3.3-70b-versatile");
+        check(body.find("\"model\":\"llama-3.3-70b-versatile\"") != std::string::npos,
+              "NL API body: contains model");
+        check(body.find("\"content\":\"test prompt\"") != std::string::npos,
+              "NL API body: contains prompt");
+        check(body.find("\"temperature\"") != std::string::npos,
+              "NL API body: contains temperature");
+    }
+
+    // ── 5. API URL selection ────────────────────────────────────
+    {
+        check(nl::getApiUrl("groq").find("groq.com") != std::string::npos,
+              "NL API URL: groq URL correct");
+        check(nl::getApiUrl("openai").find("openai.com") != std::string::npos,
+              "NL API URL: openai URL correct");
+    }
+
+    // ── 6. Content extraction from API response ─────────────────
+    {
+        std::string resp = R"({"choices":[{"message":{"content":"SELECT * FROM users"}}]})";
+        auto content = nl::extractContentFromApiResponse(resp);
+        check(content == "SELECT * FROM users",
+              "NL extract content: parses API response JSON");
+
+        std::string resp2 = R"({"choices":[{"message":{"content":"SELECT name\nFROM users"}}]})";
+        auto content2 = nl::extractContentFromApiResponse(resp2);
+        check(content2.find("SELECT name") != std::string::npos,
+              "NL extract content: handles newline escapes");
+    }
+
+    // ── 7. NL Config SET/SHOW commands ──────────────────────────
+    {
+        // SET NL_API_KEY
+        auto r1 = execSQL("SET NL_API_KEY = 'test_key_123'");
+        check(r1.error.empty(), "NL SET: NL_API_KEY accepted");
+        check(nl::g_nlConfig().getApiKey() == "test_key_123",
+              "NL SET: NL_API_KEY value stored");
+
+        // SET NL_MODEL
+        auto r2 = execSQL("SET NL_MODEL = 'gpt-4o-mini'");
+        check(r2.error.empty(), "NL SET: NL_MODEL accepted");
+        check(nl::g_nlConfig().getModel() == "gpt-4o-mini",
+              "NL SET: NL_MODEL value stored");
+
+        // SET NL_PROVIDER
+        auto r3 = execSQL("SET NL_PROVIDER = 'openai'");
+        check(r3.error.empty(), "NL SET: NL_PROVIDER accepted");
+        check(nl::g_nlConfig().getProvider() == "openai",
+              "NL SET: NL_PROVIDER value stored");
+
+        // SET NL_PROVIDER with invalid value (stays unchanged)
+        auto r3b = execSQL("SET NL_PROVIDER = 'invalid'");
+        check(nl::g_nlConfig().getProvider() == "openai",
+              "NL SET: NL_PROVIDER rejects invalid provider");
+
+        // SHOW NL STATUS
+        auto r4 = execSQL("SHOW NL STATUS");
+        check(r4.error.empty(), "NL SHOW: NL STATUS no error");
+        check(r4.columns.size() == 2, "NL SHOW: NL STATUS has 2 columns");
+        check(r4.rows.size() == 3, "NL SHOW: NL STATUS has 3 rows");
+        // Check values
+        bool foundProvider = false, foundModel = false, foundKey = false;
+        for (const auto& row : r4.rows) {
+            if (row.values[0] == "provider" && row.values[1] == "openai") foundProvider = true;
+            if (row.values[0] == "model" && row.values[1] == "gpt-4o-mini") foundModel = true;
+            if (row.values[0] == "api_key_set" && row.values[1] == "yes") foundKey = true;
+        }
+        check(foundProvider, "NL SHOW: provider = openai");
+        check(foundModel, "NL SHOW: model = gpt-4o-mini");
+        check(foundKey, "NL SHOW: api_key_set = yes");
+
+        // Reset config for other tests
+        nl::g_nlConfig().setApiKey("");
+        nl::g_nlConfig().setModel("llama-3.3-70b-versatile");
+        nl::g_nlConfig().setProvider("groq");
+    }
+
+    // ── 8. Prompt builder ───────────────────────────────────────
+    {
+        std::string prompt = nl::buildPrompt("Show all users", "Table \"users\" (id INT, name TEXT)\n");
+        check(prompt.find("Show all users") != std::string::npos,
+              "NL prompt: contains question");
+        check(prompt.find("Table \"users\"") != std::string::npos,
+              "NL prompt: contains schema");
+        check(prompt.find("SELECT") != std::string::npos || prompt.find("SQL") != std::string::npos,
+              "NL prompt: contains SQL instruction");
+    }
+
+    // ── 9. Schema context with engine tables ────────────────────
+    {
+        execSQL("CREATE TABLE g105_products (id INT, name TEXT, price DECIMAL)");
+        execSQL("INSERT INTO g105_products VALUES (1, 'Widget', 9.99)");
+        execSQL("INSERT INTO g105_products VALUES (2, 'Gadget', 19.99)");
+
+        auto names = engine.getTableNamesForUser(0, true);
+        bool found = false;
+        for (const auto& n : names)
+            if (n.find("g105_products") != std::string::npos) found = true;
+        check(found, "NL schema: getTableNamesForUser returns created table");
+
+        auto cols = engine.getTableColumns("g105_products");
+        check(cols.size() == 3, "NL schema: getTableColumns returns 3 columns");
+        check(cols[0].name == "id", "NL schema: first column is 'id'");
+        check(cols[1].name == "name", "NL schema: second column is 'name'");
+        check(cols[2].name == "price", "NL schema: third column is 'price'");
+
+        execSQL("DROP TABLE g105_products");
+    }
+
+    // ── 10. NL status JSON output ───────────────────────────────
+    {
+        nl::g_nlConfig().setProvider("groq");
+        nl::g_nlConfig().setModel("llama-3.3-70b-versatile");
+        nl::g_nlConfig().setApiKey("");
+        std::string json = nl::nlStatusJson();
+        check(json.find("\"provider\":\"groq\"") != std::string::npos,
+              "NL status JSON: contains provider");
+        check(json.find("\"model\":\"llama-3.3-70b-versatile\"") != std::string::npos,
+              "NL status JSON: contains model");
+        check(json.find("\"api_key_set\":false") != std::string::npos,
+              "NL status JSON: api_key_set false when no key");
+    }
+}
+
 // MAIN
 // ============================================================
 
@@ -11623,6 +11885,9 @@ int main() {
     }
     try { testGroup102(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 102 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup105(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 105 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

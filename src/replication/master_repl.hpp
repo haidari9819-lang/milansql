@@ -27,6 +27,11 @@
   #include <ws2tcpip.h>
   using sock_t = SOCKET;
   static inline void repl_closesock(sock_t s) { closesocket(s); }
+  // Ensure Winsock is initialized before any socket call
+  static inline void repl_ensureWinsock() {
+      static bool done = false;
+      if (!done) { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); done = true; }
+  }
 #else
   #include <sys/socket.h>
   #include <netinet/in.h>
@@ -39,6 +44,7 @@
   #define INVALID_SOCKET (-1)
   #endif
   static inline void repl_closesock(sock_t s) { ::close(s); }
+  static inline void repl_ensureWinsock() {} // no-op on Unix
 #endif
 
 namespace milansql {
@@ -115,6 +121,7 @@ private:
     }
 
     void listenLoop() {
+        repl_ensureWinsock();
         sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
         if (srv == INVALID_SOCKET) {
             std::cerr << "MasterRepl: socket() failed\n";

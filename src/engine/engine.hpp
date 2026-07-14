@@ -4961,6 +4961,40 @@ public:
         return json;
     }
 
+    // Phase 175 stub: Column-Level Security — always allow (no CLS policies defined)
+    bool isColumnAllowed(const std::string& /*table*/, const std::string& /*col*/) const {
+        return true; // CLS not implemented yet; all columns accessible
+    }
+
+    // Block 7: Get table names visible to a user (for NL query context)
+    std::vector<std::string> getTableNamesForUser(int userId, bool isRoot) const {
+        std::vector<std::string> names;
+        if (isRoot || userId <= 0) {
+            for (const auto& [name, tbl] : tables_) names.push_back(name);
+        } else {
+            std::string userPrefix = "u" + std::to_string(userId) + "_";
+            for (const auto& [name, tbl] : tables_) {
+                std::string bareName = name;
+                auto dot = name.find('.');
+                if (dot != std::string::npos) bareName = name.substr(dot + 1);
+                if (bareName.substr(0, userPrefix.size()) == userPrefix)
+                    names.push_back(name);
+            }
+        }
+        return names;
+    }
+
+    // Block 7: Get columns for a table (for NL query context)
+    std::vector<Column> getTableColumns(const std::string& tblName) const {
+        auto it = tables_.find(tblName);
+        if (it == tables_.end()) {
+            auto key = resolveTableName(tblName);
+            it = tables_.find(key);
+        }
+        if (it == tables_.end()) return {};
+        return it->second.columns();
+    }
+
     // Phase 172: User-filtered schema JSON (security: non-root sees only own tables)
     std::string getSchemaJsonForUser(int userId, bool isRoot) const {
         if (isRoot || userId <= 0) return getSchemaJson();

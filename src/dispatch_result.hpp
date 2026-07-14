@@ -11,6 +11,7 @@
 #include "optimizer/cost_model.hpp"   // Optimizer Phase 2: Cost Model
 #include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 #include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
+#include "nl/nl_query.hpp"              // Block 7: Natural Language SQL
 
 namespace milansql {
 
@@ -174,6 +175,15 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         else if (cmd.varName == "AUDIT_LOG_FILE") {
             engine.auditLogger.setLogFile(cmd.varValue);
         }
+        else if (cmd.varName == "AUDIT_LEVEL") {
+            engine.auditLogger.setLevel(milansql::auditLevelFromString(cmd.varValue));
+        }
+        else if (cmd.varName == "AUDIT_ANONYMIZE") {
+            engine.auditLogger.setAnonymize(cmd.varValue == "ON" || cmd.varValue == "1");
+        }
+        else if (cmd.varName == "AUDIT_ROTATION") {
+            engine.auditLogger.setRotation(cmd.varValue == "ON" || cmd.varValue == "1");
+        }
         else if (cmd.varName == "ALLOW_HOST") {
             engine.accessControl.addAllowHost(cmd.varValue);
         }
@@ -217,6 +227,19 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         }
         else if (cmd.varName == "AUTO_ANALYZE_THRESHOLD") {
             try { milansql::g_autoAnalyze().threshold = std::stod(cmd.varValue); } catch (...) {}
+            qr.message = "SET";
+        }
+        // Block 7: NL Query configuration
+        else if (cmd.varName == "NL_API_KEY") {
+            milansql::nl::g_nlConfig().setApiKey(cmd.varValue);
+            qr.message = "SET";
+        }
+        else if (cmd.varName == "NL_MODEL") {
+            milansql::nl::g_nlConfig().setModel(cmd.varValue);
+            qr.message = "SET";
+        }
+        else if (cmd.varName == "NL_PROVIDER") {
+            milansql::nl::g_nlConfig().setProvider(cmd.varValue);
             qr.message = "SET";
         }
         if (qr.message.empty()) qr.message = "SET";
@@ -1346,6 +1369,15 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             "Kosten Auswertung eines Operators/Filters"}));
         qr.rows.push_back(milansql::Row({"page_size_bytes", fmt(c.page_size_bytes),
             "Angenommene Page-Groesse in Bytes"}));
+        break;
+    }
+
+    // Block 7: SHOW NL STATUS
+    case milansql::CommandType::SHOW_NL_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        qr.rows.push_back(milansql::Row({"provider", milansql::nl::g_nlConfig().getProvider()}));
+        qr.rows.push_back(milansql::Row({"model", milansql::nl::g_nlConfig().getModel()}));
+        qr.rows.push_back(milansql::Row({"api_key_set", milansql::nl::g_nlConfig().hasKey() ? "yes" : "no"}));
         break;
     }
 

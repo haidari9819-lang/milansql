@@ -776,6 +776,12 @@ public:
         return (it != users_.end()) ? &it->second : nullptr;
     }
 
+    // Phase 175: CLS - access all permissions
+    const std::vector<Permission>& getPermissions() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return permissions_;
+    }
+
     // Public wrappers for testing
     static std::string sha256Hex_pub(const std::string& s) { return SHA256Impl::hashHex(s); }
     static std::pair<bool,bool> checkPasswordExPublic(const std::string& pw, const std::string& h) {

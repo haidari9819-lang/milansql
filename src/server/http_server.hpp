@@ -56,10 +56,11 @@
 #include "../auth/auth_manager.hpp"
 #include "../auth/rate_limiter.hpp"
 #include "../security/fortress.hpp"
+#include "../nl/nl_query.hpp"
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1578;
+static constexpr int MILANSQL_TEST_COUNT = 1626;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
@@ -2710,6 +2711,29 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
 ::-webkit-scrollbar-track{background:var(--bg-primary)}
 ::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:4px}
 ::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+
+/* AI ASSISTANT PANEL */
+#ai-toggle{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;border:none;border-radius:50%;width:44px;height:44px;position:fixed;bottom:20px;right:20px;cursor:pointer;font-size:20px;z-index:10000;box-shadow:0 4px 20px rgba(124,58,237,0.5);transition:transform .2s var(--ease)}
+#ai-toggle:hover{transform:scale(1.1)}
+#ai-panel{display:none;position:fixed;bottom:76px;right:20px;width:400px;max-height:500px;background:var(--bg-card);border:1px solid var(--border-2);border-radius:12px;z-index:10000;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.5),0 0 40px rgba(124,58,237,0.1)}
+#ai-panel.open{display:flex}
+#ai-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-weight:600;font-size:0.9rem;background:rgba(124,58,237,0.08)}
+#ai-header .ai-icon{color:#a855f7;font-size:1.1rem}
+#ai-header .ai-close{margin-left:auto;cursor:pointer;color:var(--text-3);font-size:1.1rem;background:none;border:none;padding:2px 6px}
+#ai-header .ai-close:hover{color:var(--text-1)}
+#ai-messages{flex:1;overflow-y:auto;padding:12px;max-height:320px;min-height:120px}
+.ai-msg{margin-bottom:10px;font-size:0.82rem;line-height:1.5}
+.ai-msg.user{text-align:right}
+.ai-msg.user .ai-bubble{display:inline-block;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.3);border-radius:12px 12px 4px 12px;padding:8px 12px;color:var(--text-1);max-width:85%;text-align:left}
+.ai-msg.bot .ai-bubble{display:inline-block;background:var(--bg-hover);border:1px solid var(--border);border-radius:12px 12px 12px 4px;padding:8px 12px;color:var(--text-1);max-width:85%;text-align:left}
+.ai-sql{background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-family:var(--mono);font-size:0.78rem;color:var(--accent);margin:6px 0;cursor:pointer;word-break:break-all}
+.ai-sql:hover{border-color:var(--accent)}
+#ai-input-area{padding:8px 12px;border-top:1px solid var(--border);display:flex;gap:8px}
+#ai-input{flex:1;background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-1);font-size:0.82rem;font-family:inherit;outline:none}
+#ai-input:focus{border-color:#a855f7}
+#ai-send{background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:0.82rem;font-weight:600}
+#ai-send:hover{background:#6d28d9}
+.ai-loading{color:var(--text-3);font-style:italic}
 </style>
 </head>
 <body>
@@ -4638,6 +4662,58 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     </div>
   </div>
 </div>
+<!-- AI Assistant Panel (Block 7) -->
+<button id="ai-toggle" onclick="toggleAI()" title="AI SQL Assistant">&#x2728;</button>
+<div id="ai-panel">
+  <div id="ai-header">
+    <span class="ai-icon">&#x2728;</span> AI SQL Assistant
+    <button class="ai-close" onclick="toggleAI()">&#x2715;</button>
+  </div>
+  <div id="ai-messages">
+    <div class="ai-msg bot"><div class="ai-bubble">Ask me anything about your database in plain English. I will generate and run SQL for you.</div></div>
+  </div>
+  <div id="ai-input-area">
+    <input id="ai-input" type="text" placeholder="e.g. Show me all orders from last week..." onkeydown="if(event.key==='Enter')sendAI()">
+    <button id="ai-send" onclick="sendAI()">Send</button>
+  </div>
+</div>
+<script>
+function toggleAI(){var p=document.getElementById('ai-panel');p.classList.toggle('open');}
+async function sendAI(){
+  var inp=document.getElementById('ai-input');var q=inp.value.trim();if(!q)return;inp.value='';
+  var msgs=document.getElementById('ai-messages');
+  msgs.innerHTML+='<div class="ai-msg user"><div class="ai-bubble">'+q.replace(/</g,'&lt;')+'</div></div>';
+  msgs.innerHTML+='<div class="ai-msg bot" id="ai-loading"><div class="ai-bubble ai-loading">Thinking...</div></div>';
+  msgs.scrollTop=msgs.scrollHeight;
+  try{
+    var r=await fetch('/api/nl-query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    var d=await r.json();var el=document.getElementById('ai-loading');if(el)el.remove();
+    if(d.success){
+      var html='<div class="ai-msg bot"><div class="ai-bubble">';
+      html+='<div class="ai-sql" onclick="setSQL(this.textContent);toggleAI();" title="Click to use in editor">'+d.sql.replace(/</g,'&lt;')+'</div>';
+      if(d.result&&d.result.success!==false){
+        var res=d.result;
+        if(res.columns&&res.rows){
+          html+='<div style="font-size:0.75rem;color:#94a3b8;margin-top:4px">'+res.rows.length+' row(s) returned</div>';
+          if(res.rows.length>0&&res.rows.length<=10){
+            html+='<table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:0.75rem">';
+            html+='<tr>';for(var c of res.columns)html+='<th style="text-align:left;padding:3px 6px;border-bottom:1px solid #1e2d40;color:#94a3b8">'+c+'</th>';html+='</tr>';
+            for(var row of res.rows){html+='<tr>';for(var v of row)html+='<td style="padding:3px 6px;border-bottom:1px solid #111827;color:#f8fafc">'+(v===null?'NULL':String(v).replace(/</g,'&lt;'))+'</td>';html+='</tr>';}
+            html+='</table>';
+          }
+        } else if(res.message){html+='<div style="color:#10b981;font-size:0.78rem;margin-top:4px">'+res.message.replace(/</g,'&lt;')+'</div>';}
+      }
+      html+='</div></div>';msgs.innerHTML+=html;
+    } else {
+      msgs.innerHTML+='<div class="ai-msg bot"><div class="ai-bubble" style="color:#ef4444">'+((d.error||'Unknown error').replace(/</g,'&lt;'))+(d.sql?'<div class="ai-sql">'+d.sql.replace(/</g,'&lt;')+'</div>':'')+'</div></div>';
+    }
+  }catch(e){
+    var el2=document.getElementById('ai-loading');if(el2)el2.remove();
+    msgs.innerHTML+='<div class="ai-msg bot"><div class="ai-bubble" style="color:#ef4444">Network error: '+e.message+'</div></div>';
+  }
+  msgs.scrollTop=msgs.scrollHeight;
+}
+</script>
 </body>
 </html>)WEBUIEND";
     return html;
@@ -5070,6 +5146,111 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         auto ctx = extractUserContext(req);
         if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         return buildHttpResponse(200, handleSemanticSearch(req.body, ctx.userId, ctx.isRoot));
+    }
+
+    // Block 7: Natural Language SQL endpoint
+    // POST /api/nl-query
+    // Body: {"question": "Show me all users older than 30", "model": "groq"}
+    if (req.path == "/api/nl-query" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
+
+        std::string question = extractJsonStr(req.body, "question");
+        if (question.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Missing 'question' field"})");
+        if (question.size() > 2000)
+            return buildHttpResponse(400, std::string("{\"success\":false,\"error\":\"Question too long (max 2000 chars)\"}"));
+
+        // Optional model override
+        std::string modelOverride = extractJsonStr(req.body, "model");
+        if (!modelOverride.empty()) {
+            // Temporarily use this provider/model
+            std::string prov = modelOverride;
+            for (auto& c : prov) c = (char)std::tolower((unsigned char)c);
+            if (prov == "groq" || prov == "openai") {
+                milansql::nl::g_nlConfig().setProvider(prov);
+            }
+        }
+
+        // Build schema context: get user's visible tables + columns
+        std::vector<milansql::nl::TableSchema> schemas;
+        {
+            std::shared_lock<std::shared_mutex> lock(engineMutex_);
+            bool isRoot = (ctx.userId <= 0 || ctx.isRoot);
+            std::string userPrefix = isRoot ? "" : ("u" + std::to_string(ctx.userId) + "_");
+
+            // Get schema JSON and parse table info from engine directly
+            for (const auto& tblName : engine_.getTableNamesForUser(ctx.userId, isRoot)) {
+                milansql::nl::TableSchema ts;
+                ts.name = tblName;
+                // Strip user prefix for display
+                std::string displayName = tblName;
+                if (!userPrefix.empty() && tblName.substr(0, userPrefix.size()) == userPrefix)
+                    displayName = tblName.substr(userPrefix.size());
+                ts.name = displayName;
+
+                auto cols = engine_.getTableColumns(tblName);
+                for (const auto& c : cols) {
+                    milansql::nl::ColumnInfo ci;
+                    ci.name = c.name;
+                    ci.type = c.type;
+                    ts.columns.push_back(ci);
+                }
+
+                // Get up to 3 sample rows
+                try {
+                    const auto& sampleResult = engine_.selectAll(tblName);
+                    size_t maxRows = std::min(sampleResult.rows().size(), (size_t)3);
+                    for (size_t i = 0; i < maxRows; ++i) {
+                        ts.sampleRows.push_back(sampleResult.rows()[i].values);
+                    }
+                } catch (...) {} // ignore errors for sample data
+
+                schemas.push_back(ts);
+            }
+        }
+
+        std::string schemaCtx = milansql::nl::buildSchemaContext(schemas);
+        std::string prompt = milansql::nl::buildPrompt(question, schemaCtx);
+
+        // Call LLM API
+        std::string llmError;
+        std::string llmResponse = milansql::nl::callLlmApi(prompt, llmError);
+        if (!llmError.empty()) {
+            return buildHttpResponse(200,
+                "{\"success\":false,\"error\":\"" + jsonEscape(llmError) + "\"}");
+        }
+
+        // Extract SQL from response
+        std::string generatedSql = milansql::nl::extractSqlFromResponse(llmResponse);
+        if (generatedSql.empty()) {
+            return buildHttpResponse(200,
+                R"({"success":false,"error":"Could not extract SQL from LLM response"})");
+        }
+
+        // Safety validation
+        auto safety = milansql::nl::validateSafety(generatedSql);
+        if (!safety.safe) {
+            return buildHttpResponse(200,
+                "{\"success\":false,\"error\":\"Safety check failed: "
+                + jsonEscape(safety.reason) + "\",\"sql\":\"" + jsonEscape(generatedSql) + "\"}");
+        }
+
+        // Audit log: NL query + generated SQL
+        engine_.auditLogger.log("NL_QUERY", "user=" + ctx.username
+            + " question=\"" + question.substr(0, 100) + "\""
+            + " sql=\"" + generatedSql.substr(0, 200) + "\"");
+
+        // Execute the generated SQL
+        std::string execResult = handleQueryForUser(generatedSql, ctx.userId, ctx.role);
+
+        // Build response with SQL + explanation + result
+        std::string response = "{\"success\":true,\"sql\":\"" + jsonEscape(generatedSql)
+            + "\",\"explanation\":\"Generated SQL from natural language query\""
+            + ",\"result\":" + execResult + "}";
+
+        return buildHttpResponse(200, response);
     }
 
     // Phase 171: Schema Visualizer API

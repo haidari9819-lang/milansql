@@ -39,3 +39,5 @@ jwt.secret
 # Runtime-Daten
 uploads/
 *.log
+build_asan/
+*.bak*

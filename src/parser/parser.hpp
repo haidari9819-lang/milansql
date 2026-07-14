@@ -351,6 +351,8 @@ enum class CommandType {
     CREATE_FUNCTION,
     DROP_FUNCTION,
     SHOW_FUNCTIONS,
+    // Block 7: Natural Language SQL
+    SHOW_NL_STATUS,
     UNKNOWN
 };
 
@@ -2763,6 +2765,10 @@ public:
             } else if (kw1 == "PERFORMANCE" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "BASELINE") {
                 cmd.type = CommandType::SHOW_PERFORMANCE_BASELINE;
+            // Block 7: SHOW NL STATUS
+            } else if (kw1 == "NL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_NL_STATUS;
             // Phase 73: SHOW BUFFER POOL STATUS
             } else if (kw1 == "BUFFER" && tokens.size() >= 4 &&
                        toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {
@@ -3537,13 +3543,24 @@ public:
                     while (!rhs.empty() && (rhs.back() == ' ' || rhs.back() == '\t' ||
                                             rhs.back() == ';')) rhs.pop_back();
                     for (char& c : lhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    // Block 7: NL vars need case-preserved + unquoted values
+                    std::string rawRhs = rhs; // preserve before uppercasing
+                    // Strip surrounding quotes from raw value
+                    if (rawRhs.size() >= 2 && rawRhs.front() == '\'' && rawRhs.back() == '\'')
+                        rawRhs = rawRhs.substr(1, rawRhs.size() - 2);
                     for (char& c : rhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                     cmd.varName  = lhs;
-                    cmd.varValue = rhs;
+                    // Use case-preserved value for NL_* variables
+                    if (lhs.substr(0, 3) == "NL_") {
+                        cmd.varValue = rawRhs;
+                    } else {
+                        cmd.varValue = rhs;
+                    }
                     // check for known Phase 125/126/141/145 varNames — use SET_CACHE as a carrier CommandType
                     static const std::vector<std::string> knownSetVars = {
                         "ROUTING", "OPTIMIZER_TRACE", "MAX_PARALLEL_WORKERS", "PARALLEL_THRESHOLD",
-                        "AUDIT_LOG", "AUDIT_LOG_FILE", "ALLOW_HOST", "DENY_HOST", "BLACKLIST_QUERY",
+                        "AUDIT_LOG", "AUDIT_LOG_FILE", "AUDIT_LEVEL", "AUDIT_ANONYMIZE", "AUDIT_ROTATION",
+                        "ALLOW_HOST", "DENY_HOST", "BLACKLIST_QUERY",
                         "PASSWORD_MIN_LENGTH", "PASSWORD_REQUIRE_SPECIAL",
                         "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT",
                         // Phase 149: Optimizer hints
@@ -3551,7 +3568,9 @@ public:
                         // Optimizer Phase 3 Block 3: Indexed-NL-Grenze
                         "NL_THRESHOLD",
                         // Optimizer Phase 3 Block 4: Auto-ANALYZE
-                        "AUTO_ANALYZE_ENABLED", "AUTO_ANALYZE_THRESHOLD"
+                        "AUTO_ANALYZE_ENABLED", "AUTO_ANALYZE_THRESHOLD",
+                        // Block 7: NL Query configuration
+                        "NL_API_KEY", "NL_MODEL", "NL_PROVIDER"
                     };
                     for (const auto& kv : knownSetVars) {
                         if (lhs == kv) { cmd.type = CommandType::SET_CACHE; break; }

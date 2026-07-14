@@ -1081,6 +1081,15 @@ static inline milansql::Table dispatch_executeSelectToTable(
         if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
     } else {
         if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
+        // Phase 175: CLS check -- explicit column access on forbidden column -> error
+        if (!cmd.selectColumns.empty() && !cmd.tableName.empty()) {
+            for (const auto& col : cmd.selectColumns) {
+                if (col != "*" && !engine.isColumnAllowed(cmd.tableName, col)) {
+                    throw std::runtime_error("Access denied: column not visible for table "
+                        + cmd.tableName);
+                }
+            }
+        }
         if (!cmd.selectColumns.empty())
             result = result.project(cmd.selectColumns);
     }

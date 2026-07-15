@@ -205,3 +205,10 @@
 [2026-07-03 14:46:34] ALERT IP=45.148.10.*: SUBNET BLOCKED: 4 flagged IPs
 [2026-07-03 15:19:38] ALERT IP=144.172.100.174: Honeypot triggered: /.git/config
 [2026-07-03 22:27:40] ALERT IP=178.16.54.137: Honeypot triggered: /.env
+[2026-07-14 12:32:27] ALERT IP=45.13.186.14: Honeypot triggered: /administrator/components/com_jce/
+[2026-07-14 20:15:07] ALERT IP=45.88.138.44: Honeypot triggered: /wp-login.php
+[2026-07-14 20:16:15] ALERT IP=91.148.245.81: Honeypot triggered: /.env.production
+[2026-07-15 01:39:35] ALERT IP=152.42.142.79: Honeypot triggered: /wp-login.php
+[2026-07-15 02:18:18] ALERT IP=167.172.53.24: Honeypot triggered: /wp-login.php
+[2026-07-15 05:07:53] ALERT IP=64.89.161.82: Honeypot triggered: /.env
+[2026-07-15 05:45:28] ALERT IP=45.148.10.120: Honeypot triggered: /.git/config

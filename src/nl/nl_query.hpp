@@ -162,6 +162,41 @@ struct SafetyResult {
 };
 
 inline SafetyResult validateSafety(const std::string& sql) {
+        // Security: strip SQL comments before safety analysis
+        std::string cleaned = sql;
+        // Remove block comments /* ... */
+        while (true) {
+            auto cs = cleaned.find("/*");
+            if (cs == std::string::npos) break;
+            auto ce = cleaned.find("*/", cs + 2);
+            if (ce == std::string::npos) ce = cleaned.size();
+            else ce += 2;
+            cleaned.erase(cs, ce - cs);
+        }
+        // Remove line comments -- ...
+        while (true) {
+            auto ls = cleaned.find("--");
+            if (ls == std::string::npos) break;
+            auto le = cleaned.find('\n', ls);
+            if (le == std::string::npos) le = cleaned.size();
+            cleaned.erase(ls, le - ls);
+        }
+
+
+
+        // Security: block DELETE/UPDATE without WHERE clause (NL injection risk)
+        {
+            std::string upper = cleaned;
+            for (auto& c : upper) c = std::toupper(c);
+            // Trim leading whitespace
+            auto start = upper.find_first_not_of(" \t\n\r");
+            if (start != std::string::npos) upper = upper.substr(start);
+            if ((upper.substr(0, 6) == "DELETE" || upper.substr(0, 6) == "UPDATE") &&
+                upper.find("WHERE") == std::string::npos) {
+                return {false, "DELETE/UPDATE without WHERE clause is not allowed via NL query"};
+            }
+        }
+
     SafetyResult r{true, ""};
     if (sql.empty()) { r.safe = false; r.reason = "Empty SQL"; return r; }
 

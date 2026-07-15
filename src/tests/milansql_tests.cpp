@@ -11583,6 +11583,172 @@ static void testGroup105() {
     }
 }
 
+
+// ============================================================
+// testGroup106 -- Security Audit Fixes (v10.7.0 Hardening)
+// ============================================================
+static void testGroup106() {
+    std::cout << "\n-- testGroup106: Security Audit Hardening --\n";
+    using namespace milansql;
+
+    // SEC-1: PBKDF2 constant-time comparison works correctly
+    {
+        AuthManager auth;
+        auto reg = auth.registerUser("sec_test1", "StrongP@ss123!", "user");
+        check(reg.ok, "SEC-1a: user created");
+        auto* u = auth.getUser("sec_test1");
+        check(u != nullptr, "SEC-1b: user found");
+        auto [ok1, _m1] = AuthManager::checkPasswordExPublic("StrongP@ss123!", u->passwordHash);
+        check(ok1, "SEC-1c: correct password accepted");
+        auto [ok2, _m2] = AuthManager::checkPasswordExPublic("WrongP@ss123!", u->passwordHash);
+        check(!ok2, "SEC-1d: wrong password rejected");
+        auto [ok3, _m3] = AuthManager::checkPasswordExPublic("", u->passwordHash);
+        check(!ok3, "SEC-1e: empty password rejected");
+    }
+
+    // SEC-2: Password hash format is PBKDF2
+    {
+        AuthManager auth;
+        auth.registerUser("sec_test2", "Test1234!@#", "user");
+        auto* u = auth.getUser("sec_test2");
+        check(u != nullptr && u->passwordHash.substr(0, 7) == "pbkdf2$",
+              "SEC-2: password stored as PBKDF2");
+    }
+
+    // SEC-3: JWT token generation and validation
+    {
+        AuthManager auth;
+        auth.registerUser("sec_jwt", "JwtTest1234!", "user");
+        auto loginR = auth.login("sec_jwt", "JwtTest1234!");
+        check(loginR.ok && !loginR.token.empty(), "SEC-3a: login returns token");
+        auto valid = auth.validateToken(loginR.token);
+        check(valid.valid, "SEC-3b: token validates");
+        check(valid.username == "sec_jwt", "SEC-3c: token contains username");
+    }
+
+    // SEC-4: Token invalidated after logout
+    {
+        AuthManager auth;
+        auth.registerUser("sec_logout", "Logout1234!", "user");
+        auto loginR = auth.login("sec_logout", "Logout1234!");
+        check(auth.validateToken(loginR.token).valid, "SEC-4a: token valid before logout");
+        auth.revokeSession(loginR.token);
+        check(!auth.validateToken(loginR.token).valid, "SEC-4b: token invalid after logout");
+    }
+
+    // SEC-5: Audit level filtering
+    {
+        AuditLogger logger;
+        logger.setEnabled(true);
+        logger.setLevel(AuditLevel::DDL);
+        AuditEntry e1; e1.op = "SELECT"; e1.table = "t"; e1.user = "u"; e1.ip = "127.0.0.1";
+        AuditEntry e2; e2.op = "CREATE_TABLE"; e2.table = "t"; e2.user = "u"; e2.ip = "127.0.0.1";
+        AuditEntry e3; e3.op = "INSERT"; e3.table = "t"; e3.user = "u"; e3.ip = "127.0.0.1";
+        logger.log(e1); logger.log(e2); logger.log(e3);
+        check(logger.getEntries().size() == 1, "SEC-5a: DDL level only logs DDL");
+        check(logger.getEntries()[0].op == "CREATE_TABLE", "SEC-5b: only CREATE TABLE logged");
+    }
+
+    // SEC-6: Audit level ALL logs everything
+    {
+        AuditLogger logger;
+        logger.setEnabled(true);
+        logger.setLevel(AuditLevel::ALL);
+        AuditEntry e1; e1.op = "SELECT"; e1.table = "t"; e1.user = "u"; e1.ip = "127.0.0.1";
+        AuditEntry e2; e2.op = "INSERT"; e2.table = "t"; e2.user = "u"; e2.ip = "127.0.0.1";
+        logger.log(e1); logger.log(e2);
+        check(logger.getEntries().size() == 2, "SEC-6: ALL level logs everything");
+    }
+
+    // SEC-7: Audit GDPR delete by user
+    {
+        AuditLogger logger;
+        logger.setEnabled(true);
+        logger.setLevel(AuditLevel::ALL);
+        AuditEntry e1; e1.op = "SELECT"; e1.table = "t"; e1.user = "alice"; e1.ip = "1.2.3.4";
+        AuditEntry e2; e2.op = "INSERT"; e2.table = "t"; e2.user = "bob"; e2.ip = "5.6.7.8";
+        logger.log(e1); logger.log(e2);
+        logger.deleteByUser("alice");
+        check(logger.getEntries().size() == 1, "SEC-7a: alice entries deleted");
+        check(logger.getEntries()[0].user == "bob", "SEC-7b: bob entries remain");
+    }
+
+    // SEC-8: CLS — skipped (CLS not yet in committed engine.hpp)
+
+    // SEC-9: NL query safety validator
+    {
+        check(!milansql::nl::validateSafety("DROP DATABASE production").safe, "SEC-9a: DROP DATABASE blocked");
+        check(!milansql::nl::validateSafety("DROP TABLE users").safe, "SEC-9b: DROP TABLE blocked");
+        check(!milansql::nl::validateSafety("TRUNCATE orders").safe, "SEC-9c: TRUNCATE blocked");
+        check(!milansql::nl::validateSafety("SELECT 1; DROP TABLE x").safe, "SEC-9d: multi-statement blocked");
+        check(milansql::nl::validateSafety("SELECT * FROM orders WHERE id = 1").safe, "SEC-9e: safe SELECT allowed");
+    }
+
+    std::cout << "  testGroup106 passed.\n";
+}
+
+
+// ============================================================
+// testGroup107 -- Security Audit Round 2 (Tenant Isolation + NL Safety)
+// ============================================================
+static void testGroup107() {
+    std::cout << "\n-- testGroup107: Security Audit Round 2 --\n";
+    using namespace milansql;
+
+    // SEC-10: NL safety - DELETE without WHERE blocked
+    {
+        auto r1 = milansql::nl::validateSafety("DELETE FROM users");
+        check(!r1.safe, "SEC-10a: DELETE without WHERE blocked");
+        auto r2 = milansql::nl::validateSafety("UPDATE users SET active = 0");
+        check(!r2.safe, "SEC-10b: UPDATE without WHERE blocked");
+        auto r3 = milansql::nl::validateSafety("DELETE FROM users WHERE id = 5");
+        check(r3.safe, "SEC-10c: DELETE with WHERE allowed");
+        auto r4 = milansql::nl::validateSafety("UPDATE users SET active = 0 WHERE id = 5");
+        check(r4.safe, "SEC-10d: UPDATE with WHERE allowed");
+    }
+
+    // SEC-11: NL safety - SQL comment stripping + dangerous patterns
+    {
+        // Comment-hidden DROP is caught by keyword check on cleaned SQL
+        auto r1 = milansql::nl::validateSafety("SELECT /* this is a comment */ 1");
+        check(r1.safe, "SEC-11a: harmless block comment stripped, query safe");
+        auto r2 = milansql::nl::validateSafety("DROP /* hide */ TABLE users");
+        check(!r2.safe, "SEC-11b: DROP TABLE hidden in comments still blocked");
+    }
+
+    // SEC-12: Audit log GDPR deleteByUser
+    {
+        AuditLogger logger;
+        logger.setEnabled(true);
+        logger.setLevel(AuditLevel::ALL);
+        AuditEntry e1; e1.op = "SELECT"; e1.table = "t"; e1.user = "gdpr_user"; e1.ip = "1.2.3.4";
+        AuditEntry e2; e2.op = "INSERT"; e2.table = "t"; e2.user = "other"; e2.ip = "5.6.7.8";
+        AuditEntry e3; e3.op = "UPDATE"; e3.table = "t"; e3.user = "gdpr_user"; e3.ip = "1.2.3.4";
+        logger.log(e1); logger.log(e2); logger.log(e3);
+        size_t before = logger.getEntries().size();
+        check(before == 3, "SEC-12a: 3 entries before GDPR delete");
+        logger.deleteByUser("gdpr_user");
+        size_t after = logger.getEntries().size();
+        check(after == 1, "SEC-12b: only 1 entry after GDPR delete");
+        check(logger.getEntries()[0].user == "other", "SEC-12c: correct user remains");
+    }
+
+    // SEC-13: Audit anonymize (hashes username for privacy)
+    {
+        AuditLogger logger;
+        logger.setEnabled(true);
+        logger.setLevel(AuditLevel::ALL);
+        logger.setAnonymize(true);
+        AuditEntry e; e.op = "SELECT"; e.table = "t"; e.user = "secret_user"; e.ip = "192.168.1.100";
+        logger.log(e);
+        auto entries = logger.getEntries();
+        check(entries.size() == 1, "SEC-13a: entry logged");
+        check(entries[0].user != "secret_user", "SEC-13b: username anonymized/hashed");
+    }
+
+    std::cout << "  testGroup107 passed.\n";
+}
+
 // MAIN
 // ============================================================
 
@@ -11888,6 +12054,12 @@ int main() {
     }
     try { testGroup105(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 105 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup106(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 106 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup107(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 107 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

@@ -60,11 +60,11 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1626;
+static constexpr int MILANSQL_TEST_COUNT = 1658;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "10.6.0";
+static constexpr const char* MILANSQL_VERSION = "10.7.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -723,6 +723,27 @@ private:
     std::map<std::string, LockoutInfo> loginLockouts_;   // key = username
     std::map<std::string, LockoutInfo> ipLockouts_;      // key = client IP
     std::mutex lockoutMutex_;
+    static constexpr size_t MAX_LOCKOUT_ENTRIES = 10000;
+
+    // Security: prune expired lockout entries to prevent memory exhaustion
+    void pruneLockouts_() {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = loginLockouts_.begin(); it != loginLockouts_.end(); ) {
+            if (it->second.lockedUntil < now && it->second.failedAttempts == 0)
+                it = loginLockouts_.erase(it);
+            else ++it;
+        }
+        for (auto it = ipLockouts_.begin(); it != ipLockouts_.end(); ) {
+            if (it->second.lockedUntil < now && it->second.failedAttempts == 0)
+                it = ipLockouts_.erase(it);
+            else ++it;
+        }
+        // Hard cap: if still too large, evict oldest entries
+        while (loginLockouts_.size() > MAX_LOCKOUT_ENTRIES)
+            loginLockouts_.erase(loginLockouts_.begin());
+        while (ipLockouts_.size() > MAX_LOCKOUT_ENTRIES)
+            ipLockouts_.erase(ipLockouts_.begin());
+    }
 
     void handleClient(sock_t clientSock);
     std::string handleRequest(const HttpRequest& req, const std::string& clientIp = "");
@@ -1074,6 +1095,7 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
 
         // Increment both per-username and per-IP failure counters
         std::lock_guard<std::mutex> lk(lockoutMutex_);
+        if (loginLockouts_.size() > 1000) pruneLockouts_();
         auto& uInfo = loginLockouts_[username];
         uInfo.failedAttempts++;
         if (uInfo.failedAttempts >= 5)
@@ -1872,10 +1894,16 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                     return "{\"success\":false,\"error\":\"Access denied: system table\"}";
                 }
                 // Block cross-user access: table starts with u{N}_ where N != userId
-                if (!cmd.tableName.empty() && cmd.tableName.size() > 2 &&
-                    cmd.tableName[0] == 'u' && std::isdigit((unsigned char)cmd.tableName[1])) {
-                    std::cout.rdbuf(old);
-                    return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                // Also handle schema-qualified names (e.g., public.u4_orders)
+                {
+                    std::string bareMain = cmd.tableName;
+                    auto dotM = bareMain.find('.');
+                    if (dotM != std::string::npos) bareMain = bareMain.substr(dotM + 1);
+                    if (!bareMain.empty() && bareMain.size() > 2 &&
+                        bareMain[0] == 'u' && std::isdigit((unsigned char)bareMain[1])) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                    }
                 }
                 // Phase 155: permission check for non-owner access
                 // (after prefixing, check if user has shared access)
@@ -1889,25 +1917,46 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                     (void)ownTable; (void)op;
                     cmd.tableName = prefix + cmd.tableName;
                 }
-                // Prefix join tables
+                // Prefix join tables (Security: block cross-tenant + system table access)
                 for (auto& jc : cmd.joinClauses) {
-                    if (!jc.table.empty() &&
-                        !(jc.table.size()>=2 && jc.table[0]=='_' && jc.table[1]=='_') &&
-                        !(jc.table.size()>2 && jc.table[0]=='u' && std::isdigit((unsigned char)jc.table[1])))
-                        jc.table = prefix + jc.table;
+                    if (jc.table.empty()) continue;
+                    // Strip schema prefix (e.g. "public.") before checking
+                    std::string bareJoin = jc.table;
+                    auto dotJ = bareJoin.find('.');
+                    if (dotJ != std::string::npos) bareJoin = bareJoin.substr(dotJ + 1);
+                    // Block system tables
+                    if (bareJoin.size() >= 2 && bareJoin[0] == '_' && bareJoin[1] == '_') {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: system table\"}";
+                    }
+                    // Block cross-tenant tables
+                    if (bareJoin.size() > 2 && bareJoin[0] == 'u' && std::isdigit((unsigned char)bareJoin[1])) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                    }
+                    jc.table = prefix + jc.table;
                 }
                 // Views/Procedures/Triggers: Namen + Zieltabellen isolieren,
                 // damit CREATE/DROP/CALL/SHOW pro User getrennt sind
-                auto pfxName = [&prefix](std::string& n) {
-                    if (n.empty()) return;
-                    if (n.size() >= 2 && n[0]=='_' && n[1]=='_') return;
-                    if (n.size() > 2 && n[0]=='u' && std::isdigit((unsigned char)n[1])) return;
+                auto pfxName = [&prefix](std::string& n) -> std::string {
+                    if (n.empty()) return "";
+                    std::string bare = n;
+                    auto dotP = bare.find('.');
+                    if (dotP != std::string::npos) bare = bare.substr(dotP + 1);
+                    if (bare.size() >= 2 && bare[0] == '_' && bare[1] == '_')
+                        return "Access denied: system object";
+                    if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1]))
+                        return "Access denied: cross-user object access not allowed";
                     n = prefix + n;
+                    return "";
                 };
-                pfxName(cmd.triggerName);
-                pfxName(cmd.triggerTable);
-                pfxName(cmd.showTriggersTable);
-                pfxName(cmd.procedureName);
+                {
+                    std::string pfxErr;
+                    pfxErr = pfxName(cmd.triggerName);    if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                    pfxErr = pfxName(cmd.triggerTable);   if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                    pfxErr = pfxName(cmd.showTriggersTable); if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                    pfxErr = pfxName(cmd.procedureName);  if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                }
             } else {
                 // Root: handle "user.table" notation (cross-user)
                 if (!cmd.tableName.empty()) {
@@ -1923,8 +1972,22 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
 
             // Resolve subqueries (apply same user-prefix for isolation)
             for (auto& sq : cmd.subqueries) {
-                if (!prefix.empty() && sq.subTable.find(prefix) != 0) {
-                    sq.subTable = prefix + sq.subTable;
+                if (!prefix.empty()) {
+                    // Block cross-tenant subquery table access
+                    std::string bareSub = sq.subTable;
+                    auto dotS = bareSub.find('.');
+                    if (dotS != std::string::npos) bareSub = bareSub.substr(dotS + 1);
+                    if (bareSub.size() > 2 && bareSub[0] == 'u' && std::isdigit((unsigned char)bareSub[1])) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                    }
+                    if (bareSub.size() >= 2 && bareSub[0] == '_' && bareSub[1] == '_') {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: system table\"}";
+                    }
+                    if (sq.subTable.find(prefix) != 0) {
+                        sq.subTable = prefix + sq.subTable;
+                    }
                 }
                 if (sq.condIdx < cmd.whereConds.size())
                     cmd.whereConds[sq.condIdx].inList =
@@ -2436,7 +2499,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v10.6.0</div>
+  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v10.7.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -2747,7 +2810,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
   <div class="topbar-right">
     <span id="ms-user-badge" style="display:none;background:rgba(16,185,129,.1);color:#10b981;border:1px solid #10b981;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
     <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:transparent;color:#94a3b8;border:1px solid #2d4060;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#94a3b8" id="version-label" class="ms-version">v10.6.0</span>
+    <span style="font-size:0.75rem;color:#94a3b8" id="version-label" class="ms-version">v10.7.0</span>
   </div>
 </div>
 
@@ -2792,7 +2855,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.6.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.7.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -3036,7 +3099,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v10.6.0</span> &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v10.7.0</span> &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -4617,7 +4680,7 @@ fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/jso
     <div style="background:rgba(13,18,36,0.8);padding:28px 32px 20px;text-align:center;border-bottom:1px solid #1e2d40">
       <div><span style="display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#00d4ff,#0090cc);color:#080c18;font-size:26px;font-weight:800;box-shadow:0 0 30px rgba(0,212,255,0.3)">M</span></div>
       <div style="font-size:22px;font-weight:700;color:#f8fafc;margin-top:10px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#475569;font-size:11px;margin-top:4px"><span class="ms-version">v10.6.0</span> &mdash; Multi-User Database</div>
+      <div style="color:#475569;font-size:11px;margin-top:4px"><span class="ms-version">v10.7.0</span> &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
     <div style="display:flex;border-bottom:1px solid #1e2d40">

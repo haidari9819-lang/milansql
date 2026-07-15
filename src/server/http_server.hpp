@@ -2645,6 +2645,16 @@ body{background:var(--bg-primary);color:var(--text-1);font-family:'Inter',-apple
 .badge.yellow{color:var(--warning)}
 .badge.yellow::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--warning)}
 .badge.blue{color:var(--accent)}
+.badge.purple{color:#a78bfa}.badge.purple::before{content:'';width:7px;height:7px;border-radius:50%;background:#7c3aed;box-shadow:0 0 8px rgba(124,58,237,0.6)}
+.part-badge{display:inline-flex;align-items:center;gap:4px;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.3);border-radius:4px;padding:1px 6px;font-size:0.65rem;color:#a78bfa;font-family:var(--mono);letter-spacing:.02em;margin-left:auto}
+.part-bar{height:6px;border-radius:3px;margin-top:2px;transition:width .3s var(--ease)}
+.part-detail{background:var(--bg-hover);border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px}
+.part-detail h4{color:var(--accent);font-size:0.8rem;margin-bottom:8px}
+.part-detail table{width:100%;font-size:0.75rem}
+.part-detail th{text-align:left;color:var(--text-2);padding:4px 8px;border-bottom:1px solid var(--border)}
+.part-detail td{padding:4px 8px;color:var(--text-1)}
+.part-progress{display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;margin-top:4px}
+.part-progress div{height:100%;border-radius:2px;min-width:4px;transition:width .3s}
 .topbar-right{margin-left:auto;display:flex;gap:8px;align-items:center}
 
 /* LAYOUT */
@@ -2877,7 +2887,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.7.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.8.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -3627,8 +3637,13 @@ async function loadSidebarTables() {
     el.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
       var badge = getRlsBadge(name);
+      var partIcon = '';
+      if (window._schemaData && window._schemaData.tables) {
+        var si = window._schemaData.tables.find(function(x){ return x.name === name || x.name === 'public.' + name; });
+        if (si && si.partitioned) partIcon = '<span class="part-badge" style="margin-left:4px;font-size:0.6rem">&#x25A6;</span>';
+      }
       return '<div class="table-item" style="display:flex;align-items:center" onclick="selectFromTable(\'' + escAttr(name) + '\')">'
-        + '<span>' + escHtml(name) + '</span>' + badge + '</div>';
+        + '<span>' + escHtml(name) + '</span>' + partIcon + badge + '</div>';
     }).join('');
   } catch(e) { /* silent */ }
 }
@@ -3666,6 +3681,37 @@ async function browseTable(name, btn) {
     var desc = await descR.json();
     var data = await dataR.json();
     var html = '<h3 style="margin-bottom:12px">&#x1F4CB; ' + escHtml(name) + '</h3>';
+    // Phase 176: Partition info
+    if (window._schemaData && window._schemaData.tables) {
+      var tInfo = window._schemaData.tables.find(function(x){ return x.name === name || x.name === 'public.' + name; });
+      if (tInfo && tInfo.partitioned) {
+        html += '<div class="part-detail"><h4>&#x25A6; ' + tInfo.partition_type + ' Partitioning on <code>' + escHtml(tInfo.partition_column) + '</code></h4>';
+        if (tInfo.partitions && tInfo.partitions.length) {
+          var totalRows = 0; tInfo.partitions.forEach(function(p){ totalRows += (p.rows||0); });
+          var colors = ['#7c3aed','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899','#8b5cf6','#14b8a6'];
+          html += '<div class="part-progress">';
+          tInfo.partitions.forEach(function(p,i){
+            var pct = totalRows > 0 ? Math.max(2, (p.rows||0)/totalRows*100) : (100/tInfo.partitions.length);
+            html += '<div style="width:'+pct+'%;background:'+colors[i%colors.length]+'" title="'+escHtml(p.name)+': '+(p.rows||0)+' rows"></div>';
+          });
+          html += '</div>';
+          html += '<table style="margin-top:8px"><thead><tr><th>Partition</th><th>Rows</th>';
+          if (tInfo.partition_type==='RANGE') html += '<th>From</th><th>To</th>';
+          if (tInfo.partition_type==='LIST') html += '<th>Values</th>';
+          html += '</tr></thead><tbody>';
+          tInfo.partitions.forEach(function(p,i){
+            html += '<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:'+colors[i%colors.length]+';margin-right:6px;vertical-align:middle"></span>' + escHtml(p.name) + '</td>';
+            html += '<td>' + (p.rows||0) + '</td>';
+            if (tInfo.partition_type==='RANGE') html += '<td>' + escHtml(p.from||'') + '</td><td>' + escHtml(p.to||'') + '</td>';
+            if (tInfo.partition_type==='LIST') html += '<td>' + (p.values||[]).map(escHtml).join(', ') + '</td>';
+            html += '</tr>';
+          });
+          html += '</tbody></table>';
+        }
+        html += '<div style="margin-top:6px;font-size:0.7rem;color:#94a3b8">' + (tInfo.partition_count||0) + ' partitions</div>';
+        html += '</div>';
+      }
+    }
     if (desc.columns && desc.rows) {
       html += '<div style="font-size:0.75rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
       html += '<div id="result-table-wrap" style="margin-bottom:16px"><table><thead><tr>';
@@ -4118,6 +4164,8 @@ async function loadTestBadge() {
 
 // Init
 updateEditorDecor();
+// Phase 176: Pre-fetch schema data for partition badges
+if(!window._schemaData){fetch("/api/schema",{credentials:"include"}).then(function(r){return r.json();}).then(function(d){window._schemaData=d;loadSidebarTables();}).catch(function(){});}
 loadSidebarTables();
 loadTestBadge();
 pollStatus();
@@ -4252,6 +4300,7 @@ function renderSchemaViz() {
     var pc = (t.policies||[]).length, rlsOn = t.rls_enabled;
     var h = '<div class="schema-card-header"><span class="rls-dot '+(rlsOn?'on':'off')+'" title="RLS '+(rlsOn?'active':'inactive')+'"></span><span>'+escHtml(t.name)+'</span>';
     if(pc>0) h+='<span class="pol-count">'+pc+'</span>';
+    if(t.partitioned) h+='<span class="part-badge" title="'+t.partition_type+' partitioned on '+escHtml(t.partition_column||'')+'">&#x25A6; '+t.partition_type+(t.partition_count?' ('+t.partition_count+')':'')+' </span>';
     h+='</div><div class="schema-card-cols">';
     (t.columns||[]).forEach(function(c) {
       var isFk=!!(fkCols[t.name]||{})[c.name];

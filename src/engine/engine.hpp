@@ -5157,6 +5157,45 @@ public:
                 }
                 json += "]";
             }
+            // Phase 176: Partition info
+            {
+                auto pkey = name;
+                if (partitionMeta_.count(pkey) && partitionMeta_.at(pkey).physical) {
+                    const auto& pm = partitionMeta_.at(pkey);
+                    json += ",\"partitioned\":true";
+                    json += ",\"partition_type\":\"";
+                    if (pm.type == PartitionType::RANGE) json += "RANGE";
+                    else if (pm.type == PartitionType::LIST) json += "LIST";
+                    else if (pm.type == PartitionType::HASH) json += "HASH";
+                    json += "\"";
+                    json += ",\"partition_column\":\"" + je(pm.column) + "\"";
+                    json += ",\"partition_count\":" + std::to_string(pm.children.size());
+                    json += ",\"partitions\":[";
+                    for (size_t pi = 0; pi < pm.children.size(); ++pi) {
+                        if (pi > 0) json += ",";
+                        json += "{\"name\":\"" + je(pm.children[pi]) + "\"";
+                        auto ckey = resolveTableName(pm.children[pi]);
+                        if (tables_.count(ckey))
+                            json += ",\"rows\":" + std::to_string(tables_.at(ckey).rowCount());
+                        // Range bounds
+                        if (pm.type == PartitionType::RANGE && pi < pm.ranges.size()) {
+                            json += ",\"from\":\"" + je(pm.ranges[pi].fromStr) + "\"";
+                            json += ",\"to\":\"" + je(pm.ranges[pi].limitStr) + "\"";
+                        }
+                        // List values
+                        if (pm.type == PartitionType::LIST && pi < pm.lists.size()) {
+                            json += ",\"values\":[";
+                            for (size_t vi = 0; vi < pm.lists[pi].values.size(); ++vi) {
+                                if (vi > 0) json += ",";
+                                json += "\"" + je(pm.lists[pi].values[vi]) + "\"";
+                            }
+                            json += "]";
+                        }
+                        json += "}";
+                    }
+                    json += "]";
+                }
+            }
             json += "}";
             first = false;
         }
@@ -5255,6 +5294,21 @@ public:
                     json += "}";
                 }
                 json += "]";
+            }
+            // Phase 176: Partition info
+            {
+                auto pkey = name;
+                if (partitionMeta_.count(pkey) && partitionMeta_.at(pkey).physical) {
+                    const auto& pm = partitionMeta_.at(pkey);
+                    json += ",\"partitioned\":true";
+                    json += ",\"partition_type\":\"";
+                    if (pm.type == PartitionType::RANGE) json += "RANGE";
+                    else if (pm.type == PartitionType::LIST) json += "LIST";
+                    else if (pm.type == PartitionType::HASH) json += "HASH";
+                    json += "\"";
+                    json += ",\"partition_column\":\"" + je(pm.column) + "\"";
+                    json += ",\"partition_count\":" + std::to_string(pm.children.size());
+                }
             }
             json += "}";
             first = false;

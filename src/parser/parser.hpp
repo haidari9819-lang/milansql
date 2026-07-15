@@ -104,6 +104,10 @@ enum class CommandType {
     SET_EVENT_SCHEDULER,
     // Phase 62: Partitioning
     SHOW_PARTITIONS,
+    CREATE_PARTITION,
+    DROP_PARTITION,
+    ATTACH_PARTITION,
+    DETACH_PARTITION,
     // Phase 64: SAVEPOINT
     SAVEPOINT,
     ROLLBACK_TO_SAVEPOINT,
@@ -554,7 +558,8 @@ struct ParsedCommand {
     // Used by CREATE TABLE parser to pass partition info to dispatch
     struct ParsedPartitionRange {
         std::string name;
-        std::string limitStr;  // "100" or "MAXVALUE"
+        std::string fromStr;   // lower bound for FROM-TO syntax
+        std::string limitStr;  // upper bound or "MAXVALUE"
     };
     struct ParsedPartitionList {
         std::string name;
@@ -567,6 +572,7 @@ struct ParsedCommand {
     std::vector<ParsedPartitionList>  partitionLists;
     // For SHOW PARTITIONS / ALTER TABLE DROP PARTITION
     std::string partitionName;   // partition name for DROP PARTITION
+    std::string parentTable;     // Phase 176: parent table for CREATE/DROP PARTITION
     // For ALTER TABLE ADD PARTITION (RANGE)
     ParsedPartitionRange addRangeDef;
     // For ALTER TABLE ADD PARTITION (LIST)
@@ -1486,6 +1492,24 @@ public:
                                                                 if (vp != std::string::npos && vpe != std::string::npos)
                                                                     rdef.limitStr = trim(pd.substr(vp + 1, vpe - vp - 1));
                                                                 else rdef.limitStr = "MAXVALUE";
+                                                            } else if (upd.find("FOR VALUES FROM") != std::string::npos || upd.find("VALUES FROM") != std::string::npos) {
+                                                                // FROM (x) TO (y) syntax
+                                                                auto fromPos = upd.find("FROM");
+                                                                if (fromPos != std::string::npos) {
+                                                                    auto fp = pd.find('(', fromPos);
+                                                                    auto fpe = pd.find(')', fp);
+                                                                    if (fp != std::string::npos && fpe != std::string::npos) {
+                                                                        rdef.fromStr = trim(pd.substr(fp + 1, fpe - fp - 1));
+                                                                    }
+                                                                    auto toPos = upd.find("TO", fpe);
+                                                                    if (toPos != std::string::npos) {
+                                                                        auto tp = pd.find('(', toPos);
+                                                                        auto tpe = pd.find(')', tp);
+                                                                        if (tp != std::string::npos && tpe != std::string::npos) {
+                                                                            rdef.limitStr = trim(pd.substr(tp + 1, tpe - tp - 1));
+                                                                        }
+                                                                    }
+                                                                }
                                                             } else if (upd.find("MAXVALUE") != std::string::npos) {
                                                                 rdef.limitStr = "MAXVALUE";
                                                             }

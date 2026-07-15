@@ -487,10 +487,76 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     case milansql::CommandType::CREATE_TABLE:
         try {
             if (cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
-                // Silently succeed — table already exists
                 break;
             }
             engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+            // Auto-create BTREE index for PRIMARY KEY column
+            for (const auto& col : cmd.columns) {
+                if (col.isPrimaryKey) {
+                    try { engine.createIndex(cmd.tableName, {col.name}, "PRIMARY"); } catch (...) {}
+                    break;
+                }
+            }
+            // Phase 176: Physical partitioning setup
+            if (!cmd.partitionType.empty()) {
+                milansql::PartitionInfo pi;
+                pi.column = cmd.partitionColumn;
+                if (cmd.partitionType == "RANGE") {
+                    pi.type = milansql::PartitionType::RANGE;
+                    for (auto& r : cmd.partitionRanges) {
+                        milansql::PartitionRangeDef rd;
+                        rd.name = r.name;
+                        rd.fromStr = r.fromStr;
+                        rd.limitStr = r.limitStr;
+                        if (!r.fromStr.empty()) {
+                            try { rd.fromVal = std::stoll(r.fromStr); } catch (...) { rd.fromVal = 0; }
+                        }
+                        if (r.limitStr == "MAXVALUE")
+                            rd.limit = std::numeric_limits<long long>::max();
+                        else { try { rd.limit = std::stoll(r.limitStr); } catch (...) { rd.limit = 0; } }
+                        pi.ranges.push_back(rd);
+                    }
+                } else if (cmd.partitionType == "LIST") {
+                    pi.type = milansql::PartitionType::LIST;
+                    for (auto& l : cmd.partitionLists) {
+                        milansql::PartitionListDef ld;
+                        ld.name = l.name;
+                        ld.values = l.values;
+                        pi.lists.push_back(ld);
+                    }
+                } else if (cmd.partitionType == "HASH") {
+                    pi.type = milansql::PartitionType::HASH;
+                    pi.hashCount = cmd.partitionHashCount;
+                }
+                // Store metadata on Table object
+                try { engine.setTablePartitionInfo(cmd.tableName, pi); } catch (...) {}
+                // Create physical partitions
+                pi.physical = true;
+                if (pi.type == milansql::PartitionType::HASH && pi.hashCount > 0) {
+                    for (int i = 0; i < pi.hashCount; ++i) {
+                        std::string childName = cmd.tableName + "_p" + std::to_string(i);
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                if (pi.type == milansql::PartitionType::RANGE) {
+                    for (const auto& rd : pi.ranges) {
+                        if (rd.name.empty()) continue;
+                        std::string childName = cmd.tableName + "_" + rd.name;
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                if (pi.type == milansql::PartitionType::LIST) {
+                    for (const auto& ld : pi.lists) {
+                        if (ld.name.empty()) continue;
+                        std::string childName = cmd.tableName + "_" + ld.name;
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                engine.setPartitionMeta(cmd.tableName, pi);
+            }
         } catch (const std::exception& e) {
             qr.error = e.what();
         }

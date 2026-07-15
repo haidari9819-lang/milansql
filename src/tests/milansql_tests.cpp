@@ -11837,6 +11837,322 @@ static void testGroup108() {
     std::cout << "  testGroup108 passed.\n";
 }
 
+
+// ============================================================
+// testGroup109 -- Physical Partitioning (Phase 176)
+// ============================================================
+static void testGroup109() {
+    std::cout << "\n-- testGroup109: Physical Partitioning --\n";
+    using namespace milansql;
+
+    // PART-1: RANGE partitioning with FROM-TO syntax
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        // Create range-partitioned table
+        auto r = milansql::dispatch(parser.parse(
+            "CREATE TABLE orders (id INT, amount INT, region TEXT) "
+            "PARTITION BY RANGE (amount) ("
+            "  PARTITION p_small  FOR VALUES FROM (0)    TO (100),"
+            "  PARTITION p_medium FOR VALUES FROM (100)  TO (1000),"
+            "  PARTITION p_large  FOR VALUES FROM (1000) TO (MAXVALUE)"
+            ")"), engine);
+        check(r.error.empty(), "PART-1a: CREATE range-partitioned table");
+
+        // Insert rows that should route to different partitions
+        milansql::dispatch(parser.parse("INSERT INTO orders VALUES (1, 50, 'EU')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO orders VALUES (2, 500, 'US')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO orders VALUES (3, 5000, 'APAC')"), engine);
+
+        // SELECT should show all rows merged
+        auto r2 = milansql::dispatch(parser.parse("SELECT * FROM orders"), engine);
+        check(r2.rows.size() == 3, "PART-1b: SELECT returns all 3 rows from partitions");
+
+        // Verify partition metadata exists
+        check(engine.isPartitionedTable("orders"), "PART-1c: table recognized as partitioned");
+
+        // Check partition meta has 3 children
+        const auto& pi = engine.getPartitionMeta("orders");
+        check(pi.children.size() == 3, "PART-1d: 3 partition children created");
+        check(pi.physical, "PART-1e: partitions are physical");
+
+        // Cleanup
+        milansql::dispatch(parser.parse("DROP TABLE orders"), engine);
+        check(!engine.isPartitionedTable("orders"), "PART-1f: DROP cleans up partition meta");
+    }
+
+    // PART-2: HASH partitioning with auto-created partitions
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        auto r = milansql::dispatch(parser.parse(
+            "CREATE TABLE sessions (id INT, user_id INT, data TEXT) "
+            "PARTITION BY HASH (user_id) PARTITIONS 4"), engine);
+        check(r.error.empty(), "PART-2a: CREATE hash-partitioned table");
+
+        check(engine.isPartitionedTable("sessions"), "PART-2b: hash table is partitioned");
+        const auto& pi = engine.getPartitionMeta("sessions");
+        check(pi.children.size() == 4, "PART-2c: 4 hash partitions created");
+
+        // Insert rows
+        for (int i = 0; i < 20; i++) {
+            std::string sql = "INSERT INTO sessions VALUES (" +
+                std::to_string(i) + ", " + std::to_string(i * 7) + ", 'data')";
+            milansql::dispatch(parser.parse(sql), engine);
+        }
+
+        // All rows should be retrievable
+        auto r2 = milansql::dispatch(parser.parse("SELECT * FROM sessions"), engine);
+        check(r2.rows.size() == 20, "PART-2d: all 20 rows visible via SELECT");
+
+        // Check rows are distributed (at least 2 partitions have rows)
+        int nonEmpty = 0;
+        for (const auto& child : pi.children) {
+            auto key = engine.resolveTableName(child);
+            if (engine.getRowCount(key) > 0) nonEmpty++;
+        }
+        check(nonEmpty >= 2, "PART-2e: rows distributed across partitions");
+
+        milansql::dispatch(parser.parse("DROP TABLE sessions"), engine);
+    }
+
+    // PART-3: LIST partitioning
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        auto r = milansql::dispatch(parser.parse(
+            "CREATE TABLE logs (id INT, level TEXT, msg TEXT) "
+            "PARTITION BY LIST (level) ("
+            "  PARTITION p_info    FOR VALUES IN ('INFO', 'DEBUG'),"
+            "  PARTITION p_warning FOR VALUES IN ('WARNING'),"
+            "  PARTITION p_error   FOR VALUES IN ('ERROR', 'CRITICAL')"
+            ")"), engine);
+        check(r.error.empty(), "PART-3a: CREATE list-partitioned table");
+
+        const auto& pi = engine.getPartitionMeta("logs");
+        check(pi.children.size() == 3, "PART-3b: 3 list partitions");
+
+        milansql::dispatch(parser.parse("INSERT INTO logs VALUES (1, 'INFO', 'started')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO logs VALUES (2, 'ERROR', 'crash')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO logs VALUES (3, 'WARNING', 'slow')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO logs VALUES (4, 'DEBUG', 'trace')"), engine);
+
+        auto r2 = milansql::dispatch(parser.parse("SELECT * FROM logs"), engine);
+        check(r2.rows.size() == 4, "PART-3c: all 4 rows visible");
+
+        milansql::dispatch(parser.parse("DROP TABLE logs"), engine);
+    }
+
+    // PART-4: Partition pruning
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE metrics (id INT, ts INT, val TEXT) "
+            "PARTITION BY RANGE (ts) ("
+            "  PARTITION p_2024 FOR VALUES FROM (0)    TO (1000),"
+            "  PARTITION p_2025 FOR VALUES FROM (1000) TO (2000),"
+            "  PARTITION p_2026 FOR VALUES FROM (2000) TO (MAXVALUE)"
+            ")"), engine);
+
+        // Insert into different partitions
+        milansql::dispatch(parser.parse("INSERT INTO metrics VALUES (1, 500, 'a')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO metrics VALUES (2, 1500, 'b')"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO metrics VALUES (3, 2500, 'c')"), engine);
+
+        // Query with WHERE on partition column
+        auto r = milansql::dispatch(parser.parse("SELECT * FROM metrics WHERE ts = 500"), engine);
+        if (!r.rows.empty()) {
+            for (const auto& v : r.rows[0].values) std::cout << "[" << v << "] ";
+            std::cout << std::endl;
+        }
+        check(r.rows.size() >= 1, "PART-4a: WHERE on partition key returns correct row");
+        if (!r.rows.empty()) {
+            check(r.rows[0].values.size() >= 3 && r.rows[0].values[2] == "a", "PART-4b: correct row returned");
+        }
+
+        // Query all
+        auto r2 = milansql::dispatch(parser.parse("SELECT * FROM metrics"), engine);
+        check(r2.rows.size() == 3, "PART-4c: SELECT * returns all rows");
+
+        milansql::dispatch(parser.parse("DROP TABLE metrics"), engine);
+    }
+
+    // PART-5: INSERT routing correctness
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE sales (id INT, amount INT) "
+            "PARTITION BY RANGE (amount) ("
+            "  PARTITION p_low  FOR VALUES FROM (0) TO (100),"
+            "  PARTITION p_high FOR VALUES FROM (100) TO (MAXVALUE)"
+            ")"), engine);
+
+        // Insert a low-value sale
+        milansql::dispatch(parser.parse("INSERT INTO sales VALUES (1, 50)"), engine);
+        // Insert a high-value sale
+        milansql::dispatch(parser.parse("INSERT INTO sales VALUES (2, 200)"), engine);
+
+        // Verify routing by checking child tables directly
+        const auto& pi = engine.getPartitionMeta("sales");
+        bool lowInFirst = false, highInSecond = false;
+        for (size_t i = 0; i < pi.children.size(); i++) {
+            auto ckey = engine.resolveTableName(pi.children[i]);
+            size_t cnt = engine.getRowCount(ckey);
+            if (i == 0 && cnt == 1) lowInFirst = true;
+            if (i == 1 && cnt == 1) highInSecond = true;
+        }
+        check(lowInFirst, "PART-5a: low-value row in first partition");
+        check(highInSecond, "PART-5b: high-value row in second partition");
+
+        milansql::dispatch(parser.parse("DROP TABLE sales"), engine);
+    }
+
+    // PART-6: DROP PARTITION
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE archive (id INT, year INT) "
+            "PARTITION BY RANGE (year) ("
+            "  PARTITION p_old FOR VALUES FROM (0) TO (2020),"
+            "  PARTITION p_new FOR VALUES FROM (2020) TO (MAXVALUE)"
+            ")"), engine);
+
+        milansql::dispatch(parser.parse("INSERT INTO archive VALUES (1, 2019)"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO archive VALUES (2, 2025)"), engine);
+
+        auto r1 = milansql::dispatch(parser.parse("SELECT * FROM archive"), engine);
+        check(r1.rows.size() == 2, "PART-6a: both rows visible before drop");
+
+        // Drop old partition
+        engine.dropPartition("archive", "p_old");
+        auto r2 = milansql::dispatch(parser.parse("SELECT * FROM archive"), engine);
+        check(r2.rows.size() == 1, "PART-6b: only 1 row after dropping old partition");
+
+        milansql::dispatch(parser.parse("DROP TABLE archive"), engine);
+    }
+
+    // PART-7: DETACH PARTITION (becomes standalone table)
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE events (id INT, type INT) "
+            "PARTITION BY RANGE (type) ("
+            "  PARTITION p_a FOR VALUES FROM (0) TO (10),"
+            "  PARTITION p_b FOR VALUES FROM (10) TO (MAXVALUE)"
+            ")"), engine);
+
+        milansql::dispatch(parser.parse("INSERT INTO events VALUES (1, 5)"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO events VALUES (2, 15)"), engine);
+
+        const auto& pi1 = engine.getPartitionMeta("events");
+        size_t childCount1 = pi1.children.size();
+        check(childCount1 == 2, "PART-7a: 2 partitions before detach");
+
+        engine.detachPartition("events", "p_a");
+        const auto& pi2 = engine.getPartitionMeta("events");
+        check(pi2.children.size() == 1, "PART-7b: 1 partition after detach");
+
+        // Parent SELECT should only show rows from remaining partition
+        auto r = milansql::dispatch(parser.parse("SELECT * FROM events"), engine);
+        check(r.rows.size() == 1, "PART-7c: only p_b rows in parent");
+
+        milansql::dispatch(parser.parse("DROP TABLE events"), engine);
+    }
+
+    // PART-8: countPartitioned
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE items (id INT, cat INT) "
+            "PARTITION BY HASH (cat) PARTITIONS 3"), engine);
+
+        for (int i = 0; i < 30; i++) {
+            milansql::dispatch(parser.parse(
+                "INSERT INTO items VALUES (" + std::to_string(i) + ", " +
+                std::to_string(i) + ")"), engine);
+        }
+
+        size_t total = engine.countPartitioned("items");
+        check(total == 30, "PART-8: countPartitioned returns 30");
+
+        milansql::dispatch(parser.parse("DROP TABLE items"), engine);
+    }
+
+    // PART-9: Partition-aware DELETE
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE temp (id INT, status INT) "
+            "PARTITION BY RANGE (status) ("
+            "  PARTITION p_active FOR VALUES FROM (0) TO (100),"
+            "  PARTITION p_done   FOR VALUES FROM (100) TO (MAXVALUE)"
+            ")"), engine);
+
+        milansql::dispatch(parser.parse("INSERT INTO temp VALUES (1, 50)"), engine);
+        milansql::dispatch(parser.parse("INSERT INTO temp VALUES (2, 150)"), engine);
+
+        auto r1 = milansql::dispatch(parser.parse("SELECT * FROM temp"), engine);
+        check(r1.rows.size() == 2, "PART-9a: 2 rows before delete");
+
+        milansql::dispatch(parser.parse("DELETE FROM temp WHERE id = 1"), engine);
+        auto r2 = milansql::dispatch(parser.parse("SELECT * FROM temp"), engine);
+        check(r2.rows.size() == 1, "PART-9b: 1 row after delete");
+
+        milansql::dispatch(parser.parse("DROP TABLE temp"), engine);
+    }
+
+    // PART-10: Multiple inserts, large scan
+    {
+        Engine engine;
+        Parser parser;
+        engine.setCurrentUser(0, true);
+
+        milansql::dispatch(parser.parse(
+            "CREATE TABLE big (id INT, val INT) "
+            "PARTITION BY HASH (id) PARTITIONS 8"), engine);
+
+        for (int i = 0; i < 100; i++) {
+            milansql::dispatch(parser.parse(
+                "INSERT INTO big VALUES (" + std::to_string(i) + ", " +
+                std::to_string(i * 10) + ")"), engine);
+        }
+
+        auto r = milansql::dispatch(parser.parse("SELECT * FROM big"), engine);
+        check(r.rows.size() == 100, "PART-10a: 100 rows across 8 hash partitions");
+
+        size_t cnt = engine.countPartitioned("big");
+        check(cnt == 100, "PART-10b: countPartitioned = 100");
+
+        milansql::dispatch(parser.parse("DROP TABLE big"), engine);
+    }
+
+    std::cout << "  testGroup109 passed.\n";
+}
+
 // MAIN
 // ============================================================
 
@@ -12151,6 +12467,9 @@ int main() {
     }
     try { testGroup108(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 108 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup109(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 109 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

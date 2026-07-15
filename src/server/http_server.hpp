@@ -60,7 +60,7 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1658;
+static constexpr int MILANSQL_TEST_COUNT = 1665;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
@@ -536,6 +536,28 @@ static std::string sanitizeError(const std::string& msg) {
             i += 6;
         } else {
             ++i;
+        }
+    }
+    // Security: strip tenant prefix u{N}_ from table/object names in error messages
+    // This prevents leaking the internal naming scheme to users
+    {
+        size_t pos = 0;
+        while (pos < r.size()) {
+            // Look for pattern: u followed by digits followed by _
+            if (r[pos] == 'u' && pos + 2 < r.size() && std::isdigit((unsigned char)r[pos+1])) {
+                size_t numEnd = pos + 1;
+                while (numEnd < r.size() && std::isdigit((unsigned char)r[numEnd])) ++numEnd;
+                if (numEnd < r.size() && r[numEnd] == '_') {
+                    // Check context: should be at word boundary (start, space, quote, colon, dot)
+                    bool atBoundary = (pos == 0 || r[pos-1] == ' ' || r[pos-1] == '\'' ||
+                                       r[pos-1] == '"' || r[pos-1] == ':' || r[pos-1] == '.');
+                    if (atBoundary) {
+                        r.erase(pos, numEnd - pos + 1);
+                        continue; // don't advance pos, check new char at this position
+                    }
+                }
+            }
+            ++pos;
         }
     }
     return r;
@@ -4788,6 +4810,31 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
 
+    // Security: Host header validation — prevent host-header injection
+    {
+        static const std::vector<std::string> allowedHosts = {
+            "milansql.de", "www.milansql.de",
+            "localhost", "127.0.0.1", "10.0.0.1",
+            "178.105.206.36"
+        };
+        auto hit = req.headers.find("host");
+        if (hit != req.headers.end()) {
+            std::string host = hit->second;
+            // Strip port if present
+            auto colon = host.find(':');
+            if (colon != std::string::npos) host = host.substr(0, colon);
+            // Lowercase
+            for (auto& c : host) c = (char)std::tolower((unsigned char)c);
+            bool allowed = false;
+            for (const auto& h : allowedHosts) {
+                if (host == h) { allowed = true; break; }
+            }
+            if (!allowed) {
+                return buildHttpResponse(400, "{\"error\":\"Invalid Host header\"}");
+            }
+        }
+    }
+
     // ══ FORTRESS: Schicht 1+2 — IP Ban Check + Honeypot ═══════
     auto& fortress = milansql::g_fortress();
 
@@ -5528,16 +5575,50 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/health") {
+        // Security: public health check returns minimal info
+        // Full details only with valid auth token
+        bool isAuthed = false;
+        {
+            std::string authH;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end()) authH = ait->second;
+            if (authH.size() > 7 && authH.substr(0, 7) == "Bearer ") {
+                auto vr = authMgr_.validateToken(authH.substr(7));
+                isAuthed = vr.valid;
+            }
+            if (!isAuthed) {
+                // Check cookie
+                auto cit = req.headers.find("cookie");
+                if (cit != req.headers.end()) {
+                    auto pos = cit->second.find("session=");
+                    if (pos != std::string::npos) {
+                        auto end = cit->second.find(';', pos);
+                        std::string tok = cit->second.substr(pos + 8,
+                            end == std::string::npos ? std::string::npos : end - pos - 8);
+                        auto vr = authMgr_.validateToken(tok);
+                        isAuthed = vr.valid;
+                    }
+                }
+            }
+        }
+
         std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        bool storageOk = lastPersistError_.empty();
+        std::string status = storageOk ? "healthy" : "degraded";
+
+        if (!isAuthed) {
+            // Public: minimal response for uptime monitoring
+            return buildHttpResponse(200, "{\"status\":\"" + status + "\"}");
+        }
+
+        // Authenticated: full details
         double upSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startTime_).count();
-        // Audit Bug #25: storage-Check spiegelt echten Persist-Status
-        bool storageOk = lastPersistError_.empty();
         std::string storageCheck = storageOk
             ? "{\"status\":\"ok\"}"
             : "{\"status\":\"error\",\"error\":\"" + jsonEscape(lastPersistError_) + "\"}";
         std::string body = "{"
-            "\"status\":\"" + std::string(storageOk ? "healthy" : "degraded") + "\","
+            "\"status\":\"" + status + "\","
             "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
             "\"version\":\"" + std::string(MILANSQL_VERSION) + "\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
@@ -5565,17 +5646,44 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
 
     // Phase 170: Connection pool statistics
     if (req.path == "/pool/stats") {
+        // Security: require auth for internal metrics
+        {
+            bool authed = false;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end() && ait->second.size() > 7 && ait->second.substr(0, 7) == "Bearer ") {
+                authed = authMgr_.validateToken(ait->second.substr(7)).valid;
+            }
+            if (!authed) return buildHttpResponse(401, "{\"error\":\"Authentication required\"}");
+        }
         return buildHttpResponse(200, milansql::g_connectionPool.statsJson());
     }
 
     // Phase 171: MVCC vacuum statistics
     if (req.path == "/vacuum/stats") {
         std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        // Security: require auth for internal metrics
+        {
+            bool authed = false;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end() && ait->second.size() > 7 && ait->second.substr(0, 7) == "Bearer ") {
+                authed = authMgr_.validateToken(ait->second.substr(7)).valid;
+            }
+            if (!authed) return buildHttpResponse(401, "{\"error\":\"Authentication required\"}");
+        }
         return buildHttpResponse(200, engine_.vacuumManager().statsJson());
     }
 
     // Phase 172: Streaming replication status (role, lag, failover)
     if (req.path == "/replication/status") {
+        // Security: require auth for internal metrics
+        {
+            bool authed = false;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end() && ait->second.size() > 7 && ait->second.substr(0, 7) == "Bearer ") {
+                authed = authMgr_.validateToken(ait->second.substr(7)).valid;
+            }
+            if (!authed) return buildHttpResponse(401, "{\"error\":\"Authentication required\"}");
+        }
         return buildHttpResponse(200, milansql::replicationStatusJson());
     }
 

@@ -5724,6 +5724,34 @@ private:
             return {"public", fullName};
         };
 
+        // Security: tenant isolation for information_schema
+        // Non-root users only see their own prefixed tables + unprefixed (shared) tables
+        std::string myPrefix = isRootUser_ ? "" : ("u" + std::to_string(currentUserId_) + "_");
+        auto isVisibleTable = [&](const std::string& tname) -> bool {
+            if (isRootUser_) return true;
+            // Strip schema prefix (e.g. "public.") for checking
+            std::string bare = tname;
+            auto dotPos = bare.find('.');
+            if (dotPos != std::string::npos) bare = bare.substr(dotPos + 1);
+            // System/temp tables: hide from non-root
+            if (bare.size() >= 2 && bare[0] == '_' && bare[1] == '_') return false;
+            // Own tables (with prefix)
+            if (!myPrefix.empty() && bare.substr(0, myPrefix.size()) == myPrefix) return true;
+            // Other tenant tables (u{N}_ prefix): hide
+            if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1])) return false;
+            // Unprefixed table = shared/root-level
+            return true;
+        };
+        // Strip tenant prefix from table name for display
+        auto stripPrefix = [&](const std::string& tname) -> std::string {
+            std::string bare = tname;
+            auto dotPos = bare.find('.');
+            if (dotPos != std::string::npos) bare = bare.substr(dotPos + 1);
+            if (!myPrefix.empty() && bare.substr(0, myPrefix.size()) == myPrefix)
+                return bare.substr(myPrefix.size());
+            return bare;
+        };
+
         if (sub == "tables") {
             Table t(rawName, {
                 Column("TABLE_SCHEMA", "TEXT"),
@@ -5733,13 +5761,15 @@ private:
             });
             for (const auto& [tname, tbl] : tables_) {
                 if (tempTableNames_.count(tname)) continue;
-                auto [schema, bare] = splitName(tname);
+                if (!isVisibleTable(tname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(tname));
                 t.insert(Row({schema, bare, "BASE TABLE",
                               std::to_string(tbl.rowCount())}));
             }
             for (const auto& [vname, vsql] : views_) {
                 (void)vsql;
-                auto [schema, bare] = splitName(vname);
+                if (!isVisibleTable(vname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(vname));
                 t.insert(Row({schema, bare, "VIEW", "0"}));
             }
             return t;
@@ -5758,7 +5788,8 @@ private:
             });
             for (const auto& [tname, tbl] : tables_) {
                 if (tempTableNames_.count(tname)) continue;
-                auto [schema, bare] = splitName(tname);
+                if (!isVisibleTable(tname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(tname));
                 const auto& cols = tbl.columns();
                 for (size_t i = 0; i < cols.size(); ++i) {
                     const Column& c = cols[i];
@@ -5786,7 +5817,8 @@ private:
             });
             for (const auto& [tname, tbl] : tables_) {
                 if (tempTableNames_.count(tname)) continue;
-                auto [schema, bare] = splitName(tname);
+                if (!isVisibleTable(tname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(tname));
                 for (const auto& idx : tbl.getIndexes()) {
                     t.insert(Row({schema, bare, idx.indexName,
                                   idx.colName, "1", "BTREE"}));
@@ -5802,7 +5834,8 @@ private:
                 Column("VIEW_DEFINITION", "TEXT")
             });
             for (const auto& [vname, vsql] : views_) {
-                auto [schema, bare] = splitName(vname);
+                if (!isVisibleTable(vname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(vname));
                 t.insert(Row({schema, bare, vsql}));
             }
             return t;
@@ -10023,11 +10056,30 @@ public:
                 Column("table_type",    "TEXT"),
             };
             Table t("information_schema.tables", cols);
+            std::string myPfx = isRootUser_ ? "" : ("u" + std::to_string(currentUserId_) + "_");
             for (const auto& [tname, _tbl] : tables_) {
-                t.insert(Row({"public", "public", bareName(tname), "BASE TABLE"}));
+                // Tenant isolation: non-root only sees own + shared tables
+                if (!isRootUser_) {
+                    if (tname.size() >= 2 && tname[0] == '_' && tname[1] == '_') continue;
+                    if (tname.size() > 2 && tname[0] == 'u' && std::isdigit((unsigned char)tname[1])) {
+                        if (myPfx.empty() || tname.substr(0, myPfx.size()) != myPfx) continue;
+                    }
+                }
+                std::string displayName = bareName(tname);
+                if (!myPfx.empty() && displayName.substr(0, myPfx.size()) == myPfx)
+                    displayName = displayName.substr(myPfx.size());
+                t.insert(Row({"public", "public", displayName, "BASE TABLE"}));
             }
             for (const auto& [vname, _vsql] : views_) {
-                t.insert(Row({"public", "public", vname, "VIEW"}));
+                if (!isRootUser_) {
+                    if (vname.size() > 2 && vname[0] == 'u' && std::isdigit((unsigned char)vname[1])) {
+                        if (myPfx.empty() || vname.substr(0, myPfx.size()) != myPfx) continue;
+                    }
+                }
+                std::string displayName = vname;
+                if (!myPfx.empty() && displayName.substr(0, myPfx.size()) == myPfx)
+                    displayName = displayName.substr(myPfx.size());
+                t.insert(Row({"public", "public", displayName, "VIEW"}));
             }
             return t;
         }
@@ -10042,6 +10094,14 @@ public:
             };
             Table t("information_schema.columns", cols);
             for (const auto& [tname, tbl] : tables_) {
+                // Tenant isolation
+                if (!isRootUser_) {
+                    std::string myPfx2 = "u" + std::to_string(currentUserId_) + "_";
+                    if (tname.size() >= 2 && tname[0] == '_' && tname[1] == '_') continue;
+                    if (tname.size() > 2 && tname[0] == 'u' && std::isdigit((unsigned char)tname[1])) {
+                        if (tname.substr(0, myPfx2.size()) != myPfx2) continue;
+                    }
+                }
                 std::string bname = bareName(tname);
                 const auto& tcols = tbl.columns();
                 for (size_t i = 0; i < tcols.size(); ++i) {

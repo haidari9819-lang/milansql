@@ -5659,8 +5659,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         std::string status = storageOk ? "healthy" : "degraded";
 
         if (!isAuthed) {
-            // Public: minimal response for uptime monitoring
-            return buildHttpResponse(200, "{\"status\":\"" + status + "\"}");
+            // Public: minimal response with version + test count for WebUI badge
+            return buildHttpResponse(200, "{\"status\":\"" + status + "\","
+                "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
+                "\"version\":\"" + std::string(MILANSQL_VERSION) + "\"}");
         }
 
         // Authenticated: full details

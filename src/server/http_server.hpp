@@ -896,6 +896,9 @@ inline void MilanHttpServer::initEngine() {
     authMgr_.load(dbPath_ + ".auth");
     authMgr_.init();  // resolves secret: env → file → legacy → generate
 
+    // Phase 62+176: Load partition metadata
+    milansql::dispatch_loadPartitions(engine_, "database.partitions");
+
     // ══ FORTRESS: Load whitelist + persistent ban list ═══════
     milansql::g_fortress().loadWhitelist(dbPath_ + ".whitelist");
     milansql::g_fortress().loadBanList(dbPath_ + ".banlist");

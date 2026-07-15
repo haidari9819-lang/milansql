@@ -1285,6 +1285,9 @@ inline void dispatch_loadPartitions(milansql::Engine& engine,
                         auto pi = engine.getPartitionMeta(pname);
                         milansql::PartitionRangeDef rd;
                         rd.name = rname; rd.fromStr = rfrom; rd.limitStr = rto;
+                        if (!rfrom.empty()) { try { rd.fromVal = std::stoll(rfrom); } catch (...) {} }
+                        if (rto == "MAXVALUE") rd.limit = std::numeric_limits<long long>::max();
+                        else { try { rd.limit = std::stoll(rto); } catch (...) {} }
                         pi.ranges.push_back(rd);
                         engine.setPartitionMeta(pname, pi);
                     }

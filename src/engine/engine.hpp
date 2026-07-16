@@ -3142,7 +3142,10 @@ public:
         mvccTxId_ = txManager_.beginTx(isolationLevel_);
         {
             std::ofstream wal(walPath_, std::ios::app);
-            if (wal) wal << "TX_BEGIN:" << mvccTxId_ << "\n";
+            if (wal) {
+                wal << "TX_BEGIN:" << mvccTxId_ << "\n";
+                wal << "TS:" << std::time(nullptr) << "\n";  // Phase 178: PITR timestamp
+            }
         }
         inTransaction_ = true;
         txBuffer_.clear();
@@ -3178,6 +3181,7 @@ public:
                     std::string line = "TX_COMMIT:" + std::to_string(commitId);
                     uint32_t crc = walCrc32(line);
                     wal << line << "\n";
+                    wal << "TS:" << std::time(nullptr) << "\n";  // Phase 178: commit timestamp
                     wal << "CRC:" << crc << "\n";
                     wal.flush();
                 }

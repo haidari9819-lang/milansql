@@ -57,14 +57,15 @@
 #include "../auth/rate_limiter.hpp"
 #include "../security/fortress.hpp"
 #include "../nl/nl_query.hpp"
+#include "../wal/pitr_manager.hpp"
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1735;
+static constexpr int MILANSQL_TEST_COUNT = 1818;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "10.9.0";
+static constexpr const char* MILANSQL_VERSION = "11.0.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -2898,7 +2899,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.9.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v11.0.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -4171,6 +4172,64 @@ async function loadTestBadge() {
     if (d.version)
       document.querySelectorAll('.ms-version').forEach(function(el){ el.textContent = 'v' + d.version; });
   } catch(e) {}
+}
+
+// Phase 178: PITR/Backup loader
+async function loadPitrStatus() {
+  try {
+    var r = await fetch('/api/pitr/status', {credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('pitr-status-panel');
+    if (!el) return;
+    var h = '<div class="ssl-card"><h3>&#x1F4BE; Backup & Recovery';
+    h += ' <span class="ssl-badge ' + (d.archive_enabled ? 'on' : 'off') + '">';
+    h += d.archive_enabled ? 'ARCHIVING' : 'DISABLED';
+    h += '</span></h3>';
+    h += '<div class="ssl-grid">';
+    h += '<div class="ssl-item"><strong>Archive Dir</strong>' + escHtml(d.archive_dir||'') + '</div>';
+    h += '<div class="ssl-item"><strong>Segments</strong>' + (d.archive_segments||0) + '</div>';
+    h += '<div class="ssl-item"><strong>Archive Size</strong>' + formatSize(d.archive_size||0) + '</div>';
+    h += '<div class="ssl-item"><strong>Retention</strong>' + (d.retention_days||0) + ' days</div>';
+    if (d.oldest_segment) h += '<div class="ssl-item"><strong>Oldest</strong>' + escHtml(d.oldest_segment) + '</div>';
+    if (d.newest_segment) h += '<div class="ssl-item"><strong>Newest</strong>' + escHtml(d.newest_segment) + '</div>';
+    h += '</div>';
+    if (d.backups && d.backups.length > 0) {
+      h += '<div style="margin-top:12px;font-size:0.75rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.06em">Backups</div>';
+      h += '<table style="width:100%;font-size:0.72rem;margin-top:4px"><thead><tr><th style="text-align:left;padding:4px 8px;color:var(--text-2);border-bottom:1px solid var(--border)">Timestamp</th><th>LSN</th><th>Size</th><th>Tables</th></tr></thead><tbody>';
+      d.backups.forEach(function(b) {
+        h += '<tr><td style="padding:4px 8px;color:var(--text-1)">' + escHtml(b.timestamp) + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + b.lsn + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + formatSize(b.size) + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + b.tables + '</td></tr>';
+      });
+      h += '</tbody></table>';
+    }
+    h += '<div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">';
+    h += '<button onclick="doArchiveNow()" style="background:var(--bg-hover);color:var(--text-1);border:1px solid var(--border);border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Archive WAL</button>';
+    h += '<button onclick="doBackupNow()" style="background:var(--accent);color:white;border:none;border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Backup Now</button>';
+    h += '</div></div>';
+    el.innerHTML = h;
+  } catch(e) {}
+}
+function formatSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return Math.round(b/1024) + ' KB';
+  if (b < 1073741824) return Math.round(b/1048576) + ' MB';
+  return (b/1073741824).toFixed(1) + ' GB';
+}
+async function doBackupNow() {
+  try {
+    var r = await fetch('/api/pitr/backup', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadPitrStatus(); } else { alert('Backup failed: ' + (d.message||'')); }
+  } catch(e) { alert('Backup failed'); }
+}
+async function doArchiveNow() {
+  try {
+    var r = await fetch('/api/pitr/archive-now', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadPitrStatus(); } else { alert('Archive failed: ' + (d.message||'')); }
+  } catch(e) { alert('Archive failed'); }
 }
 
 // Phase 177: SSL status loader
@@ -5681,6 +5740,60 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "milansql_table_count " + std::to_string(engine_.tableCount()) + "\n";
         std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics;
         return buildHttpResponse(200, body, "text/plain; version=0.0.4");
+    }
+
+    // Phase 178: PITR API endpoints
+    if (req.path == "/api/pitr/status") {
+        auto segments = milansql::g_pitrManager().listArchiveSegments();
+        auto backups = milansql::g_pitrManager().listBackups();
+        uint64_t totalArchiveSize = 0;
+        for (const auto& s : segments) totalArchiveSize += s.sizeBytes;
+
+        std::string json = "{";
+        json += "\"archive_enabled\":" + std::string(milansql::g_pitrManager().config().archiveEnabled ? "true" : "false");
+        json += ",\"archive_dir\":\"" + milansql::g_pitrManager().config().archiveDir + "\"";
+        json += ",\"retention_days\":" + std::to_string(milansql::g_pitrManager().config().retentionDays);
+        json += ",\"archive_segments\":" + std::to_string(segments.size());
+        json += ",\"archive_size\":" + std::to_string(totalArchiveSize);
+        if (!segments.empty()) {
+            json += ",\"oldest_segment\":\"" + milansql::pitr_epoch_to_str(segments.front().timestamp) + "\"";
+            json += ",\"newest_segment\":\"" + milansql::pitr_epoch_to_str(segments.back().timestamp) + "\"";
+        }
+        json += ",\"backups\":[";
+        for (size_t i = 0; i < backups.size(); ++i) {
+            if (i > 0) json += ",";
+            json += "{\"dir\":\"" + backups[i].backupDir + "\"";
+            json += ",\"timestamp\":\"" + backups[i].timestamp + "\"";
+            json += ",\"lsn\":" + std::to_string(backups[i].startLsn);
+            json += ",\"size\":" + std::to_string(backups[i].sizeBytes);
+            json += ",\"tables\":" + std::to_string(backups[i].tableCount) + "}";
+        }
+        json += "]}";
+        return buildHttpResponse(200, json);
+    }
+
+    if (req.path == "/api/pitr/backup" && req.method == "POST") {
+        // Create a new base backup
+        int64_t now = milansql::pitr_now_epoch();
+        std::string backupDir = milansql::g_pitrManager().config().backupBaseDir +
+                                "/backup_" + std::to_string(now);
+        auto& lsn = milansql::g_lsnManager();
+        std::string msg = milansql::g_pitrManager().createBaseBackup(
+            "database.milan", backupDir,
+            lsn.currentLsn(), MILANSQL_VERSION,
+            static_cast<int>(engine_.tableCount()));
+        bool ok = msg.substr(0, 2) == "OK";
+        return buildHttpResponse(ok ? 200 : 500,
+            "{\"success\":" + std::string(ok ? "true" : "false") +
+            ",\"message\":\"" + msg + "\"}");
+    }
+
+    if (req.path == "/api/pitr/archive-now" && req.method == "POST") {
+        std::string msg = milansql::g_pitrManager().archiveCurrentWal("database.milan.wal");
+        bool ok = msg.substr(0, 2) == "OK";
+        return buildHttpResponse(ok ? 200 : 500,
+            "{\"success\":" + std::string(ok ? "true" : "false") +
+            ",\"message\":\"" + msg + "\"}");
     }
 
     // Phase 177: SSL status API

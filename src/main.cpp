@@ -53,7 +53,18 @@ static void signalHandler(int sig) {
 #include "wal/wal_recovery.hpp"
 
 // Phase 85: WAL Checkpointing (header already in engine.hpp, just for clarity)
-// #include "wal/checkpoint.hpp"  — included transitively via engine.hpp
+// #include "wal/checkpoint.hpp"
+#include "wal/pitr_manager_impl.hpp"
+
+// Set up PITR checkpoint hooks
+namespace { struct PitrHookInit { PitrHookInit() {
+    milansql::pitr_hook::archiveFn = [](const std::string& walFile) {
+        milansql::g_pitrManager().archiveCurrentWal(walFile);
+    };
+    milansql::pitr_hook::cleanupFn = []() {
+        milansql::g_pitrManager().cleanOldArchives();
+    };
+} } _pitrHookInit; }
 
 // Phase 79: Connection String Parser
 #include "utils/connection_string.hpp"

@@ -47,6 +47,7 @@
 #include "types/vector_type.hpp"             // Phase 111: VectorType
 #include "optimizer/join_enumerator.hpp"     // Phase 3: Selinger Join Enumeration
 #include "optimizer/histogram.hpp"           // Phase 113: Histogram Selectivity
+#include "wal/pitr_manager.hpp"              // Phase 178: PITR
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -4758,8 +4759,17 @@ inline bool dispatchCommand(
 
     // ── Phase 57: BACKUP DATABASE ──────────────────────────────
     case milansql::CommandType::BACKUP_DATABASE: {
-        std::string msg = milansql::MilanBackup::dumpDatabase(engine, cmd.backupFile);
-        std::cout << "  " << msg << "\n\n";
+        // Phase 178: If backupFile ends with /, use PITR base backup
+        if (!cmd.backupFile.empty() && cmd.backupFile.back() == '/') {
+            auto& lsn = milansql::g_lsnManager();
+            std::string msg = milansql::g_pitrManager().createBaseBackup(
+                "database.milan", cmd.backupFile,
+                lsn.currentLsn(), "11.0.0", engine.tableCount());
+            std::cout << "  " << msg << "\n\n";
+        } else {
+            std::string msg = milansql::MilanBackup::dumpDatabase(engine, cmd.backupFile);
+            std::cout << "  " << msg << "\n\n";
+        }
         break;
     }
 

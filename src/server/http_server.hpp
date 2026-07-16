@@ -60,11 +60,11 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1694;
+static constexpr int MILANSQL_TEST_COUNT = 1735;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "10.8.0";
+static constexpr const char* MILANSQL_VERSION = "10.9.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -2649,6 +2649,14 @@ body{background:var(--bg-primary);color:var(--text-1);font-family:'Inter',-apple
 .badge.yellow::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--warning)}
 .badge.blue{color:var(--accent)}
 .badge.purple{color:#a78bfa}.badge.purple::before{content:'';width:7px;height:7px;border-radius:50%;background:#7c3aed;box-shadow:0 0 8px rgba(124,58,237,0.6)}
+.ssl-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:12px}
+.ssl-card h3{color:var(--accent);font-size:0.85rem;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.ssl-card .ssl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.ssl-card .ssl-item{font-size:0.75rem;color:var(--text-2)}
+.ssl-card .ssl-item strong{color:var(--text-1);display:block}
+.ssl-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:0.65rem;font-weight:600}
+.ssl-badge.on{background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3)}
+.ssl-badge.off{background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3)}
 .part-badge{display:inline-flex;align-items:center;gap:4px;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.3);border-radius:4px;padding:1px 6px;font-size:0.65rem;color:#a78bfa;font-family:var(--mono);letter-spacing:.02em;margin-left:auto}
 .part-bar{height:6px;border-radius:3px;margin-top:2px;transition:width .3s var(--ease)}
 .part-detail{background:var(--bg-hover);border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px}
@@ -2890,7 +2898,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.8.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.9.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -4165,6 +4173,46 @@ async function loadTestBadge() {
   } catch(e) {}
 }
 
+// Phase 177: SSL status loader
+async function loadSslStatus() {
+  try {
+    var r = await fetch('/api/ssl', {credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('ssl-status-panel');
+    if (!el) return;
+    var h = '<div class="ssl-card"><h3>&#x1F512; SSL/TLS Status ';
+    h += '<span class="ssl-badge ' + (d.enabled && d.ready ? 'on' : 'off') + '">';
+    h += d.enabled && d.ready ? 'ACTIVE' : 'INACTIVE';
+    h += '</span></h3>';
+    h += '<div class="ssl-grid">';
+    h += '<div class="ssl-item"><strong>Mode</strong>' + escHtml(d.mode || 'disabled') + '</div>';
+    h += '<div class="ssl-item"><strong>Backend</strong>' + escHtml(d.backend || 'none') + '</div>';
+    h += '<div class="ssl-item"><strong>Repl Mode</strong>' + escHtml(d.repl_mode || 'disabled') + '</div>';
+    if (d.ready) {
+      h += '<div class="ssl-item"><strong>TLS Version</strong>' + escHtml(d.tls_version || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Cipher</strong>' + escHtml(d.cipher || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Subject</strong>' + escHtml(d.subject || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Issuer</strong>' + escHtml(d.issuer || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Valid Until</strong>' + escHtml(d.not_after || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Serial</strong>' + escHtml(d.serial || 'N/A') + '</div>';
+    }
+    if (d.error) h += '<div class="ssl-item" style="grid-column:1/-1;color:#ef4444"><strong>Error</strong>' + escHtml(d.error) + '</div>';
+    h += '</div>';
+    if (d.enabled && d.ready)
+      h += '<div style="margin-top:8px;text-align:right"><button onclick="reloadSsl()" style="background:var(--accent);color:white;border:none;border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Reload SSL</button></div>';
+    h += '</div>';
+    el.innerHTML = h;
+  } catch(e) {}
+}
+async function reloadSsl() {
+  try {
+    var r = await fetch('/api/ssl/reload', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadSslStatus(); }
+    else { alert('SSL reload failed: ' + (d.error || 'unknown')); }
+  } catch(e) { alert('SSL reload failed'); }
+}
+
 // Init
 updateEditorDecor();
 // Phase 176: Pre-fetch schema data for partition badges
@@ -5416,6 +5464,15 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     // Phase 171: Schema Visualizer API
+    // Phase 177: Reload SSL certificate
+    if (req.path == "/api/ssl/reload" && req.method == "POST") {
+        bool ok = milansql::g_tlsContext().reloadCertificate();
+        std::string json = "{\"success\":" + std::string(ok ? "true" : "false");
+        if (!ok) json += ",\"error\":\"" + milansql::g_tlsContext().lastError() + "\"";
+        json += "}";
+        return buildHttpResponse(ok ? 200 : 500, json);
+    }
+
     if (req.path == "/api/schema") {
         auto ctx = extractUserContext(req);
         if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
@@ -5624,6 +5681,49 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "milansql_table_count " + std::to_string(engine_.tableCount()) + "\n";
         std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics;
         return buildHttpResponse(200, body, "text/plain; version=0.0.4");
+    }
+
+    // Phase 177: SSL status API
+    if (req.path == "/api/ssl") {
+        auto je = [](const std::string& s) -> std::string {
+            std::string r;
+            for (char c : s) {
+                if (c == '"') r += "\\\"";
+                else if (c == '\\') r += "\\\\";
+                else r += c;
+            }
+            return r;
+        };
+        const auto& cfg = milansql::g_sslConfig();
+        std::string json = "{";
+        json += "\"enabled\":" + std::string(cfg.enabled.load() ? "true" : "false");
+        json += ",\"mode\":\"" + cfg.modeStr() + "\"";
+        json += ",\"repl_mode\":\"" + cfg.replModeStr() + "\"";
+        json += ",\"ready\":" + std::string(milansql::g_tlsContext().isReady() ? "true" : "false");
+        json += ",\"cert\":\"" + je(cfg.certPath) + "\"";
+        json += ",\"key\":\"" + je(cfg.keyPath) + "\"";
+        json += ",\"ca\":\"" + je(cfg.caPath) + "\"";
+#if defined(_WIN32)
+        json += ",\"backend\":\"SChannel\"";
+#elif defined(HAVE_OPENSSL) && HAVE_OPENSSL
+        json += ",\"backend\":\"OpenSSL\"";
+#else
+        json += ",\"backend\":\"none\"";
+#endif
+        if (milansql::g_tlsContext().isReady()) {
+            auto ci = milansql::g_tlsContext().getCertInfo();
+            json += ",\"subject\":\"" + je(ci.subject) + "\"";
+            json += ",\"issuer\":\"" + je(ci.issuer) + "\"";
+            json += ",\"not_before\":\"" + je(ci.notBefore) + "\"";
+            json += ",\"not_after\":\"" + je(ci.notAfter) + "\"";
+            json += ",\"serial\":\"" + je(ci.serial) + "\"";
+            json += ",\"tls_version\":\"" + je(ci.tlsVersion) + "\"";
+            json += ",\"cipher\":\"" + je(ci.cipher) + "\"";
+        }
+        if (!milansql::g_tlsContext().lastError().empty())
+            json += ",\"error\":\"" + je(milansql::g_tlsContext().lastError()) + "\"";
+        json += "}";
+        return buildHttpResponse(200, json);
     }
 
     if (req.path == "/health") {

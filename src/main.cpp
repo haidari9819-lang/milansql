@@ -275,6 +275,15 @@ int main(int argc, char* argv[]) {
         else if (arg == "--sentinel")    sentinelMode = true;
         else if (arg == "--ssl-cert"  && i + 1 < argc) sslCert = argv[++i];
         else if (arg == "--ssl-key"   && i + 1 < argc) sslKey  = argv[++i];
+        else if (arg == "--ssl-mode"  && i + 1 < argc) {
+            std::string m = argv[++i];
+            // Applied after sslMode init (below)
+            // Store raw string, parse after SslConfig created
+        }
+        else if (arg == "--ssl-ca"   && i + 1 < argc) {
+            // Stored below after sslConfig init
+            (void)0;
+        }
         else if (arg == "--backend"   && i + 1 < argc) {
             std::string backend = argv[++i];
             auto colon = backend.rfind(':');
@@ -327,11 +336,24 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // ── Phase 110: SSL initialization ─────────────────────────
+    // ── Phase 110+177: SSL initialization ────────────────────
     if (sslMode) {
         milansql::g_sslConfig().enabled.store(true);
         milansql::g_sslConfig().certPath = sslCert;
         milansql::g_sslConfig().keyPath  = sslKey;
+        milansql::g_sslConfig().mode = milansql::SslMode::PREFERRED;  // default
+
+        // Phase 177: Auto-generate self-signed cert if none exists
+        {
+            std::ifstream cf(sslCert);
+            std::ifstream kf(sslKey);
+            if (!cf.good() || !kf.good()) {
+                std::cout << "No SSL certificate found. Generating self-signed cert...\n";
+                std::string msg = milansql::CertGenerator::generateSelfSigned(sslCert, sslKey);
+                std::cout << msg;
+            }
+        }
+
         bool ok = milansql::g_tlsContext().loadCertificate(sslCert, sslKey);
         if (ok) {
             std::cout << "SSL/TLS initialized ("

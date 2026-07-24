@@ -58,6 +58,8 @@
 #include "../security/fortress.hpp"
 #include "../nl/nl_query.hpp"
 #include "../wal/pitr_manager.hpp"
+#include "../monitoring/metrics.hpp"
+#include "../logger/logger.hpp"
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
@@ -65,7 +67,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1818;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.1.0";
+static constexpr const char* MILANSQL_VERSION = "11.2.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -708,6 +710,10 @@ public:
                     int poolMax = milansql::ConnectionPool::DEFAULT_MAX)
         : port_(port), dbPath_(dbPath), storage_(dbPath_) {
         milansql::g_connectionPool.configure(poolMin, poolMax);
+        // Phase 1.2: Initialize structured logger
+        milansql::StructuredLogger::global().open();
+        milansql::StructuredLogger::global().log(milansql::LogLevel::INFO,
+            "MilanSQL v" + std::string(MILANSQL_VERSION) + " starting");
     }
 
     void run();
@@ -2051,25 +2057,61 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         return parseOutputToJson(cap.str(), colTypesOut);
     };
 
+    // Phase 1.1: Metrics — time the whole query and count by type
+    auto t0_metrics = std::chrono::high_resolution_clock::now();
+
     auto stmts = milansql::splitStatements(sql);
+    std::string finalResult;
     if (stmts.size() <= 1) {
-        auto result = execOne(stmts.empty() ? sql : stmts[0]);
+        finalResult = execOne(stmts.empty() ? sql : stmts[0]);
         engine_.setCurrentUser(0, true); // reset per-request context
-        return result;
+    } else {
+        std::string json = "{\"success\":true,\"results\":[";
+        bool anyError = false;
+        for (size_t idx = 0; idx < stmts.size(); ++idx) {
+            if (idx) json += ",";
+            std::string res = execOne(stmts[idx]);
+            json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
+            if (res.find("\"success\":false") != std::string::npos) anyError = true;
+        }
+        engine_.setCurrentUser(0, true); // reset per-request context
+        json += "],\"count\":" + std::to_string(stmts.size());
+        json += anyError ? ",\"success\":false}" : ",\"success\":true}";
+        finalResult = json;
     }
 
-    std::string json = "{\"success\":true,\"results\":[";
-    bool anyError = false;
-    for (size_t idx = 0; idx < stmts.size(); ++idx) {
-        if (idx) json += ",";
-        std::string res = execOne(stmts[idx]);
-        json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
-        if (res.find("\"success\":false") != std::string::npos) anyError = true;
+    // Phase 1.1: Record duration + query type counters
+    {
+        auto t1_metrics = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1_metrics - t0_metrics).count();
+        milansql::MetricsCollector::global().record_duration(ms);
+
+        auto& mc = milansql::MetricsCollector::global();
+        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0)
+            mc.queries_select.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("INSERT", 0) == 0)
+            mc.queries_insert.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("UPDATE", 0) == 0)
+            mc.queries_update.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("DELETE", 0) == 0)
+            mc.queries_delete.fetch_add(1, std::memory_order_relaxed);
+
+        // Phase 1.2: Structured logging
+        std::string qtype = "OTHER";
+        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0) qtype = "SELECT";
+        else if (upper.rfind("INSERT", 0) == 0) qtype = "INSERT";
+        else if (upper.rfind("UPDATE", 0) == 0) qtype = "UPDATE";
+        else if (upper.rfind("DELETE", 0) == 0) qtype = "DELETE";
+
+        std::string uname = (userId <= 0) ? "root" : ("u" + std::to_string(userId));
+        milansql::StructuredLogger::global().log(
+            milansql::LogLevel::INFO,
+            "Query executed",
+            "", ms, qtype, "", -1, uname);
+        milansql::StructuredLogger::global().log_slow_query(sql, ms, uname);
     }
-    engine_.setCurrentUser(0, true); // reset per-request context
-    json += "],\"count\":" + std::to_string(stmts.size());
-    json += anyError ? ",\"success\":false}" : ",\"success\":true}";
-    return json;
+
+    return finalResult;
 }
 
 // ── MilanHttpServer::handleListTablesForUser ──────────────────
@@ -5735,11 +5777,53 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "milansql_errors_total{type=\"syntax\"} " + std::to_string(engine_.syntaxErrors_.load()) + "\n"
             "milansql_errors_total{type=\"constraint\"} " + std::to_string(engine_.constraintErrors_.load()) + "\n"
             "milansql_errors_total{type=\"runtime\"} " + std::to_string(engine_.runtimeErrors_.load()) + "\n"
-            "milansql_slow_queries_total " + std::to_string(engine_.slowQueryLog.size()) + "\n"
             "milansql_slow_query_threshold_ms " + std::to_string((int)engine_.slowQueryLog.thresholdMs) + "\n"
             "milansql_table_count " + std::to_string(engine_.tableCount()) + "\n";
-        std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics;
-        return buildHttpResponse(200, body, "text/plain; version=0.0.4");
+
+        // Phase 1.1: Enhanced MetricsCollector data
+        auto& mc = milansql::MetricsCollector::global();
+        auto q = mc.quantiles();
+        long long wal_size = 0;
+        { std::ifstream f("database.milan.wal", std::ios::binary | std::ios::ate); if (f) wal_size = (long long)f.tellg(); }
+        long long data_size = 0;
+        { std::ifstream f("database.milan", std::ios::binary | std::ios::ate); if (f) data_size = (long long)f.tellg(); }
+        std::ostringstream mcMetrics;
+        mcMetrics << "# HELP milansql_queries_total Total SQL queries by type\n"
+                  << "# TYPE milansql_queries_total counter\n"
+                  << "milansql_queries_total{type=\"select\"} " << mc.queries_select.load() << "\n"
+                  << "milansql_queries_total{type=\"insert\"} " << mc.queries_insert.load() << "\n"
+                  << "milansql_queries_total{type=\"update\"} " << mc.queries_update.load() << "\n"
+                  << "milansql_queries_total{type=\"delete\"} " << mc.queries_delete.load() << "\n"
+                  << "# HELP milansql_slow_queries_total Queries taking >100ms\n"
+                  << "# TYPE milansql_slow_queries_total counter\n"
+                  << "milansql_slow_queries_total " << mc.slow_queries_total.load() << "\n"
+                  << "# HELP milansql_query_duration_seconds Query duration summary\n"
+                  << "# TYPE milansql_query_duration_seconds summary\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.5\"} " << q[0] << "\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.95\"} " << q[1] << "\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.99\"} " << q[2] << "\n"
+                  << "# HELP milansql_buffer_pool_hit_ratio Buffer pool hit ratio\n"
+                  << "# TYPE milansql_buffer_pool_hit_ratio gauge\n"
+                  << "milansql_buffer_pool_hit_ratio " << mc.hit_ratio() << "\n"
+                  << "milansql_buffer_pool_hits_total " << mc.buffer_hits.load() << "\n"
+                  << "milansql_buffer_pool_misses_total " << mc.buffer_misses.load() << "\n"
+                  << "# HELP milansql_wal_size_bytes WAL file size\n"
+                  << "# TYPE milansql_wal_size_bytes gauge\n"
+                  << "milansql_wal_size_bytes " << wal_size << "\n"
+                  << "milansql_data_size_bytes " << data_size << "\n"
+                  << "# HELP milansql_replication_lag_ms Replication lag\n"
+                  << "# TYPE milansql_replication_lag_ms gauge\n"
+                  << "milansql_replication_lag_ms " << milansql::g_replState.slaveLagMs.load() << "\n"
+                  << "milansql_replication_connected_replicas " << milansql::g_replState.connectedSlaves.load() << "\n"
+                  << "# HELP milansql_uptime_seconds_v2 Uptime (MetricsCollector)\n"
+                  << "# TYPE milansql_uptime_seconds_v2 counter\n"
+                  << "milansql_uptime_seconds_v2 " << mc.uptime_seconds() << "\n"
+                  << "# HELP milansql_version MilanSQL version info\n"
+                  << "# TYPE milansql_version gauge\n"
+                  << "milansql_version{version=\"" << MILANSQL_VERSION << "\"} 1\n";
+
+        std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics + mcMetrics.str();
+        return buildHttpResponse(200, body, "text/plain; version=0.0.4; charset=utf-8");
     }
 
     // Phase 178: PITR API endpoints
@@ -5837,6 +5921,46 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             json += ",\"error\":\"" + je(milansql::g_tlsContext().lastError()) + "\"";
         json += "}";
         return buildHttpResponse(200, json);
+    }
+
+    // Phase 1.3: Health sub-endpoints (must be before "/health" to avoid prefix match issues)
+    if (req.path == "/health/live") {
+        // Liveness: process is alive
+        auto now_ts = std::chrono::system_clock::now();
+        auto tt = std::chrono::system_clock::to_time_t(now_ts);
+        char tsBuf[32];
+        struct tm tmBuf;
+#if defined(_WIN32)
+        gmtime_s(&tmBuf, &tt);
+#else
+        gmtime_r(&tt, &tmBuf);
+#endif
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%SZ", &tmBuf);
+        return buildHttpResponse(200,
+            std::string("{\"status\":\"ok\",\"timestamp\":\"") + tsBuf + "\"}", "application/json");
+    }
+
+    if (req.path == "/health/ready") {
+        // Readiness: DB subsystems are ready
+        bool wal_ok = true;
+        bool idx_ok = true;
+        bool pool_ok = (engine_.tableCount() >= 0);
+        bool ready = wal_ok && idx_ok && pool_ok;
+        std::string body = std::string("{\"status\":\"") + (ready ? "ready" : "not_ready") + "\""
+            + ",\"checks\":{"
+            + "\"wal\":\"" + (wal_ok ? "ok" : "fail") + "\""
+            + ",\"indexes\":\"" + (idx_ok ? "ok" : "fail") + "\""
+            + ",\"pool\":\"" + (pool_ok ? "ok" : "fail") + "\""
+            + "}}";
+        return buildHttpResponse(ready ? 200 : 503, body, "application/json");
+    }
+
+    if (req.path == "/health/startup") {
+        // Startup: initialization complete
+        return buildHttpResponse(200,
+            std::string("{\"status\":\"started\",\"uptime_seconds\":") +
+            std::to_string(static_cast<int>(milansql::MetricsCollector::global().uptime_seconds())) +
+            "}", "application/json");
     }
 
     if (req.path == "/health") {

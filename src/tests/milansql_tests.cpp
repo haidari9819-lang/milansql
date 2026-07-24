@@ -44,6 +44,10 @@
 // Audit Phase 174: WAL crash recovery tests
 #include "wal/wal_recovery.hpp"
 
+// Phase 1.1 / 1.2: Metrics + Logger
+#include "monitoring/metrics.hpp"
+#include "logger/logger.hpp"
+
 // Phase 154-156: Auth system
 #include "auth/auth_manager.hpp"
 #include "auth/rate_limiter.hpp"
@@ -12926,6 +12930,45 @@ static void testGroup112() {
     std::cout << "  testGroup112 passed (" << ok << " checks).\n";
 }
 
+// ── testGroup113: Phase 1.1 MetricsCollector + Phase 1.2 Logger ──────────────
+
+static void testGroup113() {
+    std::cout << "\n-- testGroup113: Phase 1.1 MetricsCollector + Phase 1.2 Logger --\n";
+
+    // Phase 1.1: Metrics Collector
+    auto& m = milansql::MetricsCollector::global();
+    uint64_t sel_before = m.queries_select.load();
+    uint64_t ins_before = m.queries_insert.load();
+    m.queries_select.fetch_add(5);
+    m.queries_insert.fetch_add(3);
+    m.record_duration(50.0);   // <100ms, nicht slow
+    m.record_duration(200.0);  // >100ms, slow
+
+    check(m.queries_select.load() >= sel_before + 5, "Metrics-1: select counter incremented");
+    check(m.queries_insert.load() >= ins_before + 3, "Metrics-2: insert counter incremented");
+    check(m.slow_queries_total.load() >= 1, "Metrics-3: slow query detected (>100ms)");
+
+    auto q = m.quantiles();
+    check(q[0] >= 0.0, "Metrics-4: p50 >= 0");
+    check(q[2] >= q[0], "Metrics-5: p99 >= p50");
+    check(m.uptime_seconds() >= 0.0, "Metrics-6: uptime >= 0");
+    check(m.hit_ratio() >= 0.0 && m.hit_ratio() <= 1.0, "Metrics-7: hit_ratio in [0,1]");
+
+    // Phase 1.2: Logger (compile + no-crash test)
+    auto& lg = milansql::StructuredLogger::global();
+    lg.log(milansql::LogLevel::INFO, "Test log entry", "corr_test", 5.0, "SELECT", "t", 3, "root");
+    lg.log(milansql::LogLevel::WARN, "Test warn", "", 150.0, "UPDATE", "u", 1, "root");
+    lg.log_slow_query("SELECT * FROM big_table", 250.0, "root", "SeqScan");
+    check(true, "Logger-1: no crash on log()");
+    check(true, "Logger-2: no crash on log_slow_query()");
+
+    // Phase 1.3: MetricsCollector singleton consistency
+    auto& m2 = milansql::MetricsCollector::global();
+    check(&m == &m2, "Metrics-8: global() returns same singleton");
+
+    std::cout << "  testGroup113 passed.\n";
+}
+
 // MAIN
 // ============================================================
 
@@ -13252,6 +13295,9 @@ int main() {
     }
     try { testGroup112(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 112 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup113(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 113 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

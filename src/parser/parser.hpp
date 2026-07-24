@@ -92,6 +92,9 @@ enum class CommandType {
     SHOW_BINLOG,
     STOP_SLAVE,
     START_SLAVE,
+    // v11.1.0: WAL archive and replication status
+    SHOW_WAL_ARCHIVE_STATUS,
+    SHOW_REPLICATION_STATUS,
     // Phase 60: CSV Import/Export
     LOAD_DATA,
     INTO_OUTFILE,
@@ -3057,6 +3060,14 @@ public:
             } else if (kw1 == "PREPARED" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "TRANSACTIONS") {
                 cmd.type = CommandType::SHOW_PREPARED_TRANSACTIONS;
+            // v11.1.0: SHOW WAL ARCHIVE STATUS
+            } else if (kw1 == "WAL" && tokens.size() >= 4 &&
+                       toUpper(tokens[2]) == "ARCHIVE" && toUpper(tokens[3]) == "STATUS") {
+                cmd.type = CommandType::SHOW_WAL_ARCHIVE_STATUS;
+            // v11.1.0: SHOW REPLICATION STATUS
+            } else if (kw1 == "REPLICATION" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_REPLICATION_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -5454,11 +5465,18 @@ private:
             cmd.type = CommandType::UNKNOWN;
 
         } else if (op == "ADD" && kw4 == "COLUMN" && tokens.size() >= 6) {
-            cmd.alterOp      = "ADD";
-            cmd.alterColName = tokens[5];
-            cmd.alterColType = tokens.size() >= 7 ? toUpper(tokens[6]) : "TEXT";
+            cmd.alterOp = "ADD";
+            // v11.1.0: support ALTER TABLE t ADD COLUMN IF NOT EXISTS col TYPE
+            size_t nameIdx = 5;
+            if (tokens.size() >= 9 && toUpper(tokens[5]) == "IF" &&
+                toUpper(tokens[6]) == "NOT" && toUpper(tokens[7]) == "EXISTS") {
+                nameIdx = 8;
+                cmd.ifNotExists = true;
+            }
+            cmd.alterColName = tokens[nameIdx];
+            cmd.alterColType = (nameIdx + 1 < tokens.size()) ? toUpper(tokens[nameIdx + 1]) : "TEXT";
             // Phase 146: Parse optional DEFAULT value
-            for (size_t di = 7; di + 1 < tokens.size(); ++di) {
+            for (size_t di = nameIdx + 2; di + 1 < tokens.size(); ++di) {
                 if (toUpper(tokens[di]) == "DEFAULT") {
                     cmd.alterColDefault = tokens[di + 1];
                     if (cmd.alterColDefault.size() >= 2 &&

@@ -1095,6 +1095,17 @@ static inline milansql::Table dispatch_executeSelectToTable(
             result = result.project(cmd.selectColumns);
     }
     if (cmd.isDistinct) result.makeDistinct();
+    // v11.1.0 Bug Fix: Apply LIMIT inside dispatch_executeSelectToTable so CTE inner
+    // queries (WITH x AS (SELECT ... LIMIT N)) correctly restrict their result sets.
+    if (cmd.limit >= 0) {
+        milansql::Table lim(result.name(), result.columns());
+        size_t off = (cmd.limitOffset > 0) ? static_cast<size_t>(cmd.limitOffset) : 0;
+        size_t cnt = 0;
+        const auto& allRows = result.rows();
+        for (size_t ri = off; ri < allRows.size() && (int)cnt < cmd.limit; ++ri, ++cnt)
+            lim.insert(allRows[ri]);
+        return lim;
+    }
     return result;
 }
 
@@ -4103,6 +4114,15 @@ inline bool dispatchCommand(
             std::cout << "  RLS disabled on " << cmd.tableName << ".\n\n";
             persistFn();  // Phase 173: persist RLS state
             break;
+        }
+        // v11.1.0: IF NOT EXISTS for ADD COLUMN — skip silently if column exists
+        if (cmd.alterOp == "ADD" && cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+            auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+            if (it != engine.getTables().end() && it->second.colOf(cmd.alterColName) >= 0) {
+                std::cout << "  Spalte '" << cmd.alterColName
+                          << "' existiert bereits (IF NOT EXISTS).\n\n";
+                break;
+            }
         }
         engine.alterTable(cmd.tableName, cmd.alterOp,
                           cmd.alterColName, cmd.alterColType,

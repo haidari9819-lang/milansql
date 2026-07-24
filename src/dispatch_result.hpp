@@ -12,6 +12,7 @@
 #include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 #include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
 #include "nl/nl_query.hpp"              // Block 7: Natural Language SQL
+#include "replication/repl_state.hpp"   // v11.1.0: SHOW WAL ARCHIVE / REPLICATION STATUS
 
 namespace milansql {
 
@@ -413,6 +414,39 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         qr.rows.push_back(milansql::Row({"Monitored Nodes", std::to_string(engine.sentinel.nodeCount())}));
         qr.rows.push_back(milansql::Row({"Current Master",
             engine.sentinel.currentMasterHost + ":" + std::to_string(engine.sentinel.currentMasterPort)}));
+        break;
+    }
+
+    // ── v11.1.0: SHOW WAL ARCHIVE STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_WAL_ARCHIVE_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        // Check if WAL archive file exists and its size
+        bool archiveExists = false;
+        long long archiveSize = 0;
+        {
+            std::ifstream af("database.wal.archive", std::ios::binary | std::ios::ate);
+            if (af) { archiveExists = true; archiveSize = af.tellg(); }
+        }
+        qr.rows.push_back(milansql::Row({"Archive Mode", "ON"}));
+        qr.rows.push_back(milansql::Row({"Archive File", "database.wal.archive"}));
+        qr.rows.push_back(milansql::Row({"Archive File Size", std::to_string(archiveSize) + " bytes"}));
+        qr.rows.push_back(milansql::Row({"Archive Status", archiveExists ? "OK" : "EMPTY"}));
+        qr.rows.push_back(milansql::Row({"WAL File", "database.milan.wal"}));
+        qr.rows.push_back(milansql::Row({"Binlog Position", std::to_string(milansql::g_replState.slavePos.load())}));
+        break;
+    }
+
+    // ── v11.1.0: SHOW REPLICATION STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_REPLICATION_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        bool isMaster = milansql::g_replState.isMaster.load();
+        bool isSlave  = milansql::g_replState.isSlave.load();
+        qr.rows.push_back(milansql::Row({"Role", isMaster ? "PRIMARY" : (isSlave ? "REPLICA" : "STANDALONE")}));
+        qr.rows.push_back(milansql::Row({"Replication Active", (isMaster || isSlave) ? "YES" : "NO"}));
+        qr.rows.push_back(milansql::Row({"Connected Replicas", std::to_string(milansql::g_replState.connectedSlaves.load())}));
+        qr.rows.push_back(milansql::Row({"Replication Lag (ms)", std::to_string(milansql::g_replState.slaveLagMs.load())}));
+        qr.rows.push_back(milansql::Row({"Slave Running", milansql::g_replState.slaveRunning.load() ? "YES" : "NO"}));
+        qr.rows.push_back(milansql::Row({"Binlog Position", std::to_string(milansql::g_replState.slavePos.load())}));
         break;
     }
 
@@ -854,6 +888,14 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             if (cmd.isJoin) {
                 milansql::Table tbl = engine.executeJoins(cmd.tableName, cmd.joinClauses,
                                                           cmd.whereConds, cmd.whereLogic);
+                // v11.1.0 Bug Fix: COUNT(*) over JOIN — count rows in joined result, not source table
+                if (cmd.isCount) {
+                    size_t cnt = 0;
+                    for (const auto& r : tbl.rows()) if (r.xmax == 0) ++cnt;
+                    qr.columns = {milansql::Column{"COUNT(*)", "INT"}};
+                    qr.rows.push_back(milansql::Row({std::to_string(cnt)}));
+                    break;
+                }
                 // Phase 167: JOIN + GROUP BY
                 if (cmd.isGroupBy) {
                     std::string tmpName = "__join_grp_tmp";
@@ -1185,6 +1227,14 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     // ── Phase 146: Online DDL ──────────────────────────────────────
     case milansql::CommandType::ALTER_TABLE:
         try {
+            // v11.1.0: IF NOT EXISTS for ADD COLUMN — skip silently if column exists
+            if (cmd.alterOp == "ADD" && cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+                auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+                if (it != engine.getTables().end() && it->second.colOf(cmd.alterColName) >= 0) {
+                    qr.message = "ALTER TABLE (column already exists, IF NOT EXISTS)";
+                    break;
+                }
+            }
             engine.alterTable(cmd.tableName, cmd.alterOp, cmd.alterColName,
                               cmd.alterColType, cmd.alterColNew, cmd.alterColDefault);
         } catch (const std::exception& e) { qr.error = e.what(); }
@@ -1350,8 +1400,13 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         std::string tblTarget = !cmd.statsTable.empty() ? cmd.statsTable : cmd.tableName;
         if (!tblTarget.empty() && tblTarget != "*") {
             if (engine.tableExists(tblTarget)) {
-                const milansql::Table& tbl =
-                    engine.getTables().at(engine.resolveTableName(tblTarget));
+                // v11.1.0 Bug Fix: use find() instead of at() to avoid map::at exception
+                auto it = engine.getTables().find(engine.resolveTableName(tblTarget));
+                if (it == engine.getTables().end()) {
+                    qr.error = "Table not found: " + tblTarget;
+                    break;
+                }
+                const milansql::Table& tbl = it->second;
                 milansql::g_tableStats.analyzeTable(tblTarget, tbl);
                 milansql::g_tableStats.saveStats();
                 milansql::g_joinEnumerator().invalidate(tblTarget);  // Phase 3: Stats geaendert

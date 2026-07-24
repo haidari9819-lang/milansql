@@ -5826,7 +5826,10 @@ inline bool dispatchCommand(
             g_adaptiveStats.analyzeTable(cmd.tableName);
             milansql::g_joinEnumerator().invalidate(cmd.tableName);  // Phase 113
             if (engine.tableExists(cmd.tableName)) {
-                const Table& tbl = engine.getTables().at(cmd.tableName);
+                // v11.1.0 Bug Fix: use find() + resolveTableName() instead of .at()
+                auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+                if (it == engine.getTables().end()) break;
+                const Table& tbl = it->second;
                 g_tableStats.analyzeTable(cmd.tableName, tbl);
                 g_tableStats.saveStats();
                 std::cout << "  ANALYZE TABLE '" << cmd.tableName
@@ -7158,6 +7161,38 @@ inline bool dispatchCommand(
         std::cout << "  Monitored Nodes: " << engine.sentinel.nodeCount() << "\n";
         std::cout << "  Current Master: " << engine.sentinel.currentMasterHost
                   << ":" << engine.sentinel.currentMasterPort << "\n\n";
+        break;
+    }
+
+    // ── v11.1.0: SHOW WAL ARCHIVE STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_WAL_ARCHIVE_STATUS: {
+        bool archiveExists = false;
+        long long archiveSize = 0;
+        {
+            std::ifstream af("database.wal.archive", std::ios::binary | std::ios::ate);
+            if (af) { archiveExists = true; archiveSize = af.tellg(); }
+        }
+        std::cout << "\n  WAL Archive Status:\n";
+        std::cout << "  Archive Mode        | ON\n";
+        std::cout << "  Archive File        | database.wal.archive\n";
+        std::cout << "  Archive File Size   | " << archiveSize << " bytes\n";
+        std::cout << "  Archive Status      | " << (archiveExists ? "OK" : "EMPTY") << "\n";
+        std::cout << "  WAL File            | database.milan.wal\n";
+        std::cout << "  Binlog Position     | " << milansql::g_replState.slavePos.load() << "\n\n";
+        break;
+    }
+
+    // ── v11.1.0: SHOW REPLICATION STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_REPLICATION_STATUS: {
+        bool isMaster = milansql::g_replState.isMaster.load();
+        bool isSlave  = milansql::g_replState.isSlave.load();
+        std::cout << "\n  Replication Status:\n";
+        std::cout << "  Role                | " << (isMaster ? "PRIMARY" : (isSlave ? "REPLICA" : "STANDALONE")) << "\n";
+        std::cout << "  Replication Active  | " << ((isMaster || isSlave) ? "YES" : "NO") << "\n";
+        std::cout << "  Connected Replicas  | " << milansql::g_replState.connectedSlaves.load() << "\n";
+        std::cout << "  Replication Lag(ms) | " << milansql::g_replState.slaveLagMs.load() << "\n";
+        std::cout << "  Slave Running       | " << (milansql::g_replState.slaveRunning.load() ? "YES" : "NO") << "\n";
+        std::cout << "  Binlog Position     | " << milansql::g_replState.slavePos.load() << "\n\n";
         break;
     }
 

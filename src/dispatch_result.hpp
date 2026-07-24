@@ -11,6 +11,8 @@
 #include "optimizer/cost_model.hpp"   // Optimizer Phase 2: Cost Model
 #include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 #include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
+#include "nl/nl_query.hpp"              // Block 7: Natural Language SQL
+#include "replication/repl_state.hpp"   // v11.1.0: SHOW WAL ARCHIVE / REPLICATION STATUS
 
 namespace milansql {
 
@@ -174,6 +176,15 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         else if (cmd.varName == "AUDIT_LOG_FILE") {
             engine.auditLogger.setLogFile(cmd.varValue);
         }
+        else if (cmd.varName == "AUDIT_LEVEL") {
+            engine.auditLogger.setLevel(milansql::auditLevelFromString(cmd.varValue));
+        }
+        else if (cmd.varName == "AUDIT_ANONYMIZE") {
+            engine.auditLogger.setAnonymize(cmd.varValue == "ON" || cmd.varValue == "1");
+        }
+        else if (cmd.varName == "AUDIT_ROTATION") {
+            engine.auditLogger.setRotation(cmd.varValue == "ON" || cmd.varValue == "1");
+        }
         else if (cmd.varName == "ALLOW_HOST") {
             engine.accessControl.addAllowHost(cmd.varValue);
         }
@@ -217,6 +228,19 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         }
         else if (cmd.varName == "AUTO_ANALYZE_THRESHOLD") {
             try { milansql::g_autoAnalyze().threshold = std::stod(cmd.varValue); } catch (...) {}
+            qr.message = "SET";
+        }
+        // Block 7: NL Query configuration
+        else if (cmd.varName == "NL_API_KEY") {
+            milansql::nl::g_nlConfig().setApiKey(cmd.varValue);
+            qr.message = "SET";
+        }
+        else if (cmd.varName == "NL_MODEL") {
+            milansql::nl::g_nlConfig().setModel(cmd.varValue);
+            qr.message = "SET";
+        }
+        else if (cmd.varName == "NL_PROVIDER") {
+            milansql::nl::g_nlConfig().setProvider(cmd.varValue);
             qr.message = "SET";
         }
         if (qr.message.empty()) qr.message = "SET";
@@ -393,6 +417,39 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── v11.1.0: SHOW WAL ARCHIVE STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_WAL_ARCHIVE_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        // Check if WAL archive file exists and its size
+        bool archiveExists = false;
+        long long archiveSize = 0;
+        {
+            std::ifstream af("database.wal.archive", std::ios::binary | std::ios::ate);
+            if (af) { archiveExists = true; archiveSize = af.tellg(); }
+        }
+        qr.rows.push_back(milansql::Row({"Archive Mode", "ON"}));
+        qr.rows.push_back(milansql::Row({"Archive File", "database.wal.archive"}));
+        qr.rows.push_back(milansql::Row({"Archive File Size", std::to_string(archiveSize) + " bytes"}));
+        qr.rows.push_back(milansql::Row({"Archive Status", archiveExists ? "OK" : "EMPTY"}));
+        qr.rows.push_back(milansql::Row({"WAL File", "database.milan.wal"}));
+        qr.rows.push_back(milansql::Row({"Binlog Position", std::to_string(milansql::g_replState.slavePos.load())}));
+        break;
+    }
+
+    // ── v11.1.0: SHOW REPLICATION STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_REPLICATION_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        bool isMaster = milansql::g_replState.isMaster.load();
+        bool isSlave  = milansql::g_replState.isSlave.load();
+        qr.rows.push_back(milansql::Row({"Role", isMaster ? "PRIMARY" : (isSlave ? "REPLICA" : "STANDALONE")}));
+        qr.rows.push_back(milansql::Row({"Replication Active", (isMaster || isSlave) ? "YES" : "NO"}));
+        qr.rows.push_back(milansql::Row({"Connected Replicas", std::to_string(milansql::g_replState.connectedSlaves.load())}));
+        qr.rows.push_back(milansql::Row({"Replication Lag (ms)", std::to_string(milansql::g_replState.slaveLagMs.load())}));
+        qr.rows.push_back(milansql::Row({"Slave Running", milansql::g_replState.slaveRunning.load() ? "YES" : "NO"}));
+        qr.rows.push_back(milansql::Row({"Binlog Position", std::to_string(milansql::g_replState.slavePos.load())}));
+        break;
+    }
+
     // ── Phase 129: SHOW DSN ────────────────────────────────────
     case milansql::CommandType::SHOW_DSN: {
         qr.columns = {milansql::Column{"Parameter","TEXT"}, milansql::Column{"Value","TEXT"}};
@@ -464,10 +521,76 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     case milansql::CommandType::CREATE_TABLE:
         try {
             if (cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
-                // Silently succeed — table already exists
                 break;
             }
             engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+            // Auto-create BTREE index for PRIMARY KEY column
+            for (const auto& col : cmd.columns) {
+                if (col.isPrimaryKey) {
+                    try { engine.createIndex(cmd.tableName, {col.name}, "PRIMARY"); } catch (...) {}
+                    break;
+                }
+            }
+            // Phase 176: Physical partitioning setup
+            if (!cmd.partitionType.empty()) {
+                milansql::PartitionInfo pi;
+                pi.column = cmd.partitionColumn;
+                if (cmd.partitionType == "RANGE") {
+                    pi.type = milansql::PartitionType::RANGE;
+                    for (auto& r : cmd.partitionRanges) {
+                        milansql::PartitionRangeDef rd;
+                        rd.name = r.name;
+                        rd.fromStr = r.fromStr;
+                        rd.limitStr = r.limitStr;
+                        if (!r.fromStr.empty()) {
+                            try { rd.fromVal = std::stoll(r.fromStr); } catch (...) { rd.fromVal = 0; }
+                        }
+                        if (r.limitStr == "MAXVALUE")
+                            rd.limit = std::numeric_limits<long long>::max();
+                        else { try { rd.limit = std::stoll(r.limitStr); } catch (...) { rd.limit = 0; } }
+                        pi.ranges.push_back(rd);
+                    }
+                } else if (cmd.partitionType == "LIST") {
+                    pi.type = milansql::PartitionType::LIST;
+                    for (auto& l : cmd.partitionLists) {
+                        milansql::PartitionListDef ld;
+                        ld.name = l.name;
+                        ld.values = l.values;
+                        pi.lists.push_back(ld);
+                    }
+                } else if (cmd.partitionType == "HASH") {
+                    pi.type = milansql::PartitionType::HASH;
+                    pi.hashCount = cmd.partitionHashCount;
+                }
+                // Store metadata on Table object
+                try { engine.setTablePartitionInfo(cmd.tableName, pi); } catch (...) {}
+                // Create physical partitions
+                pi.physical = true;
+                if (pi.type == milansql::PartitionType::HASH && pi.hashCount > 0) {
+                    for (int i = 0; i < pi.hashCount; ++i) {
+                        std::string childName = cmd.tableName + "_p" + std::to_string(i);
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                if (pi.type == milansql::PartitionType::RANGE) {
+                    for (const auto& rd : pi.ranges) {
+                        if (rd.name.empty()) continue;
+                        std::string childName = cmd.tableName + "_" + rd.name;
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                if (pi.type == milansql::PartitionType::LIST) {
+                    for (const auto& ld : pi.lists) {
+                        if (ld.name.empty()) continue;
+                        std::string childName = cmd.tableName + "_" + ld.name;
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                engine.setPartitionMeta(cmd.tableName, pi);
+            }
         } catch (const std::exception& e) {
             qr.error = e.what();
         }
@@ -765,6 +888,14 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             if (cmd.isJoin) {
                 milansql::Table tbl = engine.executeJoins(cmd.tableName, cmd.joinClauses,
                                                           cmd.whereConds, cmd.whereLogic);
+                // v11.1.0 Bug Fix: COUNT(*) over JOIN — count rows in joined result, not source table
+                if (cmd.isCount) {
+                    size_t cnt = 0;
+                    for (const auto& r : tbl.rows()) if (r.xmax == 0) ++cnt;
+                    qr.columns = {milansql::Column{"COUNT(*)", "INT"}};
+                    qr.rows.push_back(milansql::Row({std::to_string(cnt)}));
+                    break;
+                }
                 // Phase 167: JOIN + GROUP BY
                 if (cmd.isGroupBy) {
                     std::string tmpName = "__join_grp_tmp";
@@ -1096,6 +1227,14 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     // ── Phase 146: Online DDL ──────────────────────────────────────
     case milansql::CommandType::ALTER_TABLE:
         try {
+            // v11.1.0: IF NOT EXISTS for ADD COLUMN — skip silently if column exists
+            if (cmd.alterOp == "ADD" && cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+                auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+                if (it != engine.getTables().end() && it->second.colOf(cmd.alterColName) >= 0) {
+                    qr.message = "ALTER TABLE (column already exists, IF NOT EXISTS)";
+                    break;
+                }
+            }
             engine.alterTable(cmd.tableName, cmd.alterOp, cmd.alterColName,
                               cmd.alterColType, cmd.alterColNew, cmd.alterColDefault);
         } catch (const std::exception& e) { qr.error = e.what(); }
@@ -1261,8 +1400,13 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         std::string tblTarget = !cmd.statsTable.empty() ? cmd.statsTable : cmd.tableName;
         if (!tblTarget.empty() && tblTarget != "*") {
             if (engine.tableExists(tblTarget)) {
-                const milansql::Table& tbl =
-                    engine.getTables().at(engine.resolveTableName(tblTarget));
+                // v11.1.0 Bug Fix: use find() instead of at() to avoid map::at exception
+                auto it = engine.getTables().find(engine.resolveTableName(tblTarget));
+                if (it == engine.getTables().end()) {
+                    qr.error = "Table not found: " + tblTarget;
+                    break;
+                }
+                const milansql::Table& tbl = it->second;
                 milansql::g_tableStats.analyzeTable(tblTarget, tbl);
                 milansql::g_tableStats.saveStats();
                 milansql::g_joinEnumerator().invalidate(tblTarget);  // Phase 3: Stats geaendert
@@ -1346,6 +1490,15 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             "Kosten Auswertung eines Operators/Filters"}));
         qr.rows.push_back(milansql::Row({"page_size_bytes", fmt(c.page_size_bytes),
             "Angenommene Page-Groesse in Bytes"}));
+        break;
+    }
+
+    // Block 7: SHOW NL STATUS
+    case milansql::CommandType::SHOW_NL_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        qr.rows.push_back(milansql::Row({"provider", milansql::nl::g_nlConfig().getProvider()}));
+        qr.rows.push_back(milansql::Row({"model", milansql::nl::g_nlConfig().getModel()}));
+        qr.rows.push_back(milansql::Row({"api_key_set", milansql::nl::g_nlConfig().hasKey() ? "yes" : "no"}));
         break;
     }
 

@@ -47,6 +47,7 @@
 #include "types/vector_type.hpp"             // Phase 111: VectorType
 #include "optimizer/join_enumerator.hpp"     // Phase 3: Selinger Join Enumeration
 #include "optimizer/histogram.hpp"           // Phase 113: Histogram Selectivity
+#include "wal/pitr_manager.hpp"              // Phase 178: PITR
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -1081,10 +1082,30 @@ static inline milansql::Table dispatch_executeSelectToTable(
         if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
     } else {
         if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
+        // Phase 175: CLS check -- explicit column access on forbidden column -> error
+        if (!cmd.selectColumns.empty() && !cmd.tableName.empty()) {
+            for (const auto& col : cmd.selectColumns) {
+                if (col != "*" && !engine.isColumnAllowed(cmd.tableName, col)) {
+                    throw std::runtime_error("Access denied: column not visible for table "
+                        + cmd.tableName);
+                }
+            }
+        }
         if (!cmd.selectColumns.empty())
             result = result.project(cmd.selectColumns);
     }
     if (cmd.isDistinct) result.makeDistinct();
+    // v11.1.0 Bug Fix: Apply LIMIT inside dispatch_executeSelectToTable so CTE inner
+    // queries (WITH x AS (SELECT ... LIMIT N)) correctly restrict their result sets.
+    if (cmd.limit >= 0) {
+        milansql::Table lim(result.name(), result.columns());
+        size_t off = (cmd.limitOffset > 0) ? static_cast<size_t>(cmd.limitOffset) : 0;
+        size_t cnt = 0;
+        const auto& allRows = result.rows();
+        for (size_t ri = off; ri < allRows.size() && (int)cnt < cmd.limit; ++ri, ++cnt)
+            lim.insert(allRows[ri]);
+        return lim;
+    }
     return result;
 }
 
@@ -1133,6 +1154,36 @@ inline void dispatch_savePartitions(const milansql::Engine& engine,
             out << "\n";
         } catch (...) {}
     }
+    // Phase 176: Save physical partition metadata
+    {
+        std::string metaPath = path + ".partmeta";
+        std::ofstream mf(metaPath);
+        if (mf.is_open()) {
+            for (const auto& [pname, pi] : engine.getPartitionMetaMap()) {
+                if (!pi.physical) continue;
+                mf << "TABLE|" << pname << "|";
+                if (pi.type == milansql::PartitionType::RANGE) mf << "RANGE";
+                else if (pi.type == milansql::PartitionType::LIST) mf << "LIST";
+                else if (pi.type == milansql::PartitionType::HASH) mf << "HASH";
+                mf << "|" << pi.column << "|" << pi.hashCount << "\n";
+                for (const auto& ch : pi.children) {
+                    mf << "CHILD|" << pname << "|" << ch << "\n";
+                }
+                for (const auto& r : pi.ranges) {
+                    mf << "RANGE|" << pname << "|" << r.name << "|" << r.fromStr << "|" << r.limitStr << "\n";
+                }
+                for (const auto& l : pi.lists) {
+                    mf << "LIST|" << pname << "|" << l.name << "|";
+                    for (size_t i = 0; i < l.values.size(); ++i) {
+                        if (i) mf << ",";
+                        mf << l.values[i];
+                    }
+                    mf << "\n";
+                }
+            }
+        }
+    }
+
 }
 
 inline void dispatch_loadPartitions(milansql::Engine& engine,
@@ -1202,6 +1253,78 @@ inline void dispatch_loadPartitions(milansql::Engine& engine,
         }
         try { engine.setTablePartitionInfo(tbl, pi); } catch (...) {}
     }
+    // Phase 176: Load physical partition metadata
+    {
+        std::string metaPath = path + ".partmeta";
+        std::ifstream mf(metaPath);
+        if (mf.is_open()) {
+            std::string line;
+            while (std::getline(mf, line)) {
+                if (line.empty()) continue;
+                std::istringstream ss(line);
+                std::string type;
+                std::getline(ss, type, '|');
+                if (type == "TABLE") {
+                    std::string pname, ptype, pcol, phash;
+                    std::getline(ss, pname, '|');
+                    std::getline(ss, ptype, '|');
+                    std::getline(ss, pcol, '|');
+                    std::getline(ss, phash, '|');
+                    milansql::PartitionInfo pi;
+                    pi.physical = true;
+                    pi.column = pcol;
+                    if (ptype == "RANGE") pi.type = milansql::PartitionType::RANGE;
+                    else if (ptype == "LIST") pi.type = milansql::PartitionType::LIST;
+                    else if (ptype == "HASH") pi.type = milansql::PartitionType::HASH;
+                    try { pi.hashCount = std::stoi(phash); } catch (...) {}
+                    engine.setPartitionMeta(pname, pi);
+                } else if (type == "CHILD") {
+                    std::string pname, cname;
+                    std::getline(ss, pname, '|');
+                    std::getline(ss, cname, '|');
+                    if (engine.isPartitionedTable(pname)) {
+                        auto pi = engine.getPartitionMeta(pname);
+                        pi.children.push_back(cname);
+                        engine.setPartitionMeta(pname, pi);
+                    }
+                } else if (type == "RANGE") {
+                    std::string pname, rname, rfrom, rto;
+                    std::getline(ss, pname, '|');
+                    std::getline(ss, rname, '|');
+                    std::getline(ss, rfrom, '|');
+                    std::getline(ss, rto, '|');
+                    if (engine.isPartitionedTable(pname)) {
+                        auto pi = engine.getPartitionMeta(pname);
+                        milansql::PartitionRangeDef rd;
+                        rd.name = rname; rd.fromStr = rfrom; rd.limitStr = rto;
+                        if (!rfrom.empty()) { try { rd.fromVal = std::stoll(rfrom); } catch (...) {} }
+                        if (rto == "MAXVALUE") rd.limit = std::numeric_limits<long long>::max();
+                        else { try { rd.limit = std::stoll(rto); } catch (...) {} }
+                        pi.ranges.push_back(rd);
+                        engine.setPartitionMeta(pname, pi);
+                    }
+                } else if (type == "LIST") {
+                    std::string pname, lname, lvals;
+                    std::getline(ss, pname, '|');
+                    std::getline(ss, lname, '|');
+                    std::getline(ss, lvals, '|');
+                    if (engine.isPartitionedTable(pname)) {
+                        auto pi = engine.getPartitionMeta(pname);
+                        milansql::PartitionListDef ld;
+                        ld.name = lname;
+                        std::istringstream vs(lvals);
+                        std::string v;
+                        while (std::getline(vs, v, ',')) {
+                            if (!v.empty()) ld.values.push_back(v);
+                        }
+                        pi.lists.push_back(ld);
+                        engine.setPartitionMeta(pname, pi);
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 // ── Phase 66: Procedure Interpreter (DECLARE/CURSOR/LOOP/IF) ──────────────────
@@ -2333,7 +2456,11 @@ inline bool dispatchCommand(
                 for (auto& r : cmd.partitionRanges) {
                     milansql::PartitionRangeDef rd;
                     rd.name = r.name;
+                    rd.fromStr = r.fromStr;
                     rd.limitStr = r.limitStr;
+                    if (!r.fromStr.empty()) {
+                        try { rd.fromVal = std::stoll(r.fromStr); } catch (...) { rd.fromVal = 0; }
+                    }
                     if (r.limitStr == "MAXVALUE")
                         rd.limit = std::numeric_limits<long long>::max();
                     else { try { rd.limit = std::stoll(r.limitStr); } catch (...) { rd.limit = 0; } }
@@ -2352,6 +2479,36 @@ inline bool dispatchCommand(
                 pi.hashCount = cmd.partitionHashCount;
             }
             try { engine.setTablePartitionInfo(cmd.tableName, pi); } catch (...) {}
+
+            // Phase 176: Create physical partition child tables
+            pi.physical = true;
+            if (pi.type == milansql::PartitionType::HASH && pi.hashCount > 0) {
+                // Auto-create N hash partitions
+                for (int i = 0; i < pi.hashCount; ++i) {
+                    std::string childName = cmd.tableName + "_p" + std::to_string(i);
+                    engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                    pi.children.push_back(childName);
+                }
+            }
+            // For RANGE: create child tables from partition definitions
+            if (pi.type == milansql::PartitionType::RANGE) {
+                for (const auto& rd : pi.ranges) {
+                    if (rd.name.empty()) continue;
+                    std::string childName = cmd.tableName + "_" + rd.name;
+                    engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                    pi.children.push_back(childName);
+                }
+            }
+            // For LIST: create child tables from partition definitions
+            if (pi.type == milansql::PartitionType::LIST) {
+                for (const auto& ld : pi.lists) {
+                    if (ld.name.empty()) continue;
+                    std::string childName = cmd.tableName + "_" + ld.name;
+                    engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                    pi.children.push_back(childName);
+                }
+            }
+            engine.setPartitionMeta(cmd.tableName, pi);
             dispatch_savePartitions(engine);
         }
         // Phase 96: Apply compression type if specified
@@ -2376,6 +2533,28 @@ inline bool dispatchCommand(
             engine.getTimeSeriesManager().define(std::move(tsDef));
         }
         persistFn();
+        // Phase 174: Auto-RLS for tenant tables (u{N}_*)
+        {
+            const auto& tn = cmd.tableName;
+            if (tn.size() > 2 && tn[0] == 'u' && std::isdigit((unsigned char)tn[1])) {
+                size_t i = 1;
+                while (i < tn.size() && std::isdigit((unsigned char)tn[i])) ++i;
+                if (i < tn.size() && tn[i] == '_') {
+                    if (!engine.isRlsEnabled(tn)) {
+                        engine.enableRls(tn);
+                        milansql::Engine::RlsPolicy pol;
+                        pol.name = tn + "_tenant_policy";
+                        pol.table = tn;
+                        pol.command = "ALL";
+                        pol.role = "PUBLIC";
+                        pol.usingExpr = "TRUE";
+                        pol.withCheckExpr = "TRUE";
+                        engine.createRlsPolicy(pol);
+                        persistFn();
+                    }
+                }
+            }
+        }
         dispatch_binlogWrite(eingabe);
         engine.invalidateCache(cmd.tableName);
         // Phase 78: if INHERITS, invalidate parent table cache too
@@ -3927,12 +4106,23 @@ inline bool dispatchCommand(
         // Phase 75: RLS enable/disable via ALTER TABLE
         if (cmd.alterOp == "ENABLE_RLS") {
             engine.enableRls(cmd.tableName);
+            persistFn();  // Phase 173: persist RLS state
             std::cout << "  RLS enabled on " << cmd.tableName << ".\n\n";
             break;
         } else if (cmd.alterOp == "DISABLE_RLS") {
             engine.disableRls(cmd.tableName);
             std::cout << "  RLS disabled on " << cmd.tableName << ".\n\n";
+            persistFn();  // Phase 173: persist RLS state
             break;
+        }
+        // v11.1.0: IF NOT EXISTS for ADD COLUMN — skip silently if column exists
+        if (cmd.alterOp == "ADD" && cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+            auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+            if (it != engine.getTables().end() && it->second.colOf(cmd.alterColName) >= 0) {
+                std::cout << "  Spalte '" << cmd.alterColName
+                          << "' existiert bereits (IF NOT EXISTS).\n\n";
+                break;
+            }
         }
         engine.alterTable(cmd.tableName, cmd.alterOp,
                           cmd.alterColName, cmd.alterColType,
@@ -3963,6 +4153,93 @@ inline bool dispatchCommand(
         } catch (const std::exception& e) {
             std::cout << "  Fehler: " << e.what() << "\n\n";
         }
+        break;
+    }
+
+
+    // ── Phase 176: Physical Partition Commands ──────────────────────
+    case milansql::CommandType::CREATE_PARTITION: {
+        if (cmd.parentTable.empty() || cmd.partitionName.empty()) {
+            std::cout << "  Fehler: CREATE PARTITION name ON table FOR VALUES ...\n\n";
+            break;
+        }
+        auto parentKey = engine.resolveTableName(cmd.parentTable);
+        if (!engine.tableExists(parentKey)) {
+            std::cout << "  Fehler: Table '" << cmd.parentTable << "' not found\n\n";
+            break;
+        }
+        if (!engine.isPartitionedTable(cmd.parentTable)) {
+            // Check if table has partition metadata (from setTablePartitionInfo)
+            const auto& tbl = engine.selectAll(cmd.parentTable);
+            if (!tbl.partitionInfo().hasPartitions()) {
+                std::cout << "  Fehler: Table '" << cmd.parentTable << "' is not partitioned\n\n";
+                break;
+            }
+            // Initialize physical partition metadata
+            milansql::PartitionInfo pi = tbl.partitionInfo();
+            pi.physical = true;
+            engine.setPartitionMeta(cmd.parentTable, pi);
+        }
+        auto& pi = const_cast<milansql::PartitionInfo&>(engine.getPartitionMeta(cmd.parentTable));
+        // Create child table with parent's schema
+        auto parentCols = engine.selectAll(cmd.parentTable).columns();
+        engine.createPartitionChild(cmd.parentTable, cmd.partitionName,
+            std::vector<milansql::Column>(parentCols.begin(), parentCols.end()));
+        pi.children.push_back(cmd.partitionName);
+        // Add range or list definition
+        if (!cmd.addRangeDef.limitStr.empty()) {
+            milansql::PartitionRangeDef rd;
+            rd.name = cmd.partitionName;
+            rd.fromStr = cmd.addRangeDef.fromStr;
+            rd.limitStr = cmd.addRangeDef.limitStr;
+            pi.ranges.push_back(rd);
+        } else if (!cmd.addListDef.values.empty()) {
+            milansql::PartitionListDef ld;
+            ld.name = cmd.partitionName;
+            ld.values = cmd.addListDef.values;
+            pi.lists.push_back(ld);
+        }
+        engine.setPartitionMeta(cmd.parentTable, pi);
+        dispatch_savePartitions(engine);
+        persistFn();
+        std::cout << "  Partition '" << cmd.partitionName << "' on '" << cmd.parentTable << "' created.\n\n";
+        break;
+    }
+    case milansql::CommandType::DROP_PARTITION: {
+        if (cmd.partitionName.empty()) {
+            std::cout << "  Fehler: DROP PARTITION name [ON table]\n\n";
+            break;
+        }
+        // Find parent table
+        std::string parent = cmd.parentTable;
+        if (parent.empty()) {
+            // Try to find which parent this partition belongs to
+            for (const auto& [pname, pi] : engine.getPartitionMetaMap()) {
+                for (const auto& child : pi.children) {
+                    if (child == cmd.partitionName) { parent = pname; break; }
+                }
+                if (!parent.empty()) break;
+            }
+        }
+        if (parent.empty()) {
+            std::cout << "  Fehler: Parent table not found for partition '" << cmd.partitionName << "'\n\n";
+            break;
+        }
+        engine.dropPartition(parent, cmd.partitionName);
+        dispatch_savePartitions(engine);
+        persistFn();
+        std::cout << "  Partition '" << cmd.partitionName << "' dropped.\n\n";
+        break;
+    }
+    case milansql::CommandType::DETACH_PARTITION: {
+        if (cmd.partitionName.empty() || cmd.parentTable.empty()) {
+            std::cout << "  Fehler: DETACH PARTITION name FROM table\n\n";
+            break;
+        }
+        engine.detachPartition(cmd.parentTable, cmd.partitionName);
+        dispatch_savePartitions(engine);
+        persistFn();
+        std::cout << "  Partition '" << cmd.partitionName << "' detached from '" << cmd.parentTable << "'.\n\n";
         break;
     }
 
@@ -4502,8 +4779,17 @@ inline bool dispatchCommand(
 
     // ── Phase 57: BACKUP DATABASE ──────────────────────────────
     case milansql::CommandType::BACKUP_DATABASE: {
-        std::string msg = milansql::MilanBackup::dumpDatabase(engine, cmd.backupFile);
-        std::cout << "  " << msg << "\n\n";
+        // Phase 178: If backupFile ends with /, use PITR base backup
+        if (!cmd.backupFile.empty() && cmd.backupFile.back() == '/') {
+            auto& lsn = milansql::g_lsnManager();
+            std::string msg = milansql::g_pitrManager().createBaseBackup(
+                "database.milan", cmd.backupFile,
+                lsn.currentLsn(), "11.0.0", engine.tableCount());
+            std::cout << "  " << msg << "\n\n";
+        } else {
+            std::string msg = milansql::MilanBackup::dumpDatabase(engine, cmd.backupFile);
+            std::cout << "  " << msg << "\n\n";
+        }
         break;
     }
 
@@ -5338,11 +5624,13 @@ inline bool dispatchCommand(
         p.withCheckExpr  = cmd.policyWithCheckExpr;  // Phase 170
         engine.createRlsPolicy(p);
         std::cout << "  Policy " << p.name << " created.\n\n";
+        persistFn();  // Phase 173: persist RLS policies
         break;
     }
     case milansql::CommandType::DROP_POLICY:
         engine.dropRlsPolicy(cmd.policyName, cmd.tableName);
         std::cout << "  Policy " << cmd.policyName << " dropped.\n\n";
+        persistFn();  // Phase 173: persist RLS policies
         break;
     case milansql::CommandType::SHOW_POLICIES_ON:
         engine.showPolicies(cmd.tableName);
@@ -5538,7 +5826,10 @@ inline bool dispatchCommand(
             g_adaptiveStats.analyzeTable(cmd.tableName);
             milansql::g_joinEnumerator().invalidate(cmd.tableName);  // Phase 113
             if (engine.tableExists(cmd.tableName)) {
-                const Table& tbl = engine.getTables().at(cmd.tableName);
+                // v11.1.0 Bug Fix: use find() + resolveTableName() instead of .at()
+                auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+                if (it == engine.getTables().end()) break;
+                const Table& tbl = it->second;
                 g_tableStats.analyzeTable(cmd.tableName, tbl);
                 g_tableStats.saveStats();
                 std::cout << "  ANALYZE TABLE '" << cmd.tableName
@@ -6870,6 +7161,38 @@ inline bool dispatchCommand(
         std::cout << "  Monitored Nodes: " << engine.sentinel.nodeCount() << "\n";
         std::cout << "  Current Master: " << engine.sentinel.currentMasterHost
                   << ":" << engine.sentinel.currentMasterPort << "\n\n";
+        break;
+    }
+
+    // ── v11.1.0: SHOW WAL ARCHIVE STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_WAL_ARCHIVE_STATUS: {
+        bool archiveExists = false;
+        long long archiveSize = 0;
+        {
+            std::ifstream af("database.wal.archive", std::ios::binary | std::ios::ate);
+            if (af) { archiveExists = true; archiveSize = af.tellg(); }
+        }
+        std::cout << "\n  WAL Archive Status:\n";
+        std::cout << "  Archive Mode        | ON\n";
+        std::cout << "  Archive File        | database.wal.archive\n";
+        std::cout << "  Archive File Size   | " << archiveSize << " bytes\n";
+        std::cout << "  Archive Status      | " << (archiveExists ? "OK" : "EMPTY") << "\n";
+        std::cout << "  WAL File            | database.milan.wal\n";
+        std::cout << "  Binlog Position     | " << milansql::g_replState.slavePos.load() << "\n\n";
+        break;
+    }
+
+    // ── v11.1.0: SHOW REPLICATION STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_REPLICATION_STATUS: {
+        bool isMaster = milansql::g_replState.isMaster.load();
+        bool isSlave  = milansql::g_replState.isSlave.load();
+        std::cout << "\n  Replication Status:\n";
+        std::cout << "  Role                | " << (isMaster ? "PRIMARY" : (isSlave ? "REPLICA" : "STANDALONE")) << "\n";
+        std::cout << "  Replication Active  | " << ((isMaster || isSlave) ? "YES" : "NO") << "\n";
+        std::cout << "  Connected Replicas  | " << milansql::g_replState.connectedSlaves.load() << "\n";
+        std::cout << "  Replication Lag(ms) | " << milansql::g_replState.slaveLagMs.load() << "\n";
+        std::cout << "  Slave Running       | " << (milansql::g_replState.slaveRunning.load() ? "YES" : "NO") << "\n";
+        std::cout << "  Binlog Position     | " << milansql::g_replState.slavePos.load() << "\n\n";
         break;
     }
 

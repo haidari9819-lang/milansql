@@ -54,8 +54,32 @@
   #define MILAN_FSYNC(fd) _commit(fd)
 #else
   #include <unistd.h>
+  #include <fcntl.h>
   #define MILAN_FSYNC(fd) ::fdatasync(fd)
 #endif
+
+namespace milansql {
+// Hardening-Audit Block 1: Verzeichnis-fsync.
+// fsync auf eine Datei macht nur ihren INHALT dauerhaft — der
+// VERZEICHNISEINTRAG (neu angelegte Datei, atomarer rename) lebt
+// im Verzeichnis-Inode und braucht ein eigenes fsync auf das
+// Verzeichnis. Ohne das kann nach einem Crash eine frisch
+// erzeugte WAL-Datei oder ein gerade renamter Datenbestand
+// verschwinden, obwohl der Inhalt gesynct war.
+// Windows/NTFS journaled Metadaten selbst → no-op.
+inline void milanFsyncDir(const std::string& filePath) {
+#ifndef _WIN32
+    std::string dir = ".";
+    auto slash = filePath.find_last_of('/');
+    if (slash != std::string::npos && slash > 0)
+        dir = filePath.substr(0, slash);
+    int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+#else
+    (void)filePath;
+#endif
+}
+} // namespace milansql
 
 #include "btree.hpp"
 #include "../cache/query_cache.hpp"
@@ -193,10 +217,15 @@ struct ExplainPlan {
 // ── Phase 62: Partitioning ────────────────────────────────────
 enum class PartitionType { NONE, RANGE, LIST, HASH };
 
+// Forward declaration for pruneChildren
+struct WhereCondition;
+
 struct PartitionRangeDef {
     std::string name;
-    std::string limitStr;   // "100" or "MAXVALUE"
-    long long   limit;      // numeric (LLONG_MAX for MAXVALUE)
+    std::string fromStr;    // lower bound (inclusive), e.g. "2025-01-01"
+    std::string limitStr;   // upper bound (exclusive), e.g. "2026-01-01" or "MAXVALUE"
+    long long   fromVal  = std::numeric_limits<long long>::min();  // numeric lower bound
+    long long   limit    = std::numeric_limits<long long>::max();  // numeric upper bound
 };
 
 struct PartitionListDef {
@@ -210,7 +239,64 @@ struct PartitionInfo {
     std::vector<PartitionRangeDef> ranges;
     std::vector<PartitionListDef>  lists;
     int           hashCount = 0;
+    bool          physical  = false;  // Phase 176: true = child tables exist
+    std::vector<std::string> children; // Phase 176: child table names
     bool hasPartitions() const { return type != PartitionType::NONE; }
+
+    // Phase 176: Find the correct child for a given partition key value
+    std::string routeInsert(const std::string& val) const {
+        if (type == PartitionType::RANGE) {
+            // Try numeric comparison first, fall back to string
+            bool isNumeric = true;
+            long long numVal = 0;
+            try { numVal = std::stoll(val); } catch (...) { isNumeric = false; }
+            for (size_t i = 0; i < ranges.size(); ++i) {
+                const auto& r = ranges[i];
+                bool aboveFrom, belowTo;
+                if (isNumeric) {
+                    aboveFrom = r.fromStr.empty() || numVal >= r.fromVal;
+                    belowTo   = r.limitStr == "MAXVALUE" || numVal < r.limit;
+                } else {
+                    aboveFrom = r.fromStr.empty() || val >= r.fromStr;
+                    belowTo   = r.limitStr == "MAXVALUE" || val < r.limitStr;
+                }
+                if (aboveFrom && belowTo) {
+                    for (const auto& ch : children) {
+                        if (ch.find(r.name) != std::string::npos) return ch;
+                    }
+                    return r.name;
+                }
+            }
+            return "";
+        }
+        if (type == PartitionType::LIST) {
+            for (const auto& l : lists) {
+                for (const auto& v : l.values) {
+                    if (v == val) {
+                        for (const auto& ch : children) {
+                            if (ch.find(l.name) != std::string::npos) return ch;
+                        }
+                        return l.name;
+                    }
+                }
+            }
+            return "";
+        }
+        if (type == PartitionType::HASH && hashCount > 0) {
+            // FNV-1a hash for consistent distribution
+            uint32_t h = 2166136261u;
+            for (char c : val) { h ^= (uint8_t)c; h *= 16777619u; }
+            int idx = (int)(h % (uint32_t)hashCount);
+            // Children are named parentName_p0, _p1, ...
+            if (idx < (int)children.size()) return children[idx];
+            return "";
+        }
+        return "";
+    }
+
+    // Phase 176: Determine which children to scan based on WHERE conditions
+    std::vector<std::string> pruneChildren(const std::vector<WhereCondition>& conds,
+                                            const std::string& logic) const;
 };
 
 // ── Phase 37: Korrelierte Subquery-Strukturen ─────────────────
@@ -276,6 +362,87 @@ struct WhereCondition {
     WhereCondition(std::string c, std::string o, std::string v)
         : col(std::move(c)), op(std::move(o)), val(std::move(v)) {}
 };
+
+// Out-of-line implementation of PartitionInfo::pruneChildren (needs WhereCondition)
+inline std::vector<std::string> PartitionInfo::pruneChildren(
+    const std::vector<WhereCondition>& conds, const std::string& logic) const {
+    if (children.empty()) return {};
+    bool hasPartCol = false;
+    for (const auto& c : conds) {
+        if (c.col == column) { hasPartCol = true; break; }
+    }
+    if (!hasPartCol) return children;
+
+    std::vector<std::string> result;
+    if (type == PartitionType::RANGE) {
+        for (const auto& r : ranges) {
+            bool dominated = false;
+            for (const auto& c : conds) {
+                if (c.col != column) continue;
+                bool isNum = true;
+                long long nv = 0;
+                try { nv = std::stoll(c.val); } catch (...) { isNum = false; }
+                if (c.op == "=" || c.op == "==") {
+                    bool aboveFrom, belowTo;
+                    if (isNum) {
+                        aboveFrom = r.fromStr.empty() || nv >= r.fromVal;
+                        belowTo   = r.limitStr == "MAXVALUE" || nv < r.limit;
+                    } else {
+                        aboveFrom = r.fromStr.empty() || c.val >= r.fromStr;
+                        belowTo   = r.limitStr == "MAXVALUE" || c.val < r.limitStr;
+                    }
+                    if (!aboveFrom || !belowTo) { dominated = true; break; }
+                }
+                if (c.op == ">=" || c.op == ">") {
+                    if (isNum) {
+                        if (r.limitStr != "MAXVALUE" && nv >= r.limit) { dominated = true; break; }
+                    } else {
+                        if (r.limitStr != "MAXVALUE" && c.val >= r.limitStr) { dominated = true; break; }
+                    }
+                }
+                if (c.op == "<=" || c.op == "<") {
+                    if (isNum) {
+                        if (!r.fromStr.empty() && nv < r.fromVal) { dominated = true; break; }
+                    } else {
+                        if (!r.fromStr.empty() && c.val < r.fromStr) { dominated = true; break; }
+                    }
+                }
+            }
+            if (!dominated) {
+                for (const auto& ch : children) {
+                    if (ch == r.name || ch.find(r.name) != std::string::npos) {
+                        result.push_back(ch);
+                        break;
+                    }
+                }
+            }
+        }
+    } else if (type == PartitionType::LIST) {
+        for (const auto& l : lists) {
+            for (const auto& c : conds) {
+                if (c.col != column || (c.op != "=" && c.op != "==")) continue;
+                for (const auto& v : l.values) {
+                    if (v == c.val) {
+                        for (const auto& ch : children) {
+                            if (ch == l.name) { result.push_back(ch); break; }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (type == PartitionType::HASH && hashCount > 0) {
+        for (const auto& c : conds) {
+            if (c.col != column || (c.op != "=" && c.op != "==")) continue;
+            uint32_t h = 2166136261u;
+            for (char xc : c.val) { h ^= (uint8_t)xc; h *= 16777619u; }
+            int idx = (int)(h % (uint32_t)hashCount);
+            if (idx < (int)children.size()) result.push_back(children[idx]);
+        }
+    }
+    if (result.empty()) return children;
+    return result;
+}
+
 
 // ── Optimizer Phase 2: Laufzeit-Hook fuer kostenbasierte Index-Wahl ──
 // Wird von plan_selector.hpp installiert (engine.hpp kann die Optimizer-
@@ -1081,6 +1248,10 @@ public:
         return all;
     }
 
+    // Phase 176: Public accessors for partition info
+    const PartitionInfo& partitionInfo() const { return partitionInfo_; }
+    PartitionInfo& partitionInfoMut() { return partitionInfo_; }
+
 private:
     std::string         name_;
     std::vector<Column> columns_;
@@ -1370,6 +1541,19 @@ public:
     }
 
     void dropTable(const std::string& name) {
+        // Phase 176: if dropping a partitioned parent, drop all children
+        {
+            auto pkey = resolveTableName(name);
+            if (partitionMeta_.count(pkey)) {
+                const auto& pi = partitionMeta_.at(pkey);
+                for (const auto& child : pi.children) {
+                    auto ckey = resolveTableName(child);
+                    tables_.erase(ckey);
+                }
+                partitionMeta_.erase(pkey);
+            }
+        }
+
         auto key = resolveTableName(name);
         if (!tables_.erase(key))
             throw std::runtime_error("Tabelle '" + key + "' nicht gefunden.");
@@ -1479,6 +1663,28 @@ public:
             txBuffer_.push_back(std::move(op));
             return;
         }
+        // Phase 176: Route to partition child if table is partitioned
+        if (partitionMeta_.count(tbl) && partitionMeta_.at(tbl).physical) {
+            const auto& pi = partitionMeta_.at(tbl);
+            int colIdx = -1;
+            for (size_t ci = 0; ci < t.columns().size(); ++ci) {
+                if (t.columns()[ci].name == pi.column) { colIdx = (int)ci; break; }
+            }
+            if (colIdx >= 0 && colIdx < (int)vals.size()) {
+                std::string partVal = vals[colIdx];
+                std::string childName = pi.routeInsert(partVal);
+                if (!childName.empty()) {
+                    auto ckey = resolveTableName(childName);
+                    if (tables_.count(ckey)) {
+                        tables_.at(ckey).insert(Row(vals));
+                        bufferPool_.markDirty(ckey);
+                        g_autoAnalyze().recordChange(ckey);
+                        return;
+                    }
+                }
+            }
+            // Fallthrough: insert into parent if routing fails
+        }
         t.insert(Row(vals));
         bufferPool_.markDirty(tbl);  // Phase 73: mark page dirty
         g_autoAnalyze().recordChange(tbl);  // Phase 3 Block 4
@@ -1569,6 +1775,11 @@ public:
     const Table& selectAll(const std::string& tbl) const {
         auto key = resolveTableName(tbl);
         bufferPool_.access(key);  // Phase 73: Buffer Pool tracking
+        // Phase 176: If partitioned, build merged view
+        if (partitionMeta_.count(key) && partitionMeta_.at(key).physical) {
+            partitionCache_[key] = selectPartitioned(tbl);
+            return partitionCache_[key];
+        }
         return getTable(key);
     }
 
@@ -1576,6 +1787,13 @@ public:
     Table selectAllFiltered(const std::string& tbl, bool fromOnly = false) const {
         auto key = resolveTableName(tbl);
         bufferPool_.access(key);
+        // Phase 176: partitioned table
+        if (partitionMeta_.count(key) && partitionMeta_.at(key).physical) {
+            Table merged = selectPartitioned(tbl);
+            Table result = merged.clone();
+            result.mutableRows() = applyRls_(key, merged.rows(), "SELECT");
+            return result;
+        }
         ReadScope rs(getOrCreateRwLock(key), key);  // Phase 112: shared read lock
         const auto& src = getTable(key);
         Table result = src.clone();
@@ -1612,6 +1830,11 @@ public:
                             bool fromOnly = false) const {
         auto tblName = resolveTableName(tblNameRaw);
         bufferPool_.access(tblName);  // Phase 73: Buffer Pool tracking
+        // Phase 176: If partitioned, use merged partition view
+        if (partitionMeta_.count(tblName) && partitionMeta_.at(tblName).physical) {
+            Table merged = selectPartitioned(tblNameRaw, conds, logic);
+            return {std::move(merged), false};
+        }
         ReadScope rs(getOrCreateRwLock(tblName), tblName);  // Phase 112: shared read lock
         const Table& src = getTable(tblName);
         Table result(tblName, src.columns());
@@ -2593,6 +2816,10 @@ public:
     std::size_t deleteWhere(const std::string& tblRaw,
                             const std::string& wCol, const std::string& wVal) {
         auto tbl = resolveTableName(tblRaw);
+        // Phase 176: partition-aware delete
+        if (partitionMeta_.count(tbl) && partitionMeta_.at(tbl).physical) {
+            return deletePartitioned(tblRaw, wCol, wVal);
+        }
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
         if (!g_lockManager.checkWriteAllowed(tbl))  // Phase 65: table lock check
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
@@ -2915,7 +3142,10 @@ public:
         mvccTxId_ = txManager_.beginTx(isolationLevel_);
         {
             std::ofstream wal(walPath_, std::ios::app);
-            if (wal) wal << "TX_BEGIN:" << mvccTxId_ << "\n";
+            if (wal) {
+                wal << "TX_BEGIN:" << mvccTxId_ << "\n";
+                wal << "TS:" << std::time(nullptr) << "\n";  // Phase 178: PITR timestamp
+            }
         }
         inTransaction_ = true;
         txBuffer_.clear();
@@ -2951,6 +3181,7 @@ public:
                     std::string line = "TX_COMMIT:" + std::to_string(commitId);
                     uint32_t crc = walCrc32(line);
                     wal << line << "\n";
+                    wal << "TS:" << std::time(nullptr) << "\n";  // Phase 178: commit timestamp
                     wal << "CRC:" << crc << "\n";
                     wal.flush();
                 }
@@ -2961,6 +3192,11 @@ public:
                 MILAN_FSYNC(fileno(wf));
                 std::fclose(wf);
             }
+            // Hardening-Audit Block 1: Die WAL-Datei wurde ggf. erst
+            // bei TX_BEGIN neu angelegt — ohne Verzeichnis-fsync kann
+            // ihr Verzeichniseintrag den Crash nicht überleben und die
+            // committete Transaktion wäre trotz Datei-fsync weg.
+            milanFsyncDir(walPath_);
         }
         // Phase 85: track committed transaction for checkpointing
         checkpointMgr_.onCommit();
@@ -4925,11 +5161,84 @@ public:
                 }
                 json += "]";
             }
+            // Phase 176: Partition info
+            {
+                auto pkey = name;
+                if (partitionMeta_.count(pkey) && partitionMeta_.at(pkey).physical) {
+                    const auto& pm = partitionMeta_.at(pkey);
+                    json += ",\"partitioned\":true";
+                    json += ",\"partition_type\":\"";
+                    if (pm.type == PartitionType::RANGE) json += "RANGE";
+                    else if (pm.type == PartitionType::LIST) json += "LIST";
+                    else if (pm.type == PartitionType::HASH) json += "HASH";
+                    json += "\"";
+                    json += ",\"partition_column\":\"" + je(pm.column) + "\"";
+                    json += ",\"partition_count\":" + std::to_string(pm.children.size());
+                    json += ",\"partitions\":[";
+                    for (size_t pi = 0; pi < pm.children.size(); ++pi) {
+                        if (pi > 0) json += ",";
+                        json += "{\"name\":\"" + je(pm.children[pi]) + "\"";
+                        auto ckey = resolveTableName(pm.children[pi]);
+                        if (tables_.count(ckey))
+                            json += ",\"rows\":" + std::to_string(tables_.at(ckey).rowCount());
+                        // Range bounds
+                        if (pm.type == PartitionType::RANGE && pi < pm.ranges.size()) {
+                            json += ",\"from\":\"" + je(pm.ranges[pi].fromStr) + "\"";
+                            json += ",\"to\":\"" + je(pm.ranges[pi].limitStr) + "\"";
+                        }
+                        // List values
+                        if (pm.type == PartitionType::LIST && pi < pm.lists.size()) {
+                            json += ",\"values\":[";
+                            for (size_t vi = 0; vi < pm.lists[pi].values.size(); ++vi) {
+                                if (vi > 0) json += ",";
+                                json += "\"" + je(pm.lists[pi].values[vi]) + "\"";
+                            }
+                            json += "]";
+                        }
+                        json += "}";
+                    }
+                    json += "]";
+                }
+            }
             json += "}";
             first = false;
         }
         json += "]}";
         return json;
+    }
+
+    // Phase 175 stub: Column-Level Security — always allow (no CLS policies defined)
+    bool isColumnAllowed(const std::string& /*table*/, const std::string& /*col*/) const {
+        return true; // CLS not implemented yet; all columns accessible
+    }
+
+    // Block 7: Get table names visible to a user (for NL query context)
+    std::vector<std::string> getTableNamesForUser(int userId, bool isRoot) const {
+        std::vector<std::string> names;
+        if (isRoot || userId <= 0) {
+            for (const auto& [name, tbl] : tables_) names.push_back(name);
+        } else {
+            std::string userPrefix = "u" + std::to_string(userId) + "_";
+            for (const auto& [name, tbl] : tables_) {
+                std::string bareName = name;
+                auto dot = name.find('.');
+                if (dot != std::string::npos) bareName = name.substr(dot + 1);
+                if (bareName.substr(0, userPrefix.size()) == userPrefix)
+                    names.push_back(name);
+            }
+        }
+        return names;
+    }
+
+    // Block 7: Get columns for a table (for NL query context)
+    std::vector<Column> getTableColumns(const std::string& tblName) const {
+        auto it = tables_.find(tblName);
+        if (it == tables_.end()) {
+            auto key = resolveTableName(tblName);
+            it = tables_.find(key);
+        }
+        if (it == tables_.end()) return {};
+        return it->second.columns();
     }
 
     // Phase 172: User-filtered schema JSON (security: non-root sees only own tables)
@@ -4990,6 +5299,21 @@ public:
                 }
                 json += "]";
             }
+            // Phase 176: Partition info
+            {
+                auto pkey = name;
+                if (partitionMeta_.count(pkey) && partitionMeta_.at(pkey).physical) {
+                    const auto& pm = partitionMeta_.at(pkey);
+                    json += ",\"partitioned\":true";
+                    json += ",\"partition_type\":\"";
+                    if (pm.type == PartitionType::RANGE) json += "RANGE";
+                    else if (pm.type == PartitionType::LIST) json += "LIST";
+                    else if (pm.type == PartitionType::HASH) json += "HASH";
+                    json += "\"";
+                    json += ",\"partition_column\":\"" + je(pm.column) + "\"";
+                    json += ",\"partition_count\":" + std::to_string(pm.children.size());
+                }
+            }
             json += "}";
             first = false;
         }
@@ -5001,13 +5325,21 @@ public:
     std::string getRlsPoliciesJsonForUser(int userId, bool isRoot) const {
         if (isRoot || userId <= 0) return getRlsPoliciesJson();
         std::string userPrefix = "u" + std::to_string(userId) + "_";
+        // Phase 173+: Include own tenant tables AND root-level tables (no u{N}_ prefix).
+        // Skip other tenants' tables (u{otherN}_*).
+        auto isOtherTenant = [&](const std::string& bareName) {
+            if (bareName.substr(0, userPrefix.size()) == userPrefix) return false; // own
+            if (bareName.size() > 2 && bareName[0] == 'u' &&
+                std::isdigit((unsigned char)bareName[1])) return true;  // other tenant
+            return false;  // root-level table
+        };
         std::string json = "{\"enabled_tables\":[";
         bool first = true;
         for (const auto& tbl : rlsEnabled_) {
             std::string bareName = tbl;
             auto dot = tbl.find('.');
             if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
-            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (isOtherTenant(bareName)) continue;
             if (!first) json += ",";
             json += "\"" + tbl + "\"";
             first = false;
@@ -5018,7 +5350,7 @@ public:
             std::string bareName = tbl;
             auto dot = tbl.find('.');
             if (dot != std::string::npos) bareName = tbl.substr(dot + 1);
-            if (bareName.substr(0, userPrefix.size()) != userPrefix) continue;
+            if (isOtherTenant(bareName)) continue;
             if (!first) json += ",";
             json += "\"" + tbl + "\":[";
             for (size_t pi = 0; pi < pols.size(); ++pi) {
@@ -5653,6 +5985,34 @@ private:
             return {"public", fullName};
         };
 
+        // Security: tenant isolation for information_schema
+        // Non-root users only see their own prefixed tables + unprefixed (shared) tables
+        std::string myPrefix = isRootUser_ ? "" : ("u" + std::to_string(currentUserId_) + "_");
+        auto isVisibleTable = [&](const std::string& tname) -> bool {
+            if (isRootUser_) return true;
+            // Strip schema prefix (e.g. "public.") for checking
+            std::string bare = tname;
+            auto dotPos = bare.find('.');
+            if (dotPos != std::string::npos) bare = bare.substr(dotPos + 1);
+            // System/temp tables: hide from non-root
+            if (bare.size() >= 2 && bare[0] == '_' && bare[1] == '_') return false;
+            // Own tables (with prefix)
+            if (!myPrefix.empty() && bare.substr(0, myPrefix.size()) == myPrefix) return true;
+            // Other tenant tables (u{N}_ prefix): hide
+            if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1])) return false;
+            // Unprefixed table = shared/root-level
+            return true;
+        };
+        // Strip tenant prefix from table name for display
+        auto stripPrefix = [&](const std::string& tname) -> std::string {
+            std::string bare = tname;
+            auto dotPos = bare.find('.');
+            if (dotPos != std::string::npos) bare = bare.substr(dotPos + 1);
+            if (!myPrefix.empty() && bare.substr(0, myPrefix.size()) == myPrefix)
+                return bare.substr(myPrefix.size());
+            return bare;
+        };
+
         if (sub == "tables") {
             Table t(rawName, {
                 Column("TABLE_SCHEMA", "TEXT"),
@@ -5662,13 +6022,15 @@ private:
             });
             for (const auto& [tname, tbl] : tables_) {
                 if (tempTableNames_.count(tname)) continue;
-                auto [schema, bare] = splitName(tname);
+                if (!isVisibleTable(tname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(tname));
                 t.insert(Row({schema, bare, "BASE TABLE",
                               std::to_string(tbl.rowCount())}));
             }
             for (const auto& [vname, vsql] : views_) {
                 (void)vsql;
-                auto [schema, bare] = splitName(vname);
+                if (!isVisibleTable(vname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(vname));
                 t.insert(Row({schema, bare, "VIEW", "0"}));
             }
             return t;
@@ -5687,7 +6049,8 @@ private:
             });
             for (const auto& [tname, tbl] : tables_) {
                 if (tempTableNames_.count(tname)) continue;
-                auto [schema, bare] = splitName(tname);
+                if (!isVisibleTable(tname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(tname));
                 const auto& cols = tbl.columns();
                 for (size_t i = 0; i < cols.size(); ++i) {
                     const Column& c = cols[i];
@@ -5715,7 +6078,8 @@ private:
             });
             for (const auto& [tname, tbl] : tables_) {
                 if (tempTableNames_.count(tname)) continue;
-                auto [schema, bare] = splitName(tname);
+                if (!isVisibleTable(tname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(tname));
                 for (const auto& idx : tbl.getIndexes()) {
                     t.insert(Row({schema, bare, idx.indexName,
                                   idx.colName, "1", "BTREE"}));
@@ -5731,7 +6095,8 @@ private:
                 Column("VIEW_DEFINITION", "TEXT")
             });
             for (const auto& [vname, vsql] : views_) {
-                auto [schema, bare] = splitName(vname);
+                if (!isVisibleTable(vname)) continue;
+                auto [schema, bare] = splitName(stripPrefix(vname));
                 t.insert(Row({schema, bare, vsql}));
             }
             return t;
@@ -8075,6 +8440,8 @@ public:
     }
 
     std::map<std::string, Table>  tables_;
+    std::map<std::string, PartitionInfo> partitionMeta_;  // Phase 176: Physical partition metadata
+    mutable std::map<std::string, Table> partitionCache_; // Phase 176: Cached partition merges
     std::map<std::string, std::string> views_;   // Phase 24: name → SQL
     std::set<std::string> tempTableNames_;        // Phase 41: CTE-Tabellennamen
 
@@ -8337,6 +8704,225 @@ public:
     }
 
     // ── Phase 62: Partition management ───────────────────────────
+
+    // ── Phase 176: Physical Partitioning ────────────────────────────
+
+    bool isPartitionedTable(const std::string& name) const {
+        auto key = resolveTableName(name);
+        return partitionMeta_.count(key) > 0 && partitionMeta_.at(key).physical;
+    }
+
+
+    const std::map<std::string, PartitionInfo>& getPartitionMetaMap() const { return partitionMeta_; }
+
+    const PartitionInfo& getPartitionMeta(const std::string& name) const {
+        auto key = resolveTableName(name);
+        return partitionMeta_.at(key);
+    }
+
+    void setPartitionMeta(const std::string& name, const PartitionInfo& pi) {
+        auto key = resolveTableName(name);
+        partitionMeta_[key] = pi;
+    }
+
+    // Create a child partition table with same schema as parent
+    void createPartitionChild(const std::string& parentName, const std::string& childName,
+                               const std::vector<Column>& cols) {
+        auto pkey = resolveTableName(parentName);
+        auto ckey = resolveTableName(childName);
+        if (tables_.count(ckey)) return; // already exists
+        tables_.emplace(ckey, Table(ckey, cols));
+        // Copy indexes from parent to child
+        if (tables_.count(pkey)) {
+            for (const auto& idx : tables_.at(pkey).getIndexes()) {
+                try { tables_.at(ckey).createIndex({idx.colName}, idx.indexName + "_" + childName); }
+                catch (...) {}
+            }
+        }
+    }
+
+    // Insert into partitioned table: route to correct child
+    void insertPartitioned(const std::string& parentName, std::vector<std::string> vals) {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey))
+            throw std::runtime_error("Table is not partitioned: " + parentName);
+        const auto& pi = partitionMeta_.at(pkey);
+        const auto& parentTbl = tables_.at(pkey);
+        // Find partition column index
+        int colIdx = -1;
+        for (size_t i = 0; i < parentTbl.columns().size(); ++i) {
+            if (parentTbl.columns()[i].name == pi.column) { colIdx = (int)i; break; }
+        }
+        if (colIdx < 0 || colIdx >= (int)vals.size())
+            throw std::runtime_error("Partition column '" + pi.column + "' not found or value missing");
+        std::string val = vals[colIdx];
+        // Strip quotes
+        if (val.size() >= 2 && val.front() == '\'' && val.back() == '\'')
+            val = val.substr(1, val.size() - 2);
+        std::string partName = pi.routeInsert(val);
+        if (partName.empty())
+            throw std::runtime_error("No partition found for value '" + val + "'");
+        // Match partition name to actual child table
+        std::string target;
+        for (const auto& ch : pi.children) {
+            // Child is named parent_partName (e.g. orders_p_small)
+            if (ch == partName || ch.find("_" + partName) != std::string::npos ||
+                ch.substr(ch.rfind("_") + 1) == partName) {
+                target = ch;
+                break;
+            }
+        }
+        if (target.empty()) {
+            // Try direct match with full name
+            for (const auto& ch : pi.children) {
+                auto ckey = resolveTableName(ch);
+                if (tables_.count(ckey)) { target = ch; break; }
+            }
+            if (target.empty())
+                throw std::runtime_error("Partition '" + partName + "' not found");
+        }
+        auto tkey = resolveTableName(target);
+        if (!tables_.count(tkey))
+            throw std::runtime_error("Partition table '" + target + "' not found");
+        tables_.at(tkey).insert(Row(vals));
+    }
+
+    // Select from partitioned table: merge results from children
+    Table selectPartitioned(const std::string& parentName,
+                             const std::vector<WhereCondition>& conds = {},
+                             const std::string& logic = "AND") const {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey))
+            throw std::runtime_error("Table is not partitioned");
+        const auto& pi = partitionMeta_.at(pkey);
+        const auto& parentTbl = tables_.at(pkey);
+        Table result(parentName, parentTbl.columns());
+        auto targets = pi.pruneChildren(conds, logic);
+        for (const auto& child : targets) {
+            auto ckey = resolveTableName(child);
+            if (!tables_.count(ckey)) continue;
+            const auto& ctbl = tables_.at(ckey);
+            for (const auto& row : ctbl.rows()) {
+                if (row.xmax != 0) continue;
+                if (conds.empty() || rowMatches(ctbl, row, conds, logic))
+                    result.insert(row);
+            }
+        }
+        return result;
+    }
+
+    // Delete from partitioned table using WHERE col=val
+    size_t deletePartitioned(const std::string& parentName,
+                              const std::string& wCol, const std::string& wVal) {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey))
+            throw std::runtime_error("Table is not partitioned");
+        const auto& pi = partitionMeta_.at(pkey);
+        size_t total = 0;
+        // Build condition for pruning
+        std::vector<WhereCondition> conds;
+        WhereCondition wc; wc.col = wCol; wc.op = "="; wc.val = wVal;
+        conds.push_back(wc);
+        auto targets = pi.pruneChildren(conds, "AND");
+        for (const auto& child : targets) {
+            total += deleteWhere(child, wCol, wVal);
+        }
+        return total;
+    }
+
+    // Delete from partitioned table - scan all children
+    size_t deleteAllPartitioned(const std::string& parentName) {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey)) return 0;
+        const auto& pi = partitionMeta_.at(pkey);
+        size_t total = 0;
+        for (const auto& child : pi.children) {
+            auto ckey = resolveTableName(child);
+            if (!tables_.count(ckey)) continue;
+            total += tables_.at(ckey).rowCount();
+            tables_.at(ckey).mutableRows().clear();
+        }
+        return total;
+    }
+
+    // Count rows across all partitions
+    size_t countPartitioned(const std::string& parentName) const {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey)) return 0;
+        const auto& pi = partitionMeta_.at(pkey);
+        size_t total = 0;
+        for (const auto& child : pi.children) {
+            auto ckey = resolveTableName(child);
+            if (tables_.count(ckey)) total += tables_.at(ckey).rowCount();
+        }
+        return total;
+    }
+
+    // Drop a specific partition
+    void dropPartition(const std::string& parentName, const std::string& partName) {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey))
+            throw std::runtime_error("Table is not partitioned");
+        auto& pi = partitionMeta_[pkey];
+        // Find matching child (partName may be short name like "p_old" or full like "archive_p_old")
+        std::string matchedChild;
+        for (const auto& ch : pi.children) {
+            if (ch == partName || ch.find(partName) != std::string::npos) {
+                matchedChild = ch;
+                break;
+            }
+        }
+        if (!matchedChild.empty()) {
+            auto ckey = resolveTableName(matchedChild);
+            tables_.erase(ckey);
+            pi.children.erase(
+                std::remove(pi.children.begin(), pi.children.end(), matchedChild),
+                pi.children.end());
+        }
+        // Remove from range/list defs
+        pi.ranges.erase(
+            std::remove_if(pi.ranges.begin(), pi.ranges.end(),
+                [&](const PartitionRangeDef& r) { return r.name == partName; }),
+            pi.ranges.end());
+        pi.lists.erase(
+            std::remove_if(pi.lists.begin(), pi.lists.end(),
+                [&](const PartitionListDef& l) { return l.name == partName; }),
+            pi.lists.end());
+        // Clear cache
+        partitionCache_.erase(pkey);
+    }
+
+    // Detach: remove partition from parent but keep as standalone table
+    void detachPartition(const std::string& parentName, const std::string& partName) {
+        auto pkey = resolveTableName(parentName);
+        if (!partitionMeta_.count(pkey))
+            throw std::runtime_error("Table is not partitioned");
+        auto& pi = partitionMeta_[pkey];
+        // Find matching child
+        std::string matchedChild;
+        for (const auto& ch : pi.children) {
+            if (ch == partName || ch.find(partName) != std::string::npos) {
+                matchedChild = ch;
+                break;
+            }
+        }
+        if (!matchedChild.empty()) {
+            pi.children.erase(
+                std::remove(pi.children.begin(), pi.children.end(), matchedChild),
+                pi.children.end());
+        }
+        pi.ranges.erase(
+            std::remove_if(pi.ranges.begin(), pi.ranges.end(),
+                [&](const PartitionRangeDef& r) { return r.name == partName; }),
+            pi.ranges.end());
+        pi.lists.erase(
+            std::remove_if(pi.lists.begin(), pi.lists.end(),
+                [&](const PartitionListDef& l) { return l.name == partName; }),
+            pi.lists.end());
+        // Table stays in tables_ as standalone
+        partitionCache_.erase(pkey);
+    }
+
     void setTablePartitionInfo(const std::string& tblRaw, const PartitionInfo& pi) {
         auto name = resolveTableName(tblRaw);
         auto it = tables_.find(name);
@@ -9142,11 +9728,28 @@ private:
         return parts;
     }
 
+    // Phase 173: Helper to extract numeric app-user-id from service-account name.
+    // "svc_1" -> "1",  "alice" -> "alice" (fallback)
+    std::string appUserIdStr_() const {
+        if (currentUser_.size() > 4 && currentUser_.substr(0, 4) == "svc_")
+            return currentUser_.substr(4);
+        return currentUser_;
+    }
+
     // Phase 170: Substitute CURRENT_USER_ID() / current_user in RLS expression
     std::string rlsSubstituteVars_(const std::string& expr) const {
         std::string e = expr;
-        // Replace CURRENT_USER_ID() with current user name
+        // Phase 173: CURRENT_APP_USER_ID() -> numeric suffix of svc_ accounts
         size_t p;
+        while ((p = e.find("CURRENT_APP_USER_ID()")) != std::string::npos)
+            e.replace(p, 21, appUserIdStr_());
+        while ((p = e.find("current_app_user_id()")) != std::string::npos)
+            e.replace(p, 21, appUserIdStr_());
+        // Replace CURRENT_USER_ID() with current user name
+        while ((p = e.find("CURRENT_USER_ID()")) != std::string::npos)
+            e.replace(p, 17, currentUser_);
+        while ((p = e.find("current_user_id()")) != std::string::npos)
+            e.replace(p, 17, currentUser_);
         while ((p = e.find("CURRENT_USER_ID()")) != std::string::npos)
             e.replace(p, 17, currentUser_);
         while ((p = e.find("current_user_id()")) != std::string::npos)
@@ -9344,6 +9947,8 @@ private:
         if (expr.empty()) return true;
         if (expr == "1 = 1" || expr == "1=1") return true;
         if (expr == "1 = 0" || expr == "1=0") return false;
+        if (expr == "TRUE" || expr == "true") return true;
+        if (expr == "FALSE" || expr == "false") return false;
 
         try {
             auto [conds, logic] = parseRlsExpr_(expr);
@@ -9933,11 +10538,30 @@ public:
                 Column("table_type",    "TEXT"),
             };
             Table t("information_schema.tables", cols);
+            std::string myPfx = isRootUser_ ? "" : ("u" + std::to_string(currentUserId_) + "_");
             for (const auto& [tname, _tbl] : tables_) {
-                t.insert(Row({"public", "public", bareName(tname), "BASE TABLE"}));
+                // Tenant isolation: non-root only sees own + shared tables
+                if (!isRootUser_) {
+                    if (tname.size() >= 2 && tname[0] == '_' && tname[1] == '_') continue;
+                    if (tname.size() > 2 && tname[0] == 'u' && std::isdigit((unsigned char)tname[1])) {
+                        if (myPfx.empty() || tname.substr(0, myPfx.size()) != myPfx) continue;
+                    }
+                }
+                std::string displayName = bareName(tname);
+                if (!myPfx.empty() && displayName.substr(0, myPfx.size()) == myPfx)
+                    displayName = displayName.substr(myPfx.size());
+                t.insert(Row({"public", "public", displayName, "BASE TABLE"}));
             }
             for (const auto& [vname, _vsql] : views_) {
-                t.insert(Row({"public", "public", vname, "VIEW"}));
+                if (!isRootUser_) {
+                    if (vname.size() > 2 && vname[0] == 'u' && std::isdigit((unsigned char)vname[1])) {
+                        if (myPfx.empty() || vname.substr(0, myPfx.size()) != myPfx) continue;
+                    }
+                }
+                std::string displayName = vname;
+                if (!myPfx.empty() && displayName.substr(0, myPfx.size()) == myPfx)
+                    displayName = displayName.substr(myPfx.size());
+                t.insert(Row({"public", "public", displayName, "VIEW"}));
             }
             return t;
         }
@@ -9952,6 +10576,14 @@ public:
             };
             Table t("information_schema.columns", cols);
             for (const auto& [tname, tbl] : tables_) {
+                // Tenant isolation
+                if (!isRootUser_) {
+                    std::string myPfx2 = "u" + std::to_string(currentUserId_) + "_";
+                    if (tname.size() >= 2 && tname[0] == '_' && tname[1] == '_') continue;
+                    if (tname.size() > 2 && tname[0] == 'u' && std::isdigit((unsigned char)tname[1])) {
+                        if (tname.substr(0, myPfx2.size()) != myPfx2) continue;
+                    }
+                }
                 std::string bname = bareName(tname);
                 const auto& tcols = tbl.columns();
                 for (size_t i = 0; i < tcols.size(); ++i) {

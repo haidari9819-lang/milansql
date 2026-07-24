@@ -2479,6 +2479,9 @@ td.null-val{color:#484f58;font-style:italic}
       <div class="nav-item" data-page="history" onclick="showPage('history',this)">
         <span class="icon">&#x1F550;</span> Query History
       </div>
+      <div class="nav-item" data-page="auditlog" onclick="showPage('auditlog',this)">
+        <span class="icon">&#x1F512;</span> Audit Log
+      </div>
     </div>
     <div class="nav-section">
       <div class="nav-label">Tables</div>
@@ -2589,6 +2592,23 @@ td.null-val{color:#484f58;font-style:italic}
         <button class="btn btn-gray" style="margin-left:auto;font-size:0.75rem" onclick="clearHistory()">Clear</button>
       </div>
       <div id="history-list" style="flex:1;overflow-y:auto;padding:12px"></div>
+    </div>
+
+    <!-- AUDIT LOG PAGE -->
+    <div class="page" id="page-auditlog">
+      <div style="padding:12px;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center">
+        <span style="font-size:0.85rem;color:#8b949e">Audit Log</span>
+        <select id="audit-filter-field" style="background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:0.75rem">
+          <option value="">All</option>
+          <option value="user">User</option>
+          <option value="op">Operation</option>
+          <option value="table">Table</option>
+        </select>
+        <input id="audit-filter-value" placeholder="Filter value..." style="background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:0.75rem;width:140px">
+        <button class="btn btn-blue" style="font-size:0.75rem" onclick="loadAuditLog()">Filter</button>
+        <button class="btn btn-gray" style="margin-left:auto;font-size:0.75rem" onclick="clearAuditLog()">Clear Log</button>
+      </div>
+      <div id="audit-log-content" style="flex:1;overflow-y:auto;padding:12px;font-size:0.8rem"></div>
     </div>
 
   </div><!-- /main -->
@@ -2748,6 +2768,7 @@ function showPage(name, el) {
   if (el) el.classList.add('active');
   if (name === 'browser') loadBrowserTables();
   if (name === 'history') renderHistory();
+  if (name === 'auditlog') loadAuditLog();
   if (name === 'monitoring') { monLastQ = 0; monQueryHistory = []; loadMonitoring(); }
   else stopMonitoring();
 }
@@ -2999,6 +3020,32 @@ document.addEventListener('click', function(e) {
 });
 
 // Table sidebar
+// Phase 176: Audit Log page
+async function loadAuditLog() {
+  var field = document.getElementById('audit-filter-field').value;
+  var value = document.getElementById('audit-filter-value').value;
+  var sql = 'SHOW AUDIT LOG';
+  if (field && value) sql += " WHERE " + field + " = '" + value + "'";
+  sql += ' LIMIT 200';
+  try {
+    var resp = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sql})});
+    var data = await resp.json();
+    var el = document.getElementById('audit-log-content');
+    if (data.error) { el.innerHTML = '<div style="color:#f85149">' + data.error + '</div>'; return; }
+    if (!data.columns || !data.rows || data.rows.length === 0) { el.innerHTML = '<div style="color:#8b949e">No audit entries.</div>'; return; }
+    var html = '<table class="result-table" style="width:100%"><thead><tr>';
+    data.columns.forEach(function(c){html+='<th>'+c+'</th>';});
+    html += '</tr></thead><tbody>';
+    data.rows.forEach(function(r){html+='<tr>';r.forEach(function(v){html+='<td>'+v+'</td>';});html+='</tr>';});
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e) { document.getElementById('audit-log-content').innerHTML = '<div style="color:#f85149">Error: '+e+'</div>'; }
+}
+async function clearAuditLog() {
+  await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'FLUSH AUDIT LOG'})});
+  loadAuditLog();
+}
+
 async function loadSidebarTables() {
   try {
     var r = await fetch('/tables', {credentials:'include'});

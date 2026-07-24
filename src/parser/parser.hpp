@@ -92,6 +92,9 @@ enum class CommandType {
     SHOW_BINLOG,
     STOP_SLAVE,
     START_SLAVE,
+    // v11.1.0: WAL archive and replication status
+    SHOW_WAL_ARCHIVE_STATUS,
+    SHOW_REPLICATION_STATUS,
     // Phase 60: CSV Import/Export
     LOAD_DATA,
     INTO_OUTFILE,
@@ -104,6 +107,10 @@ enum class CommandType {
     SET_EVENT_SCHEDULER,
     // Phase 62: Partitioning
     SHOW_PARTITIONS,
+    CREATE_PARTITION,
+    DROP_PARTITION,
+    ATTACH_PARTITION,
+    DETACH_PARTITION,
     // Phase 64: SAVEPOINT
     SAVEPOINT,
     ROLLBACK_TO_SAVEPOINT,
@@ -351,6 +358,8 @@ enum class CommandType {
     CREATE_FUNCTION,
     DROP_FUNCTION,
     SHOW_FUNCTIONS,
+    // Block 7: Natural Language SQL
+    SHOW_NL_STATUS,
     UNKNOWN
 };
 
@@ -552,7 +561,8 @@ struct ParsedCommand {
     // Used by CREATE TABLE parser to pass partition info to dispatch
     struct ParsedPartitionRange {
         std::string name;
-        std::string limitStr;  // "100" or "MAXVALUE"
+        std::string fromStr;   // lower bound for FROM-TO syntax
+        std::string limitStr;  // upper bound or "MAXVALUE"
     };
     struct ParsedPartitionList {
         std::string name;
@@ -565,6 +575,7 @@ struct ParsedCommand {
     std::vector<ParsedPartitionList>  partitionLists;
     // For SHOW PARTITIONS / ALTER TABLE DROP PARTITION
     std::string partitionName;   // partition name for DROP PARTITION
+    std::string parentTable;     // Phase 176: parent table for CREATE/DROP PARTITION
     // For ALTER TABLE ADD PARTITION (RANGE)
     ParsedPartitionRange addRangeDef;
     // For ALTER TABLE ADD PARTITION (LIST)
@@ -1484,6 +1495,24 @@ public:
                                                                 if (vp != std::string::npos && vpe != std::string::npos)
                                                                     rdef.limitStr = trim(pd.substr(vp + 1, vpe - vp - 1));
                                                                 else rdef.limitStr = "MAXVALUE";
+                                                            } else if (upd.find("FOR VALUES FROM") != std::string::npos || upd.find("VALUES FROM") != std::string::npos) {
+                                                                // FROM (x) TO (y) syntax
+                                                                auto fromPos = upd.find("FROM");
+                                                                if (fromPos != std::string::npos) {
+                                                                    auto fp = pd.find('(', fromPos);
+                                                                    auto fpe = pd.find(')', fp);
+                                                                    if (fp != std::string::npos && fpe != std::string::npos) {
+                                                                        rdef.fromStr = trim(pd.substr(fp + 1, fpe - fp - 1));
+                                                                    }
+                                                                    auto toPos = upd.find("TO", fpe);
+                                                                    if (toPos != std::string::npos) {
+                                                                        auto tp = pd.find('(', toPos);
+                                                                        auto tpe = pd.find(')', tp);
+                                                                        if (tp != std::string::npos && tpe != std::string::npos) {
+                                                                            rdef.limitStr = trim(pd.substr(tp + 1, tpe - tp - 1));
+                                                                        }
+                                                                    }
+                                                                }
                                                             } else if (upd.find("MAXVALUE") != std::string::npos) {
                                                                 rdef.limitStr = "MAXVALUE";
                                                             }
@@ -2763,6 +2792,10 @@ public:
             } else if (kw1 == "PERFORMANCE" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "BASELINE") {
                 cmd.type = CommandType::SHOW_PERFORMANCE_BASELINE;
+            // Block 7: SHOW NL STATUS
+            } else if (kw1 == "NL" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_NL_STATUS;
             // Phase 73: SHOW BUFFER POOL STATUS
             } else if (kw1 == "BUFFER" && tokens.size() >= 4 &&
                        toUpper(tokens[2]) == "POOL" && toUpper(tokens[3]) == "STATUS") {
@@ -3027,6 +3060,14 @@ public:
             } else if (kw1 == "PREPARED" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "TRANSACTIONS") {
                 cmd.type = CommandType::SHOW_PREPARED_TRANSACTIONS;
+            // v11.1.0: SHOW WAL ARCHIVE STATUS
+            } else if (kw1 == "WAL" && tokens.size() >= 4 &&
+                       toUpper(tokens[2]) == "ARCHIVE" && toUpper(tokens[3]) == "STATUS") {
+                cmd.type = CommandType::SHOW_WAL_ARCHIVE_STATUS;
+            // v11.1.0: SHOW REPLICATION STATUS
+            } else if (kw1 == "REPLICATION" && tokens.size() >= 3 &&
+                       toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_REPLICATION_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3537,13 +3578,24 @@ public:
                     while (!rhs.empty() && (rhs.back() == ' ' || rhs.back() == '\t' ||
                                             rhs.back() == ';')) rhs.pop_back();
                     for (char& c : lhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    // Block 7: NL vars need case-preserved + unquoted values
+                    std::string rawRhs = rhs; // preserve before uppercasing
+                    // Strip surrounding quotes from raw value
+                    if (rawRhs.size() >= 2 && rawRhs.front() == '\'' && rawRhs.back() == '\'')
+                        rawRhs = rawRhs.substr(1, rawRhs.size() - 2);
                     for (char& c : rhs) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
                     cmd.varName  = lhs;
-                    cmd.varValue = rhs;
+                    // Use case-preserved value for NL_* variables
+                    if (lhs.substr(0, 3) == "NL_") {
+                        cmd.varValue = rawRhs;
+                    } else {
+                        cmd.varValue = rhs;
+                    }
                     // check for known Phase 125/126/141/145 varNames — use SET_CACHE as a carrier CommandType
                     static const std::vector<std::string> knownSetVars = {
                         "ROUTING", "OPTIMIZER_TRACE", "MAX_PARALLEL_WORKERS", "PARALLEL_THRESHOLD",
-                        "AUDIT_LOG", "AUDIT_LOG_FILE", "ALLOW_HOST", "DENY_HOST", "BLACKLIST_QUERY",
+                        "AUDIT_LOG", "AUDIT_LOG_FILE", "AUDIT_LEVEL", "AUDIT_ANONYMIZE", "AUDIT_ROTATION",
+                        "ALLOW_HOST", "DENY_HOST", "BLACKLIST_QUERY",
                         "PASSWORD_MIN_LENGTH", "PASSWORD_REQUIRE_SPECIAL",
                         "MAX_CONNECTIONS_PER_IP", "CONNECTION_RATE_LIMIT",
                         // Phase 149: Optimizer hints
@@ -3551,7 +3603,9 @@ public:
                         // Optimizer Phase 3 Block 3: Indexed-NL-Grenze
                         "NL_THRESHOLD",
                         // Optimizer Phase 3 Block 4: Auto-ANALYZE
-                        "AUTO_ANALYZE_ENABLED", "AUTO_ANALYZE_THRESHOLD"
+                        "AUTO_ANALYZE_ENABLED", "AUTO_ANALYZE_THRESHOLD",
+                        // Block 7: NL Query configuration
+                        "NL_API_KEY", "NL_MODEL", "NL_PROVIDER"
                     };
                     for (const auto& kv : knownSetVars) {
                         if (lhs == kv) { cmd.type = CommandType::SET_CACHE; break; }
@@ -5411,11 +5465,18 @@ private:
             cmd.type = CommandType::UNKNOWN;
 
         } else if (op == "ADD" && kw4 == "COLUMN" && tokens.size() >= 6) {
-            cmd.alterOp      = "ADD";
-            cmd.alterColName = tokens[5];
-            cmd.alterColType = tokens.size() >= 7 ? toUpper(tokens[6]) : "TEXT";
+            cmd.alterOp = "ADD";
+            // v11.1.0: support ALTER TABLE t ADD COLUMN IF NOT EXISTS col TYPE
+            size_t nameIdx = 5;
+            if (tokens.size() >= 9 && toUpper(tokens[5]) == "IF" &&
+                toUpper(tokens[6]) == "NOT" && toUpper(tokens[7]) == "EXISTS") {
+                nameIdx = 8;
+                cmd.ifNotExists = true;
+            }
+            cmd.alterColName = tokens[nameIdx];
+            cmd.alterColType = (nameIdx + 1 < tokens.size()) ? toUpper(tokens[nameIdx + 1]) : "TEXT";
             // Phase 146: Parse optional DEFAULT value
-            for (size_t di = 7; di + 1 < tokens.size(); ++di) {
+            for (size_t di = nameIdx + 2; di + 1 < tokens.size(); ++di) {
                 if (toUpper(tokens[di]) == "DEFAULT") {
                     cmd.alterColDefault = tokens[di + 1];
                     if (cmd.alterColDefault.size() >= 2 &&

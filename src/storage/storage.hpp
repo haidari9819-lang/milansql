@@ -82,6 +82,11 @@ inline void atomicWriteFile(const std::string& path, const std::string& data) {
         std::remove(tmp.c_str());
         throw std::runtime_error("Rename fehlgeschlagen: " + path);
     }
+    // Hardening-Audit Block 1: Verzeichnis-fsync nach rename —
+    // erst damit ist der atomare Tausch selbst crash-sicher
+    // (sonst kann nach Stromausfall noch die alte Datei da sein
+    // UND die tmp-Datei fehlen → Save wirkt "verloren").
+    milanFsyncDir(path);
 #endif
 }
 

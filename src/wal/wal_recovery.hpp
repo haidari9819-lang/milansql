@@ -160,8 +160,8 @@ public:
     // Replays any committed transactions that weren't yet persisted.
     RecoveryResult recover(Engine& engine, const std::string& path);
 
-private:
     // Parse one op block (lines between TX_BEGIN and ---) into a BufferedOp
+    // Phase 178: Made public for PITR restore
     bool parseOpBlock(const std::vector<std::string>& lines,
                       BufferedOp& op) const {
         op = BufferedOp{};

@@ -639,6 +639,7 @@ public:
     // ── Persistence ───────────────────────────────────────────
 
     void save(const std::string& path) const {
+        // Security: ensure auth file is owner-only readable
         std::lock_guard<std::mutex> lk(mutex_);
         std::ofstream f(path);
         if (!f) return;
@@ -675,6 +676,9 @@ public:
               << s.username << "\t" << s.createdAt << "\t" << s.expiresAt << "\t"
               << s.refreshExpiresAt << "\t" << (s.revoked?1:0) << "\n";
         }
+#ifndef _WIN32
+        chmod(path.c_str(), 0600);  // Security: owner-only readable
+#endif
     }
 
     void load(const std::string& path) {
@@ -774,6 +778,12 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         auto it = users_.find(id);
         return (it != users_.end()) ? &it->second : nullptr;
+    }
+
+    // Phase 175: CLS - access all permissions
+    const std::vector<Permission>& getPermissions() const {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return permissions_;
     }
 
     // Public wrappers for testing
@@ -986,7 +996,13 @@ private:
             std::string salt = storedHash.substr(d2+1, d3-d2-1);
             std::string expected = storedHash.substr(d3+1);
             auto dk = pbkdf2HmacSha256(password, salt, iters);
-            bool matches = SHA256Impl::hexStr(dk) == expected;
+            // Security: constant-time comparison to prevent timing attacks
+            std::string computed = SHA256Impl::hexStr(dk);
+            bool matches = (computed.size() == expected.size());
+            volatile unsigned char diff = 0;
+            for (size_t i = 0; i < computed.size() && i < expected.size(); ++i)
+                diff |= static_cast<unsigned char>(computed[i]) ^ static_cast<unsigned char>(expected[i]);
+            matches = matches && (diff == 0);
             // Migrate if stored iterations differ from current target
             return {matches, matches && iters != PBKDF2_ITERATIONS};
         }
@@ -995,7 +1011,12 @@ private:
         if (colon == std::string::npos) return {false, false};
         std::string salt = storedHash.substr(0, colon);
         std::string expected = storedHash.substr(colon+1);
-        bool ok = SHA256Impl::hashHex(salt + password) == expected;
+        std::string computed = SHA256Impl::hashHex(salt + password);
+        bool ok = (computed.size() == expected.size());
+        volatile unsigned char diff2 = 0;
+        for (size_t i = 0; i < computed.size() && i < expected.size(); ++i)
+            diff2 |= static_cast<unsigned char>(computed[i]) ^ static_cast<unsigned char>(expected[i]);
+        ok = ok && (diff2 == 0);
         return {ok, ok};  // if matched, needs migration to PBKDF2
     }
     // Legacy compat wrapper

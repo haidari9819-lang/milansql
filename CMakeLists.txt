@@ -18,7 +18,7 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src src/server src/auth src/crypto src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api src/monitoring src/federation src/config src/migration src/ssl src/index src/concurrent)
+target_include_directories(milansql PRIVATE src src/server src/auth src/crypto src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api src/monitoring src/federation src/config src/migration src/ssl src/index src/concurrent src/nl)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)
@@ -45,7 +45,7 @@ endif()
 # ── Test-Suite (Phase 99) ────────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src src/server src/auth src/crypto src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor)
+target_include_directories(milansql_tests PRIVATE src src/server src/auth src/crypto src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor src/nl)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()

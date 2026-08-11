@@ -37,6 +37,8 @@
 #include "pubsub/pubsub.hpp"           // Phase 76: LISTEN/NOTIFY
 #include "copy/copy_manager.hpp"       // Phase 92: COPY FROM/TO
 #include "cache/statement_cache.hpp"   // Phase 93: Prepared Statement Cache
+#include "parallel/thread_pool.hpp"    // Phase 2.1: Thread Pool
+#include "cache/user_query_cache.hpp"  // Phase 2.2: Per-User Query Cache
 #include "pool/connection_pool.hpp"    // Phase 94: Connection Pool Multiplexing
 #include "monitoring/prometheus.hpp"   // Phase 102: Prometheus Metrics
 #include "federation/federation_manager.hpp"  // Phase 105: Query Federation
@@ -7234,6 +7236,67 @@ inline bool dispatchCommand(
         std::cout << "  Transaction commit   | 0.1 ms          | OK\n";
         std::cout << "  Memory per row       | 150 bytes       | OK\n";
         std::cout << "  Startup time         | 45 ms           | OK\n\n";
+        break;
+    }
+
+    // ── Phase 2.1: SET parallel_workers = N ──────────────────────
+    case milansql::CommandType::SET_PARALLEL_WORKERS: {
+        if (!cmd.values.empty()) {
+            try {
+                int n = std::stoi(cmd.values[0]);
+                if (n < 1) n = 1;
+                if (n > 64) n = 64;
+                milansql::g_threadPool().resize(static_cast<size_t>(n));
+                std::cout << "  parallel_workers = " << n << "\n\n";
+            } catch (...) {
+                std::cout << "  ERROR: SET parallel_workers = <N>\n\n";
+            }
+        }
+        break;
+    }
+
+    // ── Phase 2.1: SHOW PARALLEL WORKERS ─────────────────────────
+    case milansql::CommandType::SHOW_PARALLEL_STATUS_V2: {
+        std::cout << "  parallel_workers        : " << milansql::g_threadPool().size() << "\n";
+        std::cout << "  parallel_workers_active : " << milansql::g_parallelWorkersActive().load() << "\n\n";
+        break;
+    }
+
+    // ── Phase 2.2: SET query_cache_size = N ──────────────────────
+    case milansql::CommandType::SET_QUERY_CACHE_SIZE: {
+        if (!cmd.values.empty()) {
+            try {
+                size_t n = static_cast<size_t>(std::stoul(cmd.values[0]));
+                milansql::g_userQueryCache().setMaxEntries(n);
+                engine.getQueryCache().setEnabled(true);
+                std::cout << "  query_cache_size = " << n << "\n\n";
+            } catch (...) {
+                std::cout << "  ERROR: SET query_cache_size = <N>\n\n";
+            }
+        }
+        break;
+    }
+
+    // ── Phase 2.2: FLUSH QUERY CACHE ─────────────────────────────
+    case milansql::CommandType::FLUSH_QUERY_CACHE: {
+        milansql::g_userQueryCache().flush();
+        engine.getQueryCache().clear();
+        std::cout << "  Query cache flushed.\n\n";
+        break;
+    }
+
+    // ── Phase 2.2: SHOW QUERY CACHE STATS ────────────────────────
+    case milansql::CommandType::SHOW_QUERY_CACHE_STATS: {
+        auto& uc = milansql::g_userQueryCache();
+        std::cout << "  User Query Cache Stats:\n";
+        std::cout << "  Enabled  : " << (uc.isEnabled() ? "YES" : "NO") << "\n";
+        std::cout << "  Size     : " << uc.size() << " / " << uc.maxSize() << "\n";
+        std::cout << "  Hits     : " << uc.hits() << "\n";
+        std::cout << "  Misses   : " << uc.misses() << "\n";
+        long long total = uc.hits() + uc.misses();
+        if (total > 0)
+            std::cout << "  Hit rate : " << (uc.hits() * 100 / total) << "%\n";
+        std::cout << "\n";
         break;
     }
 

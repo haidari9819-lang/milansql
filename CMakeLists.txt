@@ -81,6 +81,19 @@ if(WIN32)
     target_link_libraries(milansql_fuzzer PRIVATE ws2_32)
 endif()
 
+# ── TPC-H Regression (Phase 2.4) ─────────────────────────────
+add_executable(milansql_tpch_regression src/tests/tpch_regression.cpp)
+target_compile_features(milansql_tpch_regression PRIVATE cxx_std_17)
+target_include_directories(milansql_tpch_regression PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor src/nl)
+if(MSVC)
+    target_compile_options(milansql_tpch_regression PRIVATE /W4)
+else()
+    target_compile_options(milansql_tpch_regression PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_tpch_regression PRIVATE ws2_32 secur32 crypt32)
+endif()
+
 # ── TPC-H Benchmark (Phase 101) ──────────────────────────────
 add_executable(milansql_tpch src/tests/tpch_benchmark.cpp)
 target_compile_features(milansql_tpch PRIVATE cxx_std_17)

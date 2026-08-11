@@ -13,6 +13,8 @@
 #include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
 #include "nl/nl_query.hpp"              // Block 7: Natural Language SQL
 #include "replication/repl_state.hpp"   // v11.1.0: SHOW WAL ARCHIVE / REPLICATION STATUS
+#include "parallel/thread_pool.hpp"    // Phase 2.1: Thread Pool
+#include "cache/user_query_cache.hpp"  // Phase 2.2: Per-User Query Cache
 
 namespace milansql {
 
@@ -1586,6 +1588,66 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── Phase 2.1: SET parallel_workers = N ──────────────────────
+    case milansql::CommandType::SET_PARALLEL_WORKERS: {
+        if (!cmd.values.empty()) {
+            try {
+                int n = std::stoi(cmd.values[0]);
+                if (n < 1) n = 1;
+                if (n > 64) n = 64;
+                milansql::g_threadPool().resize(static_cast<size_t>(n));
+                qr.columns.push_back(milansql::Column{"result", "TEXT"});
+                qr.rows.push_back(milansql::Row({"parallel_workers = " + std::to_string(n)}));
+            } catch (...) {
+                qr.error = "ERROR: SET parallel_workers = <N>";
+            }
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_PARALLEL_STATUS_V2: {
+        qr.columns.push_back(milansql::Column{"setting", "TEXT"});
+        qr.columns.push_back(milansql::Column{"value",   "TEXT"});
+        qr.rows.push_back(milansql::Row({"parallel_workers", std::to_string(milansql::g_threadPool().size())}));
+        qr.rows.push_back(milansql::Row({"parallel_workers_active", std::to_string(milansql::g_parallelWorkersActive().load())}));
+        break;
+    }
+
+    // ── Phase 2.2: SET query_cache_size = N ──────────────────────
+    case milansql::CommandType::SET_QUERY_CACHE_SIZE: {
+        if (!cmd.values.empty()) {
+            try {
+                size_t n = static_cast<size_t>(std::stoul(cmd.values[0]));
+                milansql::g_userQueryCache().setMaxEntries(n);
+                qr.columns.push_back(milansql::Column{"result", "TEXT"});
+                qr.rows.push_back(milansql::Row({"query_cache_size = " + std::to_string(n)}));
+            } catch (...) {
+                qr.error = "ERROR: SET query_cache_size = <N>";
+            }
+        }
+        break;
+    }
+
+    case milansql::CommandType::FLUSH_QUERY_CACHE: {
+        milansql::g_userQueryCache().flush();
+        engine.getQueryCache().clear();
+        qr.columns.push_back(milansql::Column{"result", "TEXT"});
+        qr.rows.push_back(milansql::Row({"Query cache flushed"}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_QUERY_CACHE_STATS: {
+        auto& uc = milansql::g_userQueryCache();
+        qr.columns.push_back(milansql::Column{"setting", "TEXT"});
+        qr.columns.push_back(milansql::Column{"value",   "TEXT"});
+        qr.rows.push_back(milansql::Row({"enabled",  uc.isEnabled() ? "true" : "false"}));
+        qr.rows.push_back(milansql::Row({"size",     std::to_string(uc.size())}));
+        qr.rows.push_back(milansql::Row({"max_size", std::to_string(uc.maxSize())}));
+        qr.rows.push_back(milansql::Row({"hits",     std::to_string(uc.hits())}));
+        qr.rows.push_back(milansql::Row({"misses",   std::to_string(uc.misses())}));
+        break;
+    }
+
     default:
         break;
     }
@@ -1631,6 +1693,13 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     }
 
     return qr;
+}
+
+// ── Convenience: dispatch a SQL string directly ───────────────
+inline QueryResult dispatch(const std::string& sql, milansql::Engine& engine, QueryResult& qrOut) {
+    milansql::Parser parser;
+    qrOut = dispatch(parser.parse(sql), engine);
+    return qrOut;
 }
 
 } // namespace milansql

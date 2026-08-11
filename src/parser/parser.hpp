@@ -360,6 +360,13 @@ enum class CommandType {
     SHOW_FUNCTIONS,
     // Block 7: Natural Language SQL
     SHOW_NL_STATUS,
+    // Phase 2.1: Read Query Parallelism
+    SET_PARALLEL_WORKERS,
+    SHOW_PARALLEL_STATUS_V2,
+    // Phase 2.2: Adaptive Query Result Cache
+    SET_QUERY_CACHE_SIZE,
+    FLUSH_QUERY_CACHE,
+    SHOW_QUERY_CACHE_STATS,
     UNKNOWN
 };
 
@@ -3068,6 +3075,12 @@ public:
             } else if (kw1 == "REPLICATION" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "STATUS") {
                 cmd.type = CommandType::SHOW_REPLICATION_STATUS;
+            // ── Phase 2.1: SHOW PARALLEL WORKERS ─────────────────
+            } else if (kw1 == "PARALLEL" && tokens.size() >= 3 && toUpper(tokens[2]) == "WORKERS") {
+                cmd.type = CommandType::SHOW_PARALLEL_STATUS_V2;
+            // ── Phase 2.2: SHOW QUERY CACHE STATS ────────────────
+            } else if (kw1 == "QUERY" && tokens.size() >= 4 && toUpper(tokens[2]) == "CACHE" && toUpper(tokens[3]) == "STATS") {
+                cmd.type = CommandType::SHOW_QUERY_CACHE_STATS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3237,6 +3250,36 @@ public:
                 if (val == "=" && tokens.size() >= 4) val = tokens[3];
                 if (!val.empty()) cmd.values.push_back(val);
             }
+
+        // ── Phase 2.1: SET parallel_workers = N ──────────────────
+        } else if (kw0 == "SET" && kw1 == "PARALLEL_WORKERS") {
+            cmd.type = CommandType::SET_PARALLEL_WORKERS;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                if (!val.empty()) cmd.values.push_back(val);
+            }
+
+        // ── Phase 2.2: SET query_cache_size = N ──────────────────
+        } else if (kw0 == "SET" && kw1 == "QUERY_CACHE_SIZE") {
+            cmd.type = CommandType::SET_QUERY_CACHE_SIZE;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                if (!val.empty()) cmd.values.push_back(val);
+            }
+
+        // ── Phase 2.2: FLUSH QUERY CACHE ─────────────────────────
+        } else if (kw0 == "FLUSH" && kw1 == "QUERY" && tokens.size() >= 3 && toUpper(tokens[2]) == "CACHE") {
+            cmd.type = CommandType::FLUSH_QUERY_CACHE;
+
+        // ── Phase 2.2: SHOW QUERY CACHE STATS ────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "QUERY" && tokens.size() >= 4 && toUpper(tokens[2]) == "CACHE" && toUpper(tokens[3]) == "STATS") {
+            cmd.type = CommandType::SHOW_QUERY_CACHE_STATS;
+
+        // ── Phase 2.1: SHOW PARALLEL STATUS ──────────────────────
+        } else if (kw0 == "SHOW" && kw1 == "PARALLEL" && tokens.size() >= 3 && toUpper(tokens[2]) == "WORKERS") {
+            cmd.type = CommandType::SHOW_PARALLEL_STATUS_V2;
 
         // ── Phase 76: LISTEN channel ──────────────────────────────
         } else if (kw0 == "LISTEN") {

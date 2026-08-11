@@ -60,6 +60,8 @@
 #include "../wal/pitr_manager.hpp"
 #include "../monitoring/metrics.hpp"
 #include "../logger/logger.hpp"
+#include "../cache/user_query_cache.hpp"  // Phase 2.2: Per-User Query Cache
+#include "../parallel/thread_pool.hpp"    // Phase 2.1: Thread Pool
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
@@ -67,7 +69,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1818;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.2.0";
+static constexpr const char* MILANSQL_VERSION = "11.6.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -5820,7 +5822,24 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
                   << "milansql_uptime_seconds_v2 " << mc.uptime_seconds() << "\n"
                   << "# HELP milansql_version MilanSQL version info\n"
                   << "# TYPE milansql_version gauge\n"
-                  << "milansql_version{version=\"" << MILANSQL_VERSION << "\"} 1\n";
+                  << "milansql_version{version=\"" << MILANSQL_VERSION << "\"} 1\n"
+                  // Phase 2.1: parallel workers
+                  << "# HELP milansql_parallel_workers Number of parallel worker threads\n"
+                  << "# TYPE milansql_parallel_workers gauge\n"
+                  << "milansql_parallel_workers " << milansql::g_threadPool().size() << "\n"
+                  << "# HELP milansql_parallel_workers_active Currently active parallel workers\n"
+                  << "# TYPE milansql_parallel_workers_active gauge\n"
+                  << "milansql_parallel_workers_active " << milansql::g_parallelWorkersActive().load() << "\n"
+                  // Phase 2.2: query cache metrics
+                  << "# HELP milansql_cache_hits_total Total query cache hits\n"
+                  << "# TYPE milansql_cache_hits_total counter\n"
+                  << "milansql_cache_hits_total " << milansql::g_userQueryCache().hits() << "\n"
+                  << "# HELP milansql_cache_misses_total Total query cache misses\n"
+                  << "# TYPE milansql_cache_misses_total counter\n"
+                  << "milansql_cache_misses_total " << milansql::g_userQueryCache().misses() << "\n"
+                  << "# HELP milansql_cache_size Current number of cached query results\n"
+                  << "# TYPE milansql_cache_size gauge\n"
+                  << "milansql_cache_size " << milansql::g_userQueryCache().size() << "\n";
 
         std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics + mcMetrics.str();
         return buildHttpResponse(200, body, "text/plain; version=0.0.4; charset=utf-8");
@@ -5878,6 +5897,132 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(ok ? 200 : 500,
             "{\"success\":" + std::string(ok ? "true" : "false") +
             ",\"message\":\"" + msg + "\"}");
+    }
+
+    // ── Phase 2.3: POST /bulk-import — CSV bulk import ───────────
+    if (req.path == "/bulk-import" && req.method == "POST") {
+        // Auth required
+        auto bctx = extractUserContext(req);
+        if (!bctx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
+
+        // Extract parameters: table= and delimiter= from query string or headers
+        std::string tableName;
+        char delim = ',';
+
+        // Try to get table from query string in path (e.g. /bulk-import?table=foo&delimiter=;)
+        // req.path is already stripped; check query_ field or parse from raw path
+        // Parse a query string (e.g. "?table=foo&delimiter=,") for a named parameter
+        auto getQueryParam = [](const std::string& rawQs, const std::string& paramName) -> std::string {
+            // rawQs starts with '?'
+            std::string qs = rawQs.size() > 1 ? rawQs.substr(1) : "";
+            size_t p = 0;
+            while (p < qs.size()) {
+                auto eq = qs.find('=', p);
+                if (eq == std::string::npos) break;
+                std::string key = qs.substr(p, eq - p);
+                auto amp = qs.find('&', eq + 1);
+                std::string val = (amp == std::string::npos)
+                    ? qs.substr(eq + 1) : qs.substr(eq + 1, amp - eq - 1);
+                if (key == paramName) return val;
+                p = (amp == std::string::npos) ? qs.size() : amp + 1;
+            }
+            return "";
+        };
+
+        // Check X-Table header or table query param
+        auto tblHdr = req.headers.find("x-table");
+        if (tblHdr != req.headers.end()) tableName = tblHdr->second;
+        auto tblHdr2 = req.headers.find("table");
+        if (tableName.empty() && tblHdr2 != req.headers.end()) tableName = tblHdr2->second;
+
+        // Parse query parameters from req.query (the part after '?' in URL)
+        if (tableName.empty()) tableName = getQueryParam("?" + req.query, "table");
+        if (tableName.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Missing 'table' parameter"})");
+
+        std::string delimStr = getQueryParam("?" + req.query, "delimiter");
+        if (!delimStr.empty()) delim = delimStr[0];
+
+        // Body is CSV text
+        std::string csvData = req.body;
+        if (csvData.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Empty CSV body"})");
+
+        // Split CSV into lines and use copyManager logic
+        try {
+            std::vector<std::string> lines;
+            std::istringstream iss(csvData);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) lines.push_back(std::move(line));
+            }
+
+            // Use a simple CSV insert approach
+            // Parse header row
+            if (lines.empty())
+                return buildHttpResponse(400, R"({"success":false,"error":"No data rows"})");
+
+            auto splitCsv = [&](const std::string& s, char d) -> std::vector<std::string> {
+                std::vector<std::string> cols;
+                std::string cur;
+                bool inq = false;
+                for (char c : s) {
+                    if (c == '"') { inq = !inq; continue; }
+                    if (c == d && !inq) { cols.push_back(cur); cur.clear(); }
+                    else cur += c;
+                }
+                cols.push_back(cur);
+                return cols;
+            };
+
+            std::vector<std::string> headers = splitCsv(lines[0], delim);
+            int inserted = 0;
+            for (size_t i = 1; i < lines.size(); ++i) {
+                auto vals = splitCsv(lines[i], delim);
+                if (vals.size() != headers.size()) continue;
+                // Build INSERT SQL
+                std::string sql = "INSERT INTO " + tableName + " (";
+                for (size_t j = 0; j < headers.size(); ++j) {
+                    if (j > 0) sql += ",";
+                    sql += headers[j];
+                }
+                sql += ") VALUES (";
+                for (size_t j = 0; j < vals.size(); ++j) {
+                    if (j > 0) sql += ",";
+                    // Quote string values
+                    std::string v = vals[j];
+                    // Check if numeric
+                    bool isNum = !v.empty();
+                    for (char c : v) if (!std::isdigit((unsigned char)c) && c != '.' && c != '-') { isNum = false; break; }
+                    if (isNum) sql += v;
+                    else {
+                        // Escape single quotes
+                        std::string esc;
+                        for (char c : v) { if (c == '\'') esc += "'"; esc += c; }
+                        sql += "'" + esc + "'";
+                    }
+                }
+                sql += ")";
+
+                std::string result = handleQueryForUser(sql, bctx.userId, bctx.role);
+                // Check for error in JSON result
+                if (result.find("\"error\"") == std::string::npos &&
+                    result.find("\"success\":false") == std::string::npos)
+                    ++inserted;
+            }
+
+            // Invalidate cache for this table
+            milansql::g_userQueryCache().invalidate(tableName);
+            engine_.getQueryCache().invalidate(tableName);
+
+            return buildHttpResponse(200,
+                "{\"success\":true,\"copied\":" + std::to_string(inserted) + "}");
+        } catch (const std::exception& ex) {
+            return buildHttpResponse(500,
+                std::string("{\"success\":false,\"error\":\"") + ex.what() + "\"}");
+        }
     }
 
     // Phase 177: SSL status API

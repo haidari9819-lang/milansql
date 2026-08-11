@@ -69,7 +69,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1818;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.6.0";
+static constexpr const char* MILANSQL_VERSION = "11.6.1";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -1891,6 +1891,34 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         return "{\"success\":true,\"message\":\"Session revoked\"}";
     }
 
+    // Phase 2.2: SHOW QUERY CACHE STATS — return as JSON table
+    {
+        std::string u2 = upper;
+        while (!u2.empty() && (u2.back()==';'||u2.back()==' ')) u2.pop_back();
+        if (u2 == "SHOW QUERY CACHE STATS") {
+            auto& uc = milansql::g_userQueryCache();
+            long long h = uc.hits(), m = uc.misses(), total = h + m;
+            std::string hitRate = (total > 0) ? std::to_string(h * 100 / total) + "%" : "N/A";
+            std::string out =
+                "{\"success\":true,\"columns\":[\"setting\",\"value\"],"
+                "\"rows\":["
+                "[\"enabled\","  + std::string(uc.isEnabled() ? "\"true\"" : "\"false\"") + "],"
+                "[\"size\",\""   + std::to_string(uc.size())     + "\"],"
+                "[\"max_size\",\"" + std::to_string(uc.maxSize())  + "\"],"
+                "[\"hits\",\""   + std::to_string(h)             + "\"],"
+                "[\"misses\",\"" + std::to_string(m)             + "\"],"
+                "[\"hit_rate\",\"" + hitRate                     + "\"]"
+                "],\"rowCount\":6}";
+            return out;
+        }
+        // Phase 2.2: FLUSH QUERY CACHE
+        if (u2 == "FLUSH QUERY CACHE") {
+            milansql::g_userQueryCache().flush();
+            engine_.getQueryCache().clear();
+            return "{\"success\":true,\"message\":\"Query cache flushed.\",\"rowsAffected\":0}";
+        }
+    }
+
     auto execOne = [&](const std::string& oneSQL) -> std::string {
         std::ostringstream cap;
         std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
@@ -2062,11 +2090,66 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     // Phase 1.1: Metrics — time the whole query and count by type
     auto t0_metrics = std::chrono::high_resolution_clock::now();
 
+    // Phase 2.2: Query cache — determine user key for cache namespace
+    std::string cacheUserKey = (userId <= 0) ? "root" : ("u" + std::to_string(userId));
+    // Only cache single-statement, non-mutating SELECT/WITH queries
+    bool isCacheable = (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0);
+
     auto stmts = milansql::splitStatements(sql);
     std::string finalResult;
     if (stmts.size() <= 1) {
-        finalResult = execOne(stmts.empty() ? sql : stmts[0]);
+        const std::string& effectiveSql = stmts.empty() ? sql : stmts[0];
+        // Phase 2.2: Check query cache for SELECT (single stmt only)
+        if (isCacheable) {
+            auto cached = milansql::g_userQueryCache().get(cacheUserKey, effectiveSql);
+            if (cached.has_value()) {
+                engine_.setCurrentUser(0, true);
+                return *cached;
+            }
+        }
+        finalResult = execOne(effectiveSql);
         engine_.setCurrentUser(0, true); // reset per-request context
+        // Phase 2.2: Store successful SELECT results in cache
+        if (isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
+            // Extract table name from SQL for invalidation support
+            std::string tblHint;
+            auto fromPos = upper.find(" FROM ");
+            if (fromPos != std::string::npos) {
+                size_t start = fromPos + 6;
+                while (start < upper.size() && upper[start] == ' ') ++start;
+                size_t end = start;
+                while (end < upper.size() && upper[end] != ' ' && upper[end] != ';'
+                       && upper[end] != ',' && upper[end] != ')') ++end;
+                tblHint = upper.substr(start, end - start);
+                // Strip prefix for root queries
+                if (!prefix.empty() && tblHint.rfind(prefix, 0) == 0)
+                    tblHint = tblHint.substr(prefix.size());
+            }
+            milansql::g_userQueryCache().put(cacheUserKey, effectiveSql, finalResult, tblHint);
+        }
+        // Phase 2.2: Invalidate cache on mutating queries
+        if (!isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
+            // Extract table name and invalidate
+            auto mutPos = upper.find(" INTO ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" FROM ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" TABLE ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" UPDATE ");
+            size_t tblStart = (mutPos != std::string::npos) ? mutPos + 7 : std::string::npos;
+            // For UPDATE, table name follows immediately
+            if (upper.rfind("UPDATE", 0) == 0) {
+                tblStart = 7;
+                while (tblStart < upper.size() && upper[tblStart] == ' ') ++tblStart;
+            }
+            if (tblStart != std::string::npos && tblStart < upper.size()) {
+                size_t tblEnd = tblStart;
+                while (tblEnd < upper.size() && upper[tblEnd] != ' ' && upper[tblEnd] != ';'
+                       && upper[tblEnd] != ',' && upper[tblEnd] != ')') ++tblEnd;
+                std::string mutTbl = upper.substr(tblStart, tblEnd - tblStart);
+                if (!mutTbl.empty()) {
+                    milansql::g_userQueryCache().invalidate(mutTbl);
+                }
+            }
+        }
     } else {
         std::string json = "{\"success\":true,\"results\":[";
         bool anyError = false;

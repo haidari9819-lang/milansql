@@ -7257,8 +7257,14 @@ inline bool dispatchCommand(
 
     // ── Phase 2.1: SHOW PARALLEL WORKERS ─────────────────────────
     case milansql::CommandType::SHOW_PARALLEL_STATUS_V2: {
-        std::cout << "  parallel_workers        : " << milansql::g_threadPool().size() << "\n";
-        std::cout << "  parallel_workers_active : " << milansql::g_parallelWorkersActive().load() << "\n\n";
+        milansql::Table pwTbl;
+        pwTbl.addColumn(milansql::Column{"setting", "TEXT"});
+        pwTbl.addColumn(milansql::Column{"value",   "TEXT"});
+        pwTbl.mutableRows().push_back(milansql::Row({"parallel_workers",
+            std::to_string(milansql::g_threadPool().size())}));
+        pwTbl.mutableRows().push_back(milansql::Row({"parallel_workers_active",
+            std::to_string(milansql::g_parallelWorkersActive().load())}));
+        dispatch_printTable(pwTbl, -1, 0);
         break;
     }
 

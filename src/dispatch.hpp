@@ -50,6 +50,9 @@
 #include "optimizer/join_enumerator.hpp"     // Phase 3: Selinger Join Enumeration
 #include "optimizer/histogram.hpp"           // Phase 113: Histogram Selectivity
 #include "wal/pitr_manager.hpp"              // Phase 178: PITR
+#include "branching/branch_manager.hpp"        // Phase 3.1: DB Branching
+#include "router/shard_router.hpp"             // Phase 3.3: Sharding
+#include "serverless/serverless_manager.hpp"   // Phase 3.4: Serverless
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -7305,6 +7308,143 @@ inline bool dispatchCommand(
         std::cout << "\n";
         break;
     }
+
+    // ── Phase 3.1: Database Branching ────────────────────────────
+    case milansql::CommandType::CREATE_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().createBranch(
+            cmd.branchName, cmd.branchFrom, engine, err);
+        if (ok)
+            std::cout << "  Branch '" << cmd.branchName << "' created from '"
+                      << cmd.branchFrom << "'.\n\n";
+        else
+            std::cout << "  Error: " << err << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::DROP_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().dropBranch(cmd.branchName, err);
+        if (ok)
+            std::cout << "  Branch '" << cmd.branchName << "' dropped.\n\n";
+        else
+            std::cout << "  Error: " << err << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::USE_BRANCH: {
+        if (!milansql::BranchManager::global().hasBranch(cmd.branchName))
+            std::cout << "  Error: Branch '" << cmd.branchName << "' does not exist.\n\n";
+        else {
+            milansql::BranchManager::global().useBranch(cmd.branchName);
+            std::cout << "  Switched to branch '" << cmd.branchName << "'.\n\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_BRANCHES: {
+        std::cout << "\n  Branches:\n";
+        std::cout << "  Name            | Parent | Created At          | Status\n";
+        std::cout << "  ----------------+--------+---------------------+--------\n";
+        for (auto& bi : milansql::BranchManager::global().listBranches()) {
+            std::cout << "  " << bi.name << " | " << bi.parent << " | "
+                      << bi.created_at << " | " << bi.status << "\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::MERGE_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().mergeBranch(
+            cmd.branchName, cmd.branchTarget, engine, err);
+        if (ok)
+            std::cout << "  Branch '" << cmd.branchName << "' merged into '"
+                      << cmd.branchTarget << "'.\n\n";
+        else
+            std::cout << "  Error: " << err << "\n\n";
+        break;
+    }
+
+    // ── Phase 3.3: Sharding ───────────────────────────────────────
+    case milansql::CommandType::CREATE_SHARDED_TABLE: {
+        try {
+            engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys, cmd.tableInherits);
+        } catch (...) {}
+        milansql::ShardedTable st;
+        st.tableName = cmd.tableName;
+        st.shardKey  = cmd.shardKey;
+        st.numShards = cmd.numShards > 0 ? cmd.numShards : 1;
+        for (int i = 0; i < (int)cmd.shardNodes.size(); ++i) {
+            milansql::ShardNode sn;
+            sn.address = cmd.shardNodes[i];
+            sn.shardId = i % st.numShards;
+            st.nodes.push_back(sn);
+        }
+        std::string err;
+        bool ok = milansql::ShardRouter::global().createShardedTable(st, err);
+        if (ok)
+            std::cout << "  Sharded table '" << cmd.tableName
+                      << "' created with " << st.numShards << " shards.\n\n";
+        else
+            std::cout << "  Error: " << err << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SHARDS: {
+        if (!milansql::ShardRouter::global().isSharded(cmd.tableName)) {
+            std::cout << "  Error: Table '" << cmd.tableName << "' is not sharded.\n\n";
+        } else {
+            auto nodes = milansql::ShardRouter::global().getNodes(cmd.tableName);
+            std::cout << "\n  Shards for table '" << cmd.tableName << "':\n";
+            std::cout << "  shard_id | node_address | key_range\n";
+            for (auto& n : nodes) {
+                std::cout << "  " << n.shardId << " | " << n.address
+                          << " | shard_" << n.shardId << "\n";
+            }
+            std::cout << "\n";
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SHARD_DISTRIBUTION: {
+        std::cout << "\n  Shard Distribution:\n";
+        for (auto& st : milansql::ShardRouter::global().listShards()) {
+            std::cout << "  " << st.tableName << ": key=" << st.shardKey
+                      << " shards=" << st.numShards
+                      << " nodes=" << st.nodes.size() << "\n";
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    // ── Phase 3.4: Serverless Mode ────────────────────────────────
+    case milansql::CommandType::SET_SERVERLESS_IDLE_TIMEOUT: {
+        milansql::ServerlessManager::global().setIdleTimeout(cmd.serverlessTimeout);
+        std::cout << "  Serverless idle timeout set to "
+                  << cmd.serverlessTimeout << " seconds.\n\n";
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SERVERLESS_STATUS: {
+        auto& sm = milansql::ServerlessManager::global();
+        std::cout << "\n  Serverless Status:\n";
+        std::cout << "  Enabled         : " << (sm.isEnabled() ? "YES" : "NO") << "\n";
+        std::cout << "  Idle Timeout    : " << sm.idleTimeout() << " sec\n";
+        std::cout << "  Suspended       : " << (sm.isSuspended() ? "YES" : "NO") << "\n";
+        std::cout << "  Cold Start (ms) : " << sm.coldStartLatencyMs() << "\n\n";
+        break;
+    }
+
+    case milansql::CommandType::ENABLE_SERVERLESS:
+        milansql::ServerlessManager::global().setEnabled(true);
+        std::cout << "  Serverless mode enabled.\n\n";
+        break;
+
+    case milansql::CommandType::DISABLE_SERVERLESS:
+        milansql::ServerlessManager::global().setEnabled(false);
+        std::cout << "  Serverless mode disabled.\n\n";
+        break;
 
     case milansql::CommandType::UNKNOWN:
     default:

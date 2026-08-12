@@ -367,6 +367,21 @@ enum class CommandType {
     SET_QUERY_CACHE_SIZE,
     FLUSH_QUERY_CACHE,
     SHOW_QUERY_CACHE_STATS,
+    // Phase 3.1: Database Branching
+    CREATE_BRANCH,
+    DROP_BRANCH,
+    USE_BRANCH,
+    SHOW_BRANCHES,
+    MERGE_BRANCH,
+    // Phase 3.3: Sharding
+    CREATE_SHARDED_TABLE,
+    SHOW_SHARDS,
+    SHOW_SHARD_DISTRIBUTION,
+    // Phase 3.4: Serverless Mode
+    SET_SERVERLESS_IDLE_TIMEOUT,
+    SHOW_SERVERLESS_STATUS,
+    ENABLE_SERVERLESS,
+    DISABLE_SERVERLESS,
     UNKNOWN
 };
 
@@ -743,6 +758,19 @@ struct ParsedCommand {
     std::string routineBody;
     std::string routineReturnType;
     std::vector<std::string> routineParams;  // raw param list (one string)
+
+    // Phase 3.1: Database Branching
+    std::string branchName;    // branch name for CREATE/DROP/USE/MERGE BRANCH
+    std::string branchFrom;    // source branch for CREATE BRANCH ... FROM
+    std::string branchTarget;  // target branch for MERGE BRANCH ... INTO
+
+    // Phase 3.3: Sharding
+    std::string shardKey;      // SHARDED BY (col)
+    int         numShards = 0; // SHARDS N
+    std::vector<std::string> shardNodes; // NODES ('a:p', 'b:p', ...)
+
+    // Phase 3.4: Serverless
+    int serverlessTimeout = 0; // SET SERVERLESS_IDLE_TIMEOUT = N
 };
 
 class Parser {
@@ -1052,6 +1080,13 @@ public:
                 if (k0 == "USE" && k1 == "TENANT") {
                     cmd.type = CommandType::USE_TENANT;
                     if (st.size() >= 3) cmd.tenantName = st[2];
+                    return cmd;
+                }
+                // Phase 3.1: USE BRANCH name — must be before generic USE
+                if (k0 == "USE" && k1 == "BRANCH") {
+                    cmd.type = CommandType::USE_BRANCH;
+                    if (st.size() >= 3) cmd.branchName = st[2];
+                    else cmd.type = CommandType::UNKNOWN;
                     return cmd;
                 }
                 // USE schemaname
@@ -2629,6 +2664,47 @@ public:
                 // Phase 78: INHERITS
                 if (!tableInheritsTemp.empty())
                     cmd.tableInherits = tableInheritsTemp;
+                // Phase 3.3: detect SHARDED BY clause in CREATE TABLE
+                {
+                    std::string upInput;
+                    upInput.reserve(input.size());
+                    for (unsigned char c : input) upInput += static_cast<char>(std::toupper(c));
+                    auto shardedPos = upInput.find(" SHARDED BY ");
+                    if (shardedPos != std::string::npos) {
+                        cmd.type = CommandType::CREATE_SHARDED_TABLE;
+                        // parse SHARDED BY (col) SHARDS N NODES ('h:p', ...)
+                        auto ftToks = tokenizeFull(input);
+                        for (size_t si = 0; si < ftToks.size(); ++si) {
+                            if (toUpper(ftToks[si]) == "SHARDED" && si + 2 < ftToks.size() &&
+                                toUpper(ftToks[si+1]) == "BY") {
+                                // next token is (col) or col
+                                std::string sk = ftToks[si+2];
+                                // strip parens
+                                if (!sk.empty() && sk.front() == '(') sk = sk.substr(1);
+                                if (!sk.empty() && sk.back()  == ')') sk.pop_back();
+                                cmd.shardKey = sk;
+                                si += 2;
+                            } else if (toUpper(ftToks[si]) == "SHARDS" && si + 1 < ftToks.size()) {
+                                try { cmd.numShards = std::stoi(ftToks[si+1]); } catch (...) {}
+                                ++si;
+                            } else if (toUpper(ftToks[si]) == "NODES" && si + 1 < ftToks.size()) {
+                                // collect all quoted tokens after NODES until end
+                                ++si;
+                                while (si < ftToks.size()) {
+                                    std::string nd = ftToks[si];
+                                    // strip surrounding parens/quotes/commas
+                                    while (!nd.empty() && (nd.front() == '(' || nd.front() == '\'' || nd.front() == '"'))
+                                        nd = nd.substr(1);
+                                    while (!nd.empty() && (nd.back() == ')' || nd.back() == '\'' || nd.back() == '"' || nd.back() == ','))
+                                        nd.pop_back();
+                                    if (!nd.empty()) cmd.shardNodes.push_back(nd);
+                                    ++si;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             } else { cmd.type = CommandType::UNKNOWN; }
 
         // ── UPDATE ──────────────────────────────────────────────
@@ -3081,6 +3157,19 @@ public:
             // ── Phase 2.2: SHOW QUERY CACHE STATS ────────────────
             } else if (kw1 == "QUERY" && tokens.size() >= 4 && toUpper(tokens[2]) == "CACHE" && toUpper(tokens[3]) == "STATS") {
                 cmd.type = CommandType::SHOW_QUERY_CACHE_STATS;
+            // Phase 3.1: SHOW BRANCHES
+            } else if (kw1 == "BRANCHES") {
+                cmd.type = CommandType::SHOW_BRANCHES;
+            // Phase 3.3: SHOW SHARDS ON tablename
+            } else if (kw1 == "SHARDS" && tokens.size() >= 4 && toUpper(tokens[2]) == "ON") {
+                cmd.type = CommandType::SHOW_SHARDS;
+                cmd.tableName = tokens[3];
+            // Phase 3.3: SHOW SHARD DISTRIBUTION
+            } else if (kw1 == "SHARD" && tokens.size() >= 3 && toUpper(tokens[2]) == "DISTRIBUTION") {
+                cmd.type = CommandType::SHOW_SHARD_DISTRIBUTION;
+            // Phase 3.4: SHOW SERVERLESS STATUS
+            } else if (kw1 == "SERVERLESS" && tokens.size() >= 3 && toUpper(tokens[2]) == "STATUS") {
+                cmd.type = CommandType::SHOW_SERVERLESS_STATUS;
             } else {
                 cmd.type = CommandType::SHOW_TABLES;
             }
@@ -3269,6 +3358,17 @@ public:
                 if (!val.empty()) cmd.values.push_back(val);
             }
 
+        // ── Phase 3.4: SET SERVERLESS_IDLE_TIMEOUT = N ───────────
+        } else if (kw0 == "SET" && kw1 == "SERVERLESS_IDLE_TIMEOUT") {
+            cmd.type = CommandType::SET_SERVERLESS_IDLE_TIMEOUT;
+            {
+                std::string val = tokens.size() >= 3 ? tokens[2] : "";
+                if (val == "=" && tokens.size() >= 4) val = tokens[3];
+                if (!val.empty()) {
+                    try { cmd.serverlessTimeout = std::stoi(val); } catch (...) {}
+                }
+            }
+
         // ── Phase 2.2: FLUSH QUERY CACHE ─────────────────────────
         } else if (kw0 == "FLUSH" && kw1 == "QUERY" && tokens.size() >= 3 && toUpper(tokens[2]) == "CACHE") {
             cmd.type = CommandType::FLUSH_QUERY_CACHE;
@@ -3280,6 +3380,53 @@ public:
         // ── Phase 2.1: SHOW PARALLEL STATUS ──────────────────────
         } else if (kw0 == "SHOW" && kw1 == "PARALLEL" && tokens.size() >= 3 && toUpper(tokens[2]) == "WORKERS") {
             cmd.type = CommandType::SHOW_PARALLEL_STATUS_V2;
+
+        // ── Phase 3.1: CREATE BRANCH name FROM parent ─────────────
+        } else if (kw0 == "CREATE" && kw1 == "BRANCH") {
+            cmd.type = CommandType::CREATE_BRANCH;
+            if (tokens.size() >= 3) {
+                cmd.branchName = tokens[2];
+                // FROM parent (optional, default = main)
+                cmd.branchFrom = "main";
+                for (size_t i = 3; i + 1 < tokens.size(); ++i) {
+                    if (toUpper(tokens[i]) == "FROM") {
+                        cmd.branchFrom = tokens[i + 1];
+                        break;
+                    }
+                }
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 3.1: DROP BRANCH name ───────────────────────────
+        } else if (kw0 == "DROP" && kw1 == "BRANCH") {
+            cmd.type = CommandType::DROP_BRANCH;
+            if (tokens.size() >= 3) cmd.branchName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 3.1: USE BRANCH name ────────────────────────────
+        } else if (kw0 == "USE" && kw1 == "BRANCH") {
+            cmd.type = CommandType::USE_BRANCH;
+            if (tokens.size() >= 3) cmd.branchName = tokens[2];
+            else cmd.type = CommandType::UNKNOWN;
+
+        // ── Phase 3.1: MERGE BRANCH src INTO dst ──────────────────
+        } else if (kw0 == "MERGE" && kw1 == "BRANCH") {
+            cmd.type = CommandType::MERGE_BRANCH;
+            if (tokens.size() >= 5 && toUpper(tokens[3]) == "INTO") {
+                cmd.branchName   = tokens[2]; // src
+                cmd.branchTarget = tokens[4]; // dst
+            } else {
+                cmd.type = CommandType::UNKNOWN;
+            }
+
+        // ── Phase 3.4: ENABLE SERVERLESS ──────────────────────────
+        } else if (kw0 == "ENABLE" && kw1 == "SERVERLESS") {
+            cmd.type = CommandType::ENABLE_SERVERLESS;
+
+        // ── Phase 3.4: DISABLE SERVERLESS ─────────────────────────
+        } else if (kw0 == "DISABLE" && kw1 == "SERVERLESS") {
+            cmd.type = CommandType::DISABLE_SERVERLESS;
 
         // ── Phase 76: LISTEN channel ──────────────────────────────
         } else if (kw0 == "LISTEN") {

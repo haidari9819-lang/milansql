@@ -13354,6 +13354,410 @@ static void testGroup117() {
     std::cout << "  testGroup117 passed (" << ok << " checks).\n";
 }
 
+// ── testGroup118: Phase 3.1 Database Branching ───────────────────────────────
+
+static void testGroup118() {
+    std::cout << "\n-- testGroup118: Phase 3.1 Database Branching --\n";
+    int ok = 0;
+    milansql::Parser parser118;
+    milansql::Engine eng118;
+    eng118.setCurrentUser(0, true);
+
+    auto exec = [&](const std::string& sql) -> milansql::QueryResult {
+        return milansql::dispatch(parser118.parse(sql), eng118);
+    };
+
+    // 118-1: SHOW BRANCHES always has "main"
+    {
+        auto qr = exec("SHOW BRANCHES");
+        bool hasMain = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "main") hasMain = true;
+        }
+        check(hasMain, "118-1: SHOW BRANCHES contains 'main'");
+        ++ok;
+    }
+
+    // 118-2: CREATE BRANCH dev FROM main
+    {
+        auto qr = exec("CREATE BRANCH dev FROM main");
+        check(qr.error.empty(), "118-2: CREATE BRANCH dev FROM main no error");
+        ++ok;
+    }
+
+    // 118-3: SHOW BRANCHES has "dev"
+    {
+        auto qr = exec("SHOW BRANCHES");
+        bool hasDev = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "dev") hasDev = true;
+        }
+        check(hasDev, "118-3: SHOW BRANCHES contains 'dev'");
+        ++ok;
+    }
+
+    // 118-4: USE BRANCH dev → success
+    {
+        auto qr = exec("USE BRANCH dev");
+        check(qr.error.empty(), "118-4: USE BRANCH dev no error");
+        ++ok;
+    }
+
+    // 118-5: USE BRANCH nonexistent → error
+    {
+        auto qr = exec("USE BRANCH nonexistent_xyz");
+        check(!qr.error.empty(), "118-5: USE BRANCH nonexistent yields error");
+        ++ok;
+    }
+
+    // 118-6: MERGE BRANCH dev INTO main → success
+    {
+        auto qr = exec("MERGE BRANCH dev INTO main");
+        check(qr.error.empty(), "118-6: MERGE BRANCH dev INTO main no error");
+        ++ok;
+    }
+
+    // 118-7: CREATE another branch and DROP it
+    {
+        exec("CREATE BRANCH tmp_branch FROM main");
+        auto qr = exec("DROP BRANCH tmp_branch");
+        check(qr.error.empty(), "118-7: DROP BRANCH tmp_branch no error");
+        ++ok;
+    }
+
+    // 118-8: DROP BRANCH main → error
+    {
+        auto qr = exec("DROP BRANCH main");
+        check(!qr.error.empty(), "118-8: DROP BRANCH main yields error");
+        ++ok;
+    }
+
+    // 118-9: After DROP, SHOW BRANCHES no longer has tmp_branch
+    {
+        auto qr = exec("SHOW BRANCHES");
+        bool hasTmp = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "tmp_branch") hasTmp = true;
+        }
+        check(!hasTmp, "118-9: SHOW BRANCHES no longer has tmp_branch");
+        ++ok;
+    }
+
+    // 118-10: CREATE duplicate branch → error
+    {
+        exec("CREATE BRANCH dup_br FROM main");
+        auto qr = exec("CREATE BRANCH dup_br FROM main");
+        check(!qr.error.empty(), "118-10: Duplicate branch yields error");
+        ++ok;
+    }
+
+    std::cout << "  testGroup118 passed (" << ok << " checks).\n";
+}
+
+// ── testGroup119: Phase 3.2 Logical Replication ──────────────────────────────
+
+static void testGroup119() {
+    std::cout << "\n-- testGroup119: Phase 3.2 Logical Replication --\n";
+    int ok = 0;
+    milansql::Parser parser119;
+    milansql::Engine eng119;
+    eng119.setCurrentUser(0, true);
+
+    auto exec = [&](const std::string& sql) -> milansql::QueryResult {
+        return milansql::dispatch(parser119.parse(sql), eng119);
+    };
+
+    // Cleanup from previous runs (publications persist to disk)
+    exec("DROP PUBLICATION pub119_p1");
+    exec("DROP PUBLICATION pub119_p2");
+    exec("DROP PUBLICATION pub119_dup");
+    exec("DROP SUBSCRIPTION sub119_s1");
+    exec("DROP SUBSCRIPTION sub119_dup");
+
+    // 119-1: CREATE PUBLICATION p1 FOR TABLE orders
+    {
+        exec("DROP TABLE IF EXISTS orders119");
+        exec("CREATE TABLE orders119 (id INT, total DOUBLE)");
+        auto qr = exec("CREATE PUBLICATION pub119_p1 FOR TABLE orders119");
+        check(qr.error.empty(), "119-1: CREATE PUBLICATION pub119_p1 no error");
+        ++ok;
+    }
+
+    // 119-2: SHOW PUBLICATIONS has "pub119_p1"
+    {
+        auto qr = exec("SHOW PUBLICATIONS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "pub119_p1") found = true;
+        }
+        check(found, "119-2: SHOW PUBLICATIONS contains pub119_p1");
+        ++ok;
+    }
+
+    // 119-3: CREATE PUBLICATION p2 FOR ALL TABLES → tables = "*"
+    {
+        auto qr = exec("CREATE PUBLICATION pub119_p2 FOR ALL TABLES");
+        check(qr.error.empty(), "119-3: CREATE PUBLICATION FOR ALL TABLES no error");
+        ++ok;
+    }
+
+    // 119-4: SHOW PUBLICATIONS p2 has tables = "*"
+    {
+        auto qr = exec("SHOW PUBLICATIONS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (r.values.size() >= 2 && r.values[0] == "pub119_p2" && r.values[1] == "*")
+                found = true;
+        }
+        check(found, "119-4: pub119_p2 has tables='*'");
+        ++ok;
+    }
+
+    // 119-5: CREATE SUBSCRIPTION s1 CONNECTION 'host=replica' PUBLICATION pub119_p1
+    {
+        auto qr = exec("CREATE SUBSCRIPTION sub119_s1 CONNECTION 'host=replica' PUBLICATION pub119_p1");
+        check(qr.error.empty(), "119-5: CREATE SUBSCRIPTION sub119_s1 no error");
+        ++ok;
+    }
+
+    // 119-6: SHOW SUBSCRIPTIONS has "sub119_s1"
+    {
+        auto qr = exec("SHOW SUBSCRIPTIONS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "sub119_s1") found = true;
+        }
+        check(found, "119-6: SHOW SUBSCRIPTIONS contains sub119_s1");
+        ++ok;
+    }
+
+    // 119-7: DROP PUBLICATION pub119_p1 → gone from SHOW PUBLICATIONS
+    {
+        exec("DROP PUBLICATION pub119_p1");
+        auto qr = exec("SHOW PUBLICATIONS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "pub119_p1") found = true;
+        }
+        check(!found, "119-7: pub119_p1 gone after DROP");
+        ++ok;
+    }
+
+    // 119-8: DROP SUBSCRIPTION sub119_s1 → gone
+    {
+        exec("DROP SUBSCRIPTION sub119_s1");
+        auto qr = exec("SHOW SUBSCRIPTIONS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "sub119_s1") found = true;
+        }
+        check(!found, "119-8: sub119_s1 gone after DROP");
+        ++ok;
+    }
+
+    // 119-9: Duplicate publication name → error
+    {
+        exec("CREATE PUBLICATION pub119_dup FOR ALL TABLES");
+        auto qr = exec("CREATE PUBLICATION pub119_dup FOR ALL TABLES");
+        check(!qr.error.empty(), "119-9: Duplicate publication name yields error");
+        ++ok;
+    }
+
+    // 119-10: Duplicate subscription name → error
+    {
+        exec("CREATE SUBSCRIPTION sub119_dup CONNECTION 'host=x' PUBLICATION pub119_p2");
+        auto qr = exec("CREATE SUBSCRIPTION sub119_dup CONNECTION 'host=x' PUBLICATION pub119_p2");
+        check(!qr.error.empty(), "119-10: Duplicate subscription name yields error");
+        ++ok;
+    }
+
+    std::cout << "  testGroup119 passed (" << ok << " checks).\n";
+}
+
+// ── testGroup120: Phase 3.3 Sharding ─────────────────────────────────────────
+
+static void testGroup120() {
+    std::cout << "\n-- testGroup120: Phase 3.3 Sharding --\n";
+    int ok = 0;
+    milansql::Parser parser120;
+    milansql::Engine eng120;
+    eng120.setCurrentUser(0, true);
+
+    auto exec = [&](const std::string& sql) -> milansql::QueryResult {
+        return milansql::dispatch(parser120.parse(sql), eng120);
+    };
+
+    // 120-1: CREATE TABLE orders120 SHARDED BY (user_id) SHARDS 4 NODES
+    {
+        exec("DROP TABLE IF EXISTS orders120");
+        auto qr = exec("CREATE TABLE orders120 (id INT, user_id INT, total DOUBLE) SHARDED BY (user_id) SHARDS 4 NODES ('n1:8080','n2:8080','n3:8080','n4:8080')");
+        check(qr.error.empty(), "120-1: CREATE SHARDED TABLE no error");
+        ++ok;
+    }
+
+    // 120-2: isSharded("orders120") == true
+    {
+        bool sharded = milansql::ShardRouter::global().isSharded("orders120");
+        check(sharded, "120-2: orders120 is sharded");
+        ++ok;
+    }
+
+    // 120-3: isSharded("nonexistent") == false
+    {
+        bool sharded = milansql::ShardRouter::global().isSharded("nonexistent_table_xyz");
+        check(!sharded, "120-3: nonexistent table is not sharded");
+        ++ok;
+    }
+
+    // 120-4: SHOW SHARDS ON orders120 → 4 rows
+    {
+        auto qr = exec("SHOW SHARDS ON orders120");
+        check(qr.error.empty() && qr.rows.size() == 4, "120-4: SHOW SHARDS has 4 rows");
+        ++ok;
+    }
+
+    // 120-5: SHOW SHARD DISTRIBUTION → has "orders120"
+    {
+        auto qr = exec("SHOW SHARD DISTRIBUTION");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (!r.values.empty() && r.values[0] == "orders120") found = true;
+        }
+        check(found, "120-5: SHOW SHARD DISTRIBUTION contains orders120");
+        ++ok;
+    }
+
+    // 120-6: routeShard is deterministic — same key always same shard
+    {
+        int s1 = milansql::ShardRouter::global().routeShard("orders120", "42");
+        int s2 = milansql::ShardRouter::global().routeShard("orders120", "42");
+        check(s1 == s2 && s1 >= 0 && s1 < 4, "120-6: routeShard('42') deterministic in [0,3]");
+        ++ok;
+    }
+
+    // 120-7: routeShard returns different shards for different keys (probabilistic)
+    {
+        // With 4 shards, keys "1" and "99999" are likely different but not guaranteed
+        // Just check they are in valid range
+        int s1 = milansql::ShardRouter::global().routeShard("orders120", "1");
+        int s2 = milansql::ShardRouter::global().routeShard("orders120", "2");
+        check(s1 >= 0 && s1 < 4 && s2 >= 0 && s2 < 4, "120-7: routeShard returns valid shard IDs");
+        ++ok;
+    }
+
+    // 120-8: getNodes returns 4 nodes
+    {
+        auto nodes = milansql::ShardRouter::global().getNodes("orders120");
+        check(nodes.size() == 4, "120-8: getNodes returns 4 nodes");
+        ++ok;
+    }
+
+    std::cout << "  testGroup120 passed (" << ok << " checks).\n";
+}
+
+// ── testGroup121: Phase 3.4 Serverless Mode ──────────────────────────────────
+
+static void testGroup121() {
+    std::cout << "\n-- testGroup121: Phase 3.4 Serverless Mode --\n";
+    int ok = 0;
+    milansql::Parser parser121;
+    milansql::Engine eng121;
+    eng121.setCurrentUser(0, true);
+
+    auto exec = [&](const std::string& sql) -> milansql::QueryResult {
+        return milansql::dispatch(parser121.parse(sql), eng121);
+    };
+
+    // 121-1: SET SERVERLESS_IDLE_TIMEOUT = 60 → timeout changes
+    {
+        auto qr = exec("SET SERVERLESS_IDLE_TIMEOUT = 60");
+        check(qr.error.empty(), "121-1: SET SERVERLESS_IDLE_TIMEOUT no error");
+        ++ok;
+    }
+
+    // 121-2: SHOW SERVERLESS STATUS has timeout=60
+    {
+        auto qr = exec("SHOW SERVERLESS STATUS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (r.values.size() >= 2 && r.values[0] == "idle_timeout_sec" && r.values[1] == "60")
+                found = true;
+        }
+        check(found, "121-2: SHOW SERVERLESS STATUS has idle_timeout_sec=60");
+        ++ok;
+    }
+
+    // 121-3: ENABLE SERVERLESS → enabled=1
+    {
+        auto qr = exec("ENABLE SERVERLESS");
+        check(qr.error.empty(), "121-3: ENABLE SERVERLESS no error");
+        ++ok;
+    }
+
+    // 121-4: SHOW SERVERLESS STATUS → enabled=1
+    {
+        auto qr = exec("SHOW SERVERLESS STATUS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (r.values.size() >= 2 && r.values[0] == "enabled" && r.values[1] == "1")
+                found = true;
+        }
+        check(found, "121-4: SHOW SERVERLESS STATUS enabled=1");
+        ++ok;
+    }
+
+    // 121-5: DISABLE SERVERLESS → enabled=0
+    {
+        auto qr = exec("DISABLE SERVERLESS");
+        check(qr.error.empty(), "121-5: DISABLE SERVERLESS no error");
+        ++ok;
+    }
+
+    // 121-6: SHOW SERVERLESS STATUS → enabled=0
+    {
+        auto qr = exec("SHOW SERVERLESS STATUS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (r.values.size() >= 2 && r.values[0] == "enabled" && r.values[1] == "0")
+                found = true;
+        }
+        check(found, "121-6: SHOW SERVERLESS STATUS enabled=0");
+        ++ok;
+    }
+
+    // 121-7: SHOW SERVERLESS STATUS has correct columns
+    {
+        auto qr = exec("SHOW SERVERLESS STATUS");
+        bool hasCols = (qr.columns.size() >= 2 && !qr.rows.empty());
+        check(hasCols, "121-7: SHOW SERVERLESS STATUS has columns and rows");
+        ++ok;
+    }
+
+    // 121-8: recordActivity() doesn't crash
+    {
+        bool ok8 = true;
+        try {
+            milansql::ServerlessManager::global().recordActivity();
+        } catch (...) { ok8 = false; }
+        check(ok8, "121-8: recordActivity() doesn't crash");
+        ++ok;
+    }
+
+    // 121-9: suspended=0 initially (not suspended)
+    {
+        auto qr = exec("SHOW SERVERLESS STATUS");
+        bool found = false;
+        for (auto& r : qr.rows) {
+            if (r.values.size() >= 2 && r.values[0] == "suspended" && r.values[1] == "0")
+                found = true;
+        }
+        check(found, "121-9: SHOW SERVERLESS STATUS suspended=0");
+        ++ok;
+    }
+
+    std::cout << "  testGroup121 passed (" << ok << " checks).\n";
+}
+
 // MAIN
 // ============================================================
 
@@ -13695,6 +14099,18 @@ int main() {
     }
     try { testGroup117(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 117 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup118(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 118 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup119(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 119 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup120(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 120 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup121(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 121 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

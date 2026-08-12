@@ -4798,6 +4798,14 @@ public:
         std::cout << "\n";
     }
 
+    // ── Phase 3.2: Pub/Sub accessors for dispatch_result ─────────
+    const std::map<std::string, PublicationDef>& getPublications() const {
+        return publications_;
+    }
+    const std::map<std::string, SubscriptionDef>& getSubscriptions() const {
+        return subscriptions_;
+    }
+
     // ── Phase 89: Foreign Data Wrapper ───────────────────────
 
     void createServer(const std::string& name, const std::string& wrapperType) {
@@ -8180,6 +8188,7 @@ public:
 
     // ── Phase 86: Table map accessor for statistics ───────────
     const std::map<std::string, Table>& getTables() const { return tables_; }
+
 
     // ── Phase 36: EXPLAIN ─────────────────────────────────────
     ExplainPlan buildExplain(const ExplainRequest& req) const {

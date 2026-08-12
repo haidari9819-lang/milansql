@@ -65,11 +65,11 @@
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1865;
+static constexpr int MILANSQL_TEST_COUNT = 1902;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.6.1";
+static constexpr const char* MILANSQL_VERSION = "11.7.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 

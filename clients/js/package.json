@@ -1,7 +1,7 @@
 {
-  "name": "milansql",
-  "version": "1.0.0",
-  "description": "JavaScript client for MilanSQL — the open source, self-hosted database for developers",
+  "name": "milansql-js",
+  "version": "0.1.0",
+  "description": "Official JavaScript/TypeScript client for MilanSQL \u2014 Supabase-compatible API",
   "main": "milansql.js",
   "module": "milansql.js",
   "exports": {
@@ -10,7 +10,15 @@
       "require": "./milansql.js"
     }
   },
-  "keywords": ["database", "sql", "milansql", "rest-api", "self-hosted"],
+  "keywords": [
+    "database",
+    "sql",
+    "milansql",
+    "supabase",
+    "typescript",
+    "rest-api",
+    "self-hosted"
+  ],
   "author": "Mirwais Haidari",
   "license": "MIT",
   "repository": {

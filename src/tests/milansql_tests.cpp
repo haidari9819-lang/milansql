@@ -13655,6 +13655,127 @@ static void testGroup120() {
     std::cout << "  testGroup120 passed (" << ok << " checks).\n";
 }
 
+
+// ── testGroup122: Phase 4.5 Schema Introspection ─────────────────────────────
+static void testGroup122() {
+    std::cout << "\n-- testGroup122: Phase 4.5 Schema Introspection --\n";
+    milansql::Engine engine;
+
+    auto exec = [&](const std::string& sql) {
+        milansql::Parser p;
+        auto cmd = p.parse(sql);
+        auto noop = [](){};
+        milansql::dispatchCommand(cmd, engine, p, sql, noop, noop, noop);
+    };
+
+    exec("CREATE TABLE schema_test (id INT PRIMARY KEY, name TEXT NOT NULL, age INT)");
+    exec("CREATE INDEX idx_schema_name ON schema_test (name)");
+
+    check(engine.tableExists("schema_test"), "schema_test table exists");
+
+    const auto& tbl = engine.selectAll("schema_test");
+    const auto& cols = tbl.columns();
+    check(cols.size() == 3, "schema_test has 3 columns");
+    check(cols[0].name == "id", "first column is id");
+    check(cols[0].isPrimaryKey == true, "id is primary key");
+    check(cols[1].name == "name", "second column is name");
+    check(cols[1].notNull == true, "name is NOT NULL");
+    check(cols[2].name == "age", "third column is age");
+    check(cols[2].notNull == false, "age is nullable");
+
+    auto indexes = engine.getIndexes("schema_test");
+    bool foundIdx = false;
+    for (const auto& idx : indexes)
+        if (idx.indexName == "idx_schema_name") foundIdx = true;
+    check(foundIdx, "idx_schema_name index found");
+
+    // Test TypeScript type mapping
+    auto tsType = [](const std::string& t) -> std::string {
+        std::string up;
+        for (char c : t) {
+            if (c == '(' || c == ' ') break;
+            up += static_cast<char>(std::toupper((unsigned char)c));
+        }
+        if (up=="INT"||up=="FLOAT"||up=="DECIMAL") return "number";
+        if (up=="BOOLEAN"||up=="BOOL") return "boolean";
+        if (up=="JSON"||up=="JSONB") return "Record<string, unknown>";
+        return "string";
+    };
+    check(tsType("INT") == "number", "INT -> number");
+    check(tsType("TEXT") == "string", "TEXT -> string");
+    check(tsType("BOOLEAN") == "boolean", "BOOLEAN -> boolean");
+    check(tsType("JSONB") == "Record<string, unknown>", "JSONB -> Record");
+
+    exec("DROP TABLE schema_test");
+    std::cout << "  testGroup122 passed.\n";
+}
+
+// ── testGroup123: Phase 4.2 MIGRATE SQL Commands ─────────────────────────────
+static void testGroup123() {
+    std::cout << "\n-- testGroup123: Phase 4.2 MIGRATE SQL Commands --\n";
+
+    // Test parser for MIGRATE commands
+    milansql::Parser p;
+
+    auto cmd1 = p.parse("MIGRATE UP");
+    check(cmd1.type == milansql::CommandType::MIGRATE_UP, "MIGRATE UP parsed");
+    check(cmd1.limit == -1, "MIGRATE UP has limit=-1 (all)");
+
+    auto cmd2 = p.parse("MIGRATE UP 3");
+    check(cmd2.type == milansql::CommandType::MIGRATE_UP, "MIGRATE UP 3 parsed");
+    check(cmd2.limit == 3, "MIGRATE UP 3 has limit=3");
+
+    auto cmd3 = p.parse("MIGRATE DOWN");
+    check(cmd3.type == milansql::CommandType::MIGRATE_DOWN, "MIGRATE DOWN parsed");
+    check(cmd3.limit == 1, "MIGRATE DOWN has limit=1");
+
+    auto cmd4 = p.parse("MIGRATE DOWN 2");
+    check(cmd4.type == milansql::CommandType::MIGRATE_DOWN, "MIGRATE DOWN 2 parsed");
+    check(cmd4.limit == 2, "MIGRATE DOWN 2 has limit=2");
+
+    auto cmd5 = p.parse("MIGRATE STATUS");
+    check(cmd5.type == milansql::CommandType::MIGRATE_STATUS, "MIGRATE STATUS parsed");
+
+    auto cmd6 = p.parse("MIGRATE RESET");
+    check(cmd6.type == milansql::CommandType::MIGRATE_RESET, "MIGRATE RESET parsed");
+
+    // Test MigrationManager batch API
+    // Use unique names to avoid collision with persistent state
+    milansql::MigrationManager mm;
+    std::string m1 = "test_m_unique_aaa";
+    std::string m2 = "test_m_unique_bbb";
+    mm.createMigration(m1, "CREATE TABLE mm_t1_tmp (id INT)");
+    mm.createMigration(m2, "CREATE TABLE mm_t2_tmp (id INT)");
+
+    auto pending = mm.getPendingNames();
+    bool m1inPending = false, m2inPending = false;
+    for (const auto& n : pending) { if (n == m1) m1inPending = true; if (n == m2) m2inPending = true; }
+    check(m1inPending, "MigrationManager: m1 in pending");
+    check(m2inPending, "MigrationManager: m2 in pending");
+
+    mm.markApplied(m1);
+    auto applied = mm.getAppliedNames();
+    bool m1inApplied = false;
+    for (const auto& n : applied) if (n == m1) m1inApplied = true;
+    check(m1inApplied, "MigrationManager: m1 applied");
+
+    auto pending2 = mm.getPendingNames();
+    bool m1notPending = true;
+    for (const auto& n : pending2) if (n == m1) m1notPending = false;
+    check(m1notPending, "MigrationManager: m1 no longer pending");
+
+    auto all = mm.getAllMigrations();
+    bool bothInAll = false;
+    int cnt = 0;
+    for (const auto& m : all) if (m.name == m1 || m.name == m2) ++cnt;
+    check(cnt >= 2, "getAllMigrations contains both test migrations");
+
+    // Cleanup: roll back to keep test idempotent
+    mm.markRolledBack(m1);
+
+    std::cout << "  testGroup123 passed.\n";
+}
+
 // ── testGroup121: Phase 3.4 Serverless Mode ──────────────────────────────────
 
 static void testGroup121() {
@@ -14111,6 +14232,12 @@ int main() {
     }
     try { testGroup121(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 121 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup122(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 122 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup123(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 123 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

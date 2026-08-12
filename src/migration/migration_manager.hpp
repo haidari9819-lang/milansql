@@ -124,6 +124,38 @@ public:
     }
 
     std::string showStatus() const { return showMigrations(); }
+    // ── Phase 4.2: Batch migration support ───────────────────
+    std::vector<std::string> getPendingNames() const {
+        std::vector<std::string> result;
+        for (const auto& name : order_) {
+            auto it = migrations_.find(name);
+            if (it != migrations_.end() && it->second.appliedAt.empty())
+                result.push_back(name);
+        }
+        return result;
+    }
+
+    std::vector<std::string> getAppliedNames() const {
+        std::vector<std::string> result;
+        for (const auto& name : order_) {
+            auto it = migrations_.find(name);
+            if (it != migrations_.end() && !it->second.appliedAt.empty())
+                result.push_back(name);
+        }
+        return result;
+    }
+
+    std::vector<MigrationDef> getAllMigrations() const {
+        std::vector<MigrationDef> result;
+        for (const auto& name : order_) {
+            auto it = migrations_.find(name);
+            if (it != migrations_.end())
+                result.push_back(it->second);
+        }
+        return result;
+    }
+
+
 
 private:
     static constexpr const char* filePath_ = "database.migrations";

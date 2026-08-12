@@ -69,7 +69,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1902;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.7.0";
+static constexpr const char* MILANSQL_VERSION = "11.8.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -788,6 +788,12 @@ private:
     std::string handleDashboard();   // Phase 54C
     std::string handleWebUI();       // Phase 135: Professional Admin Dashboard
     std::string handleSemanticSearch(const std::string& body, int userId = 0, bool isRoot = true);  // Phase 121
+    std::string handleSchemaForTable(const std::string& tableName, int userId, bool isRoot);   // Phase 4.5
+    std::string handleSchemaTableColumns(const std::string& tableName, int userId, bool isRoot); // Phase 4.5
+    std::string handleSchemaGenerateTypescript(int userId, bool isRoot);                         // Phase 4.5
+    std::string handleMigrateUp(int n = -1);     // Phase 4.2
+    std::string handleMigrateDown(int n = 1);    // Phase 4.2
+    std::string handleMigrateStatus();           // Phase 4.2
 
     // Phase 154: Auth routes
     std::string handleAuthRegister(const std::string& body, const std::string& clientIp);
@@ -2197,6 +2203,230 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     }
 
     return finalResult;
+}
+
+
+// ── Phase 4.5: Schema Introspection API ──────────────────────
+
+static std::string sqlTypeToTs(const std::string& t) {
+    std::string up;
+    for (char c : t) {
+        if (c == '(' || c == ' ') break;
+        up += static_cast<char>(std::toupper((unsigned char)c));
+    }
+    if (up=="INT"||up=="INTEGER"||up=="BIGINT"||up=="SMALLINT"||up=="TINYINT"
+        ||up=="SERIAL"||up=="BIGSERIAL"||up=="FLOAT"||up=="DOUBLE"
+        ||up=="DECIMAL"||up=="NUMERIC"||up=="REAL"||up=="NUMBER") return "number";
+    if (up=="BOOLEAN"||up=="BOOL") return "boolean";
+    if (up=="JSON"||up=="JSONB") return "Record<string, unknown>";
+    return "string";
+}
+
+inline std::string MilanHttpServer::handleSchemaForTable(
+    const std::string& tableName, int userId, bool isRoot)
+{
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    std::string resolvedName = tableName;
+    if (!isRoot && userId > 0) {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        if (tableName.size() < pf.size() || tableName.substr(0, pf.size()) != pf)
+            resolvedName = pf + tableName;
+    }
+    if (!engine_.tableExists(resolvedName))
+        return R"({"success":false,"error":"Table not found"})";
+    const auto& tbl = engine_.selectAll(resolvedName);
+    const auto& cols = tbl.columns();
+    auto indexes = engine_.getIndexes(resolvedName);
+    size_t rowCount = 0;
+    try { rowCount = engine_.countRows(resolvedName, true); } catch (...) {}
+    std::string j = "{\"success\":true,\"table\":{\"name\":\"" + jsonEscape(tableName) + "\",";
+    j += "\"row_count\":" + std::to_string(rowCount) + ",";
+    j += "\"columns\":[";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(cols[i].name) + "\"";
+        j += ",\"type\":\"" + jsonEscape(cols[i].type) + "\"";
+        j += ",\"nullable\":" + std::string((cols[i].notNull||cols[i].isPrimaryKey)?"false":"true");
+        j += ",\"primary_key\":" + std::string(cols[i].isPrimaryKey?"true":"false");
+        if (cols[i].isUnique) j += ",\"unique\":true";
+        if (cols[i].autoIncrement) j += ",\"auto_increment\":true";
+        if (!cols[i].defaultValue.empty())
+            j += ",\"default\":\"" + jsonEscape(cols[i].defaultValue) + "\"";
+        j += "}";
+    }
+    j += "],\"indexes\":[";
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(indexes[i].indexName) + "\"";
+        j += ",\"columns\":\"" + jsonEscape(indexes[i].colName) + "\"";
+        j += ",\"type\":\"" + jsonEscape(indexes[i].type) + "\"}";
+    }
+    j += "]}}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleSchemaTableColumns(
+    const std::string& tableName, int userId, bool isRoot)
+{
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    std::string resolvedName = tableName;
+    if (!isRoot && userId > 0) {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        if (tableName.size() < pf.size() || tableName.substr(0, pf.size()) != pf)
+            resolvedName = pf + tableName;
+    }
+    if (!engine_.tableExists(resolvedName))
+        return R"({"success":false,"error":"Table not found"})";
+    const auto& tbl = engine_.selectAll(resolvedName);
+    const auto& cols = tbl.columns();
+    std::string j = "{\"success\":true,\"columns\":[";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(cols[i].name) + "\"";
+        j += ",\"type\":\"" + jsonEscape(cols[i].type) + "\"";
+        j += ",\"nullable\":" + std::string((cols[i].notNull||cols[i].isPrimaryKey)?"false":"true");
+        j += ",\"primary_key\":" + std::string(cols[i].isPrimaryKey?"true":"false");
+        j += ",\"unique\":" + std::string(cols[i].isUnique?"true":"false");
+        j += ",\"auto_increment\":" + std::string(cols[i].autoIncrement?"true":"false");
+        if (!cols[i].defaultValue.empty())
+            j += ",\"default\":\"" + jsonEscape(cols[i].defaultValue) + "\"";
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleSchemaGenerateTypescript(int userId, bool isRoot) {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    auto allTables = engine_.getAllTableNames();
+    std::string userPrefix = (!isRoot && userId > 0) ? "u" + std::to_string(userId) + "_" : "";
+    std::string ts;
+    ts += "// Auto-generated by MilanSQL\n";
+    ts += "// Do not edit manually\n\n";
+    for (const auto& tname : allTables) {
+        std::string bareName = tname;
+        if (!userPrefix.empty()) {
+            if (tname.size() < userPrefix.size() || tname.substr(0, userPrefix.size()) != userPrefix) continue;
+            bareName = tname.substr(userPrefix.size());
+        }
+        std::string ifName = bareName;
+        if (!ifName.empty()) ifName[0] = static_cast<char>(std::toupper((unsigned char)ifName[0]));
+        const auto& tbl2 = engine_.selectAll(tname);
+        const auto& cols2 = tbl2.columns();
+        ts += "export interface " + ifName + " {\n";
+        for (const auto& col : cols2) {
+            std::string tsType = sqlTypeToTs(col.type);
+            bool nullable = !(col.notNull || col.isPrimaryKey);
+            ts += "  " + col.name + ": " + tsType + (nullable ? " | null" : "") + ";\n";
+        }
+        ts += "}\n\n";
+    }
+    // Encode as JSON string value
+    std::string enc = "\"";
+    for (char c : ts) {
+        if      (c == '"')  enc += "\\\"";
+        else if (c == '\\') enc += "\\\\";
+        else if (c == '\n') enc += "\\n";
+        else                enc += c;
+    }
+    enc += "\"";
+    return "{\"success\":true,\"typescript\":" + enc + "}";
+}
+
+// ── Phase 4.2: Migration HTTP Handlers ───────────────────────
+
+inline std::string MilanHttpServer::handleMigrateUp(int n) {
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
+    auto& mm = milansql::g_migrationManager();
+    auto pending = mm.getPendingNames();
+    if (pending.empty())
+        return R"({"success":true,"message":"No pending migrations","applied":[]})";
+    int count = (n < 0) ? (int)pending.size() : std::min(n, (int)pending.size());
+    std::vector<std::string> applied;
+    std::string errors;
+    for (int i = 0; i < count; ++i) {
+        const std::string& mname = pending[(size_t)i];
+        std::string sql = mm.getMigrationSql(mname);
+        if (sql.empty()) { errors += "Migration '" + mname + "' has no SQL. "; continue; }
+        try {
+            milansql::Parser p;
+            auto cmd = p.parse(sql);
+            auto noop = [](){};
+            milansql::dispatchCommand(cmd, engine_, p, sql, noop, noop, noop);
+            mm.markApplied(mname);
+            applied.push_back(mname);
+        } catch (const std::exception& e) {
+            errors += "Migration '" + mname + "' failed: " + std::string(e.what()) + ". ";
+            break;
+        }
+    }
+    std::string j = "{\"success\":" + std::string(errors.empty()?"true":"false");
+    j += ",\"applied\":[";
+    for (size_t i = 0; i < applied.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + jsonEscape(applied[i]) + "\"";
+    }
+    j += "]";
+    if (!errors.empty()) j += ",\"error\":\"" + jsonEscape(errors) + "\"";
+    j += "}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleMigrateDown(int n) {
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
+    auto& mm = milansql::g_migrationManager();
+    auto appliedList = mm.getAppliedNames();
+    if (appliedList.empty())
+        return R"({"success":true,"message":"No applied migrations to roll back","rolled_back":[]})";
+    int count = std::min(n, (int)appliedList.size());
+    std::vector<std::string> rolledBack;
+    std::string errors;
+    for (int i = 0; i < count; ++i) {
+        const std::string& mname = appliedList[appliedList.size() - 1 - (size_t)i];
+        std::string sql = mm.getRollbackSql(mname);
+        if (!sql.empty()) {
+            try {
+                milansql::Parser p;
+                auto cmd = p.parse(sql);
+                auto noop = [](){};
+                milansql::dispatchCommand(cmd, engine_, p, sql, noop, noop, noop);
+            } catch (const std::exception& e) {
+                errors += "Rollback '" + mname + "' failed: " + std::string(e.what()) + ". ";
+                break;
+            }
+        }
+        mm.markRolledBack(mname);
+        rolledBack.push_back(mname);
+    }
+    std::string j = "{\"success\":" + std::string(errors.empty()?"true":"false");
+    j += ",\"rolled_back\":[";
+    for (size_t i = 0; i < rolledBack.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + jsonEscape(rolledBack[i]) + "\"";
+    }
+    j += "]";
+    if (!errors.empty()) j += ",\"error\":\"" + jsonEscape(errors) + "\"";
+    j += "}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleMigrateStatus() {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    const auto& mm = milansql::g_migrationManager();
+    auto all = mm.getAllMigrations();
+    std::string j = "{\"success\":true,\"migrations\":[";
+    bool first = true;
+    for (const auto& m : all) {
+        if (!first) j += ",";
+        j += "{\"name\":\"" + jsonEscape(m.name) + "\"";
+        j += ",\"status\":\"" + std::string(m.appliedAt.empty()?"pending":"applied") + "\"";
+        if (!m.appliedAt.empty())
+            j += ",\"applied_at\":\"" + jsonEscape(m.appliedAt) + "\"";
+        j += "}";
+        first = false;
+    }
+    j += "]}";
+    return j;
 }
 
 // ── MilanHttpServer::handleListTablesForUser ──────────────────
@@ -5657,6 +5887,75 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         if (!ok) json += ",\"error\":\"" + milansql::g_tlsContext().lastError() + "\"";
         json += "}";
         return buildHttpResponse(ok ? 200 : 500, json);
+    }
+
+    // Phase 4.5: Enhanced Schema Introspection API
+    // GET /api/schema/generate/typescript
+    if (req.path == "/api/schema/generate/typescript" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleSchemaGenerateTypescript(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // GET /api/schema/:table/columns
+    if (req.path.rfind("/api/schema/", 0) == 0 && req.path.size() > 12) {
+        std::string rest = req.path.substr(12);  // after "/api/schema/"
+        auto slashPos = rest.find('/');
+        if (slashPos != std::string::npos && rest.substr(slashPos) == "/columns") {
+            std::string tblName = rest.substr(0, slashPos);
+            if (!tblName.empty()) {
+                auto ctx = extractUserContext(req);
+                if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+                return buildHttpResponse(200, handleSchemaTableColumns(tblName, ctx.userId, ctx.isRoot), "application/json");
+            }
+        }
+        // GET /api/schema/:table
+        if (rest.find('/') == std::string::npos && !rest.empty()
+            && rest != "generate") {
+            auto ctx = extractUserContext(req);
+            if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+            return buildHttpResponse(200, handleSchemaForTable(rest, ctx.userId, ctx.isRoot), "application/json");
+        }
+    }
+
+    // Phase 4.2: Migration HTTP API
+    // POST /api/migrate/up  (body: {"n":3} optional)
+    if (req.path == "/api/migrate/up" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        if (!ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root required"})");
+        int n = -1;
+        auto nPos = req.body.find("\"n\"");
+        if (nPos != std::string::npos) {
+            auto colon = req.body.find(':', nPos);
+            if (colon != std::string::npos) {
+                try { n = std::stoi(req.body.substr(colon + 1)); } catch (...) {}
+            }
+        }
+        return buildHttpResponse(200, handleMigrateUp(n), "application/json");
+    }
+
+    // POST /api/migrate/down  (body: {"n":1} optional)
+    if (req.path == "/api/migrate/down" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        if (!ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root required"})");
+        int n = 1;
+        auto nPos = req.body.find("\"n\"");
+        if (nPos != std::string::npos) {
+            auto colon = req.body.find(':', nPos);
+            if (colon != std::string::npos) {
+                try { n = std::stoi(req.body.substr(colon + 1)); } catch (...) {}
+            }
+        }
+        return buildHttpResponse(200, handleMigrateDown(n), "application/json");
+    }
+
+    // GET /api/migrate/status
+    if (req.path == "/api/migrate/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleMigrateStatus(), "application/json");
     }
 
     if (req.path == "/api/schema") {

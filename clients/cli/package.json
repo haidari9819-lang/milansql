@@ -1,0 +1,20 @@
+{
+  "name": "milansql-cli",
+  "version": "0.1.0",
+  "description": "Official CLI for MilanSQL database",
+  "bin": {
+    "milansql": "./bin/milansql.js"
+  },
+  "main": "bin/milansql.js",
+  "keywords": ["database", "sql", "milansql", "cli"],
+  "author": "Mirwais Haidari",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/haidari9819-lang/milansql"
+  },
+  "homepage": "https://milansql.de",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

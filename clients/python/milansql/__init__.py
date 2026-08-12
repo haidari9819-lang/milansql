@@ -101,3 +101,10 @@ __all__ = [
     "threadsafety",
     "paramstyle",
 ]
+
+# Phase 4.4: HTTP fluent client (Supabase-compatible)
+from .http import MilanSQL, AsyncMilanSQL, QueryBuilder as HttpQueryBuilder
+
+def connect_http(url: str, token: str = "") -> "MilanSQL":
+    """Connect to MilanSQL via HTTP REST API with fluent query builder."""
+    return MilanSQL(url=url, token=token)

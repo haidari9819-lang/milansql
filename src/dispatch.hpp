@@ -6541,6 +6541,83 @@ inline bool dispatchCommand(
         break;
     }
 
+    case milansql::CommandType::MIGRATE_UP: {
+        auto& mm = milansql::g_migrationManager();
+        auto pending = mm.getPendingNames();
+        int n = (cmd.limit < 0) ? (int)pending.size() : std::min(cmd.limit, (int)pending.size());
+        if (pending.empty()) { std::cout << "  No pending migrations.\n\n"; break; }
+        int applied = 0;
+        for (int i = 0; i < n; ++i) {
+            const std::string& mname = pending[(size_t)i];
+            std::string msql = mm.getMigrationSql(mname);
+            if (msql.empty()) { std::cout << "  SKIP " << mname << " (no SQL)\n"; continue; }
+            try {
+                milansql::Parser mp;
+                auto mc = mp.parse(msql);
+                auto noop2 = [](){};
+                milansql::dispatchCommand(mc, engine, mp, msql, persistFn, saveProceduresFn, saveTriggFn);
+                mm.markApplied(mname);
+                std::cout << "  Applied: " << mname << "\n";
+                ++applied;
+            } catch (const std::exception& e) {
+                std::cout << "  ERROR applying '" << mname << "': " << e.what() << "\n";
+                break;
+            }
+        }
+        std::cout << "  " << applied << " migration(s) applied.\n\n";
+        break;
+    }
+    case milansql::CommandType::MIGRATE_DOWN: {
+        auto& mm = milansql::g_migrationManager();
+        auto appliedList = mm.getAppliedNames();
+        int n = std::min(cmd.limit > 0 ? cmd.limit : 1, (int)appliedList.size());
+        if (appliedList.empty()) { std::cout << "  No applied migrations to roll back.\n\n"; break; }
+        int rolled = 0;
+        for (int i = 0; i < n; ++i) {
+            const std::string& mname = appliedList[appliedList.size() - 1 - (size_t)i];
+            std::string rsql = mm.getRollbackSql(mname);
+            if (!rsql.empty()) {
+                try {
+                    milansql::Parser mp;
+                    auto mc = mp.parse(rsql);
+                    auto noop2 = [](){};
+                    milansql::dispatchCommand(mc, engine, mp, rsql, persistFn, saveProceduresFn, saveTriggFn);
+                } catch (const std::exception& e) {
+                    std::cout << "  ERROR rolling back '" << mname << "': " << e.what() << "\n";
+                    break;
+                }
+            }
+            mm.markRolledBack(mname);
+            std::cout << "  Rolled back: " << mname << "\n";
+            ++rolled;
+        }
+        std::cout << "  " << rolled << " migration(s) rolled back.\n\n";
+        break;
+    }
+    case milansql::CommandType::MIGRATE_STATUS:
+        std::cout << milansql::g_migrationManager().showMigrations();
+        break;
+    case milansql::CommandType::MIGRATE_RESET: {
+        auto& mm = milansql::g_migrationManager();
+        auto appliedList = mm.getAppliedNames();
+        int rolled = 0;
+        for (int i = (int)appliedList.size() - 1; i >= 0; --i) {
+            const std::string& mname = appliedList[(size_t)i];
+            std::string rsql = mm.getRollbackSql(mname);
+            if (!rsql.empty()) {
+                try {
+                    milansql::Parser mp;
+                    auto mc = mp.parse(rsql);
+                    auto noop2 = [](){};
+                    milansql::dispatchCommand(mc, engine, mp, rsql, persistFn, saveProceduresFn, saveTriggFn);
+                } catch (...) {}
+            }
+            mm.markRolledBack(mname);
+            ++rolled;
+        }
+        std::cout << "  Reset complete: " << rolled << " migration(s) rolled back.\n\n";
+        break;
+    }
     case milansql::CommandType::SHOW_MIGRATIONS:
     case milansql::CommandType::SHOW_MIGRATION_STATUS: {
         std::cout << milansql::g_migrationManager().showMigrations();

@@ -242,6 +242,11 @@ enum class CommandType {
     ROLLBACK_MIGRATION,
     SHOW_MIGRATIONS,
     SHOW_MIGRATION_STATUS,
+    // Phase 4.2: MIGRATE UP/DOWN/STATUS/RESET
+    MIGRATE_UP,
+    MIGRATE_DOWN,
+    MIGRATE_STATUS,
+    MIGRATE_RESET,
     // Phase 110: SSL/TLS
     SHOW_SSL_STATUS,
     SET_SSL,
@@ -4787,6 +4792,22 @@ public:
                     sql += tokens[i];
                 }
                 cmd.setValue = sql;
+            }
+        // Phase 4.2: MIGRATE UP [n] / DOWN [n] / STATUS / RESET
+        } else if (kw0 == "MIGRATE") {
+            std::string sub = (tokens.size() > 1) ? toUpper(tokens[1]) : "";
+            if (sub == "UP") {
+                cmd.type = CommandType::MIGRATE_UP;
+                if (tokens.size() > 2) { try { cmd.limit = std::stoi(tokens[2]); } catch (...) { cmd.limit = -1; } } else { cmd.limit = -1; }
+            } else if (sub == "DOWN") {
+                cmd.type = CommandType::MIGRATE_DOWN;
+                if (tokens.size() > 2) { try { cmd.limit = std::stoi(tokens[2]); } catch (...) { cmd.limit = 1; } } else { cmd.limit = 1; }
+            } else if (sub == "STATUS") {
+                cmd.type = CommandType::MIGRATE_STATUS;
+            } else if (sub == "RESET") {
+                cmd.type = CommandType::MIGRATE_RESET;
+            } else {
+                cmd.type = CommandType::MIGRATE_STATUS;  // default
             }
         // APPLY MIGRATION name
         } else if (kw0 == "APPLY" && kw1 == "MIGRATION") {

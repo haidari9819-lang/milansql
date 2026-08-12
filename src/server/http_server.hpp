@@ -52,6 +52,12 @@
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "../security/audit_log.hpp"
+#include "../crypto/encryption_manager.hpp"
+#include "../security/ip_allowlist.hpp"
+#include "../security/mtls_manager.hpp"
+#include "../tenant/isolated_tenant.hpp"
+#include "../security/compliance_report.hpp"
 #include "../monitoring/prometheus.hpp"
 #include "../auth/auth_manager.hpp"
 #include "../auth/rate_limiter.hpp"
@@ -69,7 +75,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1902;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.8.0";
+static constexpr const char* MILANSQL_VERSION = "11.9.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -6717,6 +6723,165 @@ function clearOutput() { document.getElementById('output').textContent = ''; }
                "Connection: close\r\n"
                "\r\n" + html;
     }
+
+
+    // ── Phase 5.2: Audit Trail API ────────────────────────────
+    if (req.path == "/api/audit/verify" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        auto res = engine_.auditLogger.verifyChain();
+        std::string j = std::string(R"({"valid":)") + (res.valid ? "true" : "false")
+                       + R"(,"checked":)" + std::to_string(res.checked)
+                       + R"(,"broken":)" + std::to_string(res.broken)
+                       + R"(,"first_broken":")" + res.firstBroken + R"("})";
+        return buildHttpResponse(200, j, "application/json");
+    }
+    if (req.path == "/api/audit/export" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, engine_.auditLogger.exportJson(), "application/json");
+    }
+
+    // ── Phase 5.1: Encryption API ─────────────────────────────
+    if (req.path == "/api/encryption/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string j = std::string(R"({"status":")") + milansql::EncryptionManager::instance().status()
+                       + R"(","enabled":)" + (milansql::EncryptionManager::instance().enabled() ? "true" : "false") + "}";
+        return buildHttpResponse(200, j, "application/json");
+    }
+    if (req.path == "/api/encryption/enable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string key = extractJsonStr(req.body, "key");
+        std::string msg = milansql::EncryptionManager::instance().enable(key);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/encryption/disable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string msg = milansql::EncryptionManager::instance().disable();
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/encryption/rotate" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string key = extractJsonStr(req.body, "key");
+        std::string msg = milansql::EncryptionManager::instance().rotateKey(key);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+    // ── Phase 5.3: IP Allowlist API ───────────────────────────
+    if (req.path.rfind("/api/allowlist", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        if (req.method == "GET") {
+            return buildHttpResponse(200, milansql::IpAllowlist::instance().statusJson(), "application/json");
+        } else if (req.method == "POST") {
+            std::string user = extractJsonStr(req.body, "user");
+            std::string ips  = extractJsonStr(req.body, "ips");
+            milansql::IpAllowlist::instance().setAllowed(user, ips);
+            return buildHttpResponse(200, R"({"message":"IP allowlist updated"})", "application/json");
+        } else if (req.method == "DELETE") {
+            std::string user = extractJsonStr(req.body, "user");
+            milansql::IpAllowlist::instance().removeAllowed(user);
+            return buildHttpResponse(200, R"({"message":"IP allowlist removed"})", "application/json");
+        }
+    }
+
+    // ── Phase 5.3: mTLS API ───────────────────────────────────
+    if (req.path == "/api/mtls/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, milansql::MtlsManager::instance().statusJson(), "application/json");
+    }
+    if (req.path == "/api/mtls/enable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string ca = extractJsonStr(req.body, "ca_path");
+        std::string msg = milansql::MtlsManager::instance().enable(ca);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/mtls/disable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string msg = milansql::MtlsManager::instance().disable();
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+    // ── Phase 5.4: Compliance Reports API ────────────────────
+    if (req.path.rfind("/api/compliance/", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string type = req.path.substr(16);
+        using CR = milansql::ComplianceReporter;
+        CR::ReportContext rctx;
+        {
+            time_t t = time(nullptr); char buf[24];
+            struct tm ltm; localtime_r(&t, &ltm);
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &ltm);
+            rctx.generatedAt = buf;
+        }
+        rctx.serverVersion = MILANSQL_VERSION;
+        rctx.auditOn       = engine_.auditLogger.isEnabled();
+        rctx.auditEntries  = (int)engine_.auditLogger.entryCount();
+        rctx.encryptionOn  = milansql::EncryptionManager::instance().enabled();
+        rctx.mtlsOn        = milansql::MtlsManager::instance().enabled();
+        if (rctx.auditOn) {
+            auto vr = engine_.auditLogger.verifyChain();
+            rctx.auditChainOk = vr.valid;
+        }
+        {
+            std::shared_lock<std::shared_mutex> lock(engineMutex_);
+            auto tables = engine_.getAllTableNames();
+            rctx.tableCount = (int)tables.size();
+            std::string rlsJson = engine_.getRlsPoliciesJson();
+            for (auto& tbl : tables) {
+                if (rlsJson.find(tbl) != std::string::npos)
+                    rctx.tablesWithRls.push_back(tbl);
+            }
+        }
+        std::string report;
+        for (auto& ch : type) ch = (char)toupper((unsigned char)ch);
+        if (type == "DSGVO" || type == "GDPR")
+            report = CR::generateDSGVO(rctx);
+        else if (type == "GOBD")
+            report = CR::generateGoBD(rctx);
+        else if (type == "SOC2")
+            report = CR::generateSOC2(rctx);
+        else
+            return buildHttpResponse(400, R"({"error":"Unknown report type. Use: dsgvo, gobd, soc2"})");
+        return buildHttpResponse(200, report, "application/json");
+    }
+
+    // ── Phase 5.5: Isolated Tenants API ──────────────────────
+    if (req.path == "/api/isolated-tenants" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, milansql::IsolatedTenantManager::instance().listJson(), "application/json");
+    }
+    if (req.path == "/api/isolated-tenants" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string name    = extractJsonStr(req.body, "name");
+        std::string memory  = extractJsonStr(req.body, "memory");
+        std::string cpu     = extractJsonStr(req.body, "cpu");
+        std::string storage = extractJsonStr(req.body, "storage");
+        std::string config;
+        if (!memory.empty())  config += "MEMORY="  + memory  + ";";
+        if (!cpu.empty())     config += "CPU="     + cpu     + ";";
+        if (!storage.empty()) config += "STORAGE=" + storage + ";";
+        std::string msg = milansql::IsolatedTenantManager::instance().create(name, config);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path.rfind("/api/isolated-tenants/", 0) == 0 && req.method == "DELETE") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string name = req.path.substr(22);
+        std::string msg = milansql::IsolatedTenantManager::instance().drop(name);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
 
     return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");
 }

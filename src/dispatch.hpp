@@ -53,6 +53,12 @@
 #include "branching/branch_manager.hpp"        // Phase 3.1: DB Branching
 #include "router/shard_router.hpp"             // Phase 3.3: Sharding
 #include "serverless/serverless_manager.hpp"   // Phase 3.4: Serverless
+#include "security/audit_log.hpp"              // Phase 5.2: Advanced Audit
+#include "crypto/encryption_manager.hpp"       // Phase 5.1: Encryption at Rest
+#include "security/ip_allowlist.hpp"           // Phase 5.3: IP Allowlisting
+#include "security/mtls_manager.hpp"           // Phase 5.3: mTLS
+#include "tenant/isolated_tenant.hpp"          // Phase 5.5: Isolated Tenants
+#include "security/compliance_report.hpp"      // Phase 5.4: Compliance Reports
 
 // Phase 106: WebSocket notification callback
 // Defined here to avoid circular dependency with websocket_server.hpp.
@@ -7522,6 +7528,150 @@ inline bool dispatchCommand(
         milansql::ServerlessManager::global().setEnabled(false);
         std::cout << "  Serverless mode disabled.\n\n";
         break;
+
+    // Phase 5.2: Advanced Audit Trail
+    case milansql::CommandType::VERIFY_AUDIT_LOG: {
+        auto res = engine.auditLogger.verifyChain();
+        std::cout << "  Audit chain: " << (res.valid ? "VALID" : "BROKEN")
+                  << " | Checked: " << res.checked
+                  << " | Broken: " << res.broken;
+        if (!res.firstBroken.empty()) std::cout << " | First: " << res.firstBroken;
+        std::cout << "\n\n";
+        break;
+    }
+    case milansql::CommandType::EXPORT_AUDIT_LOG: {
+        std::string path = cmd.tableName;
+        if (!path.empty() && path.front() == 39) path = path.substr(1);
+        if (!path.empty() && path.back()  == 39) path.pop_back();
+        if (!path.empty() && path.front() == 34) path = path.substr(1);
+        if (!path.empty() && path.back()  == 34) path.pop_back();
+        std::string json = engine.auditLogger.exportJson();
+        if (!path.empty()) {
+            std::ofstream f(path);
+            if (f.is_open()) { f << json; std::cout << "  Audit log exported to " << path << "\n\n"; }
+            else std::cout << "  ERROR: Cannot write to " << path << "\n\n";
+        } else {
+            std::cout << json << "\n\n";
+        }
+        break;
+    }
+    // Phase 5.1: Encryption at Rest
+    case milansql::CommandType::ENABLE_ENCRYPTION: {
+        std::string key = cmd.setValue;
+        if (!key.empty() && key.front() == 39) key = key.substr(1);
+        if (!key.empty() && key.back()  == 39) key.pop_back();
+        if (!key.empty() && key.front() == 34) key = key.substr(1);
+        if (!key.empty() && key.back()  == 34) key.pop_back();
+        std::cout << "  " << milansql::EncryptionManager::instance().enable(key) << "\n\n";
+        break;
+    }
+    case milansql::CommandType::DISABLE_ENCRYPTION:
+        std::cout << "  " << milansql::EncryptionManager::instance().disable() << "\n\n";
+        break;
+    case milansql::CommandType::SHOW_ENCRYPTION_STATUS:
+        std::cout << "  Encryption: " << milansql::EncryptionManager::instance().status() << "\n\n";
+        break;
+    case milansql::CommandType::ROTATE_ENCRYPTION_KEY: {
+        std::string key = cmd.setValue;
+        if (!key.empty() && key.front() == 39) key = key.substr(1);
+        if (!key.empty() && key.back()  == 39) key.pop_back();
+        if (!key.empty() && key.front() == 34) key = key.substr(1);
+        if (!key.empty() && key.back()  == 34) key.pop_back();
+        std::cout << "  " << milansql::EncryptionManager::instance().rotateKey(key) << "\n\n";
+        break;
+    }
+    // Phase 5.3: IP Allowlisting
+    case milansql::CommandType::SET_ALLOWED_IPS: {
+        std::string user = cmd.tableName, ips = cmd.setValue;
+        if (!ips.empty() && ips.front() == 39) ips = ips.substr(1);
+        if (!ips.empty() && ips.back()  == 39) ips.pop_back();
+        if (!ips.empty() && ips.front() == 34) ips = ips.substr(1);
+        if (!ips.empty() && ips.back()  == 34) ips.pop_back();
+        milansql::IpAllowlist::instance().setAllowed(user, ips);
+        std::cout << "  IP allowlist set for user " << user << ": " << ips << "\n\n";
+        break;
+    }
+    case milansql::CommandType::SHOW_ALLOWED_IPS: {
+        std::string user = cmd.tableName;
+        if (user.empty())
+            std::cout << milansql::IpAllowlist::instance().statusJson() << "\n\n";
+        else
+            std::cout << "  Allowed IPs for " << user << ": "
+                      << milansql::IpAllowlist::instance().getList(user) << "\n\n";
+        break;
+    }
+    case milansql::CommandType::REMOVE_ALLOWED_IPS:
+        milansql::IpAllowlist::instance().removeAllowed(cmd.tableName);
+        std::cout << "  IP allowlist removed for user " << cmd.tableName << "\n\n";
+        break;
+    // Phase 5.3: mTLS
+    case milansql::CommandType::ENABLE_MTLS: {
+        std::string ca = cmd.setValue;
+        if (!ca.empty() && ca.front() == 39) ca = ca.substr(1);
+        if (!ca.empty() && ca.back()  == 39) ca.pop_back();
+        if (!ca.empty() && ca.front() == 34) ca = ca.substr(1);
+        if (!ca.empty() && ca.back()  == 34) ca.pop_back();
+        std::cout << "  " << milansql::MtlsManager::instance().enable(ca) << "\n\n";
+        break;
+    }
+    case milansql::CommandType::DISABLE_MTLS:
+        std::cout << "  " << milansql::MtlsManager::instance().disable() << "\n\n";
+        break;
+    case milansql::CommandType::SHOW_MTLS_STATUS:
+        std::cout << "  " << milansql::MtlsManager::instance().statusJson() << "\n\n";
+        break;
+    // Phase 5.4: Compliance Reports
+    case milansql::CommandType::GENERATE_COMPLIANCE_REPORT: {
+        using CR = milansql::ComplianceReporter;
+        CR::ReportContext ctx;
+        {
+            time_t t = time(nullptr); char buf[24];
+            struct tm ltm; localtime_r(&t, &ltm);
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &ltm);
+            ctx.generatedAt = buf;
+        }
+        ctx.serverVersion = "11.8.0";  // Phase 5.4
+        ctx.auditOn       = engine.auditLogger.isEnabled();
+        ctx.auditEntries  = (int)engine.auditLogger.entryCount();
+        ctx.encryptionOn  = milansql::EncryptionManager::instance().enabled();
+        ctx.mtlsOn        = milansql::MtlsManager::instance().enabled();
+        if (ctx.auditOn) {
+            auto vr = engine.auditLogger.verifyChain();
+            ctx.auditChainOk = vr.valid;
+        }
+        auto tables = engine.getAllTableNames();
+        ctx.tableCount = (int)tables.size();
+        {
+            std::string rlsJson = engine.getRlsPoliciesJson();
+            for (auto& tbl : tables) {
+                if (rlsJson.find(tbl) != std::string::npos)
+                    ctx.tablesWithRls.push_back(tbl);
+            }
+        }
+        std::string type = cmd.setValue;
+        std::string report;
+        if (type == "DSGVO" || type == "GDPR" || type.empty())
+            report = CR::generateDSGVO(ctx);
+        else if (type == "GOBD")
+            report = CR::generateGoBD(ctx);
+        else if (type == "SOC2")
+            report = CR::generateSOC2(ctx);
+        else
+            report = CR::generateDSGVO(ctx);
+        std::cout << report << "\n\n";
+        break;
+    }
+    // Phase 5.5: Isolated Tenants
+    case milansql::CommandType::CREATE_ISOLATED_TENANT:
+        std::cout << "  " << milansql::IsolatedTenantManager::instance().create(cmd.tableName, cmd.setValue) << "\n\n";
+        break;
+    case milansql::CommandType::DROP_ISOLATED_TENANT:
+        std::cout << "  " << milansql::IsolatedTenantManager::instance().drop(cmd.tableName) << "\n\n";
+        break;
+    case milansql::CommandType::SHOW_ISOLATED_TENANTS:
+        std::cout << milansql::IsolatedTenantManager::instance().listJson() << "\n\n";
+        break;
+
 
     case milansql::CommandType::UNKNOWN:
     default:

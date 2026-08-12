@@ -13776,6 +13776,239 @@ static void testGroup123() {
     std::cout << "  testGroup123 passed.\n";
 }
 
+
+// ── testGroup124: Phase 5.2 Advanced Audit Trail ─────────────
+static void testGroup124() {
+    std::cout << "\n-- testGroup124: Phase 5.2 Advanced Audit Trail --\n";
+
+    // Test AuditEntry has new fields
+    milansql::AuditEntry e;
+    e.action  = "CREATE_TABLE";
+    e.query   = "CREATE TABLE test_p5 (id INT)";
+    e.success = true;
+    check(e.action == "CREATE_TABLE", "AuditEntry.action field");
+    check(e.success == true, "AuditEntry.success field");
+    check(e.query.size() > 0, "AuditEntry.query field");
+    check(e.prevHash.empty(), "AuditEntry.prevHash initially empty");
+    check(e.entryHash.empty(), "AuditEntry.entryHash initially empty");
+
+    // Test auditSha256 produces consistent 32-char hash
+    std::string h1 = milansql::auditSha256("hello world");
+    std::string h2 = milansql::auditSha256("hello world");
+    std::string h3 = milansql::auditSha256("different input");
+    check(h1.size() == 32, "auditSha256 length == 32");
+    check(h1 == h2, "auditSha256 deterministic");
+    check(h1 != h3, "auditSha256 different inputs differ");
+
+    // Test logAdmin and verifyChain
+    milansql::AuditLogger logger;
+    logger.setEnabled(true);
+
+    logger.logAdmin("TEST_ACTION", "admin", "127.0.0.1", "test_table", "test query");
+    logger.logAdmin("SECOND_ACTION", "admin", "127.0.0.1", "other_table", "another query");
+
+    auto res = logger.verifyChain();
+    check(res.valid, "verifyChain: valid after logAdmin");
+    check(res.checked == 2, "verifyChain: checked == 2");
+    check(res.broken == 0, "verifyChain: broken == 0");
+
+    // Test exportJson
+    std::string json = logger.exportJson();
+    check(json.size() > 2, "exportJson not empty");
+    check(json.front() == '[' && json.back() == ']', "exportJson is array");
+    check(json.find("TEST_ACTION") != std::string::npos, "exportJson contains action");
+    check(json.find("admin") != std::string::npos, "exportJson contains user");
+
+    std::cout << "  testGroup124 passed.\n";
+}
+
+// ── testGroup125: Phase 5.1 Encryption at Rest ────────────────
+static void testGroup125() {
+    std::cout << "\n-- testGroup125: Phase 5.1 Encryption at Rest --\n";
+
+    auto& enc = milansql::EncryptionManager::instance();
+
+    // Initially disabled
+    check(!enc.enabled(), "EncryptionManager initially disabled");
+    check(enc.status() == "disabled", "EncryptionManager status == disabled");
+
+    // Enable with valid key (64 hex chars = 256 bits)
+    std::string key64 = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    std::string msg = enc.enable(key64);
+    check(enc.enabled(), "EncryptionManager enabled after enable()");
+    check(msg.find("enabled") != std::string::npos, "enable() returns success message");
+    check(enc.status() != "disabled", "status changed after enable");
+
+    // Encrypt/decrypt roundtrip
+    std::string plain = "Hello, MilanSQL!";
+    std::string cipher = enc.encryptStr(plain);
+    std::string roundtrip = enc.decryptStr(cipher);
+    check(cipher != plain, "encrypted != plaintext");
+    check(roundtrip == plain, "decrypt(encrypt(x)) == x");
+
+    // Rotate key
+    std::string key2 = "1122334455667788990011223344556677889900112233445566778899001122";
+    std::string rotMsg = enc.rotateKey(key2);
+    check(enc.enabled(), "still enabled after rotation");
+    check(rotMsg.find("rotated") != std::string::npos || rotMsg.find("Key") != std::string::npos,
+          "rotateKey returns message");
+
+    // Short key rejected
+    std::string shortKey = "aabb";
+    std::string errMsg = enc.enable(shortKey);
+    check(errMsg.find("ERROR") != std::string::npos || errMsg.find("short") != std::string::npos,
+          "short key rejected");
+
+    // Disable
+    std::string disMsg = enc.disable();
+    check(!enc.enabled(), "disabled after disable()");
+    check(enc.status() == "disabled", "status == disabled after disable()");
+
+    std::cout << "  testGroup125 passed.\n";
+}
+
+// ── testGroup126: Phase 5.3 IP Allowlisting ───────────────────
+static void testGroup126() {
+    std::cout << "\n-- testGroup126: Phase 5.3 IP Allowlisting --\n";
+
+    auto& al = milansql::IpAllowlist::instance();
+
+    // No restriction by default
+    check(al.isAllowed("testuser_p5", "192.168.1.1"), "no restriction -> allowed");
+    check(al.isAllowed("testuser_p5", "10.0.0.1"), "no restriction -> allowed (any IP)");
+
+    // Set allowlist
+    al.setAllowed("testuser_p5", "192.168.1.100, 10.0.0.0/24");
+    check(al.isAllowed("testuser_p5", "192.168.1.100"), "exact IP match allowed");
+    check(al.isAllowed("testuser_p5", "10.0.0.55"), "CIDR /24 match allowed");
+    check(!al.isAllowed("testuser_p5", "172.16.0.1"), "non-listed IP rejected");
+
+    // getList
+    std::string list = al.getList("testuser_p5");
+    check(list.find("192.168.1.100") != std::string::npos, "getList contains IP");
+
+    // statusJson
+    std::string j = al.statusJson();
+    check(j.find("testuser_p5") != std::string::npos, "statusJson contains user");
+    check(j.front() == '{', "statusJson is object");
+
+    // Remove
+    al.removeAllowed("testuser_p5");
+    check(al.isAllowed("testuser_p5", "172.16.0.1"), "after remove: any IP allowed again");
+
+    std::cout << "  testGroup126 passed.\n";
+}
+
+// ── testGroup127: Phase 5.3 mTLS + Phase 5.5 Isolated Tenants ─
+static void testGroup127() {
+    std::cout << "\n-- testGroup127: Phase 5.3 mTLS + Phase 5.5 Isolated Tenants --\n";
+
+    // mTLS
+    auto& mtls = milansql::MtlsManager::instance();
+    check(!mtls.enabled(), "mTLS initially disabled");
+
+    std::string en = mtls.enable("/etc/milansql/ca.pem");
+    check(mtls.enabled(), "mTLS enabled after enable()");
+    check(mtls.caPath() == "/etc/milansql/ca.pem", "caPath set correctly");
+
+    std::string sj = mtls.statusJson();
+    check(sj.find("true") != std::string::npos, "statusJson shows enabled:true");
+    check(sj.find("ca.pem") != std::string::npos, "statusJson shows ca_path");
+
+    std::string di = mtls.disable();
+    check(!mtls.enabled(), "mTLS disabled after disable()");
+
+    // Isolated Tenants
+    auto& itm = milansql::IsolatedTenantManager::instance();
+
+    std::string res = itm.create("test_tenant_p5", "MEMORY=256;CPU=1;STORAGE=/tmp/test_tenant_p5/;");
+    check(res.find("test_tenant_p5") != std::string::npos, "create returns tenant name");
+    check(itm.exists("test_tenant_p5"), "tenant exists after create");
+
+    // Verify config via listJson
+    std::string lj_early = itm.listJson();
+    check(lj_early.find("256") != std::string::npos, "memoryMB 256 in listJson");
+    check(itm.exists("test_tenant_p5"), "exists() returns true");
+
+    check(lj_early.find("isolated_tenants") != std::string::npos, "listJson has isolated_tenants key");
+
+    // Duplicate create rejected
+    std::string dup = itm.create("test_tenant_p5", "MEMORY=512;");
+    check(dup.find("ERROR") != std::string::npos, "duplicate create returns error");
+
+    // Drop
+    std::string dr = itm.drop("test_tenant_p5");
+    check(dr.find("dropped") != std::string::npos, "drop returns dropped message");
+    check(!itm.exists("test_tenant_p5"), "tenant gone after drop");
+
+    // Drop non-existent
+    std::string dr2 = itm.drop("nonexistent_p5");
+    check(dr2.find("ERROR") != std::string::npos, "drop non-existent returns error");
+
+    std::cout << "  testGroup127 passed.\n";
+}
+
+// ── testGroup128: Phase 5.4 Compliance Reports ────────────────
+static void testGroup128() {
+    std::cout << "\n-- testGroup128: Phase 5.4 Compliance Reports --\n";
+
+    using CR = milansql::ComplianceReporter;
+    CR::ReportContext ctx;
+    ctx.generatedAt    = "2026-08-12T10:00:00Z";
+    ctx.serverVersion  = "11.9.0";
+    ctx.tableCount     = 5;
+    ctx.userCount      = 3;
+    ctx.auditEntries   = 42;
+    ctx.encryptionOn   = true;
+    ctx.mtlsOn         = false;
+    ctx.auditOn        = true;
+    ctx.auditChainOk   = true;
+    ctx.tablesWithRls  = {"users", "orders"};
+
+    // DSGVO report
+    std::string dsgvo = CR::generateDSGVO(ctx);
+    check(!dsgvo.empty(), "DSGVO report not empty");
+    check(dsgvo.find("DSGVO_GDPR") != std::string::npos, "DSGVO report type present");
+    check(dsgvo.find("compliance_score") != std::string::npos, "DSGVO has compliance_score");
+    check(dsgvo.find("2026-08-12") != std::string::npos, "DSGVO has generated_at");
+    check(dsgvo.front() == '{', "DSGVO is JSON object");
+
+    // GoBD report
+    std::string gobd = CR::generateGoBD(ctx);
+    check(!gobd.empty(), "GoBD report not empty");
+    check(gobd.find("GoBD") != std::string::npos, "GoBD report type present");
+    check(gobd.find("audit_hash_chain") != std::string::npos, "GoBD has audit_hash_chain");
+    check(gobd.find("true") != std::string::npos, "GoBD shows chain valid");
+
+    // SOC2 report
+    std::string soc2 = CR::generateSOC2(ctx);
+    check(!soc2.empty(), "SOC2 report not empty");
+    check(soc2.find("SOC2") != std::string::npos, "SOC2 report type present");
+    check(soc2.find("CC6_security") != std::string::npos, "SOC2 has CC6_security");
+    check(soc2.find("A1_availability") != std::string::npos, "SOC2 has A1_availability");
+
+    // Compliance score with all features: 25+25+15+0+20 = 85 (mtls=false -> -15)
+    int score_val = 25 + 25 + 15 + 0 + 20;  // enc+audit+chain+no_mtls+rls
+    std::string score_str = std::to_string(score_val);
+    check(dsgvo.find(score_str) != std::string::npos, "DSGVO compliance_score == " + score_str);
+
+    // With everything enabled: score = 100
+    ctx.mtlsOn = true;
+    std::string dsgvo2 = CR::generateDSGVO(ctx);
+    check(dsgvo2.find("100") != std::string::npos, "all features -> score == 100");
+
+    // No features: score = 0
+    CR::ReportContext empty_ctx;
+    empty_ctx.generatedAt   = "2026-08-12T10:00:00Z";
+    empty_ctx.serverVersion = "11.9.0";
+    std::string dsgvo3 = CR::generateDSGVO(empty_ctx);
+    check(dsgvo3.find(":0}") != std::string::npos || dsgvo3.find(":0,") != std::string::npos,
+          "no features -> score == 0");
+    check(dsgvo3.find("recommendations") != std::string::npos, "has recommendations when not compliant");
+
+    std::cout << "  testGroup128 passed.\n";
+}
+
 // ── testGroup121: Phase 3.4 Serverless Mode ──────────────────────────────────
 
 static void testGroup121() {
@@ -14238,6 +14471,21 @@ int main() {
     }
     try { testGroup123(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 123 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup124(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 124 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup125(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 125 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup126(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 126 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup127(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 127 exception: " << e.what() << "\n"; ++failed;
+    }
+    try { testGroup128(); } catch (const std::exception& e) {
+        std::cout << "[ERROR] Group 128 exception: " << e.what() << "\n"; ++failed;
     }
 
     std::cout << "\n========================================\n";

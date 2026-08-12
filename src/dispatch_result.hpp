@@ -12,6 +12,12 @@
 #include "optimizer/plan_selector.hpp" // Optimizer Phase 2: Plan Selector
 #include "optimizer/join_enumerator.hpp" // Optimizer Phase 3: Join Enumeration (installiert g_joinPlanHook)
 #include "nl/nl_query.hpp"              // Block 7: Natural Language SQL
+#include "replication/repl_state.hpp"   // v11.1.0: SHOW WAL ARCHIVE / REPLICATION STATUS
+#include "parallel/thread_pool.hpp"    // Phase 2.1: Thread Pool
+#include "cache/user_query_cache.hpp"  // Phase 2.2: Per-User Query Cache
+#include "branching/branch_manager.hpp"        // Phase 3.1: DB Branching
+#include "router/shard_router.hpp"             // Phase 3.3: Sharding
+#include "serverless/serverless_manager.hpp"   // Phase 3.4: Serverless
 
 namespace milansql {
 
@@ -416,6 +422,39 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── v11.1.0: SHOW WAL ARCHIVE STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_WAL_ARCHIVE_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        // Check if WAL archive file exists and its size
+        bool archiveExists = false;
+        long long archiveSize = 0;
+        {
+            std::ifstream af("database.wal.archive", std::ios::binary | std::ios::ate);
+            if (af) { archiveExists = true; archiveSize = af.tellg(); }
+        }
+        qr.rows.push_back(milansql::Row({"Archive Mode", "ON"}));
+        qr.rows.push_back(milansql::Row({"Archive File", "database.wal.archive"}));
+        qr.rows.push_back(milansql::Row({"Archive File Size", std::to_string(archiveSize) + " bytes"}));
+        qr.rows.push_back(milansql::Row({"Archive Status", archiveExists ? "OK" : "EMPTY"}));
+        qr.rows.push_back(milansql::Row({"WAL File", "database.milan.wal"}));
+        qr.rows.push_back(milansql::Row({"Binlog Position", std::to_string(milansql::g_replState.slavePos.load())}));
+        break;
+    }
+
+    // ── v11.1.0: SHOW REPLICATION STATUS ─────────────────────────
+    case milansql::CommandType::SHOW_REPLICATION_STATUS: {
+        qr.columns = {milansql::Column{"Setting","TEXT"}, milansql::Column{"Value","TEXT"}};
+        bool isMaster = milansql::g_replState.isMaster.load();
+        bool isSlave  = milansql::g_replState.isSlave.load();
+        qr.rows.push_back(milansql::Row({"Role", isMaster ? "PRIMARY" : (isSlave ? "REPLICA" : "STANDALONE")}));
+        qr.rows.push_back(milansql::Row({"Replication Active", (isMaster || isSlave) ? "YES" : "NO"}));
+        qr.rows.push_back(milansql::Row({"Connected Replicas", std::to_string(milansql::g_replState.connectedSlaves.load())}));
+        qr.rows.push_back(milansql::Row({"Replication Lag (ms)", std::to_string(milansql::g_replState.slaveLagMs.load())}));
+        qr.rows.push_back(milansql::Row({"Slave Running", milansql::g_replState.slaveRunning.load() ? "YES" : "NO"}));
+        qr.rows.push_back(milansql::Row({"Binlog Position", std::to_string(milansql::g_replState.slavePos.load())}));
+        break;
+    }
+
     // ── Phase 129: SHOW DSN ────────────────────────────────────
     case milansql::CommandType::SHOW_DSN: {
         qr.columns = {milansql::Column{"Parameter","TEXT"}, milansql::Column{"Value","TEXT"}};
@@ -487,10 +526,76 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     case milansql::CommandType::CREATE_TABLE:
         try {
             if (cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
-                // Silently succeed — table already exists
                 break;
             }
             engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys);
+            // Auto-create BTREE index for PRIMARY KEY column
+            for (const auto& col : cmd.columns) {
+                if (col.isPrimaryKey) {
+                    try { engine.createIndex(cmd.tableName, {col.name}, "PRIMARY"); } catch (...) {}
+                    break;
+                }
+            }
+            // Phase 176: Physical partitioning setup
+            if (!cmd.partitionType.empty()) {
+                milansql::PartitionInfo pi;
+                pi.column = cmd.partitionColumn;
+                if (cmd.partitionType == "RANGE") {
+                    pi.type = milansql::PartitionType::RANGE;
+                    for (auto& r : cmd.partitionRanges) {
+                        milansql::PartitionRangeDef rd;
+                        rd.name = r.name;
+                        rd.fromStr = r.fromStr;
+                        rd.limitStr = r.limitStr;
+                        if (!r.fromStr.empty()) {
+                            try { rd.fromVal = std::stoll(r.fromStr); } catch (...) { rd.fromVal = 0; }
+                        }
+                        if (r.limitStr == "MAXVALUE")
+                            rd.limit = std::numeric_limits<long long>::max();
+                        else { try { rd.limit = std::stoll(r.limitStr); } catch (...) { rd.limit = 0; } }
+                        pi.ranges.push_back(rd);
+                    }
+                } else if (cmd.partitionType == "LIST") {
+                    pi.type = milansql::PartitionType::LIST;
+                    for (auto& l : cmd.partitionLists) {
+                        milansql::PartitionListDef ld;
+                        ld.name = l.name;
+                        ld.values = l.values;
+                        pi.lists.push_back(ld);
+                    }
+                } else if (cmd.partitionType == "HASH") {
+                    pi.type = milansql::PartitionType::HASH;
+                    pi.hashCount = cmd.partitionHashCount;
+                }
+                // Store metadata on Table object
+                try { engine.setTablePartitionInfo(cmd.tableName, pi); } catch (...) {}
+                // Create physical partitions
+                pi.physical = true;
+                if (pi.type == milansql::PartitionType::HASH && pi.hashCount > 0) {
+                    for (int i = 0; i < pi.hashCount; ++i) {
+                        std::string childName = cmd.tableName + "_p" + std::to_string(i);
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                if (pi.type == milansql::PartitionType::RANGE) {
+                    for (const auto& rd : pi.ranges) {
+                        if (rd.name.empty()) continue;
+                        std::string childName = cmd.tableName + "_" + rd.name;
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                if (pi.type == milansql::PartitionType::LIST) {
+                    for (const auto& ld : pi.lists) {
+                        if (ld.name.empty()) continue;
+                        std::string childName = cmd.tableName + "_" + ld.name;
+                        engine.createPartitionChild(cmd.tableName, childName, cmd.columns);
+                        pi.children.push_back(childName);
+                    }
+                }
+                engine.setPartitionMeta(cmd.tableName, pi);
+            }
         } catch (const std::exception& e) {
             qr.error = e.what();
         }
@@ -788,6 +893,14 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
             if (cmd.isJoin) {
                 milansql::Table tbl = engine.executeJoins(cmd.tableName, cmd.joinClauses,
                                                           cmd.whereConds, cmd.whereLogic);
+                // v11.1.0 Bug Fix: COUNT(*) over JOIN — count rows in joined result, not source table
+                if (cmd.isCount) {
+                    size_t cnt = 0;
+                    for (const auto& r : tbl.rows()) if (r.xmax == 0) ++cnt;
+                    qr.columns = {milansql::Column{"COUNT(*)", "INT"}};
+                    qr.rows.push_back(milansql::Row({std::to_string(cnt)}));
+                    break;
+                }
                 // Phase 167: JOIN + GROUP BY
                 if (cmd.isGroupBy) {
                     std::string tmpName = "__join_grp_tmp";
@@ -1119,6 +1232,14 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     // ── Phase 146: Online DDL ──────────────────────────────────────
     case milansql::CommandType::ALTER_TABLE:
         try {
+            // v11.1.0: IF NOT EXISTS for ADD COLUMN — skip silently if column exists
+            if (cmd.alterOp == "ADD" && cmd.ifNotExists && engine.tableExists(cmd.tableName)) {
+                auto it = engine.getTables().find(engine.resolveTableName(cmd.tableName));
+                if (it != engine.getTables().end() && it->second.colOf(cmd.alterColName) >= 0) {
+                    qr.message = "ALTER TABLE (column already exists, IF NOT EXISTS)";
+                    break;
+                }
+            }
             engine.alterTable(cmd.tableName, cmd.alterOp, cmd.alterColName,
                               cmd.alterColType, cmd.alterColNew, cmd.alterColDefault);
         } catch (const std::exception& e) { qr.error = e.what(); }
@@ -1284,8 +1405,13 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         std::string tblTarget = !cmd.statsTable.empty() ? cmd.statsTable : cmd.tableName;
         if (!tblTarget.empty() && tblTarget != "*") {
             if (engine.tableExists(tblTarget)) {
-                const milansql::Table& tbl =
-                    engine.getTables().at(engine.resolveTableName(tblTarget));
+                // v11.1.0 Bug Fix: use find() instead of at() to avoid map::at exception
+                auto it = engine.getTables().find(engine.resolveTableName(tblTarget));
+                if (it == engine.getTables().end()) {
+                    qr.error = "Table not found: " + tblTarget;
+                    break;
+                }
+                const milansql::Table& tbl = it->second;
                 milansql::g_tableStats.analyzeTable(tblTarget, tbl);
                 milansql::g_tableStats.saveStats();
                 milansql::g_joinEnumerator().invalidate(tblTarget);  // Phase 3: Stats geaendert
@@ -1465,6 +1591,295 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
         break;
     }
 
+    // ── Phase 2.1: SET parallel_workers = N ──────────────────────
+    case milansql::CommandType::SET_PARALLEL_WORKERS: {
+        if (!cmd.values.empty()) {
+            try {
+                int n = std::stoi(cmd.values[0]);
+                if (n < 1) n = 1;
+                if (n > 64) n = 64;
+                milansql::g_threadPool().resize(static_cast<size_t>(n));
+                qr.columns.push_back(milansql::Column{"result", "TEXT"});
+                qr.rows.push_back(milansql::Row({"parallel_workers = " + std::to_string(n)}));
+            } catch (...) {
+                qr.error = "ERROR: SET parallel_workers = <N>";
+            }
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_PARALLEL_STATUS_V2: {
+        qr.columns.push_back(milansql::Column{"setting", "TEXT"});
+        qr.columns.push_back(milansql::Column{"value",   "TEXT"});
+        qr.rows.push_back(milansql::Row({"parallel_workers", std::to_string(milansql::g_threadPool().size())}));
+        qr.rows.push_back(milansql::Row({"parallel_workers_active", std::to_string(milansql::g_parallelWorkersActive().load())}));
+        break;
+    }
+
+    // ── Phase 2.2: SET query_cache_size = N ──────────────────────
+    case milansql::CommandType::SET_QUERY_CACHE_SIZE: {
+        if (!cmd.values.empty()) {
+            try {
+                size_t n = static_cast<size_t>(std::stoul(cmd.values[0]));
+                milansql::g_userQueryCache().setMaxEntries(n);
+                qr.columns.push_back(milansql::Column{"result", "TEXT"});
+                qr.rows.push_back(milansql::Row({"query_cache_size = " + std::to_string(n)}));
+            } catch (...) {
+                qr.error = "ERROR: SET query_cache_size = <N>";
+            }
+        }
+        break;
+    }
+
+    case milansql::CommandType::FLUSH_QUERY_CACHE: {
+        milansql::g_userQueryCache().flush();
+        engine.getQueryCache().clear();
+        qr.columns.push_back(milansql::Column{"result", "TEXT"});
+        qr.rows.push_back(milansql::Row({"Query cache flushed"}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_QUERY_CACHE_STATS: {
+        auto& uc = milansql::g_userQueryCache();
+        qr.columns.push_back(milansql::Column{"setting", "TEXT"});
+        qr.columns.push_back(milansql::Column{"value",   "TEXT"});
+        qr.rows.push_back(milansql::Row({"enabled",  uc.isEnabled() ? "true" : "false"}));
+        qr.rows.push_back(milansql::Row({"size",     std::to_string(uc.size())}));
+        qr.rows.push_back(milansql::Row({"max_size", std::to_string(uc.maxSize())}));
+        qr.rows.push_back(milansql::Row({"hits",     std::to_string(uc.hits())}));
+        qr.rows.push_back(milansql::Row({"misses",   std::to_string(uc.misses())}));
+        break;
+    }
+
+    // ── Phase 3.1: Database Branching ────────────────────────────
+    case milansql::CommandType::CREATE_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().createBranch(
+            cmd.branchName, cmd.branchFrom, engine, err);
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        if (ok)
+            qr.rows.push_back(milansql::Row({"Branch '" + cmd.branchName + "' created from '" + cmd.branchFrom + "'"}));
+        else
+            qr.error = err;
+        break;
+    }
+
+    case milansql::CommandType::DROP_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().dropBranch(cmd.branchName, err);
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        if (ok)
+            qr.rows.push_back(milansql::Row({"Branch '" + cmd.branchName + "' dropped"}));
+        else
+            qr.error = err;
+        break;
+    }
+
+    case milansql::CommandType::USE_BRANCH: {
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        if (!milansql::BranchManager::global().hasBranch(cmd.branchName)) {
+            qr.error = "Branch '" + cmd.branchName + "' does not exist";
+        } else {
+            milansql::BranchManager::global().useBranch(cmd.branchName);
+            qr.rows.push_back(milansql::Row({"Switched to branch '" + cmd.branchName + "'"}));
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_BRANCHES: {
+        qr.columns = {milansql::Column{"name","TEXT"}, milansql::Column{"parent","TEXT"},
+                      milansql::Column{"created_at","TEXT"}, milansql::Column{"status","TEXT"}};
+        for (auto& bi : milansql::BranchManager::global().listBranches()) {
+            qr.rows.push_back(milansql::Row({bi.name, bi.parent, bi.created_at, bi.status}));
+        }
+        break;
+    }
+
+    case milansql::CommandType::MERGE_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().mergeBranch(
+            cmd.branchName, cmd.branchTarget, engine, err);
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        if (ok)
+            qr.rows.push_back(milansql::Row({"Branch '" + cmd.branchName + "' merged into '" + cmd.branchTarget + "'"}));
+        else
+            qr.error = err;
+        break;
+    }
+
+    // ── Phase 3.2: Logical Replication (using engine's built-in pub/sub) ─
+    case milansql::CommandType::CREATE_PUBLICATION: {
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        try {
+            bool allTables = (!cmd.values.empty() && cmd.values[0] == "*");
+            std::vector<std::string> tables;
+            if (!allTables) tables = cmd.values;
+            engine.createPublication(cmd.tableName, tables, allTables);
+            qr.rows.push_back(milansql::Row({"Publication '" + cmd.tableName + "' created"}));
+        } catch (std::exception& e) { qr.error = e.what(); }
+        break;
+    }
+
+    case milansql::CommandType::DROP_PUBLICATION: {
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        try {
+            engine.dropPublication(cmd.tableName);
+            qr.rows.push_back(milansql::Row({"Publication '" + cmd.tableName + "' dropped"}));
+        } catch (std::exception& e) { qr.error = e.what(); }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_PUBLICATIONS: {
+        qr.columns = {milansql::Column{"name","TEXT"}, milansql::Column{"tables","TEXT"},
+                      milansql::Column{"created_at","TEXT"}};
+        for (auto& kv : engine.getPublications()) {
+            auto& pd = kv.second;
+            std::string tbls;
+            if (pd.allTables) { tbls = "*"; }
+            else {
+                for (size_t i = 0; i < pd.tables.size(); ++i) {
+                    if (i) tbls += ",";
+                    tbls += pd.tables[i];
+                }
+            }
+            qr.rows.push_back(milansql::Row({pd.name, tbls, ""}));
+        }
+        break;
+    }
+
+    case milansql::CommandType::CREATE_SUBSCRIPTION: {
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        try {
+            std::string conn, pub;
+            auto sep = cmd.viewSql.find('\x01');
+            if (sep != std::string::npos) {
+                conn = cmd.viewSql.substr(0, sep);
+                pub  = cmd.viewSql.substr(sep + 1);
+            }
+            engine.createSubscription(cmd.tableName, conn, pub);
+            qr.rows.push_back(milansql::Row({"Subscription '" + cmd.tableName + "' created"}));
+        } catch (std::exception& e) { qr.error = e.what(); }
+        break;
+    }
+
+    case milansql::CommandType::DROP_SUBSCRIPTION: {
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        try {
+            engine.dropSubscription(cmd.tableName);
+            qr.rows.push_back(milansql::Row({"Subscription '" + cmd.tableName + "' dropped"}));
+        } catch (std::exception& e) { qr.error = e.what(); }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SUBSCRIPTIONS: {
+        qr.columns = {milansql::Column{"name","TEXT"}, milansql::Column{"connection","TEXT"},
+                      milansql::Column{"publication","TEXT"}, milansql::Column{"status","TEXT"},
+                      milansql::Column{"created_at","TEXT"}};
+        for (auto& kv : engine.getSubscriptions()) {
+            auto& sd = kv.second;
+            qr.rows.push_back(milansql::Row({
+                sd.name, sd.connection, sd.publication,
+                sd.enabled ? "active" : "paused", ""
+            }));
+        }
+        break;
+    }
+
+    // ── Phase 3.3: Sharding ───────────────────────────────────────
+    case milansql::CommandType::CREATE_SHARDED_TABLE: {
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        // First create the table in the engine normally (uses already-parsed columns)
+        try {
+            engine.createTable(cmd.tableName, cmd.columns, cmd.foreignKeys, cmd.tableInherits);
+        } catch (...) {}
+        // Register sharded table in router
+        milansql::ShardedTable st;
+        st.tableName = cmd.tableName;
+        st.shardKey  = cmd.shardKey;
+        st.numShards = cmd.numShards > 0 ? cmd.numShards : 1;
+        for (int i = 0; i < (int)cmd.shardNodes.size(); ++i) {
+            milansql::ShardNode sn;
+            sn.address = cmd.shardNodes[i];
+            sn.shardId = i % st.numShards;
+            st.nodes.push_back(sn);
+        }
+        std::string err;
+        bool ok = milansql::ShardRouter::global().createShardedTable(st, err);
+        if (ok)
+            qr.rows.push_back(milansql::Row({"Sharded table '" + cmd.tableName +
+                "' created with " + std::to_string(st.numShards) + " shards"}));
+        else
+            qr.error = err;
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SHARDS: {
+        qr.columns = {milansql::Column{"shard_id","INT"},
+                      milansql::Column{"node_address","TEXT"},
+                      milansql::Column{"key_range","TEXT"}};
+        if (!milansql::ShardRouter::global().isSharded(cmd.tableName)) {
+            qr.error = "Table '" + cmd.tableName + "' is not sharded";
+        } else {
+            auto nodes = milansql::ShardRouter::global().getNodes(cmd.tableName);
+            for (auto& n : nodes) {
+                qr.rows.push_back(milansql::Row({
+                    std::to_string(n.shardId),
+                    n.address,
+                    "shard_" + std::to_string(n.shardId)
+                }));
+            }
+        }
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SHARD_DISTRIBUTION: {
+        qr.columns = {milansql::Column{"table","TEXT"},
+                      milansql::Column{"shard_key","TEXT"},
+                      milansql::Column{"num_shards","INT"},
+                      milansql::Column{"num_nodes","INT"}};
+        for (auto& st : milansql::ShardRouter::global().listShards()) {
+            qr.rows.push_back(milansql::Row({
+                st.tableName, st.shardKey,
+                std::to_string(st.numShards),
+                std::to_string(st.nodes.size())
+            }));
+        }
+        break;
+    }
+
+    // ── Phase 3.4: Serverless Mode ────────────────────────────────
+    case milansql::CommandType::SET_SERVERLESS_IDLE_TIMEOUT: {
+        milansql::ServerlessManager::global().setIdleTimeout(cmd.serverlessTimeout);
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        qr.rows.push_back(milansql::Row({"Serverless idle timeout set to " +
+            std::to_string(cmd.serverlessTimeout) + " seconds"}));
+        break;
+    }
+
+    case milansql::CommandType::SHOW_SERVERLESS_STATUS: {
+        auto& sm = milansql::ServerlessManager::global();
+        qr.columns = {milansql::Column{"setting","TEXT"}, milansql::Column{"value","TEXT"}};
+        qr.rows.push_back(milansql::Row({"enabled",        sm.isEnabled()   ? "1" : "0"}));
+        qr.rows.push_back(milansql::Row({"idle_timeout_sec", std::to_string(sm.idleTimeout())}));
+        qr.rows.push_back(milansql::Row({"suspended",      sm.isSuspended() ? "1" : "0"}));
+        qr.rows.push_back(milansql::Row({"cold_start_ms",  std::to_string(sm.coldStartLatencyMs())}));
+        break;
+    }
+
+    case milansql::CommandType::ENABLE_SERVERLESS: {
+        milansql::ServerlessManager::global().setEnabled(true);
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        qr.rows.push_back(milansql::Row({"Serverless mode enabled"}));
+        break;
+    }
+
+    case milansql::CommandType::DISABLE_SERVERLESS: {
+        milansql::ServerlessManager::global().setEnabled(false);
+        qr.columns.push_back(milansql::Column{"result","TEXT"});
+        qr.rows.push_back(milansql::Row({"Serverless mode disabled"}));
+        break;
+    }
+
     default:
         break;
     }
@@ -1510,6 +1925,13 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     }
 
     return qr;
+}
+
+// ── Convenience: dispatch a SQL string directly ───────────────
+inline QueryResult dispatch(const std::string& sql, milansql::Engine& engine, QueryResult& qrOut) {
+    milansql::Parser parser;
+    qrOut = dispatch(parser.parse(sql), engine);
+    return qrOut;
 }
 
 } // namespace milansql

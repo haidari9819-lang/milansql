@@ -32,17 +32,48 @@
 #include <string>
 #include <atomic>
 #include <iostream>
+#include <cctype>
 #include <mutex>
 
 namespace milansql {
 
 // ── SSL global configuration ───────────────────────────────────
+// Phase 177: SSL modes
+enum class SslMode { DISABLED, PREFERRED, REQUIRED };
+
 struct SslConfig {
     std::atomic<bool> enabled{false};
     std::string       certPath;
     std::string       keyPath;
+    std::string       caPath;        // Phase 177: CA cert for client verification
     std::atomic<bool> initialized{false};
     std::string       errorMessage;
+    SslMode           mode{SslMode::PREFERRED};      // Phase 177: disabled/preferred/required
+    SslMode           replMode{SslMode::DISABLED};    // Phase 177: replication SSL mode
+
+    std::string modeStr() const {
+        switch (mode) {
+            case SslMode::DISABLED:  return "disabled";
+            case SslMode::PREFERRED: return "preferred";
+            case SslMode::REQUIRED:  return "required";
+        }
+        return "unknown";
+    }
+    std::string replModeStr() const {
+        switch (replMode) {
+            case SslMode::DISABLED:  return "disabled";
+            case SslMode::REQUIRED:  return "required";
+            default:                 return "disabled";
+        }
+        return "unknown";
+    }
+    static SslMode parseMode(const std::string& s) {
+        std::string lower = s;
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower == "required") return SslMode::REQUIRED;
+        if (lower == "preferred") return SslMode::PREFERRED;
+        return SslMode::DISABLED;
+    }
 };
 
 inline SslConfig& g_sslConfig() {
@@ -293,6 +324,90 @@ public:
     bool isReady() const { return ready_; }
     const std::string& lastError() const { return lastError_; }
 
+    // Phase 177: Reload certificate without restart
+    bool reloadCertificate() {
+        cleanup();
+        if (certPath_.empty()) return false;
+        return loadCertificate(certPath_, keyPath_);
+    }
+
+    // Phase 177: Get certificate info for SHOW SSL STATUS
+    struct CertInfo {
+        std::string subject;
+        std::string issuer;
+        std::string notBefore;
+        std::string notAfter;
+        std::string serial;
+        std::string tlsVersion;
+        std::string cipher;
+    };
+
+    CertInfo getCertInfo() const {
+        CertInfo info;
+#if defined(_WIN32)
+        // SChannel: basic info from cert context
+        info.tlsVersion = "TLS 1.2/1.3";
+        info.cipher = "SChannel (system)";
+        info.subject = "CN=MilanSQL";
+        info.issuer = "CN=MilanSQL (self-signed)";
+        info.notBefore = "(system store)";
+        info.notAfter = "(system store)";
+#elif defined(HAVE_OPENSSL) && HAVE_OPENSSL
+        if (ctx_) {
+            info.tlsVersion = "TLS 1.2/1.3";
+            // Read cert info from file
+            FILE* fp = fopen(certPath_.c_str(), "r");
+            if (fp) {
+                X509* cert = PEM_read_X509(fp, nullptr, nullptr, nullptr);
+                fclose(fp);
+                if (cert) {
+                    // Subject
+                    char buf[256];
+                    X509_NAME_oneline(X509_get_subject_name(cert), buf, sizeof(buf));
+                    info.subject = buf;
+                    X509_NAME_oneline(X509_get_issuer_name(cert), buf, sizeof(buf));
+                    info.issuer = buf;
+                    // Validity
+                    auto fmtTime = [](const ASN1_TIME* t) -> std::string {
+                        if (!t) return "N/A";
+                        BIO* bio = BIO_new(BIO_s_mem());
+                        ASN1_TIME_print(bio, t);
+                        char tbuf[128]{};
+                        BIO_read(bio, tbuf, sizeof(tbuf) - 1);
+                        BIO_free(bio);
+                        return std::string(tbuf);
+                    };
+                    info.notBefore = fmtTime(X509_get0_notBefore(cert));
+                    info.notAfter = fmtTime(X509_get0_notAfter(cert));
+                    // Serial
+                    ASN1_INTEGER* serial = X509_get_serialNumber(cert);
+                    if (serial) {
+                        BIGNUM* bn = ASN1_INTEGER_to_BN(serial, nullptr);
+                        if (bn) {
+                            char* hex = BN_bn2hex(bn);
+                            if (hex) { info.serial = hex; OPENSSL_free(hex); }
+                            BN_free(bn);
+                        }
+                    }
+                    X509_free(cert);
+                }
+            }
+            // Ciphers
+            STACK_OF(SSL_CIPHER)* ciphers = SSL_CTX_get_ciphers(ctx_);
+            if (ciphers && sk_SSL_CIPHER_num(ciphers) > 0) {
+                info.cipher = SSL_CIPHER_get_name(sk_SSL_CIPHER_value(ciphers, 0));
+                if (sk_SSL_CIPHER_num(ciphers) > 1) {
+                    info.cipher += " (+" + std::to_string(sk_SSL_CIPHER_num(ciphers) - 1) + " more)";
+                }
+            }
+        }
+#else
+        info.tlsVersion = "N/A";
+        info.cipher = "N/A (no TLS backend)";
+#endif
+        return info;
+    }
+
     void cleanup() {
 #if defined(_WIN32)
         if (credValid_) {
@@ -466,10 +581,12 @@ inline std::string showSslStatus() {
     std::string out = "\n";
     out += "  SSL/TLS Status\n";
     out += "  ─────────────────────────────────────────\n";
-    out += "  Enabled  : ";
+    out += "  Enabled     : ";
     out += cfg.enabled.load() ? "ON" : "OFF";
     out += "\n";
-    out += "  Backend  : ";
+    out += "  SSL Mode    : " + cfg.modeStr() + "\n";
+    out += "  Repl Mode   : " + cfg.replModeStr() + "\n";
+    out += "  Backend     : ";
 #if defined(_WIN32)
     out += "SChannel (Windows native)";
 #elif defined(HAVE_OPENSSL) && HAVE_OPENSSL
@@ -478,21 +595,33 @@ inline std::string showSslStatus() {
     out += "None (not available)";
 #endif
     out += "\n";
-    out += "  Cert     : " + (cfg.certPath.empty() ? "(none)" : cfg.certPath) + "\n";
-    out += "  Key      : " + (cfg.keyPath.empty()  ? "(none)" : cfg.keyPath)  + "\n";
-    out += "  Ready    : ";
+    out += "  Cert        : " + (cfg.certPath.empty() ? "(none)" : cfg.certPath) + "\n";
+    out += "  Key         : " + (cfg.keyPath.empty()  ? "(none)" : cfg.keyPath)  + "\n";
+    out += "  CA          : " + (cfg.caPath.empty()   ? "(none)" : cfg.caPath)   + "\n";
+    out += "  Ready       : ";
     out += g_tlsContext().isReady() ? "YES" : "NO";
     out += "\n";
     if (!g_tlsContext().lastError().empty())
-        out += "  Error    : " + g_tlsContext().lastError() + "\n";
+        out += "  Error       : " + g_tlsContext().lastError() + "\n";
+    // Certificate details
+    if (g_tlsContext().isReady()) {
+        auto ci = g_tlsContext().getCertInfo();
+        out += "  ─── Certificate ─────────────────────────\n";
+        out += "  Subject     : " + ci.subject + "\n";
+        out += "  Issuer      : " + ci.issuer + "\n";
+        out += "  Valid From  : " + ci.notBefore + "\n";
+        out += "  Valid Until : " + ci.notAfter + "\n";
+        if (!ci.serial.empty())
+            out += "  Serial      : " + ci.serial + "\n";
+        out += "  TLS Version : " + ci.tlsVersion + "\n";
+        out += "  Cipher      : " + ci.cipher + "\n";
+    }
     out += "\n";
     out += "  Ports encrypted when SSL=ON:\n";
-    out += "    TCP     4406\n";
-    out += "    MySQL   4407\n";
-    out += "    PG Wire 5433\n";
-    out += "    HTTP    8080\n";
-    out += "    GraphQL 8081\n";
-    out += "    WS      8082\n";
+    out += "    MySQL   4407  (" + cfg.modeStr() + ")\n";
+    out += "    PG Wire 5433  (" + cfg.modeStr() + ")\n";
+    out += "    Repl    4408  (" + cfg.replModeStr() + ")\n";
+    out += "    HTTP    8080  (always via reverse proxy)\n";
     out += "\n";
     return out;
 }

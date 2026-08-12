@@ -18,7 +18,7 @@ set(SOURCES
 
 # ── Haupt-Executable ──────────────────────────────────────────
 add_executable(milansql ${SOURCES})
-target_include_directories(milansql PRIVATE src src/server src/auth src/crypto src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api src/monitoring src/federation src/config src/migration src/ssl src/index src/concurrent src/nl)
+target_include_directories(milansql PRIVATE src src/server src/auth src/crypto src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/locking src/pubsub src/parallel src/fdw src/extensions src/extensions/builtin src/copy src/pool src/compression src/timeseries src/cdc src/api src/monitoring src/federation src/config src/migration src/ssl src/index src/concurrent src/nl src/branching src/router src/serverless)
 
 # Compiler-Warnungen aktivieren
 if(MSVC)
@@ -45,7 +45,7 @@ endif()
 # ── Test-Suite (Phase 99) ────────────────────────────────────
 add_executable(milansql_tests src/tests/milansql_tests.cpp)
 target_compile_features(milansql_tests PRIVATE cxx_std_17)
-target_include_directories(milansql_tests PRIVATE src src/server src/auth src/crypto src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor src/nl)
+target_include_directories(milansql_tests PRIVATE src src/server src/auth src/crypto src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/extensions/builtin src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor src/nl src/branching src/router src/serverless)
 if(MSVC)
     target_compile_options(milansql_tests PRIVATE /W4)
 else()
@@ -79,6 +79,19 @@ else()
 endif()
 if(WIN32)
     target_link_libraries(milansql_fuzzer PRIVATE ws2_32)
+endif()
+
+# ── TPC-H Regression (Phase 2.4) ─────────────────────────────
+add_executable(milansql_tpch_regression src/tests/tpch_regression.cpp)
+target_compile_features(milansql_tpch_regression PRIVATE cxx_std_17)
+target_include_directories(milansql_tpch_regression PRIVATE src src/server src/locking src/optimizer src/cache src/utils src/backup src/replication src/scheduler src/pubsub src/parallel src/compression src/copy src/pool src/fdw src/cdc src/api src/extensions src/timeseries src/types src/mvcc src/wal src/buffer src/spatial src/profiler src/storage src/federation src/config src/migration src/ssl src/index src/concurrent src/debug src/executor src/nl)
+if(MSVC)
+    target_compile_options(milansql_tpch_regression PRIVATE /W4)
+else()
+    target_compile_options(milansql_tpch_regression PRIVATE -Wall -Wextra -Wmissing-field-initializers)
+endif()
+if(WIN32)
+    target_link_libraries(milansql_tpch_regression PRIVATE ws2_32 secur32 crypt32)
 endif()
 
 # ── TPC-H Benchmark (Phase 101) ──────────────────────────────

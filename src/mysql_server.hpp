@@ -60,6 +60,7 @@
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "../ssl/tls_context.hpp"
 
 namespace milansql {
 
@@ -72,6 +73,7 @@ static constexpr uint32_t MY_CLIENT_PROTOCOL_41      = 0x00000200;
 static constexpr uint32_t MY_CLIENT_TRANSACTIONS     = 0x00002000;
 static constexpr uint32_t MY_CLIENT_SECURE_CONNECTION= 0x00008000;
 static constexpr uint32_t MY_CLIENT_MULTI_RESULTS    = 0x00020000;
+static constexpr uint32_t MY_CLIENT_SSL              = 0x00000800; // Phase 177: TLS support
 
 // ── Field types ───────────────────────────────────────────────
 static constexpr uint8_t  MYSQL_TYPE_VAR_STRING = 0xfd;
@@ -193,7 +195,202 @@ private:
     std::mutex engineMutex_;
     Parser    parser_;
 
-    // ── Packet I/O ─────────────────────────────────────────────
+    // ── Phase 177: TLS-aware Packet I/O ───────────────────────
+
+    // Read exactly n bytes via TlsSocket
+    bool recvAllTls(TlsSocket& ts, uint8_t* buf, int n) {
+        int received = 0;
+        while (received < n) {
+            int r = ts.read(reinterpret_cast<char*>(buf + received), n - received);
+            if (r <= 0) return false;
+            received += r;
+        }
+        return true;
+    }
+
+    bool sendAllTls(TlsSocket& ts, const uint8_t* buf, int n) {
+        int sent = 0;
+        while (sent < n) {
+            int r = ts.write(reinterpret_cast<const char*>(buf + sent), n - sent);
+            if (r <= 0) return false;
+            sent += r;
+        }
+        return true;
+    }
+
+    std::pair<uint8_t, std::vector<uint8_t>> readPacketTls(TlsSocket& ts) {
+        uint8_t header[4];
+        if (!recvAllTls(ts, header, 4))
+            return {255, {}};
+        uint32_t len = static_cast<uint32_t>(header[0])
+                     | (static_cast<uint32_t>(header[1]) << 8)
+                     | (static_cast<uint32_t>(header[2]) << 16);
+        uint8_t seq = header[3];
+        if (len > 16u * 1024u * 1024u)
+            return {255, {}};
+        std::vector<uint8_t> payload(len);
+        if (len > 0 && !recvAllTls(ts, payload.data(), static_cast<int>(len)))
+            return {255, {}};
+        return {seq, std::move(payload)};
+    }
+
+    bool sendPacketTls(TlsSocket& ts, uint8_t seq, const std::vector<uint8_t>& payload) {
+        uint32_t len = static_cast<uint32_t>(payload.size());
+        std::vector<uint8_t> frame;
+        frame.reserve(4 + len);
+        frame.push_back(static_cast<uint8_t>(len & 0xff));
+        frame.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+        frame.push_back(static_cast<uint8_t>((len >> 16) & 0xff));
+        frame.push_back(seq);
+        frame.insert(frame.end(), payload.begin(), payload.end());
+        return sendAllTls(ts, frame.data(), static_cast<int>(frame.size()));
+    }
+
+    void sendOKTls(TlsSocket& ts, uint8_t seq,
+                uint64_t affectedRows = 0, uint64_t lastInsertId = 0) {
+        std::vector<uint8_t> pkt;
+        appendU8(pkt, 0x00);
+        appendLEI(pkt, affectedRows);
+        appendLEI(pkt, lastInsertId);
+        appendU16LE(pkt, MY_SERVER_STATUS_AUTOCOMMIT);
+        appendU16LE(pkt, 0);
+        sendPacketTls(ts, seq, pkt);
+    }
+
+    void sendERRTls(TlsSocket& ts, uint8_t seq, uint16_t errCode, const std::string& msg) {
+        std::vector<uint8_t> pkt;
+        appendU8(pkt, 0xff);
+        appendU16LE(pkt, errCode);
+        appendU8(pkt, '#');
+        for (char c : std::string("42000")) appendU8(pkt, static_cast<uint8_t>(c));
+        appendStr(pkt, msg);
+        sendPacketTls(ts, seq, pkt);
+    }
+
+    void sendEOFTls(TlsSocket& ts, uint8_t seq) {
+        std::vector<uint8_t> pkt;
+        appendU8(pkt, 0xfe);
+        appendU16LE(pkt, 0);
+        appendU16LE(pkt, MY_SERVER_STATUS_AUTOCOMMIT);
+        sendPacketTls(ts, seq, pkt);
+    }
+
+    void sendResultSetTls(TlsSocket& ts, uint8_t& seq,
+                       const Table& result, const std::string& tblName) {
+        const auto& cols = result.columns();
+        const auto& rows = result.rows();
+        size_t numCols = cols.size();
+        { std::vector<uint8_t> pkt; appendLEI(pkt, numCols); sendPacketTls(ts, seq++, pkt); }
+        for (const auto& col : cols) {
+            std::vector<uint8_t> pkt;
+            appendLES(pkt, "def"); appendLES(pkt, ""); appendLES(pkt, tblName);
+            appendLES(pkt, tblName); appendLES(pkt, col.name); appendLES(pkt, col.name);
+            appendU8(pkt, 0x0c); appendU16LE(pkt, 33); appendU32LE(pkt, 500);
+            appendU8(pkt, MYSQL_TYPE_VAR_STRING); appendU16LE(pkt, 0);
+            appendU8(pkt, 0); appendU16LE(pkt, 0);
+            sendPacketTls(ts, seq++, pkt);
+        }
+        sendEOFTls(ts, seq++);
+        for (const auto& row : rows) {
+            if (row.xmax != 0) continue;
+            std::vector<uint8_t> pkt;
+            for (size_t ci = 0; ci < numCols; ++ci) {
+                if (ci < row.values.size() && row.values[ci] != "NULL")
+                    appendLES(pkt, row.values[ci]);
+                else
+                    appendU8(pkt, 0xfb);
+            }
+            sendPacketTls(ts, seq++, pkt);
+        }
+        sendEOFTls(ts, seq++);
+    }
+
+    void executeAndReplyTls(TlsSocket& ts, uint8_t& seq, const std::string& sql) {
+        std::string upper = sql;
+        for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        size_t start = 0;
+        while (start < upper.size() && (upper[start] == ' ' || upper[start] == '\t' || upper[start] == '\n')) ++start;
+        upper = upper.substr(start);
+
+        if (upper.substr(0, 3) == "SET") { sendOKTls(ts, seq++); return; }
+        if (upper.find("@@") != std::string::npos) {
+            Table result("vars", {Column("Value", "TEXT")});
+            result.insert(Row({"MilanSQL 2.4.0"}));
+            sendResultSetTls(ts, seq, result, "vars");
+            return;
+        }
+        if (upper.substr(0, 14) == "SHOW DATABASES") {
+            Table result("Databases", {Column("Database", "TEXT")});
+            result.insert(Row({"milansql"}));
+            sendResultSetTls(ts, seq, result, "Databases");
+            return;
+        }
+        if (upper.substr(0, 3) == "USE") { sendOKTls(ts, seq++); return; }
+        if (upper == "SELECT 1" || upper == "SELECT 1;") {
+            Table result("dual", {Column("1", "INT")});
+            result.insert(Row({"1"}));
+            sendResultSetTls(ts, seq, result, "dual");
+            return;
+        }
+        if (upper.find("DATABASE()") != std::string::npos) {
+            Table result("DATABASE()", {Column("DATABASE()", "TEXT")});
+            result.insert(Row({"milansql"}));
+            sendResultSetTls(ts, seq, result, "DATABASE()");
+            return;
+        }
+        if (upper.find("USER()") != std::string::npos || upper.find("CURRENT_USER") != std::string::npos) {
+            Table result("USER()", {Column("USER()", "TEXT")});
+            result.insert(Row({"root@localhost"}));
+            sendResultSetTls(ts, seq, result, "USER()");
+            return;
+        }
+
+        std::ostringstream captureOut;
+        std::streambuf* oldBuf = std::cout.rdbuf(captureOut.rdbuf());
+        bool hasResult = false;
+        Table lastResult("", {});
+        std::string lastTableName;
+        uint64_t affectedRows = 0;
+        try {
+            std::lock_guard<std::mutex> lk(engineMutex_);
+            auto persistFn = [this]() { try { storage_.save(engine_); } catch (...) {} };
+            auto noopFn = []() {};
+            milansql::ParsedCommand cmd = parser_.parse(sql);
+            if (cmd.type == CommandType::SELECT) {
+                try {
+                    milansql::Table result = dispatch_executeSelectToTable(engine_, parser_, cmd);
+                    lastResult = std::move(result);
+                    lastTableName = cmd.tableName;
+                    hasResult = true;
+                } catch (const std::exception& ex) {
+                    std::cout.rdbuf(oldBuf);
+                    sendERRTls(ts, seq++, 1064, ex.what());
+                    return;
+                }
+            } else {
+                dispatchCommand(cmd, engine_, parser_, sql, persistFn, noopFn, noopFn);
+            }
+        } catch (const std::exception& ex) {
+            std::cout.rdbuf(oldBuf);
+            sendERRTls(ts, seq++, 1064, ex.what());
+            return;
+        }
+        std::cout.rdbuf(oldBuf);
+        if (hasResult) {
+            sendResultSetTls(ts, seq, lastResult, lastTableName);
+        } else {
+            std::string captured = captureOut.str();
+            for (size_t p = 0; p < captured.size(); ++p) {
+                if (std::isdigit(static_cast<unsigned char>(captured[p]))) {
+                    try { affectedRows = std::stoull(captured.substr(p)); } catch (...) {}
+                    break;
+                }
+            }
+            sendOKTls(ts, seq++, affectedRows);
+        }
+    }
+
+    // ── Packet I/O (raw socket) ───────────────────────────────
 
     // Read exactly n bytes from socket into buf
     bool recvAll(sock_t sock, uint8_t* buf, int n) {
@@ -304,6 +501,11 @@ private:
                       | MY_CLIENT_TRANSACTIONS
                       | MY_CLIENT_SECURE_CONNECTION
                       | MY_CLIENT_MULTI_RESULTS;
+        // Phase 177: Advertise SSL if TLS is available
+        if (g_sslConfig().enabled.load() && g_tlsContext().isReady() &&
+            g_sslConfig().mode != SslMode::DISABLED) {
+            caps |= MY_CLIENT_SSL;
+        }
         appendU16LE(pkt, static_cast<uint16_t>(caps & 0xffff));
 
         // Character set (utf8 = 33)
@@ -544,49 +746,89 @@ private:
 
         uint8_t seq = 0;
 
-        // 1. Send server greeting
+        // 1. Send server greeting (on raw socket, before TLS)
         sendHandshake(sock, seq++, connId);
 
-        // 2. Read client handshake (auth)
-        if (!readClientHandshake(sock)) return;
+        // 2. Read client handshake response
+        auto [authSeq, authPayload] = readPacket(sock);
+        if (authPayload.empty()) return;
 
+        // Phase 177: Check if client requests SSL upgrade
+        bool clientWantsSsl = false;
+        if (authPayload.size() >= 4) {
+            uint32_t clientCaps = static_cast<uint32_t>(authPayload[0])
+                                | (static_cast<uint32_t>(authPayload[1]) << 8)
+                                | (static_cast<uint32_t>(authPayload[2]) << 16)
+                                | (static_cast<uint32_t>(authPayload[3]) << 24);
+            clientWantsSsl = (clientCaps & MY_CLIENT_SSL) != 0;
+        }
+
+        if (clientWantsSsl && g_sslConfig().enabled.load() &&
+            g_tlsContext().isReady() && g_sslConfig().mode != SslMode::DISABLED) {
+            // SSL Request: client sent a short packet with caps only,
+            // now do TLS handshake, then read the real auth packet
+            TlsSocket ts = g_tlsContext().wrapAccepted(sock);
+            if (!ts.tlsActive) {
+                // TLS handshake failed
+                sendERR(sock, authSeq + 1, 2026, "SSL handshake failed");
+                return;
+            }
+            // Read the real auth packet over TLS
+            auto [realSeq, realPayload] = readPacketTls(ts);
+            if (realPayload.empty()) { ts.close(); return; }
+
+            // Send OK over TLS
+            sendOKTls(ts, realSeq + 1);
+            seq = 0;
+
+            // TLS query loop
+            while (true) {
+                auto [pktSeq, payload] = readPacketTls(ts);
+                if (payload.empty()) break;
+                seq = pktSeq + 1;
+                uint8_t cmd = payload[0];
+                if (cmd == 0x01) break;  // COM_QUIT
+                else if (cmd == 0x0e) sendOKTls(ts, seq++);
+                else if (cmd == 0x02) sendOKTls(ts, seq++);
+                else if (cmd == 0x03) {
+                    std::string sql(payload.begin() + 1, payload.end());
+                    while (!sql.empty() && sql.back() == '\0') sql.pop_back();
+                    executeAndReplyTls(ts, seq, sql);
+                }
+            }
+            ts.close();
+            return;  // Don't close raw sock, TlsSocket::close() handles it
+        }
+
+        // Check if SSL is required but client didn't request it
+        if (g_sslConfig().mode == SslMode::REQUIRED &&
+            g_sslConfig().enabled.load() && g_tlsContext().isReady()) {
+            sendERR(sock, authSeq + 1, 2026,
+                    "SSL connection required. Use --ssl-mode=REQUIRED");
+            return;
+        }
+
+        // Non-TLS path: auth payload was the real handshake
         // 3. Send OK to complete auth
-        sendOK(sock, seq++);
-        seq = 0;  // reset sequence for query phase
+        sendOK(sock, authSeq + 1);
+        seq = 0;
 
-        // 4. Query loop
+        // 4. Query loop (plaintext)
         while (true) {
             auto [pktSeq, payload] = readPacket(sock);
-            if (payload.empty()) break;  // client disconnected
+            if (payload.empty()) break;
 
             seq = pktSeq + 1;
-
             if (payload.empty()) continue;
             uint8_t cmd = payload[0];
 
-            if (cmd == 0x01) {
-                // COM_QUIT
-                break;
-            } else if (cmd == 0x0e) {
-                // COM_PING
-                sendOK(sock, seq++);
-            } else if (cmd == 0x02) {
-                // COM_INIT_DB (USE database)
-                sendOK(sock, seq++);
-            } else if (cmd == 0x03) {
-                // COM_QUERY
+            if (cmd == 0x01) break;
+            else if (cmd == 0x0e) sendOK(sock, seq++);
+            else if (cmd == 0x02) sendOK(sock, seq++);
+            else if (cmd == 0x03) {
                 std::string sql(payload.begin() + 1, payload.end());
-                // Remove trailing \0 if present
                 while (!sql.empty() && sql.back() == '\0') sql.pop_back();
-                if (!sql.empty()) {
-                    executeAndReply(sock, seq, sql);
-                } else {
-                    sendOK(sock, seq++);
-                }
-                seq = 0;  // reset sequence for next command
-            } else {
-                // Unknown command — return OK
-                sendOK(sock, seq++);
+                executeAndReply(sock, seq, sql);
             }
         }
     }

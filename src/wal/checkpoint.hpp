@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -8,6 +9,13 @@
 #include <ctime>
 #include <cstdio>
 #include "../utils/date_utils.hpp"
+// PITR archiving hook — callbacks set from main.cpp to avoid circular include
+namespace milansql {
+namespace pitr_hook {
+    inline std::function<void(const std::string&)> archiveFn;
+    inline std::function<void()> cleanupFn;
+}
+}
 
 // ============================================================
 // checkpoint.hpp — Phase 85: WAL Checkpointing
@@ -144,7 +152,12 @@ private:
 
     // ── Archive WAL: append current WAL to archive, then clear WAL ──
     void archiveWal() {
-        // Read current WAL
+        // Phase 178: Archive to PITR archive directory before legacy archive
+        if (pitr_hook::archiveFn) pitr_hook::archiveFn(WAL_FILE);
+        // Clean old archives based on retention
+        if (pitr_hook::cleanupFn) pitr_hook::cleanupFn();
+
+        // Legacy: append to single archive file
         std::ifstream src(WAL_FILE, std::ios::binary);
         if (src.is_open()) {
             std::ofstream dst(WAL_ARCHIVE, std::ios::binary | std::ios::app);
@@ -154,7 +167,7 @@ private:
         }
         // Truncate WAL (overwrite with empty file)
         std::ofstream trunc(WAL_FILE, std::ios::trunc);
-        (void)trunc; // close immediately → empty file
+        (void)trunc; // close immediately â empty file
     }
 
     // ── File size helper ──────────────────────────────────────

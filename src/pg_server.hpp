@@ -60,6 +60,7 @@
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "../ssl/tls_context.hpp"
 
 namespace milansql {
 
@@ -155,6 +156,27 @@ private:
             int r = PG_RECV(sock, buf + received, n - received, 0);
             if (r <= 0) return false;
             received += r;
+        }
+        return true;
+    }
+
+    // Phase 177: TLS-aware I/O
+    bool recvAllTls(TlsSocket& ts, uint8_t* buf, int n) {
+        int received = 0;
+        while (received < n) {
+            int r = ts.read(reinterpret_cast<char*>(buf + received), n - received);
+            if (r <= 0) return false;
+            received += r;
+        }
+        return true;
+    }
+    bool sendAllTls(TlsSocket& ts, const std::vector<uint8_t>& data) {
+        int total = static_cast<int>(data.size());
+        int sent = 0;
+        while (sent < total) {
+            int r = ts.write(reinterpret_cast<const char*>(data.data() + sent), total - sent);
+            if (r <= 0) return false;
+            sent += r;
         }
         return true;
     }
@@ -648,11 +670,26 @@ private:
             int32_t protoVer = readInt32BE(payload.data());
 
             if (protoVer == 80877103) {
-                // SSL request (0x04D2162F) — reject with single byte 'N'
-                uint8_t reject = 'N';
-                PG_SEND(sock, &reject, 1, 0);
-                // Continue to next message (real startup)
-                continue;
+                // Phase 177: SSL request — accept if TLS available
+                if (g_sslConfig().enabled.load() && g_tlsContext().isReady() &&
+                    g_sslConfig().mode != SslMode::DISABLED) {
+                    uint8_t accept_byte = 'S';
+                    PG_SEND(sock, &accept_byte, 1, 0);
+                    // Perform TLS handshake
+                    TlsSocket ts = g_tlsContext().wrapAccepted(sock);
+                    if (!ts.tlsActive) {
+                        // TLS handshake failed — close connection
+                        return;
+                    }
+                    // Continue with TLS connection handler
+                    handleClientTls(std::move(ts));
+                    return;  // TlsSocket::close() handles the fd
+                } else {
+                    // No TLS — reject with 'N', client will retry without SSL
+                    uint8_t reject = 'N';
+                    PG_SEND(sock, &reject, 1, 0);
+                    continue;
+                }
             }
 
             if (protoVer == 80877102) {
@@ -664,6 +701,15 @@ private:
             // Parse key=value pairs from payload[4..]
             // We just accept all users/databases without authentication
             break;
+        }
+
+        // Phase 177: If SSL_MODE=required, reject plaintext connections
+        if (g_sslConfig().mode == SslMode::REQUIRED &&
+            g_sslConfig().enabled.load() && g_tlsContext().isReady()) {
+            // Send ErrorResponse: SSL required
+            auto errMsg = makeErrorResponse("08P01", "SSL connection required");
+            sendAll(sock, errMsg);
+            return;
         }
 
         // ── Step 2: Send authentication OK and startup messages ──

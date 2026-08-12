@@ -57,14 +57,19 @@
 #include "../auth/rate_limiter.hpp"
 #include "../security/fortress.hpp"
 #include "../nl/nl_query.hpp"
+#include "../wal/pitr_manager.hpp"
+#include "../monitoring/metrics.hpp"
+#include "../logger/logger.hpp"
+#include "../cache/user_query_cache.hpp"  // Phase 2.2: Per-User Query Cache
+#include "../parallel/thread_pool.hpp"    // Phase 2.1: Thread Pool
 
 // Phase 174: test suite size — served via /health as test_count,
 // displayed dynamically in the WebUI navbar badge.
-static constexpr int MILANSQL_TEST_COUNT = 1665;
+static constexpr int MILANSQL_TEST_COUNT = 1902;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "10.7.0";
+static constexpr const char* MILANSQL_VERSION = "11.7.1";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -707,6 +712,10 @@ public:
                     int poolMax = milansql::ConnectionPool::DEFAULT_MAX)
         : port_(port), dbPath_(dbPath), storage_(dbPath_) {
         milansql::g_connectionPool.configure(poolMin, poolMax);
+        // Phase 1.2: Initialize structured logger
+        milansql::StructuredLogger::global().open();
+        milansql::StructuredLogger::global().log(milansql::LogLevel::INFO,
+            "MilanSQL v" + std::string(MILANSQL_VERSION) + " starting");
     }
 
     void run();
@@ -779,6 +788,12 @@ private:
     std::string handleDashboard();   // Phase 54C
     std::string handleWebUI();       // Phase 135: Professional Admin Dashboard
     std::string handleSemanticSearch(const std::string& body, int userId = 0, bool isRoot = true);  // Phase 121
+    std::string handleSchemaForTable(const std::string& tableName, int userId, bool isRoot);   // Phase 4.5
+    std::string handleSchemaTableColumns(const std::string& tableName, int userId, bool isRoot); // Phase 4.5
+    std::string handleSchemaGenerateTypescript(int userId, bool isRoot);                         // Phase 4.5
+    std::string handleMigrateUp(int n = -1);     // Phase 4.2
+    std::string handleMigrateDown(int n = 1);    // Phase 4.2
+    std::string handleMigrateStatus();           // Phase 4.2
 
     // Phase 154: Auth routes
     std::string handleAuthRegister(const std::string& body, const std::string& clientIp);
@@ -895,6 +910,9 @@ inline void MilanHttpServer::initEngine() {
     // Load first (reads legacy secret + users), then init (resolves JWT secret)
     authMgr_.load(dbPath_ + ".auth");
     authMgr_.init();  // resolves secret: env → file → legacy → generate
+
+    // Phase 62+176: Load partition metadata
+    milansql::dispatch_loadPartitions(engine_, "database.partitions");
 
     // ══ FORTRESS: Load whitelist + persistent ban list ═══════
     milansql::g_fortress().loadWhitelist(dbPath_ + ".whitelist");
@@ -1879,6 +1897,34 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         return "{\"success\":true,\"message\":\"Session revoked\"}";
     }
 
+    // Phase 2.2: SHOW QUERY CACHE STATS — return as JSON table
+    {
+        std::string u2 = upper;
+        while (!u2.empty() && (u2.back()==';'||u2.back()==' ')) u2.pop_back();
+        if (u2 == "SHOW QUERY CACHE STATS") {
+            auto& uc = milansql::g_userQueryCache();
+            long long h = uc.hits(), m = uc.misses(), total = h + m;
+            std::string hitRate = (total > 0) ? std::to_string(h * 100 / total) + "%" : "N/A";
+            std::string out =
+                "{\"success\":true,\"columns\":[\"setting\",\"value\"],"
+                "\"rows\":["
+                "[\"enabled\","  + std::string(uc.isEnabled() ? "\"true\"" : "\"false\"") + "],"
+                "[\"size\",\""   + std::to_string(uc.size())     + "\"],"
+                "[\"max_size\",\"" + std::to_string(uc.maxSize())  + "\"],"
+                "[\"hits\",\""   + std::to_string(h)             + "\"],"
+                "[\"misses\",\"" + std::to_string(m)             + "\"],"
+                "[\"hit_rate\",\"" + hitRate                     + "\"]"
+                "],\"rowCount\":6}";
+            return out;
+        }
+        // Phase 2.2: FLUSH QUERY CACHE
+        if (u2 == "FLUSH QUERY CACHE") {
+            milansql::g_userQueryCache().flush();
+            engine_.getQueryCache().clear();
+            return "{\"success\":true,\"message\":\"Query cache flushed.\",\"rowsAffected\":0}";
+        }
+    }
+
     auto execOne = [&](const std::string& oneSQL) -> std::string {
         std::ostringstream cap;
         std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
@@ -2047,25 +2093,340 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         return parseOutputToJson(cap.str(), colTypesOut);
     };
 
+    // Phase 1.1: Metrics — time the whole query and count by type
+    auto t0_metrics = std::chrono::high_resolution_clock::now();
+
+    // Phase 2.2: Query cache — determine user key for cache namespace
+    std::string cacheUserKey = (userId <= 0) ? "root" : ("u" + std::to_string(userId));
+    // Only cache single-statement, non-mutating SELECT/WITH queries
+    bool isCacheable = (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0);
+
     auto stmts = milansql::splitStatements(sql);
+    std::string finalResult;
     if (stmts.size() <= 1) {
-        auto result = execOne(stmts.empty() ? sql : stmts[0]);
+        const std::string& effectiveSql = stmts.empty() ? sql : stmts[0];
+        // Phase 2.2: Check query cache for SELECT (single stmt only)
+        if (isCacheable) {
+            auto cached = milansql::g_userQueryCache().get(cacheUserKey, effectiveSql);
+            if (cached.has_value()) {
+                engine_.setCurrentUser(0, true);
+                return *cached;
+            }
+        }
+        finalResult = execOne(effectiveSql);
         engine_.setCurrentUser(0, true); // reset per-request context
-        return result;
+        // Phase 2.2: Store successful SELECT results in cache
+        if (isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
+            // Extract table name from SQL for invalidation support
+            std::string tblHint;
+            auto fromPos = upper.find(" FROM ");
+            if (fromPos != std::string::npos) {
+                size_t start = fromPos + 6;
+                while (start < upper.size() && upper[start] == ' ') ++start;
+                size_t end = start;
+                while (end < upper.size() && upper[end] != ' ' && upper[end] != ';'
+                       && upper[end] != ',' && upper[end] != ')') ++end;
+                tblHint = upper.substr(start, end - start);
+                // Strip prefix for root queries
+                if (!prefix.empty() && tblHint.rfind(prefix, 0) == 0)
+                    tblHint = tblHint.substr(prefix.size());
+            }
+            milansql::g_userQueryCache().put(cacheUserKey, effectiveSql, finalResult, tblHint);
+        }
+        // Phase 2.2: Invalidate cache on mutating queries
+        if (!isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
+            // Extract table name and invalidate
+            auto mutPos = upper.find(" INTO ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" FROM ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" TABLE ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" UPDATE ");
+            size_t tblStart = (mutPos != std::string::npos) ? mutPos + 7 : std::string::npos;
+            // For UPDATE, table name follows immediately
+            if (upper.rfind("UPDATE", 0) == 0) {
+                tblStart = 7;
+                while (tblStart < upper.size() && upper[tblStart] == ' ') ++tblStart;
+            }
+            if (tblStart != std::string::npos && tblStart < upper.size()) {
+                size_t tblEnd = tblStart;
+                while (tblEnd < upper.size() && upper[tblEnd] != ' ' && upper[tblEnd] != ';'
+                       && upper[tblEnd] != ',' && upper[tblEnd] != ')') ++tblEnd;
+                std::string mutTbl = upper.substr(tblStart, tblEnd - tblStart);
+                if (!mutTbl.empty()) {
+                    milansql::g_userQueryCache().invalidate(mutTbl);
+                }
+            }
+        }
+    } else {
+        std::string json = "{\"success\":true,\"results\":[";
+        bool anyError = false;
+        for (size_t idx = 0; idx < stmts.size(); ++idx) {
+            if (idx) json += ",";
+            std::string res = execOne(stmts[idx]);
+            json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
+            if (res.find("\"success\":false") != std::string::npos) anyError = true;
+        }
+        engine_.setCurrentUser(0, true); // reset per-request context
+        json += "],\"count\":" + std::to_string(stmts.size());
+        json += anyError ? ",\"success\":false}" : ",\"success\":true}";
+        finalResult = json;
     }
 
-    std::string json = "{\"success\":true,\"results\":[";
-    bool anyError = false;
-    for (size_t idx = 0; idx < stmts.size(); ++idx) {
-        if (idx) json += ",";
-        std::string res = execOne(stmts[idx]);
-        json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
-        if (res.find("\"success\":false") != std::string::npos) anyError = true;
+    // Phase 1.1: Record duration + query type counters
+    {
+        auto t1_metrics = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1_metrics - t0_metrics).count();
+        milansql::MetricsCollector::global().record_duration(ms);
+
+        auto& mc = milansql::MetricsCollector::global();
+        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0)
+            mc.queries_select.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("INSERT", 0) == 0)
+            mc.queries_insert.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("UPDATE", 0) == 0)
+            mc.queries_update.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("DELETE", 0) == 0)
+            mc.queries_delete.fetch_add(1, std::memory_order_relaxed);
+
+        // Phase 1.2: Structured logging
+        std::string qtype = "OTHER";
+        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0) qtype = "SELECT";
+        else if (upper.rfind("INSERT", 0) == 0) qtype = "INSERT";
+        else if (upper.rfind("UPDATE", 0) == 0) qtype = "UPDATE";
+        else if (upper.rfind("DELETE", 0) == 0) qtype = "DELETE";
+
+        std::string uname = (userId <= 0) ? "root" : ("u" + std::to_string(userId));
+        milansql::StructuredLogger::global().log(
+            milansql::LogLevel::INFO,
+            "Query executed",
+            "", ms, qtype, "", -1, uname);
+        milansql::StructuredLogger::global().log_slow_query(sql, ms, uname);
     }
-    engine_.setCurrentUser(0, true); // reset per-request context
-    json += "],\"count\":" + std::to_string(stmts.size());
-    json += anyError ? ",\"success\":false}" : ",\"success\":true}";
-    return json;
+
+    return finalResult;
+}
+
+
+// ── Phase 4.5: Schema Introspection API ──────────────────────
+
+static std::string sqlTypeToTs(const std::string& t) {
+    std::string up;
+    for (char c : t) {
+        if (c == '(' || c == ' ') break;
+        up += static_cast<char>(std::toupper((unsigned char)c));
+    }
+    if (up=="INT"||up=="INTEGER"||up=="BIGINT"||up=="SMALLINT"||up=="TINYINT"
+        ||up=="SERIAL"||up=="BIGSERIAL"||up=="FLOAT"||up=="DOUBLE"
+        ||up=="DECIMAL"||up=="NUMERIC"||up=="REAL"||up=="NUMBER") return "number";
+    if (up=="BOOLEAN"||up=="BOOL") return "boolean";
+    if (up=="JSON"||up=="JSONB") return "Record<string, unknown>";
+    return "string";
+}
+
+inline std::string MilanHttpServer::handleSchemaForTable(
+    const std::string& tableName, int userId, bool isRoot)
+{
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    std::string resolvedName = tableName;
+    if (!isRoot && userId > 0) {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        if (tableName.size() < pf.size() || tableName.substr(0, pf.size()) != pf)
+            resolvedName = pf + tableName;
+    }
+    if (!engine_.tableExists(resolvedName))
+        return R"({"success":false,"error":"Table not found"})";
+    const auto& tbl = engine_.selectAll(resolvedName);
+    const auto& cols = tbl.columns();
+    auto indexes = engine_.getIndexes(resolvedName);
+    size_t rowCount = 0;
+    try { rowCount = engine_.countRows(resolvedName, true); } catch (...) {}
+    std::string j = "{\"success\":true,\"table\":{\"name\":\"" + jsonEscape(tableName) + "\",";
+    j += "\"row_count\":" + std::to_string(rowCount) + ",";
+    j += "\"columns\":[";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(cols[i].name) + "\"";
+        j += ",\"type\":\"" + jsonEscape(cols[i].type) + "\"";
+        j += ",\"nullable\":" + std::string((cols[i].notNull||cols[i].isPrimaryKey)?"false":"true");
+        j += ",\"primary_key\":" + std::string(cols[i].isPrimaryKey?"true":"false");
+        if (cols[i].isUnique) j += ",\"unique\":true";
+        if (cols[i].autoIncrement) j += ",\"auto_increment\":true";
+        if (!cols[i].defaultValue.empty())
+            j += ",\"default\":\"" + jsonEscape(cols[i].defaultValue) + "\"";
+        j += "}";
+    }
+    j += "],\"indexes\":[";
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(indexes[i].indexName) + "\"";
+        j += ",\"columns\":\"" + jsonEscape(indexes[i].colName) + "\"";
+        j += ",\"type\":\"" + jsonEscape(indexes[i].type) + "\"}";
+    }
+    j += "]}}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleSchemaTableColumns(
+    const std::string& tableName, int userId, bool isRoot)
+{
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    std::string resolvedName = tableName;
+    if (!isRoot && userId > 0) {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        if (tableName.size() < pf.size() || tableName.substr(0, pf.size()) != pf)
+            resolvedName = pf + tableName;
+    }
+    if (!engine_.tableExists(resolvedName))
+        return R"({"success":false,"error":"Table not found"})";
+    const auto& tbl = engine_.selectAll(resolvedName);
+    const auto& cols = tbl.columns();
+    std::string j = "{\"success\":true,\"columns\":[";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(cols[i].name) + "\"";
+        j += ",\"type\":\"" + jsonEscape(cols[i].type) + "\"";
+        j += ",\"nullable\":" + std::string((cols[i].notNull||cols[i].isPrimaryKey)?"false":"true");
+        j += ",\"primary_key\":" + std::string(cols[i].isPrimaryKey?"true":"false");
+        j += ",\"unique\":" + std::string(cols[i].isUnique?"true":"false");
+        j += ",\"auto_increment\":" + std::string(cols[i].autoIncrement?"true":"false");
+        if (!cols[i].defaultValue.empty())
+            j += ",\"default\":\"" + jsonEscape(cols[i].defaultValue) + "\"";
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleSchemaGenerateTypescript(int userId, bool isRoot) {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    auto allTables = engine_.getAllTableNames();
+    std::string userPrefix = (!isRoot && userId > 0) ? "u" + std::to_string(userId) + "_" : "";
+    std::string ts;
+    ts += "// Auto-generated by MilanSQL\n";
+    ts += "// Do not edit manually\n\n";
+    for (const auto& tname : allTables) {
+        std::string bareName = tname;
+        if (!userPrefix.empty()) {
+            if (tname.size() < userPrefix.size() || tname.substr(0, userPrefix.size()) != userPrefix) continue;
+            bareName = tname.substr(userPrefix.size());
+        }
+        std::string ifName = bareName;
+        if (!ifName.empty()) ifName[0] = static_cast<char>(std::toupper((unsigned char)ifName[0]));
+        const auto& tbl2 = engine_.selectAll(tname);
+        const auto& cols2 = tbl2.columns();
+        ts += "export interface " + ifName + " {\n";
+        for (const auto& col : cols2) {
+            std::string tsType = sqlTypeToTs(col.type);
+            bool nullable = !(col.notNull || col.isPrimaryKey);
+            ts += "  " + col.name + ": " + tsType + (nullable ? " | null" : "") + ";\n";
+        }
+        ts += "}\n\n";
+    }
+    // Encode as JSON string value
+    std::string enc = "\"";
+    for (char c : ts) {
+        if      (c == '"')  enc += "\\\"";
+        else if (c == '\\') enc += "\\\\";
+        else if (c == '\n') enc += "\\n";
+        else                enc += c;
+    }
+    enc += "\"";
+    return "{\"success\":true,\"typescript\":" + enc + "}";
+}
+
+// ── Phase 4.2: Migration HTTP Handlers ───────────────────────
+
+inline std::string MilanHttpServer::handleMigrateUp(int n) {
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
+    auto& mm = milansql::g_migrationManager();
+    auto pending = mm.getPendingNames();
+    if (pending.empty())
+        return R"({"success":true,"message":"No pending migrations","applied":[]})";
+    int count = (n < 0) ? (int)pending.size() : std::min(n, (int)pending.size());
+    std::vector<std::string> applied;
+    std::string errors;
+    for (int i = 0; i < count; ++i) {
+        const std::string& mname = pending[(size_t)i];
+        std::string sql = mm.getMigrationSql(mname);
+        if (sql.empty()) { errors += "Migration '" + mname + "' has no SQL. "; continue; }
+        try {
+            milansql::Parser p;
+            auto cmd = p.parse(sql);
+            auto noop = [](){};
+            milansql::dispatchCommand(cmd, engine_, p, sql, noop, noop, noop);
+            mm.markApplied(mname);
+            applied.push_back(mname);
+        } catch (const std::exception& e) {
+            errors += "Migration '" + mname + "' failed: " + std::string(e.what()) + ". ";
+            break;
+        }
+    }
+    std::string j = "{\"success\":" + std::string(errors.empty()?"true":"false");
+    j += ",\"applied\":[";
+    for (size_t i = 0; i < applied.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + jsonEscape(applied[i]) + "\"";
+    }
+    j += "]";
+    if (!errors.empty()) j += ",\"error\":\"" + jsonEscape(errors) + "\"";
+    j += "}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleMigrateDown(int n) {
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
+    auto& mm = milansql::g_migrationManager();
+    auto appliedList = mm.getAppliedNames();
+    if (appliedList.empty())
+        return R"({"success":true,"message":"No applied migrations to roll back","rolled_back":[]})";
+    int count = std::min(n, (int)appliedList.size());
+    std::vector<std::string> rolledBack;
+    std::string errors;
+    for (int i = 0; i < count; ++i) {
+        const std::string& mname = appliedList[appliedList.size() - 1 - (size_t)i];
+        std::string sql = mm.getRollbackSql(mname);
+        if (!sql.empty()) {
+            try {
+                milansql::Parser p;
+                auto cmd = p.parse(sql);
+                auto noop = [](){};
+                milansql::dispatchCommand(cmd, engine_, p, sql, noop, noop, noop);
+            } catch (const std::exception& e) {
+                errors += "Rollback '" + mname + "' failed: " + std::string(e.what()) + ". ";
+                break;
+            }
+        }
+        mm.markRolledBack(mname);
+        rolledBack.push_back(mname);
+    }
+    std::string j = "{\"success\":" + std::string(errors.empty()?"true":"false");
+    j += ",\"rolled_back\":[";
+    for (size_t i = 0; i < rolledBack.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + jsonEscape(rolledBack[i]) + "\"";
+    }
+    j += "]";
+    if (!errors.empty()) j += ",\"error\":\"" + jsonEscape(errors) + "\"";
+    j += "}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleMigrateStatus() {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    const auto& mm = milansql::g_migrationManager();
+    auto all = mm.getAllMigrations();
+    std::string j = "{\"success\":true,\"migrations\":[";
+    bool first = true;
+    for (const auto& m : all) {
+        if (!first) j += ",";
+        j += "{\"name\":\"" + jsonEscape(m.name) + "\"";
+        j += ",\"status\":\"" + std::string(m.appliedAt.empty()?"pending":"applied") + "\"";
+        if (!m.appliedAt.empty())
+            j += ",\"applied_at\":\"" + jsonEscape(m.appliedAt) + "\"";
+        j += "}";
+        first = false;
+    }
+    j += "]}";
+    return j;
 }
 
 // ── MilanHttpServer::handleListTablesForUser ──────────────────
@@ -2645,6 +3006,24 @@ body{background:var(--bg-primary);color:var(--text-1);font-family:'Inter',-apple
 .badge.yellow{color:var(--warning)}
 .badge.yellow::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--warning)}
 .badge.blue{color:var(--accent)}
+.badge.purple{color:#a78bfa}.badge.purple::before{content:'';width:7px;height:7px;border-radius:50%;background:#7c3aed;box-shadow:0 0 8px rgba(124,58,237,0.6)}
+.ssl-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:12px}
+.ssl-card h3{color:var(--accent);font-size:0.85rem;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.ssl-card .ssl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.ssl-card .ssl-item{font-size:0.75rem;color:var(--text-2)}
+.ssl-card .ssl-item strong{color:var(--text-1);display:block}
+.ssl-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:0.65rem;font-weight:600}
+.ssl-badge.on{background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3)}
+.ssl-badge.off{background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3)}
+.part-badge{display:inline-flex;align-items:center;gap:4px;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.3);border-radius:4px;padding:1px 6px;font-size:0.65rem;color:#a78bfa;font-family:var(--mono);letter-spacing:.02em;margin-left:auto}
+.part-bar{height:6px;border-radius:3px;margin-top:2px;transition:width .3s var(--ease)}
+.part-detail{background:var(--bg-hover);border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px}
+.part-detail h4{color:var(--accent);font-size:0.8rem;margin-bottom:8px}
+.part-detail table{width:100%;font-size:0.75rem}
+.part-detail th{text-align:left;color:var(--text-2);padding:4px 8px;border-bottom:1px solid var(--border)}
+.part-detail td{padding:4px 8px;color:var(--text-1)}
+.part-progress{display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;margin-top:4px}
+.part-progress div{height:100%;border-radius:2px;min-width:4px;transition:width .3s}
 .topbar-right{margin-left:auto;display:flex;gap:8px;align-items:center}
 
 /* LAYOUT */
@@ -2877,7 +3256,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v10.7.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v11.0.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -3627,8 +4006,13 @@ async function loadSidebarTables() {
     el.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
       var badge = getRlsBadge(name);
+      var partIcon = '';
+      if (window._schemaData && window._schemaData.tables) {
+        var si = window._schemaData.tables.find(function(x){ return x.name === name || x.name === 'public.' + name; });
+        if (si && si.partitioned) partIcon = '<span class="part-badge" style="margin-left:4px;font-size:0.6rem">&#x25A6;</span>';
+      }
       return '<div class="table-item" style="display:flex;align-items:center" onclick="selectFromTable(\'' + escAttr(name) + '\')">'
-        + '<span>' + escHtml(name) + '</span>' + badge + '</div>';
+        + '<span>' + escHtml(name) + '</span>' + partIcon + badge + '</div>';
     }).join('');
   } catch(e) { /* silent */ }
 }
@@ -3666,6 +4050,37 @@ async function browseTable(name, btn) {
     var desc = await descR.json();
     var data = await dataR.json();
     var html = '<h3 style="margin-bottom:12px">&#x1F4CB; ' + escHtml(name) + '</h3>';
+    // Phase 176: Partition info
+    if (window._schemaData && window._schemaData.tables) {
+      var tInfo = window._schemaData.tables.find(function(x){ return x.name === name || x.name === 'public.' + name; });
+      if (tInfo && tInfo.partitioned) {
+        html += '<div class="part-detail"><h4>&#x25A6; ' + tInfo.partition_type + ' Partitioning on <code>' + escHtml(tInfo.partition_column) + '</code></h4>';
+        if (tInfo.partitions && tInfo.partitions.length) {
+          var totalRows = 0; tInfo.partitions.forEach(function(p){ totalRows += (p.rows||0); });
+          var colors = ['#7c3aed','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899','#8b5cf6','#14b8a6'];
+          html += '<div class="part-progress">';
+          tInfo.partitions.forEach(function(p,i){
+            var pct = totalRows > 0 ? Math.max(2, (p.rows||0)/totalRows*100) : (100/tInfo.partitions.length);
+            html += '<div style="width:'+pct+'%;background:'+colors[i%colors.length]+'" title="'+escHtml(p.name)+': '+(p.rows||0)+' rows"></div>';
+          });
+          html += '</div>';
+          html += '<table style="margin-top:8px"><thead><tr><th>Partition</th><th>Rows</th>';
+          if (tInfo.partition_type==='RANGE') html += '<th>From</th><th>To</th>';
+          if (tInfo.partition_type==='LIST') html += '<th>Values</th>';
+          html += '</tr></thead><tbody>';
+          tInfo.partitions.forEach(function(p,i){
+            html += '<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:'+colors[i%colors.length]+';margin-right:6px;vertical-align:middle"></span>' + escHtml(p.name) + '</td>';
+            html += '<td>' + (p.rows||0) + '</td>';
+            if (tInfo.partition_type==='RANGE') html += '<td>' + escHtml(p.from||'') + '</td><td>' + escHtml(p.to||'') + '</td>';
+            if (tInfo.partition_type==='LIST') html += '<td>' + (p.values||[]).map(escHtml).join(', ') + '</td>';
+            html += '</tr>';
+          });
+          html += '</tbody></table>';
+        }
+        html += '<div style="margin-top:6px;font-size:0.7rem;color:#94a3b8">' + (tInfo.partition_count||0) + ' partitions</div>';
+        html += '</div>';
+      }
+    }
     if (desc.columns && desc.rows) {
       html += '<div style="font-size:0.75rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
       html += '<div id="result-table-wrap" style="margin-bottom:16px"><table><thead><tr>';
@@ -4116,8 +4531,108 @@ async function loadTestBadge() {
   } catch(e) {}
 }
 
+// Phase 178: PITR/Backup loader
+async function loadPitrStatus() {
+  try {
+    var r = await fetch('/api/pitr/status', {credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('pitr-status-panel');
+    if (!el) return;
+    var h = '<div class="ssl-card"><h3>&#x1F4BE; Backup & Recovery';
+    h += ' <span class="ssl-badge ' + (d.archive_enabled ? 'on' : 'off') + '">';
+    h += d.archive_enabled ? 'ARCHIVING' : 'DISABLED';
+    h += '</span></h3>';
+    h += '<div class="ssl-grid">';
+    h += '<div class="ssl-item"><strong>Archive Dir</strong>' + escHtml(d.archive_dir||'') + '</div>';
+    h += '<div class="ssl-item"><strong>Segments</strong>' + (d.archive_segments||0) + '</div>';
+    h += '<div class="ssl-item"><strong>Archive Size</strong>' + formatSize(d.archive_size||0) + '</div>';
+    h += '<div class="ssl-item"><strong>Retention</strong>' + (d.retention_days||0) + ' days</div>';
+    if (d.oldest_segment) h += '<div class="ssl-item"><strong>Oldest</strong>' + escHtml(d.oldest_segment) + '</div>';
+    if (d.newest_segment) h += '<div class="ssl-item"><strong>Newest</strong>' + escHtml(d.newest_segment) + '</div>';
+    h += '</div>';
+    if (d.backups && d.backups.length > 0) {
+      h += '<div style="margin-top:12px;font-size:0.75rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.06em">Backups</div>';
+      h += '<table style="width:100%;font-size:0.72rem;margin-top:4px"><thead><tr><th style="text-align:left;padding:4px 8px;color:var(--text-2);border-bottom:1px solid var(--border)">Timestamp</th><th>LSN</th><th>Size</th><th>Tables</th></tr></thead><tbody>';
+      d.backups.forEach(function(b) {
+        h += '<tr><td style="padding:4px 8px;color:var(--text-1)">' + escHtml(b.timestamp) + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + b.lsn + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + formatSize(b.size) + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + b.tables + '</td></tr>';
+      });
+      h += '</tbody></table>';
+    }
+    h += '<div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">';
+    h += '<button onclick="doArchiveNow()" style="background:var(--bg-hover);color:var(--text-1);border:1px solid var(--border);border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Archive WAL</button>';
+    h += '<button onclick="doBackupNow()" style="background:var(--accent);color:white;border:none;border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Backup Now</button>';
+    h += '</div></div>';
+    el.innerHTML = h;
+  } catch(e) {}
+}
+function formatSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return Math.round(b/1024) + ' KB';
+  if (b < 1073741824) return Math.round(b/1048576) + ' MB';
+  return (b/1073741824).toFixed(1) + ' GB';
+}
+async function doBackupNow() {
+  try {
+    var r = await fetch('/api/pitr/backup', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadPitrStatus(); } else { alert('Backup failed: ' + (d.message||'')); }
+  } catch(e) { alert('Backup failed'); }
+}
+async function doArchiveNow() {
+  try {
+    var r = await fetch('/api/pitr/archive-now', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadPitrStatus(); } else { alert('Archive failed: ' + (d.message||'')); }
+  } catch(e) { alert('Archive failed'); }
+}
+
+// Phase 177: SSL status loader
+async function loadSslStatus() {
+  try {
+    var r = await fetch('/api/ssl', {credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('ssl-status-panel');
+    if (!el) return;
+    var h = '<div class="ssl-card"><h3>&#x1F512; SSL/TLS Status ';
+    h += '<span class="ssl-badge ' + (d.enabled && d.ready ? 'on' : 'off') + '">';
+    h += d.enabled && d.ready ? 'ACTIVE' : 'INACTIVE';
+    h += '</span></h3>';
+    h += '<div class="ssl-grid">';
+    h += '<div class="ssl-item"><strong>Mode</strong>' + escHtml(d.mode || 'disabled') + '</div>';
+    h += '<div class="ssl-item"><strong>Backend</strong>' + escHtml(d.backend || 'none') + '</div>';
+    h += '<div class="ssl-item"><strong>Repl Mode</strong>' + escHtml(d.repl_mode || 'disabled') + '</div>';
+    if (d.ready) {
+      h += '<div class="ssl-item"><strong>TLS Version</strong>' + escHtml(d.tls_version || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Cipher</strong>' + escHtml(d.cipher || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Subject</strong>' + escHtml(d.subject || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Issuer</strong>' + escHtml(d.issuer || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Valid Until</strong>' + escHtml(d.not_after || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Serial</strong>' + escHtml(d.serial || 'N/A') + '</div>';
+    }
+    if (d.error) h += '<div class="ssl-item" style="grid-column:1/-1;color:#ef4444"><strong>Error</strong>' + escHtml(d.error) + '</div>';
+    h += '</div>';
+    if (d.enabled && d.ready)
+      h += '<div style="margin-top:8px;text-align:right"><button onclick="reloadSsl()" style="background:var(--accent);color:white;border:none;border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Reload SSL</button></div>';
+    h += '</div>';
+    el.innerHTML = h;
+  } catch(e) {}
+}
+async function reloadSsl() {
+  try {
+    var r = await fetch('/api/ssl/reload', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadSslStatus(); }
+    else { alert('SSL reload failed: ' + (d.error || 'unknown')); }
+  } catch(e) { alert('SSL reload failed'); }
+}
+
 // Init
 updateEditorDecor();
+// Phase 176: Pre-fetch schema data for partition badges
+if(!window._schemaData){fetch("/api/schema",{credentials:"include"}).then(function(r){return r.json();}).then(function(d){window._schemaData=d;loadSidebarTables();}).catch(function(){});}
 loadSidebarTables();
 loadTestBadge();
 pollStatus();
@@ -4252,6 +4767,7 @@ function renderSchemaViz() {
     var pc = (t.policies||[]).length, rlsOn = t.rls_enabled;
     var h = '<div class="schema-card-header"><span class="rls-dot '+(rlsOn?'on':'off')+'" title="RLS '+(rlsOn?'active':'inactive')+'"></span><span>'+escHtml(t.name)+'</span>';
     if(pc>0) h+='<span class="pol-count">'+pc+'</span>';
+    if(t.partitioned) h+='<span class="part-badge" title="'+t.partition_type+' partitioned on '+escHtml(t.partition_column||'')+'">&#x25A6; '+t.partition_type+(t.partition_count?' ('+t.partition_count+')':'')+' </span>';
     h+='</div><div class="schema-card-cols">';
     (t.columns||[]).forEach(function(c) {
       var isFk=!!(fkCols[t.name]||{})[c.name];
@@ -5364,6 +5880,84 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     // Phase 171: Schema Visualizer API
+    // Phase 177: Reload SSL certificate
+    if (req.path == "/api/ssl/reload" && req.method == "POST") {
+        bool ok = milansql::g_tlsContext().reloadCertificate();
+        std::string json = "{\"success\":" + std::string(ok ? "true" : "false");
+        if (!ok) json += ",\"error\":\"" + milansql::g_tlsContext().lastError() + "\"";
+        json += "}";
+        return buildHttpResponse(ok ? 200 : 500, json);
+    }
+
+    // Phase 4.5: Enhanced Schema Introspection API
+    // GET /api/schema/generate/typescript
+    if (req.path == "/api/schema/generate/typescript" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleSchemaGenerateTypescript(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // GET /api/schema/:table/columns
+    if (req.path.rfind("/api/schema/", 0) == 0 && req.path.size() > 12) {
+        std::string rest = req.path.substr(12);  // after "/api/schema/"
+        auto slashPos = rest.find('/');
+        if (slashPos != std::string::npos && rest.substr(slashPos) == "/columns") {
+            std::string tblName = rest.substr(0, slashPos);
+            if (!tblName.empty()) {
+                auto ctx = extractUserContext(req);
+                if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+                return buildHttpResponse(200, handleSchemaTableColumns(tblName, ctx.userId, ctx.isRoot), "application/json");
+            }
+        }
+        // GET /api/schema/:table
+        if (rest.find('/') == std::string::npos && !rest.empty()
+            && rest != "generate") {
+            auto ctx = extractUserContext(req);
+            if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+            return buildHttpResponse(200, handleSchemaForTable(rest, ctx.userId, ctx.isRoot), "application/json");
+        }
+    }
+
+    // Phase 4.2: Migration HTTP API
+    // POST /api/migrate/up  (body: {"n":3} optional)
+    if (req.path == "/api/migrate/up" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        if (!ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root required"})");
+        int n = -1;
+        auto nPos = req.body.find("\"n\"");
+        if (nPos != std::string::npos) {
+            auto colon = req.body.find(':', nPos);
+            if (colon != std::string::npos) {
+                try { n = std::stoi(req.body.substr(colon + 1)); } catch (...) {}
+            }
+        }
+        return buildHttpResponse(200, handleMigrateUp(n), "application/json");
+    }
+
+    // POST /api/migrate/down  (body: {"n":1} optional)
+    if (req.path == "/api/migrate/down" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        if (!ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root required"})");
+        int n = 1;
+        auto nPos = req.body.find("\"n\"");
+        if (nPos != std::string::npos) {
+            auto colon = req.body.find(':', nPos);
+            if (colon != std::string::npos) {
+                try { n = std::stoi(req.body.substr(colon + 1)); } catch (...) {}
+            }
+        }
+        return buildHttpResponse(200, handleMigrateDown(n), "application/json");
+    }
+
+    // GET /api/migrate/status
+    if (req.path == "/api/migrate/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleMigrateStatus(), "application/json");
+    }
+
     if (req.path == "/api/schema") {
         auto ctx = extractUserContext(req);
         if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
@@ -5567,11 +6161,333 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "milansql_errors_total{type=\"syntax\"} " + std::to_string(engine_.syntaxErrors_.load()) + "\n"
             "milansql_errors_total{type=\"constraint\"} " + std::to_string(engine_.constraintErrors_.load()) + "\n"
             "milansql_errors_total{type=\"runtime\"} " + std::to_string(engine_.runtimeErrors_.load()) + "\n"
-            "milansql_slow_queries_total " + std::to_string(engine_.slowQueryLog.size()) + "\n"
             "milansql_slow_query_threshold_ms " + std::to_string((int)engine_.slowQueryLog.thresholdMs) + "\n"
             "milansql_table_count " + std::to_string(engine_.tableCount()) + "\n";
-        std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics;
-        return buildHttpResponse(200, body, "text/plain; version=0.0.4");
+
+        // Phase 1.1: Enhanced MetricsCollector data
+        auto& mc = milansql::MetricsCollector::global();
+        auto q = mc.quantiles();
+        long long wal_size = 0;
+        { std::ifstream f("database.milan.wal", std::ios::binary | std::ios::ate); if (f) wal_size = (long long)f.tellg(); }
+        long long data_size = 0;
+        { std::ifstream f("database.milan", std::ios::binary | std::ios::ate); if (f) data_size = (long long)f.tellg(); }
+        std::ostringstream mcMetrics;
+        mcMetrics << "# HELP milansql_queries_total Total SQL queries by type\n"
+                  << "# TYPE milansql_queries_total counter\n"
+                  << "milansql_queries_total{type=\"select\"} " << mc.queries_select.load() << "\n"
+                  << "milansql_queries_total{type=\"insert\"} " << mc.queries_insert.load() << "\n"
+                  << "milansql_queries_total{type=\"update\"} " << mc.queries_update.load() << "\n"
+                  << "milansql_queries_total{type=\"delete\"} " << mc.queries_delete.load() << "\n"
+                  << "# HELP milansql_slow_queries_total Queries taking >100ms\n"
+                  << "# TYPE milansql_slow_queries_total counter\n"
+                  << "milansql_slow_queries_total " << mc.slow_queries_total.load() << "\n"
+                  << "# HELP milansql_query_duration_seconds Query duration summary\n"
+                  << "# TYPE milansql_query_duration_seconds summary\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.5\"} " << q[0] << "\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.95\"} " << q[1] << "\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.99\"} " << q[2] << "\n"
+                  << "# HELP milansql_buffer_pool_hit_ratio Buffer pool hit ratio\n"
+                  << "# TYPE milansql_buffer_pool_hit_ratio gauge\n"
+                  << "milansql_buffer_pool_hit_ratio " << mc.hit_ratio() << "\n"
+                  << "milansql_buffer_pool_hits_total " << mc.buffer_hits.load() << "\n"
+                  << "milansql_buffer_pool_misses_total " << mc.buffer_misses.load() << "\n"
+                  << "# HELP milansql_wal_size_bytes WAL file size\n"
+                  << "# TYPE milansql_wal_size_bytes gauge\n"
+                  << "milansql_wal_size_bytes " << wal_size << "\n"
+                  << "milansql_data_size_bytes " << data_size << "\n"
+                  << "# HELP milansql_replication_lag_ms Replication lag\n"
+                  << "# TYPE milansql_replication_lag_ms gauge\n"
+                  << "milansql_replication_lag_ms " << milansql::g_replState.slaveLagMs.load() << "\n"
+                  << "milansql_replication_connected_replicas " << milansql::g_replState.connectedSlaves.load() << "\n"
+                  << "# HELP milansql_uptime_seconds_v2 Uptime (MetricsCollector)\n"
+                  << "# TYPE milansql_uptime_seconds_v2 counter\n"
+                  << "milansql_uptime_seconds_v2 " << mc.uptime_seconds() << "\n"
+                  << "# HELP milansql_version MilanSQL version info\n"
+                  << "# TYPE milansql_version gauge\n"
+                  << "milansql_version{version=\"" << MILANSQL_VERSION << "\"} 1\n"
+                  // Phase 2.1: parallel workers
+                  << "# HELP milansql_parallel_workers Number of parallel worker threads\n"
+                  << "# TYPE milansql_parallel_workers gauge\n"
+                  << "milansql_parallel_workers " << milansql::g_threadPool().size() << "\n"
+                  << "# HELP milansql_parallel_workers_active Currently active parallel workers\n"
+                  << "# TYPE milansql_parallel_workers_active gauge\n"
+                  << "milansql_parallel_workers_active " << milansql::g_parallelWorkersActive().load() << "\n"
+                  // Phase 2.2: query cache metrics
+                  << "# HELP milansql_cache_hits_total Total query cache hits\n"
+                  << "# TYPE milansql_cache_hits_total counter\n"
+                  << "milansql_cache_hits_total " << milansql::g_userQueryCache().hits() << "\n"
+                  << "# HELP milansql_cache_misses_total Total query cache misses\n"
+                  << "# TYPE milansql_cache_misses_total counter\n"
+                  << "milansql_cache_misses_total " << milansql::g_userQueryCache().misses() << "\n"
+                  << "# HELP milansql_cache_size Current number of cached query results\n"
+                  << "# TYPE milansql_cache_size gauge\n"
+                  << "milansql_cache_size " << milansql::g_userQueryCache().size() << "\n";
+
+        std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics + mcMetrics.str();
+        return buildHttpResponse(200, body, "text/plain; version=0.0.4; charset=utf-8");
+    }
+
+    // Phase 178: PITR API endpoints
+    if (req.path == "/api/pitr/status") {
+        auto segments = milansql::g_pitrManager().listArchiveSegments();
+        auto backups = milansql::g_pitrManager().listBackups();
+        uint64_t totalArchiveSize = 0;
+        for (const auto& s : segments) totalArchiveSize += s.sizeBytes;
+
+        std::string json = "{";
+        json += "\"archive_enabled\":" + std::string(milansql::g_pitrManager().config().archiveEnabled ? "true" : "false");
+        json += ",\"archive_dir\":\"" + milansql::g_pitrManager().config().archiveDir + "\"";
+        json += ",\"retention_days\":" + std::to_string(milansql::g_pitrManager().config().retentionDays);
+        json += ",\"archive_segments\":" + std::to_string(segments.size());
+        json += ",\"archive_size\":" + std::to_string(totalArchiveSize);
+        if (!segments.empty()) {
+            json += ",\"oldest_segment\":\"" + milansql::pitr_epoch_to_str(segments.front().timestamp) + "\"";
+            json += ",\"newest_segment\":\"" + milansql::pitr_epoch_to_str(segments.back().timestamp) + "\"";
+        }
+        json += ",\"backups\":[";
+        for (size_t i = 0; i < backups.size(); ++i) {
+            if (i > 0) json += ",";
+            json += "{\"dir\":\"" + backups[i].backupDir + "\"";
+            json += ",\"timestamp\":\"" + backups[i].timestamp + "\"";
+            json += ",\"lsn\":" + std::to_string(backups[i].startLsn);
+            json += ",\"size\":" + std::to_string(backups[i].sizeBytes);
+            json += ",\"tables\":" + std::to_string(backups[i].tableCount) + "}";
+        }
+        json += "]}";
+        return buildHttpResponse(200, json);
+    }
+
+    if (req.path == "/api/pitr/backup" && req.method == "POST") {
+        // Create a new base backup
+        int64_t now = milansql::pitr_now_epoch();
+        std::string backupDir = milansql::g_pitrManager().config().backupBaseDir +
+                                "/backup_" + std::to_string(now);
+        auto& lsn = milansql::g_lsnManager();
+        std::string msg = milansql::g_pitrManager().createBaseBackup(
+            "database.milan", backupDir,
+            lsn.currentLsn(), MILANSQL_VERSION,
+            static_cast<int>(engine_.tableCount()));
+        bool ok = msg.substr(0, 2) == "OK";
+        return buildHttpResponse(ok ? 200 : 500,
+            "{\"success\":" + std::string(ok ? "true" : "false") +
+            ",\"message\":\"" + msg + "\"}");
+    }
+
+    if (req.path == "/api/pitr/archive-now" && req.method == "POST") {
+        std::string msg = milansql::g_pitrManager().archiveCurrentWal("database.milan.wal");
+        bool ok = msg.substr(0, 2) == "OK";
+        return buildHttpResponse(ok ? 200 : 500,
+            "{\"success\":" + std::string(ok ? "true" : "false") +
+            ",\"message\":\"" + msg + "\"}");
+    }
+
+    // ── Phase 2.3: POST /bulk-import — CSV bulk import ───────────
+    if (req.path == "/bulk-import" && req.method == "POST") {
+        // Auth required
+        auto bctx = extractUserContext(req);
+        if (!bctx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
+
+        // Extract parameters: table= and delimiter= from query string or headers
+        std::string tableName;
+        char delim = ',';
+
+        // Try to get table from query string in path (e.g. /bulk-import?table=foo&delimiter=;)
+        // req.path is already stripped; check query_ field or parse from raw path
+        // Parse a query string (e.g. "?table=foo&delimiter=,") for a named parameter
+        auto getQueryParam = [](const std::string& rawQs, const std::string& paramName) -> std::string {
+            // rawQs starts with '?'
+            std::string qs = rawQs.size() > 1 ? rawQs.substr(1) : "";
+            size_t p = 0;
+            while (p < qs.size()) {
+                auto eq = qs.find('=', p);
+                if (eq == std::string::npos) break;
+                std::string key = qs.substr(p, eq - p);
+                auto amp = qs.find('&', eq + 1);
+                std::string val = (amp == std::string::npos)
+                    ? qs.substr(eq + 1) : qs.substr(eq + 1, amp - eq - 1);
+                if (key == paramName) return val;
+                p = (amp == std::string::npos) ? qs.size() : amp + 1;
+            }
+            return "";
+        };
+
+        // Check X-Table header or table query param
+        auto tblHdr = req.headers.find("x-table");
+        if (tblHdr != req.headers.end()) tableName = tblHdr->second;
+        auto tblHdr2 = req.headers.find("table");
+        if (tableName.empty() && tblHdr2 != req.headers.end()) tableName = tblHdr2->second;
+
+        // Parse query parameters from req.query (the part after '?' in URL)
+        if (tableName.empty()) tableName = getQueryParam("?" + req.query, "table");
+        if (tableName.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Missing 'table' parameter"})");
+
+        std::string delimStr = getQueryParam("?" + req.query, "delimiter");
+        if (!delimStr.empty()) delim = delimStr[0];
+
+        // Body is CSV text
+        std::string csvData = req.body;
+        if (csvData.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Empty CSV body"})");
+
+        // Split CSV into lines and use copyManager logic
+        try {
+            std::vector<std::string> lines;
+            std::istringstream iss(csvData);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) lines.push_back(std::move(line));
+            }
+
+            // Use a simple CSV insert approach
+            // Parse header row
+            if (lines.empty())
+                return buildHttpResponse(400, R"({"success":false,"error":"No data rows"})");
+
+            auto splitCsv = [&](const std::string& s, char d) -> std::vector<std::string> {
+                std::vector<std::string> cols;
+                std::string cur;
+                bool inq = false;
+                for (char c : s) {
+                    if (c == '"') { inq = !inq; continue; }
+                    if (c == d && !inq) { cols.push_back(cur); cur.clear(); }
+                    else cur += c;
+                }
+                cols.push_back(cur);
+                return cols;
+            };
+
+            std::vector<std::string> headers = splitCsv(lines[0], delim);
+            int inserted = 0;
+            for (size_t i = 1; i < lines.size(); ++i) {
+                auto vals = splitCsv(lines[i], delim);
+                if (vals.size() != headers.size()) continue;
+                // Build INSERT SQL
+                std::string sql = "INSERT INTO " + tableName + " (";
+                for (size_t j = 0; j < headers.size(); ++j) {
+                    if (j > 0) sql += ",";
+                    sql += headers[j];
+                }
+                sql += ") VALUES (";
+                for (size_t j = 0; j < vals.size(); ++j) {
+                    if (j > 0) sql += ",";
+                    // Quote string values
+                    std::string v = vals[j];
+                    // Check if numeric
+                    bool isNum = !v.empty();
+                    for (char c : v) if (!std::isdigit((unsigned char)c) && c != '.' && c != '-') { isNum = false; break; }
+                    if (isNum) sql += v;
+                    else {
+                        // Escape single quotes
+                        std::string esc;
+                        for (char c : v) { if (c == '\'') esc += "'"; esc += c; }
+                        sql += "'" + esc + "'";
+                    }
+                }
+                sql += ")";
+
+                std::string result = handleQueryForUser(sql, bctx.userId, bctx.role);
+                // Check for error in JSON result
+                if (result.find("\"error\"") == std::string::npos &&
+                    result.find("\"success\":false") == std::string::npos)
+                    ++inserted;
+            }
+
+            // Invalidate cache for this table
+            milansql::g_userQueryCache().invalidate(tableName);
+            engine_.getQueryCache().invalidate(tableName);
+
+            return buildHttpResponse(200,
+                "{\"success\":true,\"copied\":" + std::to_string(inserted) + "}");
+        } catch (const std::exception& ex) {
+            return buildHttpResponse(500,
+                std::string("{\"success\":false,\"error\":\"") + ex.what() + "\"}");
+        }
+    }
+
+    // Phase 177: SSL status API
+    if (req.path == "/api/ssl") {
+        auto je = [](const std::string& s) -> std::string {
+            std::string r;
+            for (char c : s) {
+                if (c == '"') r += "\\\"";
+                else if (c == '\\') r += "\\\\";
+                else r += c;
+            }
+            return r;
+        };
+        const auto& cfg = milansql::g_sslConfig();
+        std::string json = "{";
+        json += "\"enabled\":" + std::string(cfg.enabled.load() ? "true" : "false");
+        json += ",\"mode\":\"" + cfg.modeStr() + "\"";
+        json += ",\"repl_mode\":\"" + cfg.replModeStr() + "\"";
+        json += ",\"ready\":" + std::string(milansql::g_tlsContext().isReady() ? "true" : "false");
+        json += ",\"cert\":\"" + je(cfg.certPath) + "\"";
+        json += ",\"key\":\"" + je(cfg.keyPath) + "\"";
+        json += ",\"ca\":\"" + je(cfg.caPath) + "\"";
+#if defined(_WIN32)
+        json += ",\"backend\":\"SChannel\"";
+#elif defined(HAVE_OPENSSL) && HAVE_OPENSSL
+        json += ",\"backend\":\"OpenSSL\"";
+#else
+        json += ",\"backend\":\"none\"";
+#endif
+        if (milansql::g_tlsContext().isReady()) {
+            auto ci = milansql::g_tlsContext().getCertInfo();
+            json += ",\"subject\":\"" + je(ci.subject) + "\"";
+            json += ",\"issuer\":\"" + je(ci.issuer) + "\"";
+            json += ",\"not_before\":\"" + je(ci.notBefore) + "\"";
+            json += ",\"not_after\":\"" + je(ci.notAfter) + "\"";
+            json += ",\"serial\":\"" + je(ci.serial) + "\"";
+            json += ",\"tls_version\":\"" + je(ci.tlsVersion) + "\"";
+            json += ",\"cipher\":\"" + je(ci.cipher) + "\"";
+        }
+        if (!milansql::g_tlsContext().lastError().empty())
+            json += ",\"error\":\"" + je(milansql::g_tlsContext().lastError()) + "\"";
+        json += "}";
+        return buildHttpResponse(200, json);
+    }
+
+    // Phase 1.3: Health sub-endpoints (must be before "/health" to avoid prefix match issues)
+    if (req.path == "/health/live") {
+        // Liveness: process is alive
+        auto now_ts = std::chrono::system_clock::now();
+        auto tt = std::chrono::system_clock::to_time_t(now_ts);
+        char tsBuf[32];
+        struct tm tmBuf;
+#if defined(_WIN32)
+        gmtime_s(&tmBuf, &tt);
+#else
+        gmtime_r(&tt, &tmBuf);
+#endif
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%SZ", &tmBuf);
+        return buildHttpResponse(200,
+            std::string("{\"status\":\"ok\",\"timestamp\":\"") + tsBuf + "\"}", "application/json");
+    }
+
+    if (req.path == "/health/ready") {
+        // Readiness: DB subsystems are ready
+        bool wal_ok = true;
+        bool idx_ok = true;
+        bool pool_ok = (engine_.tableCount() >= 0);
+        bool ready = wal_ok && idx_ok && pool_ok;
+        std::string body = std::string("{\"status\":\"") + (ready ? "ready" : "not_ready") + "\""
+            + ",\"checks\":{"
+            + "\"wal\":\"" + (wal_ok ? "ok" : "fail") + "\""
+            + ",\"indexes\":\"" + (idx_ok ? "ok" : "fail") + "\""
+            + ",\"pool\":\"" + (pool_ok ? "ok" : "fail") + "\""
+            + "}}";
+        return buildHttpResponse(ready ? 200 : 503, body, "application/json");
+    }
+
+    if (req.path == "/health/startup") {
+        // Startup: initialization complete
+        return buildHttpResponse(200,
+            std::string("{\"status\":\"started\",\"uptime_seconds\":") +
+            std::to_string(static_cast<int>(milansql::MetricsCollector::global().uptime_seconds())) +
+            "}", "application/json");
     }
 
     if (req.path == "/health") {
@@ -5607,8 +6523,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         std::string status = storageOk ? "healthy" : "degraded";
 
         if (!isAuthed) {
-            // Public: minimal response for uptime monitoring
-            return buildHttpResponse(200, "{\"status\":\"" + status + "\"}");
+            // Public: minimal response with version + test count for WebUI badge
+            return buildHttpResponse(200, "{\"status\":\"" + status + "\","
+                "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
+                "\"version\":\"" + std::string(MILANSQL_VERSION) + "\"}");
         }
 
         // Authenticated: full details

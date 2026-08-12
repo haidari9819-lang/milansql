@@ -45,7 +45,12 @@ public:
         } else {
             // Read file into lines
             std::ifstream f(fileName);
-            if (!f) throw std::runtime_error("COPY: Datei nicht gefunden: " + fileName);
+            if (!f) {
+                std::string hint;
+                if (fileName.find("/tmp/") == 0)
+                    hint = " (Hinweis: /tmp/ ist privat fuer den Dienst; bitte /opt/milansql/tmp/ verwenden)";
+                throw std::runtime_error("COPY: Datei nicht gefunden: " + fileName + hint);
+            }
             std::vector<std::string> lines;
             std::string line;
             while (std::getline(f, line)) {

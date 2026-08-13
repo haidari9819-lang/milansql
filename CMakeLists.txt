@@ -54,6 +54,9 @@ endif()
 if(WIN32)
     target_link_libraries(milansql_tests PRIVATE ws2_32 secur32 crypt32)
 endif()
+if(OpenSSL_FOUND AND NOT WIN32)
+    target_link_libraries(milansql_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # ── Stress Test (Phase 99) ───────────────────────────────────
 add_executable(milansql_stress src/tests/stress_test.cpp)

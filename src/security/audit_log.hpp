@@ -134,6 +134,7 @@ public:
         if (anonymize_) {
             entry.user = hashPseudonym(entry.user);
         }
+        computeHash_(entry);  // Phase 5.2: hash-chain for tamper detection
         rotateIfNeeded();
         if (buffer_.size() >= MAX_ENTRIES) buffer_.pop_front();
         buffer_.push_back(std::move(entry));

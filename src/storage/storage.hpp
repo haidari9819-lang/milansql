@@ -1,4 +1,5 @@
 #pragma once
+#include "../crypto/encryption_manager.hpp"
 
 #include <string>
 #include <vector>
@@ -493,7 +494,20 @@ public:
         // Data Section
         out.write(data.data(), static_cast<std::streamsize>(data.size()));
 
-        atomicWriteFile(filepath_, out.str());
+        // Phase 5.1: Encrypt data section if encryption is enabled
+        std::string rawOut = out.str();
+        auto& encMgr = milansql::EncryptionManager::instance();
+        if (encMgr.enabled()) {
+            // Encrypt everything after the 16-byte header
+            std::string header = rawOut.substr(0, 16);
+            std::string body   = rawOut.substr(16);
+            body = encMgr.encryptStr(body);
+            rawOut = header + body;
+            // Set a flag byte in the header to indicate encryption
+            // Byte 7 of magic: overwrite last byte of "MILANDB1" -> "MILANDB2"
+            if (rawOut.size() > 7) rawOut[7] = '2';
+        }
+        atomicWriteFile(filepath_, rawOut);
     }
 
     // ── Lesen ─────────────────────────────────────────────────
@@ -515,7 +529,9 @@ public:
         // Magic (8 Bytes)
         std::string magic(buf.data(), 8);
         pos = 8;
-        if (magic != MAGIC)
+        // Accept both "MILANDB1" (unencrypted) and "MILANDB2" (encrypted)
+        std::string magicBase = magic; if (!magicBase.empty()) magicBase[7] = '1';
+        if (magicBase != MAGIC)
             throw std::runtime_error("Keine gueltige MilanSQL-Datei (falscher Magic)");
 
         uint16_t version  = rU16(buf, pos);   // Bytes  8..9
@@ -529,6 +545,14 @@ public:
 
         // ── Data-Section: Bytes 16.. ──────────────────────────
         std::string data = buf.substr(16);
+        // Phase 5.1: Decrypt if encryption flag is set (magic byte 7 == '2')
+        if (magic.size() > 0 && buf.size() > 7 && (unsigned char)buf[7] == (unsigned char)'2') {
+            auto& encMgr = milansql::EncryptionManager::instance();
+            if (encMgr.enabled()) {
+                data = encMgr.decryptStr(data);
+            }
+            // Restore magic for version check (treat as MILANDB1)
+        }
 
         if (checksum(data) != storedCs)
             std::cerr << "  WARNUNG: Checksumme fehlerhaft — Datei moeglicherweise korrupt!\n";

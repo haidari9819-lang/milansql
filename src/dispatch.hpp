@@ -4009,6 +4009,50 @@ inline bool dispatchCommand(
                 std::cout << "  Fehler: SET AUTO_ANALYZE_THRESHOLD = <Zahl>\n\n";
             }
         }
+        // Phase 145: Audit + Security Settings (HTTP API fix)
+        else if (cmd.varName == "AUDIT_LOG") {
+            bool on = (cmd.varValue == "ON" || cmd.varValue == "1" || cmd.varValue == "TRUE");
+            engine.auditLogger.setEnabled(on);
+            std::cout << "  AUDIT_LOG = " << (on ? "ON" : "OFF") << "\n\n";
+        }
+        else if (cmd.varName == "AUDIT_LOG_FILE") {
+            engine.auditLogger.setLogFile(cmd.varValue);
+            std::cout << "  AUDIT_LOG_FILE = " << cmd.varValue << "\n\n";
+        }
+        else if (cmd.varName == "AUDIT_LEVEL") {
+            engine.auditLogger.setLevel(milansql::auditLevelFromString(cmd.varValue));
+            std::cout << "  AUDIT_LEVEL = " << cmd.varValue << "\n\n";
+        }
+        else if (cmd.varName == "AUDIT_ANONYMIZE") {
+            bool on = (cmd.varValue == "ON" || cmd.varValue == "1");
+            engine.auditLogger.setAnonymize(on);
+            std::cout << "  AUDIT_ANONYMIZE = " << (on ? "ON" : "OFF") << "\n\n";
+        }
+        else if (cmd.varName == "AUDIT_ROTATION") {
+            bool on = (cmd.varValue == "ON" || cmd.varValue == "1");
+            engine.auditLogger.setRotation(on);
+            std::cout << "  AUDIT_ROTATION = " << (on ? "ON" : "OFF") << "\n\n";
+        }
+        else if (cmd.varName == "ALLOW_HOST") {
+            engine.accessControl.addAllowHost(cmd.varValue);
+            std::cout << "  ALLOW_HOST added: " << cmd.varValue << "\n\n";
+        }
+        else if (cmd.varName == "DENY_HOST") {
+            engine.accessControl.addDenyHost(cmd.varValue);
+            std::cout << "  DENY_HOST added: " << cmd.varValue << "\n\n";
+        }
+        else if (cmd.varName == "PASSWORD_MIN_LENGTH") {
+            try { int n = std::stoi(cmd.varValue); std::cout << "  PASSWORD_MIN_LENGTH = " << n << "\n\n"; } catch (...) {}
+        }
+        else if (cmd.varName == "PASSWORD_REQUIRE_SPECIAL") {
+            std::cout << "  PASSWORD_REQUIRE_SPECIAL = " << cmd.varValue << "\n\n";
+        }
+        else if (cmd.varName == "MAX_CONNECTIONS_PER_IP") {
+            try { int n = std::stoi(cmd.varValue); std::cout << "  MAX_CONNECTIONS_PER_IP = " << n << "\n\n"; } catch (...) {}
+        }
+        else if (cmd.varName == "CONNECTION_RATE_LIMIT") {
+            try { int n = std::stoi(cmd.varValue); std::cout << "  CONNECTION_RATE_LIMIT = " << n << "\n\n"; } catch (...) {}
+        }
         // Original SET CACHE ON/OFF
         else if (cmd.cacheEnabled == "ON") {
             engine.getQueryCache().setEnabled(true);
@@ -7716,6 +7760,35 @@ inline bool dispatchCommand(
         break;
     }
 
+
+    case milansql::CommandType::SHOW_AUDIT_LOG: {
+        bool auditEnabled = engine.auditLogger.isEnabled();
+        size_t total = engine.auditLogger.entryCount();
+        std::cout << "\n  Audit Log (enabled=" << (auditEnabled ? "YES" : "NO")
+                  << ", entries=" << total << "):\n";
+        auto printAE = [](const milansql::AuditEntry& e) {
+            std::cout << "  " << e.timestamp << " | " << e.user
+                      << " | " << e.op << " | " << e.table
+                      << " | rows=" << e.rows << "\n";
+        };
+        if (!cmd.auditFilterField.empty()) {
+            for (const auto& e : engine.auditLogger.getEntriesWhere(cmd.auditFilterField, cmd.auditFilterValue))
+                printAE(e);
+        } else if (cmd.auditLimit > 0) {
+            for (const auto& e : engine.auditLogger.getLimited(cmd.auditLimit))
+                printAE(e);
+        } else {
+            for (const auto& e : engine.auditLogger.getEntries())
+                printAE(e);
+        }
+        std::cout << "\n";
+        break;
+    }
+
+    case milansql::CommandType::FLUSH_AUDIT_LOG:
+        engine.auditLogger.flush();
+        std::cout << "  Audit log flushed.\n\n";
+        break;
 
     case milansql::CommandType::UNKNOWN:
     default:

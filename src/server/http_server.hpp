@@ -2074,6 +2074,32 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
 
             milansql::dispatchCommand(cmd, engine_, p, oneSQL, persistFn, saveProceduresFn, saveTriggFn);
 
+            // Phase 145: Audit logging after DDL/DML operations
+            if (engine_.auditLogger.isEnabled()) {
+                std::string opStr;
+                switch (cmd.type) {
+                case milansql::CommandType::CREATE_TABLE: opStr = "CREATE_TABLE"; break;
+                case milansql::CommandType::DROP_TABLE:   opStr = "DROP_TABLE";   break;
+                case milansql::CommandType::ALTER_TABLE:  opStr = "ALTER_TABLE";  break;
+                case milansql::CommandType::CREATE_INDEX: opStr = "CREATE_INDEX"; break;
+                case milansql::CommandType::DROP_INDEX:   opStr = "DROP_INDEX";   break;
+                case milansql::CommandType::TRUNCATE:     opStr = "TRUNCATE";     break;
+                case milansql::CommandType::INSERT:       opStr = "INSERT";       break;
+                case milansql::CommandType::UPDATE:       opStr = "UPDATE";       break;
+                case milansql::CommandType::DELETE:       opStr = "DELETE";       break;
+                default: break;
+                }
+                if (!opStr.empty()) {
+                    milansql::AuditEntry ae;
+                    ae.op        = opStr;
+                    ae.table     = cmd.tableName;
+                    ae.user      = "user_" + std::to_string(userId);
+                    ae.ip        = "";
+                    ae.success   = true;
+                    engine_.auditLogger.log(ae);
+                }
+            }
+
             // Extract column types for type-aware JSON serialization
             if (cmd.type == milansql::CommandType::SELECT && !cmd.tableName.empty()
                 && engine_.tableExists(cmd.tableName)) {

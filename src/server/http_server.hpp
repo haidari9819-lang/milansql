@@ -3255,6 +3255,33 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
       </div>
     </div>
     <div class="nav-section">
+      <div class="nav-label">Enterprise</div>
+      <div class="nav-item" data-page="branches" onclick="showPage('branches',this)">
+        <span class="icon">&#x2387;</span> Branches
+      </div>
+      <div class="nav-item" data-page="security" onclick="showPage('security',this)">
+        <span class="icon">&#x1F512;</span> Security
+      </div>
+      <div class="nav-item" data-page="audit" onclick="showPage('audit',this)">
+        <span class="icon">&#x1F4CB;</span> Audit Log
+      </div>
+      <div class="nav-item" data-page="compliance" onclick="showPage('compliance',this)">
+        <span class="icon">&#x1F3DB;</span> Compliance
+      </div>
+      <div class="nav-item" data-page="migrations" onclick="showPage('migrations',this)">
+        <span class="icon">&#x1F504;</span> Migrations
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Cloud</div>
+      <div class="nav-item" data-page="cloud" onclick="showPage('cloud',this)">
+        <span class="icon">&#x2601;</span> Cloud Instances
+      </div>
+      <div class="nav-item" data-page="regions" onclick="showPage('regions',this)">
+        <span class="icon">&#x1F30D;</span> Regions
+      </div>
+    </div>
+    <div class="nav-section">
       <div class="nav-label">Tables</div>
       <div class="tables-list" id="sidebar-tables">
         <div style="font-size:0.75rem;color:#475569;padding:4px 8px">Loading...</div>
@@ -3266,7 +3293,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
         <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v11.0.0</span></div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v12.0.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -3501,6 +3528,179 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
       </div>
     </div>
 
+
+    <!-- ── BRANCHES PAGE ─────────────────────────────────── -->
+    <div class="page" id="page-branches">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Database Branches</span>
+        <button onclick="branchCreate()" style="background:#00d4ff;color:#080c18;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:700;cursor:pointer">+ New Branch</button>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div id="branches-list" style="display:flex;flex-direction:column;gap:8px">
+          <div style="color:#475569;font-size:0.8rem">Loading branches...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SECURITY PAGE ─────────────────────────────────── -->
+    <div class="page" id="page-security">
+      <div style="padding:12px 16px;border-bottom:1px solid #1e2d40;font-size:0.9rem;font-weight:600;color:#f8fafc">Security Settings</div>
+      <div style="padding:16px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <!-- Encryption -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div><div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:2px">&#x1F511; Encryption at Rest</div>
+              <div style="font-size:0.75rem;color:#64748b">AES-256 data encryption</div></div>
+            <div id="enc-status-badge" style="font-size:0.75rem;padding:3px 10px;border-radius:9999px;background:#1e2d40;color:#94a3b8">Loading...</div>
+          </div>
+          <div id="enc-details" style="font-size:0.8rem;color:#64748b;margin-bottom:10px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button onclick="secEnableEncryption()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Enable</button>
+            <button onclick="secDisableEncryption()" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Disable</button>
+            <button onclick="secRotateKey()" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Rotate Key</button>
+          </div>
+        </div>
+        <!-- mTLS -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div><div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:2px">&#x1F6E1; mTLS</div>
+              <div style="font-size:0.75rem;color:#64748b">Mutual TLS certificate auth</div></div>
+            <div id="mtls-status-badge" style="font-size:0.75rem;padding:3px 10px;border-radius:9999px;background:#1e2d40;color:#94a3b8">Loading...</div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button onclick="secEnableMtls()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Enable</button>
+            <button onclick="secDisableMtls()" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Disable</button>
+          </div>
+        </div>
+        <!-- IP Allowlist -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">&#x1F6A7; IP Allowlist</div>
+          <div id="ip-allowlist-content" style="font-size:0.8rem;color:#64748b;margin-bottom:10px">Loading...</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input id="ip-allowlist-input" type="text" placeholder="192.168.1.0/24,10.0.0.1" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:5px 10px;color:#f8fafc;font-size:0.78rem;flex:1;min-width:160px;outline:none">
+            <button onclick="secSetIpAllowlist()" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Set</button>
+            <button onclick="secRemoveIpAllowlist()" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Remove</button>
+          </div>
+        </div>
+        <!-- Active Sessions -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">&#x1F465; Active Sessions</div>
+          <div id="sessions-content" style="font-size:0.8rem;color:#64748b">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── AUDIT LOG PAGE ─────────────────────────────────── -->
+    <div class="page" id="page-audit">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40;flex-wrap:wrap;gap:8px">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Audit Trail</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div id="audit-chain-badge" style="font-size:0.72rem;padding:3px 10px;border-radius:9999px;background:#1e2d40;color:#94a3b8">Chain: —</div>
+          <input id="audit-filter-user" type="text" placeholder="Filter user..." style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:4px 8px;color:#f8fafc;font-size:0.75rem;width:110px;outline:none">
+          <select id="audit-filter-type" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:4px 8px;color:#f8fafc;font-size:0.75rem;outline:none">
+            <option value="">All types</option>
+            <option value="QUERY">QUERY</option>
+            <option value="LOGIN">LOGIN</option>
+            <option value="DDL">DDL</option>
+            <option value="ADMIN">ADMIN</option>
+          </select>
+          <button onclick="auditVerify()" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:6px;padding:5px 11px;font-size:0.75rem;cursor:pointer">&#x2714; Verify</button>
+          <button onclick="auditExport()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 11px;font-size:0.75rem;cursor:pointer">&#x21D3; Export</button>
+          <button onclick="loadAuditPage()" style="background:#1e2d40;color:#94a3b8;border:none;border-radius:6px;padding:5px 11px;font-size:0.75rem;cursor:pointer">&#x21BA;</button>
+        </div>
+      </div>
+      <div style="flex:1;overflow-y:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:0.78rem" id="audit-table">
+          <thead><tr style="background:#0d1220;border-bottom:1px solid #1e2d40">
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600;white-space:nowrap">#</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Time</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">User</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Event</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Action/Query</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Hash</th>
+          </tr></thead>
+          <tbody id="audit-tbody"><tr><td colspan="6" style="padding:20px;text-align:center;color:#475569">Loading audit log...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── COMPLIANCE PAGE ────────────────────────────────── -->
+    <div class="page" id="page-compliance">
+      <div style="padding:12px 16px;border-bottom:1px solid #1e2d40;font-size:0.9rem;font-weight:600;color:#f8fafc">Compliance Reports</div>
+      <div style="padding:16px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+          <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:16px">
+            <div style="font-size:0.95rem;font-weight:700;color:#f8fafc;margin-bottom:4px">&#x1F1E9;&#x1F1EA; DSGVO</div>
+            <div style="font-size:0.75rem;color:#64748b;margin-bottom:12px">EU Data Protection Regulation</div>
+            <div id="dsgvo-score" style="font-size:1.8rem;font-weight:700;color:#00d4ff;margin-bottom:8px">—</div>
+            <button onclick="genReport('dsgvo')" style="width:100%;background:#0ea5e9;color:#fff;border:none;border-radius:6px;padding:7px;font-size:0.8rem;font-weight:600;cursor:pointer">Generate Report</button>
+          </div>
+          <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:16px">
+            <div style="font-size:0.95rem;font-weight:700;color:#f8fafc;margin-bottom:4px">&#x1F4DC; GoBD</div>
+            <div style="font-size:0.75rem;color:#64748b;margin-bottom:12px">German Bookkeeping Standard</div>
+            <div id="gobd-score" style="font-size:1.8rem;font-weight:700;color:#00d4ff;margin-bottom:8px">—</div>
+            <button onclick="genReport('gobd')" style="width:100%;background:#0ea5e9;color:#fff;border:none;border-radius:6px;padding:7px;font-size:0.8rem;font-weight:600;cursor:pointer">Generate Report</button>
+          </div>
+          <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:16px">
+            <div style="font-size:0.95rem;font-weight:700;color:#f8fafc;margin-bottom:4px">&#x1F6E1; SOC2</div>
+            <div style="font-size:0.75rem;color:#64748b;margin-bottom:12px">Service Organization Control 2</div>
+            <div id="soc2-score" style="font-size:1.8rem;font-weight:700;color:#00d4ff;margin-bottom:8px">—</div>
+            <button onclick="genReport('soc2')" style="width:100%;background:#0ea5e9;color:#fff;border:none;border-radius:6px;padding:7px;font-size:0.8rem;font-weight:600;cursor:pointer">Generate Report</button>
+          </div>
+        </div>
+        <div id="compliance-report-panel" style="display:none;background:#080c18;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div style="font-size:0.85rem;font-weight:600;color:#f8fafc" id="compliance-report-title">Report</div>
+            <button onclick="downloadReport()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:4px 10px;font-size:0.75rem;cursor:pointer">&#x21D3; Download</button>
+          </div>
+          <pre id="compliance-report-content" style="font-size:0.75rem;color:#94a3b8;white-space:pre-wrap;max-height:400px;overflow-y:auto"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── MIGRATIONS PAGE ────────────────────────────────── -->
+    <div class="page" id="page-migrations">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Schema Migrations</span>
+        <div style="display:flex;gap:8px">
+          <button onclick="migRun('up')" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:600;cursor:pointer">&#x25B2; Migrate Up</button>
+          <button onclick="migRun('down')" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:600;cursor:pointer">&#x25BC; Migrate Down</button>
+          <button onclick="loadMigrationsPage()" style="background:#1e2d40;color:#94a3b8;border:none;border-radius:6px;padding:5px 10px;font-size:0.8rem;cursor:pointer">&#x21BA;</button>
+        </div>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div id="mig-status-msg" style="font-size:0.8rem;color:#64748b;margin-bottom:12px"></div>
+        <div id="mig-list" style="display:flex;flex-direction:column;gap:6px">
+          <div style="color:#475569;font-size:0.8rem">Loading migrations...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── CLOUD INSTANCES PAGE ───────────────────────────── -->
+    <div class="page" id="page-cloud">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Cloud Instances</span>
+        <button onclick="cloudNewInstance()" style="background:#00d4ff;color:#080c18;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:700;cursor:pointer">+ New Instance</button>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div id="cloud-instances-list" style="display:flex;flex-direction:column;gap:8px">
+          <div style="color:#475569;font-size:0.8rem">Loading cloud instances...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── REGIONS PAGE ───────────────────────────────────── -->
+    <div class="page" id="page-regions">
+      <div style="padding:12px 16px;border-bottom:1px solid #1e2d40;font-size:0.9rem;font-weight:600;color:#f8fafc">Regions &amp; Replicas</div>
+      <div style="padding:16px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <div id="regions-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
+        <div>
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Active Replicas</div>
+          <div id="replicas-list" style="color:#475569;font-size:0.8rem">Loading...</div>
+        </div>
+      </div>
+    </div>
+
   </div><!-- /main -->
 </div><!-- /layout -->
 
@@ -3510,7 +3710,7 @@ td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v10.7.0</span> &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v12.0.0</span> &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -3663,6 +3863,13 @@ function showPage(name, el) {
   else stopMonitoring();
   if (name === 'vacuum') loadVacuumPage(); else stopVacuumPage();
   if (name === 'replication') loadReplicationPage(); else stopReplicationPage();
+  if (name === 'branches')   loadBranchesPage();
+  if (name === 'security')   loadSecurityPage();
+  if (name === 'audit')      loadAuditPage();
+  if (name === 'compliance') loadCompliancePage();
+  if (name === 'migrations') loadMigrationsPage();
+  if (name === 'cloud')      loadCloudPage();
+  if (name === 'regions')    loadRegionsPage();
 }
 
 // ── SQL Execution ──────────────────────────────────────────────
@@ -5210,6 +5417,375 @@ async function msSubmitRegister(){
 }
 // Back/Forward-Cache-Guard: Browser restauriert sonst eine eingefrorene
 // (evtl. ausgeloggte/veraltete) Seite aus dem bfcache — dann neu laden.
+
+
+// ══════════════════════════════════════════════════════════════
+// BRANCHES PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadBranchesPage() {
+  var el = document.getElementById('branches-list');
+  el.innerHTML = '<div style="color:#475569;font-size:0.8rem">Loading...</div>';
+  try {
+    var r = await fetch('/api/query', {method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sql: 'SHOW BRANCHES'})});
+    var d = await r.json();
+    if (!d.success) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Error: ' + (d.error||'unknown') + '</div>'; return; }
+    var rows = d.rows || [];
+    if (!rows.length) { el.innerHTML = '<div style="color:#475569;font-size:0.8rem">No branches. Create your first branch.</div>'; return; }
+    var cols = d.columns || [];
+    el.innerHTML = rows.map(function(row) {
+      var name = row[0] || row[cols.indexOf('name')] || row[0];
+      var isMain = name === 'main' || name === 'master';
+      return '<div style="background:#0d1220;border:1px solid ' + (isMain?'#00d4ff':'#1e2d40') + ';border-radius:8px;padding:12px 14px;display:flex;align-items:center;gap:10px">'
+        + '<span style="font-size:0.9rem;color:#f8fafc;font-weight:' + (isMain?'700':'400') + ';flex:1">&#x2387; ' + name + '</span>'
+        + (isMain ? '<span style="font-size:0.7rem;background:#003d5c;color:#00d4ff;border-radius:9999px;padding:2px 8px">active</span>' : '')
+        + '<button onclick="branchMerge(\'' + name + '\')" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Merge</button>'
+        + (!isMain ? '<button onclick="branchDrop(\'' + name + '\')" style="background:#450a0a;color:#f87171;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Drop</button>' : '')
+        + '</div>';
+    }).join('');
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Network error</div>'; }
+}
+async function branchCreate() {
+  var name = prompt('Branch name:');
+  if (!name) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'CREATE BRANCH '+name})});
+  var d = await r.json();
+  if (d.success) loadBranchesPage(); else alert('Error: '+(d.error||'failed'));
+}
+async function branchMerge(name) {
+  if (!confirm('Merge branch "'+name+'" into main?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'MERGE BRANCH '+name+' INTO main'})});
+  var d = await r.json();
+  loadBranchesPage();
+}
+async function branchDrop(name) {
+  if (!confirm('Drop branch "'+name+'"? This cannot be undone.')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DROP BRANCH '+name})});
+  loadBranchesPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECURITY PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadSecurityPage() {
+  // Encryption
+  try {
+    var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW ENCRYPTION STATUS'})});
+    var d = await r.json();
+    var txt = d.success ? (d.rows&&d.rows[0]?d.rows[0][0]:'unknown') : (d.message||'');
+    var isEnabled = txt.toLowerCase().includes('enabled');
+    var badge = document.getElementById('enc-status-badge');
+    badge.style.background = isEnabled?'#064e3b':'#422006';
+    badge.style.color = isEnabled?'#34d399':'#fb923c';
+    badge.textContent = isEnabled?'Enabled':'Disabled';
+    document.getElementById('enc-details').textContent = txt;
+  } catch(e) {}
+  // mTLS
+  try {
+    var r2 = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW MTLS STATUS'})});
+    var d2 = await r2.json();
+    var txt2 = d2.success?(d2.rows&&d2.rows[0]?d2.rows[0][0]:'unknown'):(d2.message||'');
+    var mtlsOn = txt2.toLowerCase().includes('enabled');
+    var mb = document.getElementById('mtls-status-badge');
+    mb.style.background = mtlsOn?'#064e3b':'#422006';
+    mb.style.color = mtlsOn?'#34d399':'#fb923c';
+    mb.textContent = mtlsOn?'Enabled':'Disabled';
+  } catch(e) {}
+  // IP Allowlist
+  try {
+    var r3 = await fetch('/api/allowlist',{credentials:'include'});
+    var d3 = await r3.json();
+    var ips = d3.ips||d3.allowed||[];
+    document.getElementById('ip-allowlist-content').textContent = ips.length ? ips.join(', ') : 'No IPs set (all allowed)';
+  } catch(e) { document.getElementById('ip-allowlist-content').textContent = 'N/A'; }
+  // Sessions
+  try {
+    var r4 = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW SESSIONS'})});
+    var d4 = await r4.json();
+    if (d4.success && d4.rows) {
+      document.getElementById('sessions-content').innerHTML = d4.rows.map(function(row){
+        return '<div style="padding:4px 0;border-bottom:1px solid #1e2d40">'+row.join(' | ')+'</div>';
+      }).join('') || '<div style="color:#475569">No active sessions</div>';
+    } else { document.getElementById('sessions-content').textContent = 'N/A'; }
+  } catch(e) { document.getElementById('sessions-content').textContent = 'N/A'; }
+}
+async function secEnableEncryption() {
+  var key = prompt('Hex key (64 chars for AES-256, or leave blank for auto-generated):') || '';
+  var sql = key ? "ENABLE ENCRYPTION WITH KEY '" + key + "'" : "ENABLE ENCRYPTION WITH KEY 'auto'";
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
+  var d = await r.json(); alert(d.message||d.error||JSON.stringify(d)); loadSecurityPage();
+}
+async function secDisableEncryption() {
+  if (!confirm('Disable encryption?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DISABLE ENCRYPTION'})});
+  var d = await r.json(); loadSecurityPage();
+}
+async function secRotateKey() {
+  var newKey = prompt('New hex key (64 chars):') || '';
+  if (!newKey) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:"ROTATE ENCRYPTION KEY TO '"+newKey+"'"})});
+  var d = await r.json(); alert(d.message||d.error||'Done'); loadSecurityPage();
+}
+async function secEnableMtls() {
+  var ca = prompt('CA cert path:', '/etc/milansql/ca.crt'); if (!ca) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:"ENABLE MTLS WITH CA '"+ca+"'"})});
+  var d = await r.json(); loadSecurityPage();
+}
+async function secDisableMtls() {
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DISABLE MTLS'})});
+  loadSecurityPage();
+}
+async function secSetIpAllowlist() {
+  var ips = document.getElementById('ip-allowlist-input').value.trim(); if (!ips) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:"SET ALLOWED_IPS FOR USER root = '"+ips+"'"})});
+  var d = await r.json(); loadSecurityPage();
+}
+async function secRemoveIpAllowlist() {
+  if (!confirm('Remove IP allowlist?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'REMOVE ALLOWED_IPS FOR USER root'})});
+  loadSecurityPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// AUDIT LOG PAGE
+// ══════════════════════════════════════════════════════════════
+var lastAuditData = null;
+async function loadAuditPage() {
+  var tbody = document.getElementById('audit-tbody');
+  tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#475569">Loading...</td></tr>';
+  try {
+    var r = await fetch('/api/audit/export', {credentials:'include'});
+    var d = await r.json();
+    var entries = d.entries || d.log || (Array.isArray(d)?d:[]);
+    lastAuditData = d;
+    renderAuditTable(entries);
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#ef4444">Failed to load audit log</td></tr>';
+  }
+}
+function renderAuditTable(entries) {
+  var userF = (document.getElementById('audit-filter-user')||{}).value||'';
+  var typeF = (document.getElementById('audit-filter-type')||{}).value||'';
+  var filtered = entries.filter(function(e){
+    if (userF && !(e.user||e.username||'').toLowerCase().includes(userF.toLowerCase())) return false;
+    if (typeF && (e.event_type||e.type||'') !== typeF) return false;
+    return true;
+  });
+  var tbody = document.getElementById('audit-tbody');
+  if (!filtered.length) { tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#475569">No entries</td></tr>'; return; }
+  tbody.innerHTML = filtered.slice(0,200).map(function(e,i){
+    var hash = e.entry_hash||e.hash||'';
+    return '<tr style="border-bottom:1px solid #1e2d40">'
+      +'<td style="padding:6px 10px;color:#475569">'+(e.id||i+1)+'</td>'
+      +'<td style="padding:6px 10px;color:#64748b;white-space:nowrap">'+(e.timestamp||e.time||'').replace('T',' ').slice(0,19)+'</td>'
+      +'<td style="padding:6px 10px;color:#7dd3fc">'+(e.user||e.username||'system')+'</td>'
+      +'<td style="padding:6px 10px"><span style="font-size:0.7rem;padding:2px 7px;border-radius:9999px;background:#1e3a5f;color:#7dd3fc">'+(e.event_type||e.type||'—')+'</span></td>'
+      +'<td style="padding:6px 10px;color:#94a3b8;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(e.query||e.action||'')+'"><code>'+(e.query||e.action||'—').slice(0,60)+'</code></td>'
+      +'<td style="padding:6px 10px;font-family:monospace;font-size:0.7rem;color:#475569" title="'+hash+'">'+hash.slice(0,8)+'...</td>'
+      +'</tr>';
+  }).join('');
+}
+document.addEventListener('input', function(ev){
+  if (ev.target.id==='audit-filter-user'||ev.target.id==='audit-filter-type') {
+    if (lastAuditData) renderAuditTable(lastAuditData.entries||lastAuditData.log||(Array.isArray(lastAuditData)?lastAuditData:[]));
+  }
+});
+document.addEventListener('change', function(ev){
+  if (ev.target.id==='audit-filter-type') {
+    if (lastAuditData) renderAuditTable(lastAuditData.entries||lastAuditData.log||(Array.isArray(lastAuditData)?lastAuditData:[]));
+  }
+});
+async function auditVerify() {
+  var badge = document.getElementById('audit-chain-badge');
+  badge.textContent = 'Verifying...'; badge.style.background='#1e2d40'; badge.style.color='#94a3b8';
+  try {
+    var r = await fetch('/api/audit/verify',{credentials:'include'});
+    var d = await r.json();
+    var ok = d.valid !== false && !d.error;
+    badge.style.background = ok?'#064e3b':'#450a0a';
+    badge.style.color = ok?'#34d399':'#f87171';
+    badge.textContent = ok?('Chain OK ('+( d.checked||'?')+' entries)'):('BROKEN at #'+(d.first_broken||'?'));
+  } catch(e) { badge.textContent='Error'; badge.style.color='#f87171'; }
+}
+async function auditExport() {
+  try {
+    var r = await fetch('/api/audit/export',{credentials:'include'});
+    var d = await r.json();
+    var blob = new Blob([JSON.stringify(d, null, 2)], {type:'application/json'});
+    var a = document.createElement('a'); a.href=URL.createObjectURL(blob);
+    a.download='audit-log-'+new Date().toISOString().slice(0,10)+'.json'; a.click();
+  } catch(e) { alert('Export failed'); }
+}
+
+// ══════════════════════════════════════════════════════════════
+// COMPLIANCE PAGE
+// ══════════════════════════════════════════════════════════════
+var lastReport = null; var lastReportType = '';
+async function loadCompliancePage() {
+  // Scores are shown after generating reports — nothing to auto-load
+}
+async function genReport(type) {
+  var btn = event.target; btn.textContent='Generating...'; btn.disabled=true;
+  try {
+    var r = await fetch('/api/compliance/'+type, {credentials:'include'});
+    var d = await r.json();
+    lastReport = d; lastReportType = type.toUpperCase();
+    var scoreEl = document.getElementById(type+'-score');
+    if (scoreEl) scoreEl.textContent = (d.score !== undefined ? d.score : '—') + (d.score !== undefined ? '/100':'');
+    var panel = document.getElementById('compliance-report-panel');
+    panel.style.display = 'block';
+    document.getElementById('compliance-report-title').textContent = lastReportType + ' Report';
+    document.getElementById('compliance-report-content').textContent = JSON.stringify(d, null, 2);
+  } catch(e) { alert('Failed to generate report'); }
+  btn.textContent='Generate Report'; btn.disabled=false;
+}
+function downloadReport() {
+  if (!lastReport) return;
+  var blob = new Blob([JSON.stringify(lastReport, null, 2)], {type:'application/json'});
+  var a = document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='compliance-'+lastReportType.toLowerCase()+'-'+new Date().toISOString().slice(0,10)+'.json'; a.click();
+}
+
+// ══════════════════════════════════════════════════════════════
+// MIGRATIONS PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadMigrationsPage() {
+  var el = document.getElementById('mig-list');
+  el.innerHTML = '<div style="color:#475569;font-size:0.8rem">Loading...</div>';
+  try {
+    var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'MIGRATE STATUS'})});
+    var d = await r.json();
+    var rows = d.rows || [];
+    if (!rows.length) { el.innerHTML = '<div style="color:#475569;font-size:0.8rem">No migrations found.</div>'; return; }
+    el.innerHTML = rows.map(function(row, i) {
+      var name = row[0]||'Migration #'+(i+1);
+      var status = (row[1]||'pending').toLowerCase();
+      var ts = row[2]||'';
+      var applied = status === 'applied' || status === 'up';
+      return '<div style="background:#0d1220;border:1px solid '+(applied?'#065f46':'#1e2d40')+';border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px">'
+        +'<span style="font-size:0.85rem;color:#f8fafc;flex:1;font-family:monospace">'+name+'</span>'
+        +(ts?'<span style="font-size:0.72rem;color:#475569">'+ts.slice(0,16)+'</span>':'')
+        +'<span style="font-size:0.72rem;padding:2px 8px;border-radius:9999px;background:'+(applied?'#064e3b':'#1e2d40')+';color:'+(applied?'#34d399':'#64748b')+'">'+(applied?'applied':'pending')+'</span>'
+        +'</div>';
+    }).join('');
+    var msg = document.getElementById('mig-status-msg');
+    msg.textContent = rows.filter(function(r){return (r[1]||'').toLowerCase()==='pending';}).length + ' pending migration(s)';
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Error loading migrations</div>'; }
+}
+async function migRun(dir) {
+  if (!confirm('Run MIGRATE '+dir.toUpperCase()+'?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'MIGRATE '+dir.toUpperCase()})});
+  var d = await r.json();
+  document.getElementById('mig-status-msg').textContent = d.message||d.error||'Done';
+  loadMigrationsPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// CLOUD INSTANCES PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadCloudPage() {
+  var el = document.getElementById('cloud-instances-list');
+  el.innerHTML = '<div style="color:#475569;font-size:0.8rem">Loading...</div>';
+  try {
+    var r = await fetch('/cloud/instances',{credentials:'include',headers:{'Accept':'application/json','Authorization':'Bearer '+(msToken||'')}});
+    var d = await r.json();
+    var insts = d.instances || (Array.isArray(d)?d:[]);
+    if (!insts.length) { el.innerHTML = '<div style="color:#475569;font-size:0.8rem">No cloud instances. Create one to get started.</div>'; return; }
+    el.innerHTML = insts.map(function(inst) {
+      var running = inst.status === 'running';
+      var plan = inst.plan || 'free';
+      return '<div style="background:#0d1220;border:1px solid '+(running?'#064e3b':'#1e2d40')+';border-radius:8px;padding:12px 14px">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        +'<span style="font-size:0.9rem;font-weight:600;color:#f8fafc;flex:1">'+inst.name+'</span>'
+        +'<span style="font-size:0.7rem;padding:2px 8px;border-radius:9999px;background:'+(running?'#064e3b':'#422006')+';color:'+(running?'#34d399':'#fb923c')+'">'+inst.status+'</span>'
+        +'<span style="font-size:0.7rem;padding:2px 8px;border-radius:9999px;background:#1e3a5f;color:#7dd3fc">'+plan+'</span>'
+        +'</div>'
+        +'<div style="font-size:0.75rem;color:#475569;margin-bottom:8px">'+inst.id+' &middot; '+inst.region+'</div>'
+        +'<div style="font-family:monospace;font-size:0.72rem;background:#080c18;border:1px solid #1e2d40;border-radius:4px;padding:5px 8px;color:#00d4ff;display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        +'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">msql://'+inst.id+'.cloud.milansql.com:5432/default</span>'
+        +'<button onclick="navigator.clipboard.writeText(\'msql://'+inst.id+'.cloud.milansql.com:5432/default\')" style="background:none;border:none;color:#00d4ff;cursor:pointer;font-size:0.8rem;flex-shrink:0">&#x1F4CB;</button>'
+        +'</div>'
+        +'<div style="display:flex;gap:6px">'
+        +(running?'<button onclick="cloudPause(\''+inst.id+'\')" style="background:#422006;color:#fb923c;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Pause</button>'
+                 :'<button onclick="cloudResume(\''+inst.id+'\')" style="background:#064e3b;color:#34d399;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Resume</button>')
+        +'<button onclick="cloudResize(\''+inst.id+'\')" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Resize</button>'
+        +'<button onclick="cloudDelete(\''+inst.id+'\')" style="background:#450a0a;color:#f87171;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Delete</button>'
+        +'</div>'
+        +'</div>';
+    }).join('');
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Failed to load instances</div>'; }
+}
+async function cloudNewInstance() {
+  var name = prompt('Instance name:'); if (!name) return;
+  var plan = prompt('Plan (free/starter/pro/enterprise):', 'free') || 'free';
+  var region = prompt('Region:', 'eu-central-1') || 'eu-central-1';
+  var r = await fetch('/cloud/instances',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+(msToken||'')},
+    body:JSON.stringify({name,plan,region})});
+  var d = await r.json();
+  if (d.id || d.success) { alert('Instance created! API Key: '+(d.api_key_plain||d.apiKeyPlain||'(see logs)')); loadCloudPage(); }
+  else alert('Error: '+(d.error||JSON.stringify(d)));
+}
+async function cloudPause(id) {
+  await fetch('/cloud/instances/'+id+'/pause',{method:'POST',credentials:'include',headers:{'Authorization':'Bearer '+(msToken||'')}});
+  loadCloudPage();
+}
+async function cloudResume(id) {
+  await fetch('/cloud/instances/'+id+'/resume',{method:'POST',credentials:'include',headers:{'Authorization':'Bearer '+(msToken||'')}});
+  loadCloudPage();
+}
+async function cloudResize(id) {
+  var plan = prompt('New plan (free/starter/pro/enterprise):'); if (!plan) return;
+  await fetch('/cloud/instances/'+id+'/resize',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+(msToken||'')},
+    body:JSON.stringify({plan})});
+  loadCloudPage();
+}
+async function cloudDelete(id) {
+  if (!confirm('Delete instance '+id+'? This is permanent.')) return;
+  await fetch('/cloud/instances/'+id,{method:'DELETE',credentials:'include',headers:{'Authorization':'Bearer '+(msToken||'')}});
+  loadCloudPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// REGIONS PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadRegionsPage() {
+  try {
+    var r = await fetch('/cloud/regions');
+    var d = await r.json();
+    var regions = d.regions || (Array.isArray(d)?d:[]);
+    var el = document.getElementById('regions-list');
+    el.innerHTML = regions.map(function(reg) {
+      var active = (reg.status||reg.state||'').toLowerCase() === 'active';
+      return '<div style="background:#0d1220;border:1px solid '+(active?'#00d4ff':'#1e2d40')+';border-radius:8px;padding:14px">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+        +'<span style="width:8px;height:8px;border-radius:50%;background:'+(active?'#34d399':'#f59e0b')+';display:inline-block;flex-shrink:0"></span>'
+        +'<span style="font-size:0.85rem;font-weight:700;color:#f8fafc">'+(reg.id||reg.name)+'</span>'
+        +'</div>'
+        +'<div style="font-size:0.75rem;color:#64748b;margin-bottom:4px">'+(reg.location||reg.city||'')+'</div>'
+        +'<div style="font-size:0.72rem;color:'+(active?'#34d399':'#f59e0b')+';margin-bottom:10px">'+(active?'Active':'Coming Soon')+(reg.latency_ms?' &middot; ~'+reg.latency_ms+'ms':'')+'</div>'
+        +(active?'<button onclick="cloudCreateReplica(\''+( reg.id||reg.name)+'\')" style="background:#065f46;color:#34d399;border:none;border-radius:5px;padding:4px 12px;font-size:0.75rem;cursor:pointer">Create Replica</button>':'')
+        +'</div>';
+    }).join('') || '<div style="color:#475569;font-size:0.8rem">No regions found</div>';
+  } catch(e) { document.getElementById('regions-list').innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Failed to load regions</div>'; }
+  // Load replicas via SQL
+  try {
+    var r2 = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW REGIONS'})});
+    var d2 = await r2.json();
+    var repEl = document.getElementById('replicas-list');
+    repEl.innerHTML = '<div style="color:#475569;font-size:0.8rem">Use CREATE REPLICA IN REGION to create cross-region replicas.</div>';
+  } catch(e) {}
+}
+async function cloudCreateReplica(region) {
+  var instId = prompt('Instance ID (leave blank for default):') || 'default';
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sql:"CREATE REPLICA IN REGION '"+region+"'"})});
+  var d = await r.json();
+  alert(d.message||d.error||'Replica creation started');
+}
+
 window.addEventListener('pageshow', function(e){ if (e.persisted) window.location.reload(); });
 // Start: try cookie-based auto-login (survives page refresh), then show login if not authenticated
 fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/json'}})

@@ -52,6 +52,16 @@
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "../security/audit_log.hpp"
+#include "../crypto/encryption_manager.hpp"
+#include "../security/ip_allowlist.hpp"
+#include "../security/mtls_manager.hpp"
+#include "../tenant/isolated_tenant.hpp"
+#include "../security/compliance_report.hpp"
+#include "../cloud/cloud_instance.hpp"
+#include "../cloud/usage_meter.hpp"
+#include "../cloud/billing_manager.hpp"
+#include "../cloud/region_manager.hpp"
 #include "../monitoring/prometheus.hpp"
 #include "../auth/auth_manager.hpp"
 #include "../auth/rate_limiter.hpp"
@@ -69,7 +79,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1902;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "11.8.0";
+static constexpr const char* MILANSQL_VERSION = "12.0.0";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -6716,6 +6726,843 @@ function clearOutput() { document.getElementById('output').textContent = ''; }
                "Access-Control-Allow-Origin: *\r\n"
                "Connection: close\r\n"
                "\r\n" + html;
+    }
+
+
+    // ── Phase 5.2: Audit Trail API ────────────────────────────
+    if (req.path == "/api/audit/verify" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        auto res = engine_.auditLogger.verifyChain();
+        std::string j = std::string(R"({"valid":)") + (res.valid ? "true" : "false")
+                       + R"(,"checked":)" + std::to_string(res.checked)
+                       + R"(,"broken":)" + std::to_string(res.broken)
+                       + R"(,"first_broken":")" + res.firstBroken + R"("})";
+        return buildHttpResponse(200, j, "application/json");
+    }
+    if (req.path == "/api/audit/export" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, engine_.auditLogger.exportJson(), "application/json");
+    }
+
+    // ── Phase 5.1: Encryption API ─────────────────────────────
+    if (req.path == "/api/encryption/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string j = std::string(R"({"status":")") + milansql::EncryptionManager::instance().status()
+                       + R"(","enabled":)" + (milansql::EncryptionManager::instance().enabled() ? "true" : "false") + "}";
+        return buildHttpResponse(200, j, "application/json");
+    }
+    if (req.path == "/api/encryption/enable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string key = extractJsonStr(req.body, "key");
+        std::string msg = milansql::EncryptionManager::instance().enable(key);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/encryption/disable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string msg = milansql::EncryptionManager::instance().disable();
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/encryption/rotate" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string key = extractJsonStr(req.body, "key");
+        std::string msg = milansql::EncryptionManager::instance().rotateKey(key);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+    // ── Phase 5.3: IP Allowlist API ───────────────────────────
+    if (req.path.rfind("/api/allowlist", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        if (req.method == "GET") {
+            return buildHttpResponse(200, milansql::IpAllowlist::instance().statusJson(), "application/json");
+        } else if (req.method == "POST") {
+            std::string user = extractJsonStr(req.body, "user");
+            std::string ips  = extractJsonStr(req.body, "ips");
+            milansql::IpAllowlist::instance().setAllowed(user, ips);
+            return buildHttpResponse(200, R"({"message":"IP allowlist updated"})", "application/json");
+        } else if (req.method == "DELETE") {
+            std::string user = extractJsonStr(req.body, "user");
+            milansql::IpAllowlist::instance().removeAllowed(user);
+            return buildHttpResponse(200, R"({"message":"IP allowlist removed"})", "application/json");
+        }
+    }
+
+    // ── Phase 5.3: mTLS API ───────────────────────────────────
+    if (req.path == "/api/mtls/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, milansql::MtlsManager::instance().statusJson(), "application/json");
+    }
+    if (req.path == "/api/mtls/enable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string ca = extractJsonStr(req.body, "ca_path");
+        std::string msg = milansql::MtlsManager::instance().enable(ca);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/mtls/disable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string msg = milansql::MtlsManager::instance().disable();
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+    // ── Phase 5.4: Compliance Reports API ────────────────────
+    if (req.path.rfind("/api/compliance/", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string type = req.path.substr(16);
+        using CR = milansql::ComplianceReporter;
+        CR::ReportContext rctx;
+        {
+            time_t t = time(nullptr); char buf[24];
+            struct tm ltm; localtime_r(&t, &ltm);
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &ltm);
+            rctx.generatedAt = buf;
+        }
+        rctx.serverVersion = MILANSQL_VERSION;
+        rctx.auditOn       = engine_.auditLogger.isEnabled();
+        rctx.auditEntries  = (int)engine_.auditLogger.entryCount();
+        rctx.encryptionOn  = milansql::EncryptionManager::instance().enabled();
+        rctx.mtlsOn        = milansql::MtlsManager::instance().enabled();
+        if (rctx.auditOn) {
+            auto vr = engine_.auditLogger.verifyChain();
+            rctx.auditChainOk = vr.valid;
+        }
+        {
+            std::shared_lock<std::shared_mutex> lock(engineMutex_);
+            auto tables = engine_.getAllTableNames();
+            rctx.tableCount = (int)tables.size();
+            std::string rlsJson = engine_.getRlsPoliciesJson();
+            for (auto& tbl : tables) {
+                if (rlsJson.find(tbl) != std::string::npos)
+                    rctx.tablesWithRls.push_back(tbl);
+            }
+        }
+        std::string report;
+        for (auto& ch : type) ch = (char)toupper((unsigned char)ch);
+        if (type == "DSGVO" || type == "GDPR")
+            report = CR::generateDSGVO(rctx);
+        else if (type == "GOBD")
+            report = CR::generateGoBD(rctx);
+        else if (type == "SOC2")
+            report = CR::generateSOC2(rctx);
+        else
+            return buildHttpResponse(400, R"({"error":"Unknown report type. Use: dsgvo, gobd, soc2"})");
+        return buildHttpResponse(200, report, "application/json");
+    }
+
+    // ── Phase 5.5: Isolated Tenants API ──────────────────────
+    if (req.path == "/api/isolated-tenants" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, milansql::IsolatedTenantManager::instance().listJson(), "application/json");
+    }
+    if (req.path == "/api/isolated-tenants" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string name    = extractJsonStr(req.body, "name");
+        std::string memory  = extractJsonStr(req.body, "memory");
+        std::string cpu     = extractJsonStr(req.body, "cpu");
+        std::string storage = extractJsonStr(req.body, "storage");
+        std::string config;
+        if (!memory.empty())  config += "MEMORY="  + memory  + ";";
+        if (!cpu.empty())     config += "CPU="     + cpu     + ";";
+        if (!storage.empty()) config += "STORAGE=" + storage + ";";
+        std::string msg = milansql::IsolatedTenantManager::instance().create(name, config);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path.rfind("/api/isolated-tenants/", 0) == 0 && req.method == "DELETE") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string name = req.path.substr(22);
+        std::string msg = milansql::IsolatedTenantManager::instance().drop(name);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+
+
+    // Plan string -> CloudPlan helper
+    auto strToPlan = [](const std::string& s) -> milansql::CloudPlan {
+        if (s == "starter")    return milansql::CloudPlan::STARTER;
+        if (s == "pro")        return milansql::CloudPlan::PRO;
+        if (s == "enterprise") return milansql::CloudPlan::ENTERPRISE;
+        return milansql::CloudPlan::FREE;
+    };
+
+    // ── Phase 6.1: Cloud Instance API ────────────────────────
+    // POST /cloud/instances — create new instance
+    if (req.path == "/cloud/instances" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string name   = extractJsonStr(req.body, "name");
+        std::string plan   = extractJsonStr(req.body, "plan");
+        std::string region = extractJsonStr(req.body, "region");
+        if (region.empty()) region = "eu-central-1";
+        if (plan.empty())   plan   = "free";
+        if (name.empty())   return buildHttpResponse(400, R"({"error":"name required"})");
+        auto inst = milansql::CloudInstanceManager::instance().create(
+            std::to_string(ctx.userId), name, strToPlan(plan), region);
+        std::string j = milansql::CloudInstanceManager::instance().instanceJson(inst.id);
+        return buildHttpResponse(201, j, "application/json");
+    }
+
+    // GET /cloud/instances — list instances for user
+    if (req.path == "/cloud/instances" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200,
+            milansql::CloudInstanceManager::instance().listJson(std::to_string(ctx.userId)),
+            "application/json");
+    }
+
+    // POST /cloud/instances/:id/pause|resume|resize (must come before GET :id)
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "POST") {
+        std::string rest = req.path.substr(17);
+        auto sl = rest.find('/');
+        std::string id     = (sl != std::string::npos) ? rest.substr(0, sl) : rest;
+        std::string action = (sl != std::string::npos) ? rest.substr(sl+1) : "";
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+
+        if (action == "pause") {
+            milansql::CloudInstanceManager::instance().pauseInstance(id);
+            return buildHttpResponse(200, R"({"message":"Instance paused","status":"paused"})", "application/json");
+        }
+        if (action == "resume") {
+            milansql::CloudInstanceManager::instance().resumeInstance(id);
+            return buildHttpResponse(200, R"({"message":"Instance resumed","status":"running"})", "application/json");
+        }
+        if (action == "resize") {
+            std::string newPlan = extractJsonStr(req.body, "plan");
+            milansql::CloudInstanceManager::instance().resizeInstance(id, strToPlan(newPlan));
+            return buildHttpResponse(200,
+                std::string(R"({"message":"Instance resized","plan":")") + newPlan + "\"}",
+                "application/json");
+        }
+    }
+
+    // GET /cloud/instances/:id
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string id = req.path.substr(17);
+        auto sl = id.find('/'); if (sl != std::string::npos) id = id.substr(0, sl);
+        std::string j = milansql::CloudInstanceManager::instance().instanceJson(id);
+        if (j.empty() || j == "null")
+            return buildHttpResponse(404, R"({"error":"Instance not found"})");
+        std::string usage = milansql::UsageMeter::instance().getUsageJson(id);
+        if (j.size() > 1 && j.back() == '}')
+            j = j.substr(0, j.size()-1) + ",\"usage\":" + usage + "}";
+        return buildHttpResponse(200, j, "application/json");
+    }
+
+    // DELETE /cloud/instances/:id
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "DELETE") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string id = req.path.substr(17);
+        auto sl = id.find('/'); if (sl != std::string::npos) id = id.substr(0, sl);
+        milansql::CloudInstanceManager::instance().deleteInstance(id);
+        return buildHttpResponse(200, R"({"message":"Instance deleted"})", "application/json");
+    }
+
+    // GET /cloud/instances/:id/replicas
+    if (req.path.rfind("/cloud/instances/", 0) == 0 &&
+        req.path.find("/replicas") != std::string::npos) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string rest = req.path.substr(17);
+        auto sl = rest.find('/');
+        std::string id = (sl != std::string::npos) ? rest.substr(0, sl) : rest;
+        if (req.method == "GET") {
+            return buildHttpResponse(200,
+                milansql::RegionManager::instance().listReplicasJson(id),
+                "application/json");
+        } else if (req.method == "POST") {
+            std::string region = extractJsonStr(req.body, "region");
+            milansql::RegionManager::instance().createReplica(id, region);
+            return buildHttpResponse(200,
+                std::string(R"({"message":"Replica creating in ")") + region + "\"}",
+                "application/json");
+        }
+    }
+
+    // ── Phase 6.2: Billing API ────────────────────────────────
+    if (req.path == "/cloud/billing/plans" && req.method == "GET") {
+        return buildHttpResponse(200,
+            milansql::BillingManager::instance().getAllPlansJson(),
+            "application/json");
+    }
+    if (req.path.rfind("/cloud/billing/usage", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string month;
+        auto q = req.path.find('?');
+        if (q != std::string::npos) {
+            std::string qs = req.path.substr(q+1);
+            auto eq = qs.find('=');
+            if (eq != std::string::npos) month = qs.substr(eq+1);
+        }
+        return buildHttpResponse(200,
+            milansql::BillingManager::instance().getBillingUsageJson(
+                std::to_string(ctx.userId), month),
+            "application/json");
+    }
+    if (req.path.rfind("/cloud/billing/invoices", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200,
+            milansql::BillingManager::instance().getInvoiceJson(
+                std::to_string(ctx.userId), ""),
+            "application/json");
+    }
+    if (req.path == "/cloud/billing/subscribe" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string plan = extractJsonStr(req.body, "plan");
+        std::string subId = milansql::BillingManager::instance().createSubscription(
+            std::to_string(ctx.userId), strToPlan(plan));
+        return buildHttpResponse(200,
+                        std::string(R"JSONX({"subscription_id":")JSONX") + subId +
+                std::string(R"JSONX(","status":"active","plan":")JSONX") + plan +
+                std::string(R"JSONX("})JSONX"),
+            "application/json");
+    }
+
+    // ── Phase 6.3: Regions API ────────────────────────────────
+    if (req.path == "/cloud/regions" && req.method == "GET") {
+        return buildHttpResponse(200,
+            milansql::RegionManager::instance().listJson(),
+            "application/json");
+    }
+
+
+
+    // ── Phase 6.4: Cloud Dashboard HTML pages ────────────────
+
+    // GET /cloud — Cloud dashboard overview
+    if (req.path == "/cloud" && req.method == "GET") {
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:1200px;margin:0 auto;padding:2rem}
+h1{font-size:1.8rem;margin-bottom:.5rem}
+.subtitle{color:#64748b;margin-bottom:2rem}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.5rem;margin-bottom:2rem}
+.stat-card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1.5rem}
+.stat-card .label{font-size:.8rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem}
+.stat-card .value{font-size:2rem;font-weight:700;color:#38bdf8}
+.stat-card .sub{font-size:.8rem;color:#475569;margin-top:.25rem}
+.section-title{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:#cbd5e1}
+.instances-table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:.75rem;overflow:hidden;border:1px solid #334155}
+.instances-table th{background:#0f172a;padding:.75rem 1rem;text-align:left;font-size:.8rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em}
+.instances-table td{padding:.75rem 1rem;border-top:1px solid #1e293b;font-size:.9rem}
+.instances-table tr:hover td{background:#1e293b}
+.badge{display:inline-block;padding:.2rem .6rem;border-radius:9999px;font-size:.75rem;font-weight:600}
+.badge-running{background:#064e3b;color:#34d399}.badge-paused{background:#422006;color:#fb923c}
+.badge-free{background:#1e3a5f;color:#7dd3fc}.badge-starter{background:#3b0764;color:#c084fc}
+.badge-pro{background:#0c4a6e;color:#38bdf8}.badge-enterprise{background:#1a1a2e;color:#fbbf24}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1rem;border-radius:.5rem;font-size:.85rem;font-weight:600;text-decoration:none;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.btn-secondary{background:#1e293b;color:#94a3b8;border:1px solid #334155}.btn-secondary:hover{background:#334155;color:#e2e8f0}
+.actions{display:flex;gap:.5rem;align-items:center;justify-content:flex-end;margin-bottom:1.5rem}
+.empty-state{text-align:center;padding:3rem;color:#475569}
+.empty-state h3{margin-bottom:.5rem;color:#64748b}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <h1>Cloud Dashboard</h1>
+  <p class="subtitle">Manage your MilanSQL cloud instances</p>
+
+  <div class="stats-grid" id="stats">
+    <div class="stat-card"><div class="label">Total Instances</div><div class="value" id="total-inst">—</div><div class="sub">across all plans</div></div>
+    <div class="stat-card"><div class="label">Running</div><div class="value" id="running-inst">—</div><div class="sub">active instances</div></div>
+    <div class="stat-card"><div class="label">Active Region</div><div class="value" id="region">eu-central-1</div><div class="sub">Frankfurt, Germany</div></div>
+    <div class="stat-card"><div class="label">Uptime SLA</div><div class="value">99.9%</div><div class="sub">guaranteed</div></div>
+  </div>
+
+  <div class="actions">
+    <a href="/cloud/new" class="btn btn-primary">+ New Instance</a>
+    <a href="/cloud/billing" class="btn btn-secondary">Billing</a>
+  </div>
+
+  <div class="section-title">Your Instances</div>
+  <table class="instances-table" id="inst-table">
+    <thead><tr>
+      <th>Name</th><th>Plan</th><th>Region</th><th>Status</th><th>Created</th><th>Actions</th>
+    </tr></thead>
+    <tbody id="inst-tbody"><tr><td colspan="6" style="text-align:center;padding:2rem;color:#475569">Loading…</td></tr></tbody>
+  </table>
+</div>
+<script>
+const planBadge=(p)=>`<span class="badge badge-${p}">${p}</span>`;
+const statusBadge=(s)=>`<span class="badge badge-${s}">${s}</span>`;
+async function load(){
+  try{
+    const r=await fetch('/cloud/instances',{headers:{'Authorization':'Bearer '+localStorage.getItem('msql_token')||''}});
+    const d=await r.json();
+    const insts=d.instances||d||[];
+    document.getElementById('total-inst').textContent=insts.length;
+    document.getElementById('running-inst').textContent=insts.filter(i=>i.status==='running').length;
+    const tb=document.getElementById('inst-tbody');
+    if(!insts.length){tb.innerHTML='<tr><td colspan="6"><div class="empty-state"><h3>No instances yet</h3><p>Create your first cloud database</p></div></td></tr>';return;}
+    tb.innerHTML=insts.map(i=>`<tr>
+      <td><strong>${i.name||i.id}</strong><br><small style="color:#475569">${i.id}</small></td>
+      <td>${planBadge(i.plan||'free')}</td>
+      <td>${i.region||'eu-central-1'}</td>
+      <td>${statusBadge(i.status||'running')}</td>
+      <td>${(i.created_at||i.createdAt||'').slice(0,10)}</td>
+      <td><a href="/cloud/instances/${i.id}" class="btn btn-secondary" style="font-size:.75rem">Manage</a></td>
+    </tr>`).join('');
+  }catch(e){document.getElementById('inst-tbody').innerHTML='<tr><td colspan="6" style="text-align:center;color:#ef4444">Failed to load instances</td></tr>';}
+}
+load();
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
+    }
+
+    // GET /cloud/new — Create new instance form
+    if (req.path == "/cloud/new" && req.method == "GET") {
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — New Instance</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:700px;margin:3rem auto;padding:0 2rem}
+h1{font-size:1.8rem;margin-bottom:.5rem}
+.subtitle{color:#64748b;margin-bottom:2rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:2rem;margin-bottom:1.5rem}
+.form-group{margin-bottom:1.5rem}
+label{display:block;font-size:.85rem;font-weight:600;color:#94a3b8;margin-bottom:.5rem;text-transform:uppercase;letter-spacing:.05em}
+input,select{width:100%;background:#0f172a;border:1px solid #334155;border-radius:.5rem;padding:.75rem 1rem;color:#e2e8f0;font-size:.95rem}
+input:focus,select:focus{outline:none;border-color:#38bdf8}
+.plan-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}
+.plan-card{border:2px solid #334155;border-radius:.75rem;padding:1rem;cursor:pointer;transition:all .2s;position:relative}
+.plan-card:hover{border-color:#38bdf8}.plan-card.selected{border-color:#0ea5e9;background:#0c1e33}
+.plan-card h3{font-size:.95rem;margin-bottom:.25rem}
+.plan-card .price{font-size:1.5rem;font-weight:700;color:#38bdf8}
+.plan-card .price span{font-size:.8rem;color:#64748b;font-weight:400}
+.plan-card ul{margin-top:.75rem;list-style:none}
+.plan-card ul li{font-size:.8rem;color:#64748b;padding:.15rem 0}
+.plan-card ul li::before{content:"✓ ";color:#34d399}
+.plan-card input[type=radio]{position:absolute;opacity:0}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.75rem 1.5rem;border-radius:.5rem;font-size:.95rem;font-weight:600;cursor:pointer;border:none;transition:all .2s;width:100%;justify-content:center}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.alert{padding:1rem;border-radius:.5rem;margin-bottom:1rem;display:none}
+.alert-success{background:#064e3b;color:#34d399;border:1px solid #065f46}
+.alert-error{background:#450a0a;color:#f87171;border:1px solid #7f1d1d}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <h1>New Instance</h1>
+  <p class="subtitle">Launch a managed MilanSQL database in seconds</p>
+
+  <div id="alert" class="alert"></div>
+
+  <div class="card">
+    <div class="form-group">
+      <label>Instance Name</label>
+      <input type="text" id="name" placeholder="my-database" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label>Region</label>
+      <select id="region">
+        <option value="eu-central-1">eu-central-1 — Frankfurt, Germany (Active)</option>
+        <option value="eu-west-1" disabled>eu-west-1 — Ireland (Coming Soon)</option>
+        <option value="us-east-1" disabled>us-east-1 — N. Virginia (Coming Soon)</option>
+        <option value="ap-southeast-1" disabled>ap-southeast-1 — Singapore (Coming Soon)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Plan</label>
+      <div class="plan-grid" id="plan-grid">
+        <label class="plan-card selected" onclick="selectPlan('free',this)">
+          <input type="radio" name="plan" value="free" checked>
+          <h3>Free</h3>
+          <div class="price">€0<span>/month</span></div>
+          <ul><li>500 MB storage</li><li>100 queries/day</li><li>1 instance</li></ul>
+        </label>
+        <label class="plan-card" onclick="selectPlan('starter',this)">
+          <input type="radio" name="plan" value="starter">
+          <h3>Starter</h3>
+          <div class="price">€9<span>/month</span></div>
+          <ul><li>5 GB storage</li><li>Unlimited queries</li><li>3 instances</li></ul>
+        </label>
+        <label class="plan-card" onclick="selectPlan('pro',this)">
+          <input type="radio" name="plan" value="pro">
+          <h3>Pro</h3>
+          <div class="price">€49<span>/month</span></div>
+          <ul><li>50 GB storage</li><li>Unlimited queries</li><li>10 instances</li></ul>
+        </label>
+        <label class="plan-card" onclick="selectPlan('enterprise',this)">
+          <input type="radio" name="plan" value="enterprise">
+          <h3>Enterprise</h3>
+          <div class="price">Custom</div>
+          <ul><li>Unlimited storage</li><li>Dedicated cluster</li><li>SLA 99.99%</li></ul>
+        </label>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="createInstance()">Launch Instance</button>
+  </div>
+</div>
+<script>
+let selectedPlan='free';
+function selectPlan(p,el){
+  selectedPlan=p;
+  document.querySelectorAll('.plan-card').forEach(c=>c.classList.remove('selected'));
+  el.classList.add('selected');
+}
+async function createInstance(){
+  const name=document.getElementById('name').value.trim();
+  const region=document.getElementById('region').value;
+  const al=document.getElementById('alert');
+  if(!name){al.style.display='block';al.className='alert alert-error';al.textContent='Instance name is required';return;}
+  try{
+    const r=await fetch('/cloud/instances',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+localStorage.getItem('msql_token')||''},body:JSON.stringify({name,plan:selectedPlan,region})});
+    const d=await r.json();
+    if(r.ok){
+      al.style.display='block';al.className='alert alert-success';
+      al.innerHTML='Instance created! <strong>API Key: '+d.api_key_plain+'</strong> — save this, it won\'t be shown again.';
+      setTimeout(()=>window.location='/cloud',3000);
+    }else{al.style.display='block';al.className='alert alert-error';al.textContent=d.error||'Failed to create instance';}
+  }catch(e){al.style.display='block';al.className='alert alert-error';al.textContent='Network error';}
+}
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
+    }
+
+    // GET /cloud/billing — Billing dashboard
+    if (req.path == "/cloud/billing" && req.method == "GET") {
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — Billing</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:1000px;margin:0 auto;padding:2rem}
+h1{font-size:1.8rem;margin-bottom:.5rem}
+.subtitle{color:#64748b;margin-bottom:2rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1.5rem}
+.card h2{font-size:1rem;color:#94a3b8;margin-bottom:1rem}
+.amount{font-size:2.5rem;font-weight:700;color:#38bdf8}
+.amount span{font-size:1rem;color:#64748b}
+.usage-bar{background:#0f172a;border-radius:9999px;height:.5rem;margin:.5rem 0}
+.usage-bar .fill{background:linear-gradient(90deg,#0ea5e9,#38bdf8);border-radius:9999px;height:100%;transition:width .5s}
+.usage-row{display:flex;justify-content:space-between;font-size:.85rem;color:#64748b;margin-bottom:.25rem}
+.plans-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem}
+.plan-card{border:1px solid #334155;border-radius:.75rem;padding:1rem;text-align:center}
+.plan-card.active{border-color:#0ea5e9;background:#0c1e33}
+.plan-card h3{font-size:.95rem;margin-bottom:.5rem}
+.plan-card .price{font-size:1.75rem;font-weight:700;color:#38bdf8;margin-bottom:.5rem}
+.plan-card .price span{font-size:.8rem;color:#64748b;font-weight:400}
+.plan-card ul{list-style:none;font-size:.8rem;color:#64748b;text-align:left}
+.plan-card ul li{padding:.2rem 0}
+.plan-card ul li::before{content:"✓ ";color:#34d399}
+.btn{display:inline-flex;align-items:center;padding:.5rem 1rem;border-radius:.5rem;font-size:.85rem;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-decoration:none}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.btn-sm{padding:.35rem .75rem;font-size:.8rem}
+.invoices-table{width:100%;border-collapse:collapse}
+.invoices-table th{text-align:left;font-size:.8rem;color:#64748b;text-transform:uppercase;padding:.5rem;border-bottom:1px solid #334155}
+.invoices-table td{padding:.75rem .5rem;border-bottom:1px solid #1e293b;font-size:.9rem}
+.badge-paid{background:#064e3b;color:#34d399;display:inline-block;padding:.15rem .5rem;border-radius:9999px;font-size:.75rem}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <h1>Billing</h1>
+  <p class="subtitle">Manage your subscription and view invoices</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Current Month</h2>
+      <div class="amount" id="curr-amount">€0.00<span>/month</span></div>
+      <div style="margin-top:1rem">
+        <div class="usage-row"><span>Query Usage</span><span id="q-pct">0%</span></div>
+        <div class="usage-bar"><div class="fill" id="q-fill" style="width:0%"></div></div>
+        <div class="usage-row"><span>Storage</span><span id="s-pct">0%</span></div>
+        <div class="usage-bar"><div class="fill" id="s-fill" style="width:0%"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Current Plan</h2>
+      <div id="curr-plan" style="font-size:1.5rem;font-weight:700;color:#c084fc;margin-bottom:.5rem">Free</div>
+      <p style="font-size:.85rem;color:#64748b;margin-bottom:1rem">Change your plan anytime</p>
+      <a href="#plans" class="btn btn-primary btn-sm">Upgrade Plan</a>
+    </div>
+  </div>
+
+  <div id="plans">
+    <div class="card" style="margin-bottom:1.5rem">
+      <h2>Plans</h2>
+      <div class="plans-grid" id="plans-grid">Loading...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Invoices</h2>
+    <table class="invoices-table">
+      <thead><tr><th>Date</th><th>Amount</th><th>Status</th><th>Download</th></tr></thead>
+      <tbody id="inv-tbody"><tr><td colspan="4" style="color:#475569;padding:1rem 0">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+<script>
+async function loadBilling(){
+  const token='Bearer '+(localStorage.getItem('msql_token')||'');
+  // Load plans
+  try{
+    const r=await fetch('/cloud/billing/plans');
+    const d=await r.json();
+    const plans=d.plans||Object.values(d)||[];
+    const grid=document.getElementById('plans-grid');
+    grid.innerHTML=plans.map(p=>`
+      <div class="plan-card">
+        <h3>${p.name||p.id||'—'}</h3>
+        <div class="price">${p.price_monthly===0?'€0':(p.price_monthly?'€'+p.price_monthly:'Custom')}<span>/mo</span></div>
+        <ul>
+          ${p.storage_gb?'<li>'+p.storage_gb+' GB storage</li>':'<li>Unlimited storage</li>'}
+          ${p.queries_per_day?'<li>'+p.queries_per_day+' queries/day</li>':'<li>Unlimited queries</li>'}
+        </ul>
+        <button onclick="subscribe('${p.id||p.name||'free'}')" class="btn btn-primary btn-sm" style="margin-top:.75rem;width:100%;justify-content:center">Select</button>
+      </div>`).join('');
+  }catch(e){document.getElementById('plans-grid').textContent='Failed to load plans';}
+  // Load invoices
+  try{
+    const r=await fetch('/cloud/billing/invoices',{headers:{'Authorization':token}});
+    const d=await r.json();
+    const invs=d.invoices||[d]||[];
+    const tb=document.getElementById('inv-tbody');
+    if(!invs.length||!invs[0].month){tb.innerHTML='<tr><td colspan="4" style="color:#475569">No invoices yet</td></tr>';return;}
+    tb.innerHTML=invs.map(i=>`<tr>
+      <td>${i.month||'—'}</td>
+      <td>€${(i.total||0).toFixed(2)}</td>
+      <td><span class="badge-paid">Paid</span></td>
+      <td><a href="/cloud/billing/invoices?month=${i.month}" style="color:#38bdf8;font-size:.85rem">Download</a></td>
+    </tr>`).join('');
+  }catch(e){document.getElementById('inv-tbody').innerHTML='<tr><td colspan="4" style="color:#ef4444">Failed to load invoices</td></tr>';}
+}
+async function subscribe(plan){
+  const token='Bearer '+(localStorage.getItem('msql_token')||'');
+  try{
+    const r=await fetch('/cloud/billing/subscribe',{method:'POST',headers:{'Content-Type':'application/json','Authorization':token},body:JSON.stringify({plan})});
+    const d=await r.json();
+    alert('Subscribed to '+plan+' — ID: '+d.subscription_id);
+  }catch(e){alert('Failed to subscribe');}
+}
+loadBilling();
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
+    }
+
+    // GET /cloud/instances/:id — Instance detail page
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "GET" &&
+        req.path.find('/', 17) == std::string::npos) {
+        // Only handle simple /cloud/instances/:id (no sub-path) for HTML
+        std::string instId = req.path.substr(17);
+        // If looks like an API request (has Accept: application/json), handled above
+        // This serves the HTML page
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — Instance</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:900px;margin:0 auto;padding:2rem}
+.breadcrumb{font-size:.85rem;color:#475569;margin-bottom:1.5rem}
+.breadcrumb a{color:#38bdf8;text-decoration:none}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:2rem}
+h1{font-size:1.8rem}
+.badge{display:inline-block;padding:.25rem .75rem;border-radius:9999px;font-size:.8rem;font-weight:600}
+.badge-running{background:#064e3b;color:#34d399}.badge-paused{background:#422006;color:#fb923c}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1.5rem}
+.card h2{font-size:1rem;color:#94a3b8;margin-bottom:1rem}
+.info-row{display:flex;justify-content:space-between;padding:.5rem 0;border-bottom:1px solid #1e293b;font-size:.9rem}
+.info-row:last-child{border-bottom:none}
+.info-row .key{color:#64748b}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1rem;border-radius:.5rem;font-size:.85rem;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-decoration:none}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.btn-warning{background:#92400e;color:#fbbf24}.btn-warning:hover{background:#78350f}
+.btn-success{background:#065f46;color:#34d399}.btn-success:hover{background:#064e3b}
+.btn-danger{background:#7f1d1d;color:#f87171}.btn-danger:hover{background:#6b1c1c}
+.actions{display:flex;gap:.75rem;flex-wrap:wrap}
+.usage-bar{background:#0f172a;border-radius:9999px;height:.5rem;margin:.5rem 0}
+.usage-bar .fill{background:linear-gradient(90deg,#0ea5e9,#38bdf8);border-radius:9999px;height:100%}
+.usage-label{display:flex;justify-content:space-between;font-size:.8rem;color:#64748b}
+.conn-string{background:#0f172a;border:1px solid #334155;border-radius:.5rem;padding:.75rem 1rem;font-family:monospace;font-size:.85rem;color:#38bdf8;word-break:break-all;margin-top:.5rem}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <div class="breadcrumb"><a href="/cloud">Dashboard</a> / <span id="inst-name">Instance</span></div>
+  <div class="header">
+    <div>
+      <h1 id="inst-title">Loading…</h1>
+      <div style="margin-top:.5rem"><span id="status-badge" class="badge">—</span></div>
+    </div>
+    <div class="actions" id="action-btns"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Instance Details</h2>
+      <div id="details">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Usage</h2>
+      <div id="usage">Loading…</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:1.5rem">
+    <h2>Connection String</h2>
+    <p style="font-size:.85rem;color:#64748b;margin-bottom:.5rem">Use this API key to connect:</p>
+    <div class="conn-string" id="conn-str">Loading…</div>
+  </div>
+
+  <div class="card">
+    <h2>Danger Zone</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <div style="font-weight:600;margin-bottom:.25rem">Delete Instance</div>
+        <div style="font-size:.85rem;color:#64748b">Permanently delete this instance and all its data</div>
+      </div>
+      <button class="btn btn-danger" onclick="deleteInstance()">Delete Instance</button>
+    </div>
+  </div>
+</div>
+<script>
+const id=location.pathname.split('/').pop();
+const token='Bearer '+(localStorage.getItem('msql_token')||'');
+let inst={};
+async function load(){
+  try{
+    const r=await fetch('/cloud/instances/'+id,{headers:{'Authorization':token,'Accept':'application/json'}});
+    const d=await r.json();
+    inst=d;
+    document.getElementById('inst-name').textContent=d.name||id;
+    document.getElementById('inst-title').textContent=d.name||id;
+    const sb=document.getElementById('status-badge');
+    sb.textContent=d.status||'running';sb.className='badge badge-'+(d.status||'running');
+    document.getElementById('details').innerHTML=[
+      ['ID',d.id],['Plan',d.plan||'free'],['Region',d.region||'eu-central-1'],
+      ['Created',(d.created_at||d.createdAt||'').slice(0,10)]
+    ].map(([k,v])=>`<div class="info-row"><span class="key">${k}</span><span>${v||'—'}</span></div>`).join('');
+    const u=d.usage||{};
+    const qpct=Math.min(100,Math.round((u.queryCountDaily||0)/100));
+    const spct=Math.min(100,Math.round((u.storageBytes||0)/(500*1024*1024)*100));
+    document.getElementById('usage').innerHTML=`
+      <div class="usage-label"><span>Queries today</span><span>${u.queryCountDaily||0}/100</span></div>
+      <div class="usage-bar"><div class="fill" style="width:${qpct}%"></div></div>
+      <div class="usage-label" style="margin-top:.5rem"><span>Storage</span><span>${((u.storageBytes||0)/1024/1024).toFixed(1)} MB / 500 MB</span></div>
+      <div class="usage-bar"><div class="fill" style="width:${spct}%"></div></div>`;
+    document.getElementById('conn-str').textContent='msql://'+id+'.cloud.milansql.com:5432/default?key=<your-api-key>';
+    const btns=document.getElementById('action-btns');
+    if(d.status==='running'){
+      btns.innerHTML='<button class="btn btn-warning" onclick="pauseInst()">Pause</button>';
+    }else{
+      btns.innerHTML='<button class="btn btn-success" onclick="resumeInst()">Resume</button>';
+    }
+    btns.innerHTML+='<button class="btn btn-primary" onclick="showResize()">Resize</button>';
+  }catch(e){document.getElementById('inst-title').textContent='Instance not found';}
+}
+async function pauseInst(){if(confirm('Pause instance?')){await fetch('/cloud/instances/'+id+'/pause',{method:'POST',headers:{'Authorization':token}});load();}}
+async function resumeInst(){await fetch('/cloud/instances/'+id+'/resume',{method:'POST',headers:{'Authorization':token}});load();}
+async function showResize(){
+  const plan=prompt('New plan (free/starter/pro/enterprise):');
+  if(plan){await fetch('/cloud/instances/'+id+'/resize',{method:'POST',headers:{'Content-Type':'application/json','Authorization':token},body:JSON.stringify({plan})});load();}
+}
+async function deleteInstance(){
+  if(confirm('Delete this instance permanently? This cannot be undone.')){
+    await fetch('/cloud/instances/'+id,{method:'DELETE',headers:{'Authorization':token}});
+    window.location='/cloud';
+  }
+}
+load();
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
     }
 
     return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");

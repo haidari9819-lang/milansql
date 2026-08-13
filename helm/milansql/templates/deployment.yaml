@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "milansql.fullname" . }}
+  labels:
+    {{- include "milansql.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "milansql.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "milansql.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: milansql
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.port }}
+          env:
+            - name: DB_ROOT_PW
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "milansql.fullname" . }}-secret
+                  key: root-password
+          args:
+            - --port
+            - "{{ .Values.config.port }}"
+            - --data-dir
+            - /var/lib/milansql
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/milansql
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "milansql.fullname" . }}-pvc
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

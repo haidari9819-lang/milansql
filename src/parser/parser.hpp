@@ -387,6 +387,39 @@ enum class CommandType {
     SHOW_SERVERLESS_STATUS,
     ENABLE_SERVERLESS,
     DISABLE_SERVERLESS,
+    // Phase 5.2: Advanced Audit Trail
+    VERIFY_AUDIT_LOG,
+    EXPORT_AUDIT_LOG,
+    SHOW_AUDIT_LOG_ENHANCED,
+    // Phase 5.1: Encryption at Rest
+    ENABLE_ENCRYPTION,
+    DISABLE_ENCRYPTION,
+    SHOW_ENCRYPTION_STATUS,
+    ROTATE_ENCRYPTION_KEY,
+    // Phase 5.3: IP Allowlisting + mTLS
+    SET_ALLOWED_IPS,
+    SHOW_ALLOWED_IPS,
+    REMOVE_ALLOWED_IPS,
+    ENABLE_MTLS,
+    DISABLE_MTLS,
+    SHOW_MTLS_STATUS,
+    // Phase 5.4: Compliance Reports
+    GENERATE_COMPLIANCE_REPORT,
+    // Phase 5.5: Dedicated Tenant Isolation
+    CREATE_ISOLATED_TENANT,
+    DROP_ISOLATED_TENANT,
+    SHOW_ISOLATED_TENANTS,
+    // Phase 6.1: Cloud Instances
+    SHOW_CLOUD_INSTANCES,
+    SHOW_CLOUD_INSTANCE,
+    // Phase 6.2: Usage / Billing
+    SHOW_CLOUD_USAGE,
+    SHOW_CLOUD_BILLING,
+    SHOW_CLOUD_LIMITS,
+    // Phase 6.3: Regions / Replicas
+    SHOW_REGIONS,
+    CREATE_CLOUD_REPLICA,
+    SET_READ_REGION,
     UNKNOWN
 };
 
@@ -3124,6 +3157,28 @@ public:
             } else if (kw1 == "ALLOWED" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "HOSTS") {
                 cmd.type = CommandType::SHOW_ALLOWED_HOSTS;
+            } else if (kw1 == "ALLOWED_IPS") {
+                // SHOW ALLOWED_IPS FOR USER xxx
+                cmd.type = CommandType::SHOW_ALLOWED_IPS;
+                for (size_t i = 3; i < tokens.size(); ++i)
+                    if (toUpper(tokens[i]) == "USER" && i+1 < tokens.size()) {
+                        cmd.tableName = tokens[i+1]; break;
+                    }
+            } else if (kw1 == "ENCRYPTION") {
+                cmd.type = CommandType::SHOW_ENCRYPTION_STATUS;
+            } else if (kw1 == "MTLS") {
+                cmd.type = CommandType::SHOW_MTLS_STATUS;
+            } else if (kw1 == "ISOLATED") {
+                cmd.type = CommandType::SHOW_ISOLATED_TENANTS;
+            } else if (kw1 == "CLOUD") {
+                // SHOW CLOUD USAGE / BILLING / LIMITS / INSTANCES
+                std::string kw2 = (tokens.size() > 2) ? toUpper(tokens[2]) : "";
+                if (kw2 == "USAGE")     cmd.type = CommandType::SHOW_CLOUD_USAGE;
+                else if (kw2 == "BILLING") cmd.type = CommandType::SHOW_CLOUD_BILLING;
+                else if (kw2 == "LIMITS")  cmd.type = CommandType::SHOW_CLOUD_LIMITS;
+                else                       cmd.type = CommandType::SHOW_CLOUD_INSTANCES;
+            } else if (kw1 == "REGIONS") {
+                cmd.type = CommandType::SHOW_REGIONS;
             // Phase 146: SHOW SCHEMA VERSION
             } else if (kw1 == "SCHEMA" && tokens.size() >= 3 &&
                        toUpper(tokens[2]) == "VERSION") {
@@ -3752,6 +3807,12 @@ public:
         // ── Phase 125: SET ROUTING = AUTO/MASTER/SLAVE ───────────────
         // ── Phase 126: SET OPTIMIZER_TRACE = ON/OFF ──────────────────
         // Generic SET varName = varValue  (also handles = inside token)
+        // Phase 6.3: SET READ_REGION = 'eu-west-1'
+        } else if (kw0 == "SET" && kw1 == "READ_REGION") {
+            cmd.type = CommandType::SET_READ_REGION;
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (tokens[i] == "=" && i+1 < tokens.size())
+                    cmd.setValue = tokens[i+1];
         } else if (kw0 == "SET" && tokens.size() >= 2) {
             // tokens[1] may be "ROUTING" and tokens[2] "=" tokens[3] "AUTO"
             // or tokens[1] may be "ROUTING=AUTO" (all in one)
@@ -4793,6 +4854,15 @@ public:
                 }
                 cmd.setValue = sql;
             }
+        // Phase 5.3: SET ALLOWED_IPS FOR USER xxx = '...'
+        } else if (kw0 == "SET" && kw1 == "ALLOWED_IPS") {
+            cmd.type = CommandType::SET_ALLOWED_IPS;
+            for (size_t i = 2; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "USER" && i+1 < tokens.size())
+                    cmd.tableName = tokens[i+1];
+                if (tokens[i] == "=" && i+1 < tokens.size())
+                    cmd.setValue = tokens[i+1];
+            }
         // Phase 4.2: MIGRATE UP [n] / DOWN [n] / STATUS / RESET
         } else if (kw0 == "MIGRATE") {
             std::string sub = (tokens.size() > 1) ? toUpper(tokens[1]) : "";
@@ -4809,6 +4879,71 @@ public:
             } else {
                 cmd.type = CommandType::MIGRATE_STATUS;  // default
             }
+        // ── Phase 5.2: VERIFY/EXPORT AUDIT LOG ────────────────────
+        } else if (kw0 == "VERIFY" && kw1 == "AUDIT") {
+            cmd.type = CommandType::VERIFY_AUDIT_LOG;
+        } else if (kw0 == "EXPORT" && kw1 == "AUDIT") {
+            cmd.type = CommandType::EXPORT_AUDIT_LOG;
+            // EXPORT AUDIT LOG TO '/path'
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "TO" && i+1 < tokens.size()) {
+                    cmd.tableName = tokens[i+1]; break;
+                }
+        // ── Phase 5.1: Encryption ──────────────────────────────────
+        } else if (kw0 == "ENABLE" && kw1 == "ENCRYPTION") {
+            cmd.type = CommandType::ENABLE_ENCRYPTION;
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "KEY" && i+1 < tokens.size()) {
+                    cmd.setValue = tokens[i+1]; break;
+                }
+        } else if (kw0 == "DISABLE" && kw1 == "ENCRYPTION") {
+            cmd.type = CommandType::DISABLE_ENCRYPTION;
+        } else if (kw0 == "ROTATE" && kw1 == "ENCRYPTION") {
+            cmd.type = CommandType::ROTATE_ENCRYPTION_KEY;
+            // ROTATE ENCRYPTION KEY 'new-key'
+            if (tokens.size() >= 4) cmd.setValue = tokens[3];
+        } else if (kw0 == "ENABLE" && kw1 == "MTLS") {
+            // ── Phase 5.3: mTLS ───────────────────────────────────────
+            cmd.type = CommandType::ENABLE_MTLS;
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "CA" && i+1 < tokens.size()) {
+                    cmd.setValue = tokens[i+1]; break;
+                }
+        } else if (kw0 == "DISABLE" && kw1 == "MTLS") {
+            cmd.type = CommandType::DISABLE_MTLS;
+        } else if (kw0 == "GENERATE" && kw1 == "COMPLIANCE") {
+            // ── Phase 5.4: Compliance ─────────────────────────────────
+            cmd.type = CommandType::GENERATE_COMPLIANCE_REPORT;
+            if (tokens.size() >= 3) cmd.setValue = toUpper(tokens[2]); // DSGVO/GOBD/SOC2
+        } else if (kw0 == "REMOVE" && kw1 == "ALLOWED_IPS") {
+            // ── Phase 5.3: IP Allowlisting ────────────────────────────
+            cmd.type = CommandType::REMOVE_ALLOWED_IPS;
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "USER" && i+1 < tokens.size()) {
+                    cmd.tableName = tokens[i+1]; break;
+                }
+        } else if (kw0 == "CREATE" && kw1 == "REPLICA") {
+            cmd.type = CommandType::CREATE_CLOUD_REPLICA;
+            // CREATE REPLICA IN REGION 'eu-west-1'
+            for (size_t i = 2; i < tokens.size(); ++i)
+                if (toUpper(tokens[i]) == "REGION" && i+1 < tokens.size())
+                    cmd.setValue = tokens[i+1];
+        } else if (kw0 == "CREATE" && kw1 == "ISOLATED") {
+            // ── Phase 5.5: Isolated Tenants ───────────────────────────
+            cmd.type = CommandType::CREATE_ISOLATED_TENANT;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+            for (size_t i = 3; i < tokens.size(); ++i) {
+                if (toUpper(tokens[i]) == "MEMORY" && i+1 < tokens.size())
+                    cmd.setValue += "MEMORY=" + tokens[i+1] + ";";
+                if (toUpper(tokens[i]) == "CPU" && i+1 < tokens.size())
+                    cmd.setValue += "CPU=" + tokens[i+1] + ";";
+                if (toUpper(tokens[i]) == "STORAGE" && i+1 < tokens.size())
+                    cmd.setValue += "STORAGE=" + tokens[i+1] + ";";
+            }
+        } else if (kw0 == "DROP" && kw1 == "ISOLATED") {
+            cmd.type = CommandType::DROP_ISOLATED_TENANT;
+            if (tokens.size() >= 3) cmd.tableName = tokens[2];
+        // APPLY MIGRATION name
         // APPLY MIGRATION name
         } else if (kw0 == "APPLY" && kw1 == "MIGRATION") {
             cmd.type = CommandType::APPLY_MIGRATION;

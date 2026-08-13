@@ -1,0 +1,14 @@
+apiVersion: v2
+name: milansql
+description: MilanSQL Cloud — Managed SQL Database as a Service
+type: application
+version: 12.0.0
+appVersion: "12.0.0"
+keywords:
+  - database
+  - sql
+  - cloud
+home: https://milansql.com
+maintainers:
+  - name: MilanSQL Team
+    email: support@milansql.com

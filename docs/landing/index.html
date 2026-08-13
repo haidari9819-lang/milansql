@@ -197,7 +197,7 @@ pre{padding:20px 22px;overflow-x:auto;font-family:var(--font-mono);font-size:0.8
 .os-tagline strong{color:var(--accent)}
 
 /* ── Pricing ── */
-.pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;max-width:960px;margin:48px auto 0}
+.pricing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:24px;max-width:740px;margin:52px auto 0}
 .price-card{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:34px;text-align:left;transition:all .2s var(--ease)}
 .price-card:hover{box-shadow:var(--glow-card)}
 .price-card.featured{border-color:var(--accent-2);position:relative;box-shadow:var(--glow-purple)}
@@ -236,7 +236,6 @@ footer::before{content:"";position:absolute;top:-1px;left:0;height:1px;width:100
     <a href="#performance">Performance</a>
     <a href="#code">Docs</a>
     <a href="#pricing">Pricing</a>
-    <a href="/cloud">Cloud</a>
     <a href="/webui#register" class="btn btn-primary" style="padding:8px 18px;font-size:0.85rem">Start Free &#x2192;</a>
   </div>
 </nav>
@@ -395,7 +394,7 @@ footer::before{content:"";position:absolute;top:-1px;left:0;height:1px;width:100
     <textarea id="demo-sql" spellcheck="false">SELECT name, price, category FROM demo_products WHERE price > 100 ORDER BY price DESC</textarea>
     <div class="demo-run-row">
       <button class="btn btn-primary" id="demo-run" style="padding:8px 22px;font-size:0.85rem">&#x25B6; Run Query</button>
-      <span class="demo-hint">Running on MilanSQL v<span class="ms-version">12.0.0</span> &middot; Frankfurt, Germany</span>
+      <span class="demo-hint">Running on MilanSQL v<span class="ms-version">10.7.0</span> &middot; Frankfurt, Germany</span>
     </div>
     <div class="demo-status" id="demo-status"></div>
     <div id="demo-result"></div>
@@ -459,121 +458,39 @@ mysql -h milansql.de -P <span class="c-num">4407</span> -u alice -p
 <!-- PRICING -->
 <section id="pricing" style="text-align:center">
   <div class="reveal">
-    <div class="eyebrow">Cloud Pricing</div>
+    <div class="eyebrow">Pricing</div>
     <h2>Simple, transparent pricing</h2>
-    <p class="muted" style="margin-top:12px">Start for free. No credit card required. Upgrade when you grow.</p>
+    <p class="muted" style="margin-top:12px">Start for free. Upgrade when you grow.</p>
   </div>
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;max-width:960px;margin:48px auto 0">
-
-    <div class="price-card reveal" style="position:relative">
+  <div class="pricing-grid">
+    <div class="price-card reveal">
       <div class="price-name">Free</div>
       <div class="price-amount">&euro;0</div>
       <div class="price-period">forever</div>
       <ul class="price-features">
-        <li>1 Cloud Instance</li>
-        <li>500 MB Storage</li>
-        <li>100 Queries / day</li>
+        <li>1 Database</li>
+        <li>100MB Storage</li>
         <li>REST + MySQL API</li>
         <li>Row-Level Security</li>
         <li>Community Support</li>
       </ul>
-      <a href="/cloud/new" class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:26px">Launch Free</a>
+      <a href="/webui#register" class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:26px">Get Started</a>
     </div>
-
-    <div class="price-card reveal" style="position:relative">
-      <div class="price-name">Starter</div>
+    <div class="price-card featured reveal">
+      <div class="price-badge">Coming Soon</div>
+      <div class="price-name">Pro</div>
       <div class="price-amount">&euro;9</div>
       <div class="price-period">per month</div>
       <ul class="price-features">
-        <li>3 Cloud Instances</li>
-        <li>5 GB Storage</li>
-        <li>Unlimited Queries</li>
+        <li>10 Databases</li>
+        <li>10GB Storage</li>
+        <li>All APIs + GraphQL</li>
         <li>Daily Backups</li>
-        <li>Email Support</li>
-        <li>Usage Analytics</li>
-      </ul>
-      <a href="/cloud/new" class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:26px">Get Started</a>
-    </div>
-
-    <div class="price-card featured reveal" style="position:relative">
-      <div class="price-badge">Most Popular</div>
-      <div class="price-name">Pro</div>
-      <div class="price-amount">&euro;49</div>
-      <div class="price-period">per month</div>
-      <ul class="price-features">
-        <li>10 Cloud Instances</li>
-        <li>50 GB Storage</li>
-        <li>Unlimited Queries</li>
-        <li>Multi-Region Replicas</li>
         <li>Priority Support</li>
-        <li>SLA 99.9%</li>
       </ul>
-      <a href="/cloud/new" class="btn btn-outline" style="width:100%;justify-content:center;margin-top:26px">Start Pro</a>
+      <button class="btn btn-outline" style="width:100%;justify-content:center;margin-top:26px;cursor:not-allowed;opacity:0.5">Notify Me</button>
     </div>
-
-    <div class="price-card reveal" style="position:relative;background:linear-gradient(135deg,#1e293b,#0f172a);border-color:#334155">
-      <div class="price-name" style="color:#fbbf24">Enterprise</div>
-      <div class="price-amount" style="font-size:2rem;color:#fbbf24">Custom</div>
-      <div class="price-period">tailored pricing</div>
-      <ul class="price-features">
-        <li>Unlimited Instances</li>
-        <li>Unlimited Storage</li>
-        <li>Dedicated Cluster</li>
-        <li>mTLS + IP Allowlist</li>
-        <li>Compliance Reports</li>
-        <li>SLA 99.99%</li>
-      </ul>
-      <a href="mailto:enterprise@milansql.com" class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:26px;color:#fbbf24;border-color:#fbbf24">Contact Sales</a>
-    </div>
-
   </div>
-
-  <!-- Regions -->
-  <div class="reveal" style="margin-top:80px">
-    <div class="eyebrow">Global Infrastructure</div>
-    <h2>Regions</h2>
-    <p class="muted" style="margin-top:12px">Your data, close to your users.</p>
-  </div>
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;max-width:900px;margin:40px auto 0">
-
-    <div style="background:var(--bg-card);border:1px solid var(--accent);border-radius:12px;padding:20px;text-align:left">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-        <span style="width:8px;height:8px;background:#34d399;border-radius:50%;display:inline-block"></span>
-        <span style="font-weight:700;font-size:.9rem">eu-central-1</span>
-      </div>
-      <div style="font-size:.8rem;color:var(--text-2)">Frankfurt, Germany</div>
-      <div style="font-size:.75rem;color:#34d399;margin-top:6px">&#x2714; Active &mdash; ~5ms</div>
-    </div>
-
-    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:left;opacity:.7">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-        <span style="width:8px;height:8px;background:#f59e0b;border-radius:50%;display:inline-block"></span>
-        <span style="font-weight:700;font-size:.9rem">eu-west-1</span>
-      </div>
-      <div style="font-size:.8rem;color:var(--text-2)">Dublin, Ireland</div>
-      <div style="font-size:.75rem;color:#f59e0b;margin-top:6px">&#x23F3; Coming Q3 2026</div>
-    </div>
-
-    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:left;opacity:.7">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-        <span style="width:8px;height:8px;background:#f59e0b;border-radius:50%;display:inline-block"></span>
-        <span style="font-weight:700;font-size:.9rem">us-east-1</span>
-      </div>
-      <div style="font-size:.8rem;color:var(--text-2)">N. Virginia, USA</div>
-      <div style="font-size:.75rem;color:#f59e0b;margin-top:6px">&#x23F3; Coming Q4 2026</div>
-    </div>
-
-    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px;text-align:left;opacity:.7">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-        <span style="width:8px;height:8px;background:#f59e0b;border-radius:50%;display:inline-block"></span>
-        <span style="font-weight:700;font-size:.9rem">ap-southeast-1</span>
-      </div>
-      <div style="font-size:.8rem;color:var(--text-2)">Singapore</div>
-      <div style="font-size:.75rem;color:#f59e0b;margin-top:6px">&#x23F3; Coming Q1 2027</div>
-    </div>
-
-  </div>
-
 </section>
 
 <!-- FOOTER -->

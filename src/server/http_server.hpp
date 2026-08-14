@@ -79,7 +79,7 @@ static constexpr int MILANSQL_TEST_COUNT = 2046;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "12.0.3";
+static constexpr const char* MILANSQL_VERSION = "12.0.5";
 
 // ── JSON helpers ──────────────────────────────────────────────
 

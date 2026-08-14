@@ -849,6 +849,9 @@ inline void MilanHttpServer::initEngine() {
                   << "\n  Starte mit leerer Datenbank.\n";
     }
 
+    // Phase 3.1 v12.0.3: Wire BranchManager to storage + engine for file-based isolation
+    milansql::BranchManager::global().init(&storage_, &engine_, storage_.filepath());
+
     engine_.loadUsers(dbPath_ + ".users");
 
     // Load triggers

@@ -8189,6 +8189,9 @@ public:
     // ── Phase 86: Table map accessor for statistics ───────────
     const std::map<std::string, Table>& getTables() const { return tables_; }
 
+    // Phase 3.1 v12.0.3: Clear all tables for branch reload
+    void clearAllTables() { tables_.clear(); }
+
 
     // ── Phase 36: EXPLAIN ─────────────────────────────────────
     ExplainPlan buildExplain(const ExplainRequest& req) const {

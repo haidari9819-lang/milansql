@@ -2,6 +2,36 @@
 
 All notable changes to MilanSQL are documented here.
 
+## [v12.0.3] — 2026-08-14 — "Real File-Based Branch Isolation"
+
+True git-style branching: each branch is an independent database file.
+
+### Fixed
+- **Branch isolation (CRITICAL)**: `CREATE BRANCH x FROM main` now copies
+  `database.milan` to `branches/x/database.milan`. `USE BRANCH x` saves the
+  current branch state, clears the engine, and reloads from the branch file.
+  Previously, all branches shared the same in-memory state (writes leaked
+  across branches).
+- **Engine-level query cache flushed on `USE BRANCH`**: the internal
+  `QueryCache` (used by the SQL dispatch layer) was not cleared on branch
+  switches, causing stale SELECTs from the previous branch to be returned
+  even after the engine was correctly reloaded. Now both `g_userQueryCache()`
+  (HTTP-layer) and `engine.getQueryCache()` (engine-layer) are cleared on
+  every `USE BRANCH` command.
+- **`MERGE BRANCH src INTO dst`**: Last-Write-Wins merge using temporary
+  storage objects; tables from `src` overwrite tables in `dst` file.
+- **`DROP BRANCH name`**: Removes the branch directory recursively.
+- **In-memory fallback**: Branch operations in test contexts (no `init()`)
+  use snapshot-based isolation so 2046 unit tests continue to pass.
+
+### Added
+- `MilanBinaryStorage::setPath()` / `filepath()` — runtime path switching
+  without reconstructing the storage object
+- `Engine::clearAllTables()` — hard reset of the in-memory table map for
+  branch reload
+- `BranchManager::init(storage, engine, mainPath)` — wires storage + engine
+  to the branch manager at server startup
+
 ## [v10.3.0] — 2026-07-06 — "Query Optimizer Phase 2: Cost Model"
 
 Unified cost model on top of the Phase-1 statistics.

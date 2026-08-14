@@ -1655,7 +1655,7 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     case milansql::CommandType::CREATE_BRANCH: {
         std::string err;
         bool ok = milansql::BranchManager::global().createBranch(
-            cmd.branchName, cmd.branchFrom, engine, err);
+            cmd.branchName, cmd.branchFrom, err, &engine);
         qr.columns.push_back(milansql::Column{"result","TEXT"});
         if (ok)
             qr.rows.push_back(milansql::Row({"Branch '" + cmd.branchName + "' created from '" + cmd.branchFrom + "'"}));
@@ -1676,13 +1676,15 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     }
 
     case milansql::CommandType::USE_BRANCH: {
+        std::string err;
+        bool ok = milansql::BranchManager::global().useBranch(cmd.branchName, err, &engine);
         qr.columns.push_back(milansql::Column{"result","TEXT"});
-        if (!milansql::BranchManager::global().hasBranch(cmd.branchName)) {
-            qr.error = "Branch '" + cmd.branchName + "' does not exist";
-        } else {
-            milansql::BranchManager::global().useBranch(cmd.branchName);
+        if (ok) {
+            milansql::g_userQueryCache().flush(); // branch switch invalidates cached data
+            engine.getQueryCache().clear();        // flush engine-level cache too
             qr.rows.push_back(milansql::Row({"Switched to branch '" + cmd.branchName + "'"}));
-        }
+        } else
+            qr.error = err;
         break;
     }
 
@@ -1698,7 +1700,7 @@ inline QueryResult dispatch(milansql::ParsedCommand cmd, milansql::Engine& engin
     case milansql::CommandType::MERGE_BRANCH: {
         std::string err;
         bool ok = milansql::BranchManager::global().mergeBranch(
-            cmd.branchName, cmd.branchTarget, engine, err);
+            cmd.branchName, cmd.branchTarget, err, &engine);
         qr.columns.push_back(milansql::Column{"result","TEXT"});
         if (ok)
             qr.rows.push_back(milansql::Row({"Branch '" + cmd.branchName + "' merged into '" + cmd.branchTarget + "'"}));

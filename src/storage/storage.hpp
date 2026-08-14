@@ -472,6 +472,9 @@ public:
     explicit MilanBinaryStorage(std::string path = "database.milan")
         : filepath_(std::move(path)) {}
 
+    void setPath(std::string path) { filepath_ = std::move(path); }
+    std::string filepath() const   { return filepath_; }
+
     std::string name() const override { return "MilanBinaryStorage v1"; }
 
     // ── Schreiben ─────────────────────────────────────────────

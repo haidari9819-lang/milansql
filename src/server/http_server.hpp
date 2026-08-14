@@ -6098,7 +6098,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict; Secure\r\n";
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax\r\n";
             return buildHttpResponse(200, result, "application/json", cookie);
         }
         return buildHttpResponse(200, result);
@@ -6115,7 +6115,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         } else if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict; Secure\r\n";
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax\r\n";
             response = buildHttpResponse(200, result, "application/json", cookie);
         } else {
             response = buildHttpResponse(200, result);

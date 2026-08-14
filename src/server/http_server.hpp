@@ -79,7 +79,7 @@ static constexpr int MILANSQL_TEST_COUNT = 1902;
 
 // Redesign 2026-07: version served via /health — Landing Page und
 // WebUI lesen sie dynamisch (Elemente mit class="ms-version").
-static constexpr const char* MILANSQL_VERSION = "12.0.0";
+static constexpr const char* MILANSQL_VERSION = "12.0.3";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -1743,14 +1743,24 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                     rows.push_back({displayName, "TABLE", "?", "?"});
                 }
             }
-            if (rows.empty())
-                return "{\"success\":true,\"columns\":[\"Name\",\"Typ\",\"Spalten\",\"Zeilen\"],\"rows\":[]}";
-            std::string out = "Name | Typ | Spalten | Zeilen\n";
-            out += "-----+-----+---------+-------\n";
-            for (const auto& r : rows)
-                out += r[0] + " | " + r[1] + " | " + r[2] + " | " + r[3] + "\n";
             engine_.setCurrentUser(0, true); // reset
-            return parseOutputToJson(out);
+            // Return proper JSON directly (parseOutputToJson needs box-drawing │,
+            // but we use ASCII | here, so build JSON manually)
+            std::string json = "{\"success\":true,\"columns\":[\"Name\",\"Typ\",\"Spalten\",\"Zeilen\"],\"rows\":";
+            if (rows.empty()) {
+                json += "[]}";
+            } else {
+                json += "[";
+                for (size_t ri = 0; ri < rows.size(); ++ri) {
+                    if (ri > 0) json += ",";
+                    json += "[\"" + jsonEscape(rows[ri][0]) + "\",\"";
+                    json += jsonEscape(rows[ri][1]) + "\",\"";
+                    json += jsonEscape(rows[ri][2]) + "\",\"";
+                    json += jsonEscape(rows[ri][3]) + "\"]";
+                }
+                json += "],\"rowCount\":" + std::to_string(rows.size()) + "}";
+            }
+            return json;
         }
     }
 

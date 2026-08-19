@@ -238,6 +238,8 @@ int main(int argc, char* argv[]) {
     int  lbPort  = 4405;
     // Phase 128: Sentinel mode
     bool sentinelMode = false;
+    // HTTP bind address (--host); defaults to all interfaces
+    std::string httpBindHost = "0.0.0.0";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -316,6 +318,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--pool-min"      && i + 1 < argc) poolMin     = std::stoi(argv[++i]);
         else if (arg == "--pool-max"      && i + 1 < argc) poolMax     = std::stoi(argv[++i]);
         else if (arg == "--max-queue"     && i + 1 < argc) maxQueue    = std::stoi(argv[++i]);
+        else if (arg == "--host"          && i + 1 < argc) httpBindHost = argv[++i];
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
         else if (arg == "--master-port"   && i + 1 < argc) masterPort  = std::stoi(argv[++i]);
         else if (arg == "--repl-port"     && i + 1 < argc) replPort    = std::stoi(argv[++i]);
@@ -410,7 +413,7 @@ int main(int argc, char* argv[]) {
     if (httpMode) {
         std::cout << "MilanSQL HTTP Server startet auf Port " << httpPort
                   << " (Pool: " << poolMin << "-" << poolMax << ")...\n";
-        MilanHttpServer httpServer(httpPort, "database.milan", poolMin, poolMax);
+        MilanHttpServer httpServer(httpPort, "database.milan", poolMin, poolMax, httpBindHost);
 
         // ── Phase 172: Streaming Replication (HTTP mode) ──────
         std::unique_ptr<milansql::BinlogWriter>      httpBinlog;

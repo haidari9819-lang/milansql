@@ -60,6 +60,30 @@ public:
         storage_  = storage;
         engine_   = engine;
         mainPath_ = mainPath;
+        currentBranch_ = "main"; // always start on main after restart
+
+        // Auto-discover existing branch directories so SHOW BRANCHES
+        // reflects filesystem state across server restarts.
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path branchesDir = "branches";
+        if (fs::exists(branchesDir, ec) && fs::is_directory(branchesDir, ec)) {
+            for (const auto& entry : fs::directory_iterator(branchesDir, ec)) {
+                if (!entry.is_directory()) continue;
+                std::string brName = entry.path().filename().string();
+                if (brName.empty() || brName == "main") continue;
+                if (branches_.count(brName)) continue; // already known
+                // Check if branch db file exists
+                fs::path dbFile = entry.path() / "database.milan";
+                if (!fs::exists(dbFile, ec)) continue;
+                BranchInfo bi;
+                bi.name   = brName;
+                bi.parent = "main";
+                bi.status = "active";
+                bi.created_at = "restored";
+                branches_[brName] = bi;
+            }
+        }
     }
 
     std::string currentBranch() const { return currentBranch_; }

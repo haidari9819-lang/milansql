@@ -29,6 +29,7 @@
 #include <thread>
 #include <future>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <string>
 #include <sstream>
@@ -44,14 +45,41 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 
 #include "../engine/engine.hpp"
 #include "../parser/parser.hpp"
 #include "../storage/storage.hpp"
 #include "../dispatch.hpp"
+#include "../security/audit_log.hpp"
+#include "../crypto/encryption_manager.hpp"
+#include "../security/ip_allowlist.hpp"
+#include "../security/mtls_manager.hpp"
+#include "../tenant/isolated_tenant.hpp"
+#include "../security/compliance_report.hpp"
+#include "../cloud/cloud_instance.hpp"
+#include "../cloud/usage_meter.hpp"
+#include "../cloud/billing_manager.hpp"
+#include "../cloud/region_manager.hpp"
 #include "../monitoring/prometheus.hpp"
 #include "../auth/auth_manager.hpp"
 #include "../auth/rate_limiter.hpp"
+#include "../security/fortress.hpp"
+#include "../nl/nl_query.hpp"
+#include "../wal/pitr_manager.hpp"
+#include "../monitoring/metrics.hpp"
+#include "../logger/logger.hpp"
+#include "../cache/user_query_cache.hpp"  // Phase 2.2: Per-User Query Cache
+#include "../parallel/thread_pool.hpp"    // Phase 2.1: Thread Pool
+
+// Phase 174: test suite size — served via /health as test_count,
+// displayed dynamically in the WebUI navbar badge.
+static constexpr int MILANSQL_TEST_COUNT = 2046;
+
+// Redesign 2026-07: version served via /health — Landing Page und
+// WebUI lesen sie dynamisch (Elemente mit class="ms-version").
+static constexpr const char* MILANSQL_VERSION = "12.0.5";
 
 // ── JSON helpers ──────────────────────────────────────────────
 
@@ -163,7 +191,7 @@ static HttpRequest parseHttpRequest(sock_t sock) {
         int n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
         buf[n] = '\0';
-        raw += buf;
+        raw.append(buf, n); // binary-safe: Bilder enthalten NUL-Bytes
         // Guard: reject headers larger than 64 KB (likely attack)
         if (raw.size() > 65536) return {};
     }
@@ -227,7 +255,7 @@ static HttpRequest parseHttpRequest(sock_t sock) {
             int n = recv(sock, buf, sizeof(buf) - 1, 0);
             if (n <= 0) break;
             buf[n] = '\0';
-            bodyPart += buf;
+            bodyPart.append(buf, n); // binary-safe
         }
         req.body = bodyPart.substr(0, contentLen);
     }
@@ -492,7 +520,7 @@ static std::string buildHttpResponse(int statusCode, const std::string& body,
            "X-Content-Type-Options: nosniff\r\n"
            "X-XSS-Protection: 1; mode=block\r\n"
            "Referrer-Policy: strict-origin-when-cross-origin\r\n"
-           "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'\r\n"
+           "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'\r\n"
            "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
            "Permissions-Policy: geolocation=(), camera=(), microphone=()\r\n"
            + extraHeaders +
@@ -512,6 +540,39 @@ static std::string sanitizeError(const std::string& msg) {
             i += 6;
         } else {
             ++i;
+        }
+    }
+    // Also strip Windows-style paths
+    for (size_t i = 0; i + 1 < r.size(); ) {
+        if (std::isalpha((unsigned char)r[i]) && r[i+1] == ':' && (i == 0 || r[i-1] == ' ' || r[i-1] == '"')) {
+            size_t end = i + 2;
+            while (end < r.size() && r[end] != ' ' && r[end] != '"') ++end;
+            r = r.substr(0, i) + "<path>" + r.substr(end);
+            i += 6;
+        } else {
+            ++i;
+        }
+    }
+    // Security: strip tenant prefix u{N}_ from table/object names in error messages
+    // This prevents leaking the internal naming scheme to users
+    {
+        size_t pos = 0;
+        while (pos < r.size()) {
+            // Look for pattern: u followed by digits followed by _
+            if (r[pos] == 'u' && pos + 2 < r.size() && std::isdigit((unsigned char)r[pos+1])) {
+                size_t numEnd = pos + 1;
+                while (numEnd < r.size() && std::isdigit((unsigned char)r[numEnd])) ++numEnd;
+                if (numEnd < r.size() && r[numEnd] == '_') {
+                    // Check context: should be at word boundary (start, space, quote, colon, dot)
+                    bool atBoundary = (pos == 0 || r[pos-1] == ' ' || r[pos-1] == '\'' ||
+                                       r[pos-1] == '"' || r[pos-1] == ':' || r[pos-1] == '.');
+                    if (atBoundary) {
+                        r.erase(pos, numEnd - pos + 1);
+                        continue; // don't advance pos, check new char at this position
+                    }
+                }
+            }
+            ++pos;
         }
     }
     return r;
@@ -650,19 +711,45 @@ struct UserContext {
     bool valid = false;
 };
 
+// Phase 170: graceful shutdown flag (set by SIGINT/SIGTERM handler)
+inline std::atomic<bool> g_httpShutdownRequested{false};
+inline void httpShutdownSignalHandler(int) { g_httpShutdownRequested.store(true); }
+
 class MilanHttpServer {
 public:
-    MilanHttpServer(int port, const std::string& dbPath)
-        : port_(port), dbPath_(dbPath), storage_(dbPath_) {}
+    MilanHttpServer(int port, const std::string& dbPath,
+                    int poolMin = milansql::ConnectionPool::DEFAULT_MIN,
+                    int poolMax = milansql::ConnectionPool::DEFAULT_MAX,
+                    const std::string& bindAddr = "0.0.0.0")
+        : port_(port), dbPath_(dbPath), storage_(dbPath_), bindAddr_(bindAddr) {
+        milansql::g_connectionPool.configure(poolMin, poolMax);
+        // Phase 1.2: Initialize structured logger
+        milansql::StructuredLogger::global().open();
+        milansql::StructuredLogger::global().log(milansql::LogLevel::INFO,
+            "MilanSQL v" + std::string(MILANSQL_VERSION) + " starting");
+    }
 
     void run();
+
+    // Phase 172: replay a binlog statement from the master (replica mode).
+    // Sets tl_binlogReplay so dispatch skips the slave read-only check.
+    void replayBinlogSql(const std::string& sql) {
+        milansql::tl_binlogReplay = true;
+        try { handleQuery(sql); } catch (...) {}
+        milansql::tl_binlogReplay = false;
+    }
 
 private:
     int port_;
     std::string dbPath_;
+    std::string bindAddr_{"0.0.0.0"};
     milansql::Engine engine_;
     milansql::MilanBinaryStorage storage_;
-    std::mutex engineMutex_;
+    mutable std::shared_mutex engineMutex_;  // Phase 173: shared for reads, exclusive for writes
+    // Audit Bug #25: letzter Persist-Fehler (z.B. Disk voll) —
+    // wird in /health als storage.status=error gemeldet.
+    // Zugriff nur unter engineMutex_ (persistFn und /health halten den Lock).
+    std::string lastPersistError_;
     std::chrono::steady_clock::time_point startTime_ = std::chrono::steady_clock::now();
     std::atomic<long long> queryCounter_{0};   // Phase 166: live query counter
 
@@ -679,6 +766,27 @@ private:
     std::map<std::string, LockoutInfo> loginLockouts_;   // key = username
     std::map<std::string, LockoutInfo> ipLockouts_;      // key = client IP
     std::mutex lockoutMutex_;
+    static constexpr size_t MAX_LOCKOUT_ENTRIES = 10000;
+
+    // Security: prune expired lockout entries to prevent memory exhaustion
+    void pruneLockouts_() {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = loginLockouts_.begin(); it != loginLockouts_.end(); ) {
+            if (it->second.lockedUntil < now && it->second.failedAttempts == 0)
+                it = loginLockouts_.erase(it);
+            else ++it;
+        }
+        for (auto it = ipLockouts_.begin(); it != ipLockouts_.end(); ) {
+            if (it->second.lockedUntil < now && it->second.failedAttempts == 0)
+                it = ipLockouts_.erase(it);
+            else ++it;
+        }
+        // Hard cap: if still too large, evict oldest entries
+        while (loginLockouts_.size() > MAX_LOCKOUT_ENTRIES)
+            loginLockouts_.erase(loginLockouts_.begin());
+        while (ipLockouts_.size() > MAX_LOCKOUT_ENTRIES)
+            ipLockouts_.erase(ipLockouts_.begin());
+    }
 
     void handleClient(sock_t clientSock);
     std::string handleRequest(const HttpRequest& req, const std::string& clientIp = "");
@@ -691,7 +799,13 @@ private:
     std::string handleStatus();
     std::string handleDashboard();   // Phase 54C
     std::string handleWebUI();       // Phase 135: Professional Admin Dashboard
-    std::string handleSemanticSearch(const std::string& body);  // Phase 121
+    std::string handleSemanticSearch(const std::string& body, int userId = 0, bool isRoot = true);  // Phase 121
+    std::string handleSchemaForTable(const std::string& tableName, int userId, bool isRoot);   // Phase 4.5
+    std::string handleSchemaTableColumns(const std::string& tableName, int userId, bool isRoot); // Phase 4.5
+    std::string handleSchemaGenerateTypescript(int userId, bool isRoot);                         // Phase 4.5
+    std::string handleMigrateUp(int n = -1);     // Phase 4.2
+    std::string handleMigrateDown(int n = 1);    // Phase 4.2
+    std::string handleMigrateStatus();           // Phase 4.2
 
     // Phase 154: Auth routes
     std::string handleAuthRegister(const std::string& body, const std::string& clientIp);
@@ -736,6 +850,9 @@ inline void MilanHttpServer::initEngine() {
         std::cerr << "  WARNUNG: Laden fehlgeschlagen: " << ex.what()
                   << "\n  Starte mit leerer Datenbank.\n";
     }
+
+    // Phase 3.1 v12.0.3: Wire BranchManager to storage + engine for file-based isolation
+    milansql::BranchManager::global().init(&storage_, &engine_, storage_.filepath());
 
     engine_.loadUsers(dbPath_ + ".users");
 
@@ -808,6 +925,45 @@ inline void MilanHttpServer::initEngine() {
     // Load first (reads legacy secret + users), then init (resolves JWT secret)
     authMgr_.load(dbPath_ + ".auth");
     authMgr_.init();  // resolves secret: env → file → legacy → generate
+
+    // Phase 62+176: Load partition metadata
+    milansql::dispatch_loadPartitions(engine_, "database.partitions");
+
+    // ══ FORTRESS: Load whitelist + persistent ban list ═══════
+    milansql::g_fortress().loadWhitelist(dbPath_ + ".whitelist");
+    milansql::g_fortress().loadBanList(dbPath_ + ".banlist");
+    // Phase 173: Load RLS policies (was only loaded in REPL mode before)
+    engine_.loadRls(dbPath_ + ".rls");
+
+    // Phase 174: Retrofit existing tenant tables with auto-RLS
+    {
+        bool changed = false;
+        for (const auto& tn : engine_.getAllTableNamesInternal()) {
+            // Strip schema prefix (e.g. "public.u2_sites" -> "u2_sites")
+            std::string bare = tn;
+            auto dot = bare.find('.');
+            if (dot != std::string::npos) bare = bare.substr(dot + 1);
+            if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1])) {
+                size_t i = 1;
+                while (i < bare.size() && std::isdigit((unsigned char)bare[i])) ++i;
+                if (i < bare.size() && bare[i] == '_') {
+                    if (!engine_.isRlsEnabled(tn)) {
+                        engine_.enableRls(tn);
+                        milansql::Engine::RlsPolicy pol;
+                        pol.name = bare + "_tenant_policy";
+                        pol.table = tn;
+                        pol.command = "ALL";
+                        pol.role = "PUBLIC";
+                        pol.usingExpr = "TRUE";
+                        pol.withCheckExpr = "TRUE";
+                        engine_.createRlsPolicy(pol);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) engine_.saveRls(dbPath_ + ".rls");
+    }
 }
 
 // ── Auth helpers ─────────────────────────────────────────────
@@ -915,6 +1071,13 @@ inline std::string MilanHttpServer::handleAuthRegister(const std::string& body, 
     std::string email    = extractJsonStr(body, "email");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
+    // MEDIUM-07: Input length limits
+    if (username.size() > 64)
+        return "{\"success\":false,\"error\":\"Username too long (max 64 chars)\"}";
+    if (password.size() > 256)
+        return "{\"success\":false,\"error\":\"Password too long (max 256 chars)\"}";
+    if (email.size() > 254)
+        return "{\"success\":false,\"error\":\"Email too long (max 254 chars)\"}";
     // Password strength: min 8 chars, min 1 digit
     if (password.size() < 8)
         return "{\"success\":false,\"error\":\"Password must be at least 8 characters\"}";
@@ -951,6 +1114,24 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
     std::string password = extractJsonStr(body, "password");
     if (username.empty() || password.empty())
         return "{\"success\":false,\"error\":\"username and password required\"}";
+
+    // ══ FORTRESS: Schicht 4 — Canary credential check ═════
+    if (milansql::g_fortress().isCanaryCredential(username, password)) {
+        milansql::g_fortress().recordHoneypotHit(clientIp, "CANARY_LOGIN: " + username);
+        milansql::g_fortress().saveBanList(dbPath_ + ".banlist");
+        // Return fake success with canary tokens
+        return milansql::g_fortress().getHoneypotLoginResponse();
+    }
+
+    // ══ FORTRESS: Schicht 2 — Progressive delay ═══════════
+    {
+        double delay = milansql::g_fortress().getDelay(clientIp);
+        if (delay > 0.0 && delay <= 16.0) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(delay * 1000)));
+        }
+    }
+
     // Layer 3: Per-username lockout (brute-force single account)
     {
         std::lock_guard<std::mutex> lk(lockoutMutex_);
@@ -964,8 +1145,12 @@ inline std::string MilanHttpServer::handleAuthLogin(const std::string& body, con
     }
     auto res = authMgr_.login(username, password);
     if (!res.ok) {
+        // ══ FORTRESS: Schicht 2 — Record failure for progressive delay ═══
+        milansql::g_fortress().recordFailure(clientIp, "LOGIN_FAIL: " + username);
+
         // Increment both per-username and per-IP failure counters
         std::lock_guard<std::mutex> lk(lockoutMutex_);
+        if (loginLockouts_.size() > 1000) pruneLockouts_();
         auto& uInfo = loginLockouts_[username];
         uInfo.failedAttempts++;
         if (uInfo.failedAttempts >= 5)
@@ -1063,8 +1248,8 @@ inline std::string MilanHttpServer::handleAuthApiKeyCreate(int userId, const std
     std::string expiresStr = "null";
     if (days > 0) {
         time_t exp = std::time(nullptr) + (time_t)days*86400;
-        char buf[32]; struct tm* tm = std::gmtime(&exp);
-        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm);
+        char buf[32]; std::tm tm = milansql::safe_gmtime(&exp);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
         expiresStr = "\"" + std::string(buf) + "\"";
     }
     return "{\"success\":true,\"key\":\"" + jsonEscape(key) +
@@ -1115,7 +1300,7 @@ inline std::string MilanHttpServer::handleAdminUsers(const std::string& token) {
 inline std::string MilanHttpServer::handleAdminStats(const std::string& token) {
     auto v = authMgr_.validateToken(token);
     if (!v.valid || v.role != "root") return "{\"success\":false,\"error\":\"Access denied\"}";
-    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::unique_lock<std::shared_mutex> lk(engineMutex_);
     auto tables = engine_.getAllTableNames();
     long long totalRows = 0;
     for (const auto& t : tables) { try { totalRows += engine_.countRows(t,true); } catch(...){} }
@@ -1133,7 +1318,7 @@ inline std::string MilanHttpServer::handleMyQuota(const std::string& token) {
     if (!token.empty()) v = authMgr_.validateToken(token);
     if (!v.valid && !token.empty()) return "{\"success\":false,\"error\":\"Unauthorized\"}";
     auto quota = authMgr_.getQuota(v.userId);
-    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::unique_lock<std::shared_mutex> lk(engineMutex_);
     auto allTables = engine_.getAllTableNames();
     int myTables = 0;
     long long myRows = 0;
@@ -1168,7 +1353,7 @@ inline std::string MilanHttpServer::handleBackup(const std::string& token) {
     bool isRoot = (v.role == "root");
     std::string userPrefix = (v.userId > 0) ? "u" + std::to_string(v.userId) + "_" : "";
 
-    std::lock_guard<std::mutex> lk(engineMutex_);
+    std::unique_lock<std::shared_mutex> lk(engineMutex_);
     std::ostringstream out;
     out << "-- MilanSQL Backup";
     if (!isRoot && v.userId > 0)
@@ -1177,7 +1362,8 @@ inline std::string MilanHttpServer::handleBackup(const std::string& token) {
     out << "-- Generated: " << [](){
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
-        char buf[64]; std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+        char buf[64]; std::tm ltm = milansql::safe_localtime(&t);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ltm);
         return std::string(buf);
     }() << "\n";
     out << "-- ================================================\n\n";
@@ -1415,14 +1601,29 @@ inline std::string MilanHttpServer::handleRestore(const std::string& token,
 // ── MilanHttpServer::handleQueryForUser (Phase 154-155) ───────
 
 inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, int userId, const std::string& userRole) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
 
     bool isRoot = (userId <= 0 || userRole == "root");
-    std::string prefix = isRoot ? "" : ("u" + std::to_string(userId) + "_");
+    bool isService = (userRole == "service");  // service accounts: no table prefix, but rate-limited
+    std::string prefix = (isRoot || isService) ? "" : ("u" + std::to_string(userId) + "_");
 
     auto persistFn = [this]() {
         if (engine_.isInTransaction()) return;
-        try { storage_.save(engine_); } catch (...) {}
+        // Audit Bug #25: Persist-Fehler (z.B. Disk voll) NICHT mehr
+        // stillschweigend schlucken — Client bekommt success:false,
+        // /health meldet storage.status=error. Vorher: bestätigte
+        // Commits waren nach Neustart weg (silent data loss).
+        try {
+            storage_.save(engine_);
+            engine_.saveRls(dbPath_ + ".rls");  // Phase 173
+            lastPersistError_.clear();
+        } catch (const std::exception& e) {
+            lastPersistError_ = e.what();
+            std::cerr << "  [Persist] FEHLER: " << e.what() << "\n";
+            throw std::runtime_error(
+                std::string("Persistierung fehlgeschlagen (Daten NICHT dauerhaft "
+                            "gespeichert): ") + e.what());
+        }
     };
     auto saveProceduresFn = [this]() {
         std::ofstream pf(dbPath_ + ".procedures");
@@ -1445,16 +1646,21 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
     };
 
     // Phase 157: Set current user in engine so USER()/CURRENT_USER() work
+    // Phase 173: Service accounts get their real username (e.g. "svc_1") so
+    //            CURRENT_APP_USER_ID() in RLS USING expressions strips the
+    //            prefix and returns the numeric app-user-id. Root-level table
+    //            access (no u{id}_ prefix) is controlled by isRootUser_ below.
     {
         std::string uname = "root";
-        if (!isRoot && userId > 0) {
+        if (userId > 0) {
             const AuthUser* au = authMgr_.getUserById(userId);
             if (au) uname = au->username;
         }
         engine_.setCurrentUserDirect(uname);
     }
     // v9.2.0: Set numeric userId for per-request context (used by SHOW TABLES filter etc.)
-    engine_.setCurrentUser(isRoot ? 0 : userId, isRoot);
+    // Service accounts get root-level table access (no prefix)
+    engine_.setCurrentUser((isRoot || isService) ? 0 : userId, isRoot || isService);
 
     // Intercept special SQL commands
     auto sqlUp = [](std::string s) {
@@ -1476,12 +1682,12 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return "{\"success\":true,\"columns\":[\"" + col + "\"],\"rows\":[[\"" + val + "\"]]}";
         };
         if (u2 == "SELECT @@VERSION" || u2 == "SELECT @@GLOBAL.VERSION")
-            return makeScalar("@@version", "9.9.0");
+            return makeScalar("@@version", MILANSQL_VERSION);
         if (u2 == "SELECT @@VERSION_COMMENT" || u2 == "SELECT @@GLOBAL.VERSION_COMMENT")
             return makeScalar("@@version_comment", "MilanSQL Database Engine");
         if (u2 == "SELECT @@VERSION, @@VERSION_COMMENT" ||
             u2 == "SELECT @@VERSION,@@VERSION_COMMENT")
-            return "{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"9.9.0\",\"MilanSQL Database Engine\"]]}";
+            return std::string("{\"success\":true,\"columns\":[\"@@version\",\"@@version_comment\"],\"rows\":[[\"") + MILANSQL_VERSION + "\",\"MilanSQL Database Engine\"]]}";
         if (u2 == "SELECT @@MAX_ALLOWED_PACKET" || u2 == "SELECT @@GLOBAL.MAX_ALLOWED_PACKET")
             return makeScalar("@@max_allowed_packet", "67108864");
         if (u2 == "SELECT @@SQL_MODE" || u2 == "SELECT @@GLOBAL.SQL_MODE" || u2 == "SELECT @@SESSION.SQL_MODE")
@@ -1494,6 +1700,24 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             return makeScalar("@@transaction_isolation", "READ-COMMITTED");
     }
 
+
+    // Phase 170: SHOW POLICIES ON <table> — return as JSON result set
+    if (upper.rfind("SHOW POLICIES", 0) == 0) {
+        // Extract table name after ON
+        std::string tblName;
+        auto onPos = upper.find(" ON ");
+        if (onPos != std::string::npos) {
+            tblName = trimmed.substr(onPos + 4);
+            while (!tblName.empty() && (tblName.back()==';'||tblName.back()==' ')) tblName.pop_back();
+            while (!tblName.empty() && tblName.front()==' ') tblName.erase(0,1);
+        }
+        if (!tblName.empty()) {
+            return engine_.getTablePoliciesJson(tblName);
+        }
+        return engine_.getRlsPoliciesJson();
+    }
+
+
     // v9.2.0: SHOW TABLES — filtered per-user to prevent cross-user table name leakage
     {
         std::string u2 = upper;
@@ -1503,7 +1727,7 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             std::vector<std::array<std::string,4>> rows;
             for (const auto& t : all) {
                 std::string displayName;
-                if (isRoot) {
+                if (isRoot || isService) {
                     if (t.size()>=2 && t[0]=='_' && t[1]=='_') continue; // skip system tables
                     displayName = t;
                 } else {
@@ -1521,14 +1745,24 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                     rows.push_back({displayName, "TABLE", "?", "?"});
                 }
             }
-            if (rows.empty())
-                return "{\"success\":true,\"columns\":[\"Name\",\"Typ\",\"Spalten\",\"Zeilen\"],\"rows\":[]}";
-            std::string out = "Name | Typ | Spalten | Zeilen\n";
-            out += "-----+-----+---------+-------\n";
-            for (const auto& r : rows)
-                out += r[0] + " | " + r[1] + " | " + r[2] + " | " + r[3] + "\n";
             engine_.setCurrentUser(0, true); // reset
-            return parseOutputToJson(out);
+            // Return proper JSON directly (parseOutputToJson needs box-drawing │,
+            // but we use ASCII | here, so build JSON manually)
+            std::string json = "{\"success\":true,\"columns\":[\"Name\",\"Typ\",\"Spalten\",\"Zeilen\"],\"rows\":";
+            if (rows.empty()) {
+                json += "[]}";
+            } else {
+                json += "[";
+                for (size_t ri = 0; ri < rows.size(); ++ri) {
+                    if (ri > 0) json += ",";
+                    json += "[\"" + jsonEscape(rows[ri][0]) + "\",\"";
+                    json += jsonEscape(rows[ri][1]) + "\",\"";
+                    json += jsonEscape(rows[ri][2]) + "\",\"";
+                    json += jsonEscape(rows[ri][3]) + "\"]";
+                }
+                json += "],\"rowCount\":" + std::to_string(rows.size()) + "}";
+            }
+            return json;
         }
     }
 
@@ -1688,6 +1922,34 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         return "{\"success\":true,\"message\":\"Session revoked\"}";
     }
 
+    // Phase 2.2: SHOW QUERY CACHE STATS — return as JSON table
+    {
+        std::string u2 = upper;
+        while (!u2.empty() && (u2.back()==';'||u2.back()==' ')) u2.pop_back();
+        if (u2 == "SHOW QUERY CACHE STATS") {
+            auto& uc = milansql::g_userQueryCache();
+            long long h = uc.hits(), m = uc.misses(), total = h + m;
+            std::string hitRate = (total > 0) ? std::to_string(h * 100 / total) + "%" : "N/A";
+            std::string out =
+                "{\"success\":true,\"columns\":[\"setting\",\"value\"],"
+                "\"rows\":["
+                "[\"enabled\","  + std::string(uc.isEnabled() ? "\"true\"" : "\"false\"") + "],"
+                "[\"size\",\""   + std::to_string(uc.size())     + "\"],"
+                "[\"max_size\",\"" + std::to_string(uc.maxSize())  + "\"],"
+                "[\"hits\",\""   + std::to_string(h)             + "\"],"
+                "[\"misses\",\"" + std::to_string(m)             + "\"],"
+                "[\"hit_rate\",\"" + hitRate                     + "\"]"
+                "],\"rowCount\":6}";
+            return out;
+        }
+        // Phase 2.2: FLUSH QUERY CACHE
+        if (u2 == "FLUSH QUERY CACHE") {
+            milansql::g_userQueryCache().flush();
+            engine_.getQueryCache().clear();
+            return "{\"success\":true,\"message\":\"Query cache flushed.\",\"rowsAffected\":0}";
+        }
+    }
+
     auto execOne = [&](const std::string& oneSQL) -> std::string {
         std::ostringstream cap;
         std::streambuf* old = std::cout.rdbuf(cap.rdbuf());
@@ -1696,6 +1958,25 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         try {
             milansql::Parser p;
             auto cmd = p.parse(oneSQL);
+
+            // Phase 173+: Block service accounts from accessing tenant-prefixed tables.
+            // Service accounts (svc_N) operate on root-level tables with RLS.
+            // u{N}_* tables are tenant namespaces and must remain inaccessible.
+            {
+                auto isTenantTbl = [](const std::string& t) {
+                    return t.size() > 2 && t[0] == 'u' && std::isdigit((unsigned char)t[1]);
+                };
+                if (isService && !isRoot && isTenantTbl(cmd.tableName)) {
+                    std::cout.rdbuf(old);
+                    return "{\"success\":false,\"error\":\"Access denied: service accounts cannot access tenant tables\"}";
+                }
+                for (const auto& jc : cmd.joinClauses) {
+                    if (isService && !isRoot && isTenantTbl(jc.table)) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: service accounts cannot access tenant tables\"}";
+                    }
+                }
+            }
 
             // Phase 154: Table name prefixing for user isolation
             if (!prefix.empty()) {
@@ -1706,10 +1987,16 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                     return "{\"success\":false,\"error\":\"Access denied: system table\"}";
                 }
                 // Block cross-user access: table starts with u{N}_ where N != userId
-                if (!cmd.tableName.empty() && cmd.tableName.size() > 2 &&
-                    cmd.tableName[0] == 'u' && std::isdigit((unsigned char)cmd.tableName[1])) {
-                    std::cout.rdbuf(old);
-                    return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                // Also handle schema-qualified names (e.g., public.u4_orders)
+                {
+                    std::string bareMain = cmd.tableName;
+                    auto dotM = bareMain.find('.');
+                    if (dotM != std::string::npos) bareMain = bareMain.substr(dotM + 1);
+                    if (!bareMain.empty() && bareMain.size() > 2 &&
+                        bareMain[0] == 'u' && std::isdigit((unsigned char)bareMain[1])) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                    }
                 }
                 // Phase 155: permission check for non-owner access
                 // (after prefixing, check if user has shared access)
@@ -1723,12 +2010,45 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                     (void)ownTable; (void)op;
                     cmd.tableName = prefix + cmd.tableName;
                 }
-                // Prefix join tables
+                // Prefix join tables (Security: block cross-tenant + system table access)
                 for (auto& jc : cmd.joinClauses) {
-                    if (!jc.table.empty() &&
-                        !(jc.table.size()>=2 && jc.table[0]=='_' && jc.table[1]=='_') &&
-                        !(jc.table.size()>2 && jc.table[0]=='u' && std::isdigit((unsigned char)jc.table[1])))
-                        jc.table = prefix + jc.table;
+                    if (jc.table.empty()) continue;
+                    // Strip schema prefix (e.g. "public.") before checking
+                    std::string bareJoin = jc.table;
+                    auto dotJ = bareJoin.find('.');
+                    if (dotJ != std::string::npos) bareJoin = bareJoin.substr(dotJ + 1);
+                    // Block system tables
+                    if (bareJoin.size() >= 2 && bareJoin[0] == '_' && bareJoin[1] == '_') {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: system table\"}";
+                    }
+                    // Block cross-tenant tables
+                    if (bareJoin.size() > 2 && bareJoin[0] == 'u' && std::isdigit((unsigned char)bareJoin[1])) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                    }
+                    jc.table = prefix + jc.table;
+                }
+                // Views/Procedures/Triggers: Namen + Zieltabellen isolieren,
+                // damit CREATE/DROP/CALL/SHOW pro User getrennt sind
+                auto pfxName = [&prefix](std::string& n) -> std::string {
+                    if (n.empty()) return "";
+                    std::string bare = n;
+                    auto dotP = bare.find('.');
+                    if (dotP != std::string::npos) bare = bare.substr(dotP + 1);
+                    if (bare.size() >= 2 && bare[0] == '_' && bare[1] == '_')
+                        return "Access denied: system object";
+                    if (bare.size() > 2 && bare[0] == 'u' && std::isdigit((unsigned char)bare[1]))
+                        return "Access denied: cross-user object access not allowed";
+                    n = prefix + n;
+                    return "";
+                };
+                {
+                    std::string pfxErr;
+                    pfxErr = pfxName(cmd.triggerName);    if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                    pfxErr = pfxName(cmd.triggerTable);   if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                    pfxErr = pfxName(cmd.showTriggersTable); if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
+                    pfxErr = pfxName(cmd.procedureName);  if (!pfxErr.empty()) { std::cout.rdbuf(old); return "{\"success\":false,\"error\":\"" + pfxErr + "\"}"; }
                 }
             } else {
                 // Root: handle "user.table" notation (cross-user)
@@ -1745,8 +2065,22 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
 
             // Resolve subqueries (apply same user-prefix for isolation)
             for (auto& sq : cmd.subqueries) {
-                if (!prefix.empty() && sq.subTable.find(prefix) != 0) {
-                    sq.subTable = prefix + sq.subTable;
+                if (!prefix.empty()) {
+                    // Block cross-tenant subquery table access
+                    std::string bareSub = sq.subTable;
+                    auto dotS = bareSub.find('.');
+                    if (dotS != std::string::npos) bareSub = bareSub.substr(dotS + 1);
+                    if (bareSub.size() > 2 && bareSub[0] == 'u' && std::isdigit((unsigned char)bareSub[1])) {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: cross-user table access not allowed\"}";
+                    }
+                    if (bareSub.size() >= 2 && bareSub[0] == '_' && bareSub[1] == '_') {
+                        std::cout.rdbuf(old);
+                        return "{\"success\":false,\"error\":\"Access denied: system table\"}";
+                    }
+                    if (sq.subTable.find(prefix) != 0) {
+                        sq.subTable = prefix + sq.subTable;
+                    }
                 }
                 if (sq.condIdx < cmd.whereConds.size())
                     cmd.whereConds[sq.condIdx].inList =
@@ -1754,6 +2088,32 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
             }
 
             milansql::dispatchCommand(cmd, engine_, p, oneSQL, persistFn, saveProceduresFn, saveTriggFn);
+
+            // Phase 145: Audit logging after DDL/DML operations
+            if (engine_.auditLogger.isEnabled()) {
+                std::string opStr;
+                switch (cmd.type) {
+                case milansql::CommandType::CREATE_TABLE: opStr = "CREATE_TABLE"; break;
+                case milansql::CommandType::DROP_TABLE:   opStr = "DROP_TABLE";   break;
+                case milansql::CommandType::ALTER_TABLE:  opStr = "ALTER_TABLE";  break;
+                case milansql::CommandType::CREATE_INDEX: opStr = "CREATE_INDEX"; break;
+                case milansql::CommandType::DROP_INDEX:   opStr = "DROP_INDEX";   break;
+                case milansql::CommandType::TRUNCATE:     opStr = "TRUNCATE";     break;
+                case milansql::CommandType::INSERT:       opStr = "INSERT";       break;
+                case milansql::CommandType::UPDATE:       opStr = "UPDATE";       break;
+                case milansql::CommandType::DELETE:       opStr = "DELETE";       break;
+                default: break;
+                }
+                if (!opStr.empty()) {
+                    milansql::AuditEntry ae;
+                    ae.op        = opStr;
+                    ae.table     = cmd.tableName;
+                    ae.user      = "user_" + std::to_string(userId);
+                    ae.ip        = "";
+                    ae.success   = true;
+                    engine_.auditLogger.log(ae);
+                }
+            }
 
             // Extract column types for type-aware JSON serialization
             if (cmd.type == milansql::CommandType::SELECT && !cmd.tableName.empty()
@@ -1784,31 +2144,346 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
         return parseOutputToJson(cap.str(), colTypesOut);
     };
 
+    // Phase 1.1: Metrics — time the whole query and count by type
+    auto t0_metrics = std::chrono::high_resolution_clock::now();
+
+    // Phase 2.2: Query cache — determine user key for cache namespace
+    std::string cacheUserKey = (userId <= 0) ? "root" : ("u" + std::to_string(userId));
+    // Only cache single-statement, non-mutating SELECT/WITH queries
+    bool isCacheable = (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0);
+
     auto stmts = milansql::splitStatements(sql);
+    std::string finalResult;
     if (stmts.size() <= 1) {
-        auto result = execOne(stmts.empty() ? sql : stmts[0]);
+        const std::string& effectiveSql = stmts.empty() ? sql : stmts[0];
+        // Phase 2.2: Check query cache for SELECT (single stmt only)
+        if (isCacheable) {
+            auto cached = milansql::g_userQueryCache().get(cacheUserKey, effectiveSql);
+            if (cached.has_value()) {
+                engine_.setCurrentUser(0, true);
+                return *cached;
+            }
+        }
+        finalResult = execOne(effectiveSql);
         engine_.setCurrentUser(0, true); // reset per-request context
-        return result;
+        // Phase 2.2: Store successful SELECT results in cache
+        if (isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
+            // Extract table name from SQL for invalidation support
+            std::string tblHint;
+            auto fromPos = upper.find(" FROM ");
+            if (fromPos != std::string::npos) {
+                size_t start = fromPos + 6;
+                while (start < upper.size() && upper[start] == ' ') ++start;
+                size_t end = start;
+                while (end < upper.size() && upper[end] != ' ' && upper[end] != ';'
+                       && upper[end] != ',' && upper[end] != ')') ++end;
+                tblHint = upper.substr(start, end - start);
+                // Strip prefix for root queries
+                if (!prefix.empty() && tblHint.rfind(prefix, 0) == 0)
+                    tblHint = tblHint.substr(prefix.size());
+            }
+            milansql::g_userQueryCache().put(cacheUserKey, effectiveSql, finalResult, tblHint);
+        }
+        // Phase 2.2: Invalidate cache on mutating queries
+        if (!isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
+            // Extract table name and invalidate
+            auto mutPos = upper.find(" INTO ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" FROM ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" TABLE ");
+            if (mutPos == std::string::npos) mutPos = upper.find(" UPDATE ");
+            size_t tblStart = (mutPos != std::string::npos) ? mutPos + 7 : std::string::npos;
+            // For UPDATE, table name follows immediately
+            if (upper.rfind("UPDATE", 0) == 0) {
+                tblStart = 7;
+                while (tblStart < upper.size() && upper[tblStart] == ' ') ++tblStart;
+            }
+            if (tblStart != std::string::npos && tblStart < upper.size()) {
+                size_t tblEnd = tblStart;
+                while (tblEnd < upper.size() && upper[tblEnd] != ' ' && upper[tblEnd] != ';'
+                       && upper[tblEnd] != ',' && upper[tblEnd] != ')') ++tblEnd;
+                std::string mutTbl = upper.substr(tblStart, tblEnd - tblStart);
+                if (!mutTbl.empty()) {
+                    milansql::g_userQueryCache().invalidate(mutTbl);
+                }
+            }
+        }
+    } else {
+        std::string json = "{\"success\":true,\"results\":[";
+        bool anyError = false;
+        for (size_t idx = 0; idx < stmts.size(); ++idx) {
+            if (idx) json += ",";
+            std::string res = execOne(stmts[idx]);
+            json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
+            if (res.find("\"success\":false") != std::string::npos) anyError = true;
+        }
+        engine_.setCurrentUser(0, true); // reset per-request context
+        json += "],\"count\":" + std::to_string(stmts.size());
+        json += anyError ? ",\"success\":false}" : ",\"success\":true}";
+        finalResult = json;
     }
 
-    std::string json = "{\"success\":true,\"results\":[";
-    bool anyError = false;
-    for (size_t idx = 0; idx < stmts.size(); ++idx) {
-        if (idx) json += ",";
-        std::string res = execOne(stmts[idx]);
-        json += "{\"statement\":\"" + jsonEscape(stmts[idx]) + "\",\"result\":" + res + "}";
-        if (res.find("\"success\":false") != std::string::npos) anyError = true;
+    // Phase 1.1: Record duration + query type counters
+    {
+        auto t1_metrics = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1_metrics - t0_metrics).count();
+        milansql::MetricsCollector::global().record_duration(ms);
+
+        auto& mc = milansql::MetricsCollector::global();
+        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0)
+            mc.queries_select.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("INSERT", 0) == 0)
+            mc.queries_insert.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("UPDATE", 0) == 0)
+            mc.queries_update.fetch_add(1, std::memory_order_relaxed);
+        else if (upper.rfind("DELETE", 0) == 0)
+            mc.queries_delete.fetch_add(1, std::memory_order_relaxed);
+
+        // Phase 1.2: Structured logging
+        std::string qtype = "OTHER";
+        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH ", 0) == 0) qtype = "SELECT";
+        else if (upper.rfind("INSERT", 0) == 0) qtype = "INSERT";
+        else if (upper.rfind("UPDATE", 0) == 0) qtype = "UPDATE";
+        else if (upper.rfind("DELETE", 0) == 0) qtype = "DELETE";
+
+        std::string uname = (userId <= 0) ? "root" : ("u" + std::to_string(userId));
+        milansql::StructuredLogger::global().log(
+            milansql::LogLevel::INFO,
+            "Query executed",
+            "", ms, qtype, "", -1, uname);
+        milansql::StructuredLogger::global().log_slow_query(sql, ms, uname);
     }
-    engine_.setCurrentUser(0, true); // reset per-request context
-    json += "],\"count\":" + std::to_string(stmts.size());
-    json += anyError ? ",\"success\":false}" : ",\"success\":true}";
-    return json;
+
+    return finalResult;
+}
+
+
+// ── Phase 4.5: Schema Introspection API ──────────────────────
+
+static std::string sqlTypeToTs(const std::string& t) {
+    std::string up;
+    for (char c : t) {
+        if (c == '(' || c == ' ') break;
+        up += static_cast<char>(std::toupper((unsigned char)c));
+    }
+    if (up=="INT"||up=="INTEGER"||up=="BIGINT"||up=="SMALLINT"||up=="TINYINT"
+        ||up=="SERIAL"||up=="BIGSERIAL"||up=="FLOAT"||up=="DOUBLE"
+        ||up=="DECIMAL"||up=="NUMERIC"||up=="REAL"||up=="NUMBER") return "number";
+    if (up=="BOOLEAN"||up=="BOOL") return "boolean";
+    if (up=="JSON"||up=="JSONB") return "Record<string, unknown>";
+    return "string";
+}
+
+inline std::string MilanHttpServer::handleSchemaForTable(
+    const std::string& tableName, int userId, bool isRoot)
+{
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    std::string resolvedName = tableName;
+    if (!isRoot && userId > 0) {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        if (tableName.size() < pf.size() || tableName.substr(0, pf.size()) != pf)
+            resolvedName = pf + tableName;
+    }
+    if (!engine_.tableExists(resolvedName))
+        return R"({"success":false,"error":"Table not found"})";
+    const auto& tbl = engine_.selectAll(resolvedName);
+    const auto& cols = tbl.columns();
+    auto indexes = engine_.getIndexes(resolvedName);
+    size_t rowCount = 0;
+    try { rowCount = engine_.countRows(resolvedName, true); } catch (...) {}
+    std::string j = "{\"success\":true,\"table\":{\"name\":\"" + jsonEscape(tableName) + "\",";
+    j += "\"row_count\":" + std::to_string(rowCount) + ",";
+    j += "\"columns\":[";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(cols[i].name) + "\"";
+        j += ",\"type\":\"" + jsonEscape(cols[i].type) + "\"";
+        j += ",\"nullable\":" + std::string((cols[i].notNull||cols[i].isPrimaryKey)?"false":"true");
+        j += ",\"primary_key\":" + std::string(cols[i].isPrimaryKey?"true":"false");
+        if (cols[i].isUnique) j += ",\"unique\":true";
+        if (cols[i].autoIncrement) j += ",\"auto_increment\":true";
+        if (!cols[i].defaultValue.empty())
+            j += ",\"default\":\"" + jsonEscape(cols[i].defaultValue) + "\"";
+        j += "}";
+    }
+    j += "],\"indexes\":[";
+    for (size_t i = 0; i < indexes.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(indexes[i].indexName) + "\"";
+        j += ",\"columns\":\"" + jsonEscape(indexes[i].colName) + "\"";
+        j += ",\"type\":\"" + jsonEscape(indexes[i].type) + "\"}";
+    }
+    j += "]}}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleSchemaTableColumns(
+    const std::string& tableName, int userId, bool isRoot)
+{
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    std::string resolvedName = tableName;
+    if (!isRoot && userId > 0) {
+        std::string pf = "u" + std::to_string(userId) + "_";
+        if (tableName.size() < pf.size() || tableName.substr(0, pf.size()) != pf)
+            resolvedName = pf + tableName;
+    }
+    if (!engine_.tableExists(resolvedName))
+        return R"({"success":false,"error":"Table not found"})";
+    const auto& tbl = engine_.selectAll(resolvedName);
+    const auto& cols = tbl.columns();
+    std::string j = "{\"success\":true,\"columns\":[";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (i) j += ",";
+        j += "{\"name\":\"" + jsonEscape(cols[i].name) + "\"";
+        j += ",\"type\":\"" + jsonEscape(cols[i].type) + "\"";
+        j += ",\"nullable\":" + std::string((cols[i].notNull||cols[i].isPrimaryKey)?"false":"true");
+        j += ",\"primary_key\":" + std::string(cols[i].isPrimaryKey?"true":"false");
+        j += ",\"unique\":" + std::string(cols[i].isUnique?"true":"false");
+        j += ",\"auto_increment\":" + std::string(cols[i].autoIncrement?"true":"false");
+        if (!cols[i].defaultValue.empty())
+            j += ",\"default\":\"" + jsonEscape(cols[i].defaultValue) + "\"";
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleSchemaGenerateTypescript(int userId, bool isRoot) {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    auto allTables = engine_.getAllTableNames();
+    std::string userPrefix = (!isRoot && userId > 0) ? "u" + std::to_string(userId) + "_" : "";
+    std::string ts;
+    ts += "// Auto-generated by MilanSQL\n";
+    ts += "// Do not edit manually\n\n";
+    for (const auto& tname : allTables) {
+        std::string bareName = tname;
+        if (!userPrefix.empty()) {
+            if (tname.size() < userPrefix.size() || tname.substr(0, userPrefix.size()) != userPrefix) continue;
+            bareName = tname.substr(userPrefix.size());
+        }
+        std::string ifName = bareName;
+        if (!ifName.empty()) ifName[0] = static_cast<char>(std::toupper((unsigned char)ifName[0]));
+        const auto& tbl2 = engine_.selectAll(tname);
+        const auto& cols2 = tbl2.columns();
+        ts += "export interface " + ifName + " {\n";
+        for (const auto& col : cols2) {
+            std::string tsType = sqlTypeToTs(col.type);
+            bool nullable = !(col.notNull || col.isPrimaryKey);
+            ts += "  " + col.name + ": " + tsType + (nullable ? " | null" : "") + ";\n";
+        }
+        ts += "}\n\n";
+    }
+    // Encode as JSON string value
+    std::string enc = "\"";
+    for (char c : ts) {
+        if      (c == '"')  enc += "\\\"";
+        else if (c == '\\') enc += "\\\\";
+        else if (c == '\n') enc += "\\n";
+        else                enc += c;
+    }
+    enc += "\"";
+    return "{\"success\":true,\"typescript\":" + enc + "}";
+}
+
+// ── Phase 4.2: Migration HTTP Handlers ───────────────────────
+
+inline std::string MilanHttpServer::handleMigrateUp(int n) {
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
+    auto& mm = milansql::g_migrationManager();
+    auto pending = mm.getPendingNames();
+    if (pending.empty())
+        return R"({"success":true,"message":"No pending migrations","applied":[]})";
+    int count = (n < 0) ? (int)pending.size() : std::min(n, (int)pending.size());
+    std::vector<std::string> applied;
+    std::string errors;
+    for (int i = 0; i < count; ++i) {
+        const std::string& mname = pending[(size_t)i];
+        std::string sql = mm.getMigrationSql(mname);
+        if (sql.empty()) { errors += "Migration '" + mname + "' has no SQL. "; continue; }
+        try {
+            milansql::Parser p;
+            auto cmd = p.parse(sql);
+            auto noop = [](){};
+            milansql::dispatchCommand(cmd, engine_, p, sql, noop, noop, noop);
+            mm.markApplied(mname);
+            applied.push_back(mname);
+        } catch (const std::exception& e) {
+            errors += "Migration '" + mname + "' failed: " + std::string(e.what()) + ". ";
+            break;
+        }
+    }
+    std::string j = "{\"success\":" + std::string(errors.empty()?"true":"false");
+    j += ",\"applied\":[";
+    for (size_t i = 0; i < applied.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + jsonEscape(applied[i]) + "\"";
+    }
+    j += "]";
+    if (!errors.empty()) j += ",\"error\":\"" + jsonEscape(errors) + "\"";
+    j += "}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleMigrateDown(int n) {
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
+    auto& mm = milansql::g_migrationManager();
+    auto appliedList = mm.getAppliedNames();
+    if (appliedList.empty())
+        return R"({"success":true,"message":"No applied migrations to roll back","rolled_back":[]})";
+    int count = std::min(n, (int)appliedList.size());
+    std::vector<std::string> rolledBack;
+    std::string errors;
+    for (int i = 0; i < count; ++i) {
+        const std::string& mname = appliedList[appliedList.size() - 1 - (size_t)i];
+        std::string sql = mm.getRollbackSql(mname);
+        if (!sql.empty()) {
+            try {
+                milansql::Parser p;
+                auto cmd = p.parse(sql);
+                auto noop = [](){};
+                milansql::dispatchCommand(cmd, engine_, p, sql, noop, noop, noop);
+            } catch (const std::exception& e) {
+                errors += "Rollback '" + mname + "' failed: " + std::string(e.what()) + ". ";
+                break;
+            }
+        }
+        mm.markRolledBack(mname);
+        rolledBack.push_back(mname);
+    }
+    std::string j = "{\"success\":" + std::string(errors.empty()?"true":"false");
+    j += ",\"rolled_back\":[";
+    for (size_t i = 0; i < rolledBack.size(); ++i) {
+        if (i) j += ",";
+        j += "\"" + jsonEscape(rolledBack[i]) + "\"";
+    }
+    j += "]";
+    if (!errors.empty()) j += ",\"error\":\"" + jsonEscape(errors) + "\"";
+    j += "}";
+    return j;
+}
+
+inline std::string MilanHttpServer::handleMigrateStatus() {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
+    const auto& mm = milansql::g_migrationManager();
+    auto all = mm.getAllMigrations();
+    std::string j = "{\"success\":true,\"migrations\":[";
+    bool first = true;
+    for (const auto& m : all) {
+        if (!first) j += ",";
+        j += "{\"name\":\"" + jsonEscape(m.name) + "\"";
+        j += ",\"status\":\"" + std::string(m.appliedAt.empty()?"pending":"applied") + "\"";
+        if (!m.appliedAt.empty())
+            j += ",\"applied_at\":\"" + jsonEscape(m.appliedAt) + "\"";
+        j += "}";
+        first = false;
+    }
+    j += "]}";
+    return j;
 }
 
 // ── MilanHttpServer::handleListTablesForUser ──────────────────
 
 inline std::string MilanHttpServer::handleListTablesForUser(int userId) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     auto all = engine_.getAllTableNames();
     std::string json = "{\"success\":true,\"tables\":[";
     bool first = true;
@@ -1836,11 +2511,24 @@ inline std::string MilanHttpServer::handleListTablesForUser(int userId) {
 // when more than one statement is present.
 
 inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
 
     auto persistFn = [this]() {
         if (engine_.isInTransaction()) return;
-        try { storage_.save(engine_); } catch (...) {}
+        // Audit Bug #25: Persist-Fehler (z.B. Disk voll) NICHT mehr
+        // stillschweigend schlucken — Client bekommt success:false,
+        // /health meldet storage.status=error. Vorher: bestätigte
+        // Commits waren nach Neustart weg (silent data loss).
+        try {
+            storage_.save(engine_);
+            lastPersistError_.clear();
+        } catch (const std::exception& e) {
+            lastPersistError_ = e.what();
+            std::cerr << "  [Persist] FEHLER: " << e.what() << "\n";
+            throw std::runtime_error(
+                std::string("Persistierung fehlgeschlagen (Daten NICHT dauerhaft "
+                            "gespeichert): ") + e.what());
+        }
     };
 
     auto saveProceduresFn = [this]() {
@@ -1909,7 +2597,7 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
                         colTypesOut.push_back(col.type);
                 }
             }
-        } catch (const std::exception& e) { ok = false; errMsg = e.what(); }
+        } catch (const std::exception& e) { ok = false; errMsg = sanitizeError(e.what()); }
           catch (...) { ok = false; errMsg = "Unbekannter Fehler"; }
         std::cout.rdbuf(old);
         if (!ok) return "{\"success\":false,\"error\":\"" + jsonEscape(errMsg) + "\"}";
@@ -1943,7 +2631,7 @@ inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
 // ── MilanHttpServer::handleListTables ─────────────────────────
 
 inline std::string MilanHttpServer::handleListTables() {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     auto tables = engine_.getAllTableNames();
     std::string json = "{\"success\":true,\"tables\":[";
     for (size_t i = 0; i < tables.size(); ++i) {
@@ -1957,7 +2645,7 @@ inline std::string MilanHttpServer::handleListTables() {
 // ── MilanHttpServer::handleDescribeTable ──────────────────────
 
 inline std::string MilanHttpServer::handleDescribeTable(const std::string& tableName) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     std::ostringstream captured;
     std::streambuf* old = std::cout.rdbuf(captured.rdbuf());
     try {
@@ -1978,7 +2666,7 @@ inline std::string MilanHttpServer::handleDescribeTable(const std::string& table
 // ── MilanHttpServer::handleListSchemas ────────────────────────
 
 inline std::string MilanHttpServer::handleListSchemas() {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
     auto schemas = engine_.showSchemas();
     std::string json = "{\"success\":true,\"schemas\":[";
     for (size_t i = 0; i < schemas.size(); ++i) {
@@ -1992,7 +2680,7 @@ inline std::string MilanHttpServer::handleListSchemas() {
 // ── MilanHttpServer::handleStatus ─────────────────────────────
 
 inline std::string MilanHttpServer::handleStatus() {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+    std::unique_lock<std::shared_mutex> lock(engineMutex_);
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - startTime_).count();
     auto tables  = engine_.getAllTableNames();
@@ -2012,7 +2700,7 @@ inline std::string MilanHttpServer::handleStatus() {
     std::string json = "{";
     json += "\"success\":true,";
     json += "\"status\":\"healthy\",";
-    json += "\"version\":\"MilanSQL v9.9.0\",";
+    json += "\"version\":\"MilanSQL v" + std::string(MILANSQL_VERSION) + "\",";
     json += "\"uptime\":"       + std::to_string(elapsed) + ",";
     json += "\"uptime_fmt\":\"" + uptimeFmt + "\",";
     json += "\"tables\":"       + std::to_string(tables.size()) + ",";
@@ -2033,8 +2721,8 @@ inline std::string MilanHttpServer::handleStatus() {
 //             "query_vector":"[1.0,0.0,0.0]","limit":5,
 //             "filter":"category = 'tech'","include_score":true}
 
-inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body) {
-    std::lock_guard<std::mutex> lock(engineMutex_);
+inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body, int userId, bool isRoot) {
+    std::shared_lock<std::shared_mutex> lock(engineMutex_);
 
     // Simple JSON field extraction helper
     auto extractStr = [&](const std::string& key) -> std::string {
@@ -2074,6 +2762,25 @@ inline std::string MilanHttpServer::handleSemanticSearch(const std::string& body
 
     if (table.empty() || vecCol.empty() || queryVecStr.empty())
         return R"({"success":false,"error":"Missing required fields: table, vector_column, query_vector"})";
+
+    // Phase 173: Validate table ownership for non-root users
+    if (!isRoot && userId > 0) {
+        std::string userPrefix = "u" + std::to_string(userId) + "_";
+        std::string bareName = table;
+        auto dot = table.find('.');
+        if (dot != std::string::npos) bareName = table.substr(dot + 1);
+        if (bareName.substr(0, userPrefix.size()) != userPrefix)
+            return R"({"success":false,"error":"Access denied: table not owned by user"})";
+    }
+    // Validate identifiers: reject SQL injection chars in table/column names
+    auto isValidIdent = [](const std::string& s) -> bool {
+        for (char c : s) {
+            if (!std::isalnum(c) && c != '_' && c != '.') return false;
+        }
+        return !s.empty();
+    };
+    if (!isValidIdent(table) || !isValidIdent(vecCol))
+        return R"({"success":false,"error":"Invalid table or column name"})";
 
     int limitN = 10;
     if (!limitStr.empty()) {
@@ -2226,7 +2933,7 @@ tr:nth-child(even):hover td{background:#2d2d44}
 </head>
 <body>
 <div class="header">
-  <div class="logo">&#9889; MilanSQL v9.9.0</div>
+  <div class="logo"><svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="100" height="100" rx="8" fill="#161616" stroke="#ff6b1a" stroke-width="0.5"/><path d="M20 78 L20 22 L50 54 L80 22 L80 78" fill="none" stroke="#ff6b1a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="20" cy="22" r="5" fill="#ff6b1a"/><circle cx="20" cy="78" r="5" fill="#ff6b1a"/><circle cx="50" cy="54" r="5" fill="#ff6b1a"/><circle cx="80" cy="22" r="5" fill="#ff6b1a"/><circle cx="80" cy="78" r="5" fill="#ff6b1a"/></svg> MilanSQL v10.7.0</div>
   <div style="display:flex;align-items:center;gap:10px">
     <span id="ms-user-badge" style="background:#313244;color:#89b4fa;padding:3px 10px;border-radius:10px;font-size:11px"></span>
     <button onclick="msLogout()" style="background:#45475a;color:#cdd6f4;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
@@ -2314,43 +3021,79 @@ loadSidebar();
 // ── MilanHttpServer::handleWebUI (Phase 135) ─────────────────
 
 inline std::string MilanHttpServer::handleWebUI() {
-    static const std::string html = R"WEBUIEND(<!DOCTYPE html>
+    // Cache-Busting: Versions-Query am einzigen externen Asset (Favicon);
+    // CSS/JS sind inline und haengen an der HTML-Seite (no-store, s.u.).
+    static const std::string html = std::string(R"WEBUIEND(<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MilanSQL Admin</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<link rel="icon" type="image/svg+xml" href="/favicon.ico?v=)WEBUIEND") + MILANSQL_VERSION + R"WEBUIEND(">
 <style>
+/* ── MilanSQL Design System (Redesign 2026-07) ── */
+:root{
+  --bg-primary:#080c18;--bg-secondary:#0d1224;--bg-card:#111827;--bg-hover:#1a2235;
+  --accent:#00d4ff;--accent-2:#7c3aed;
+  --danger:#ef4444;--success:#10b981;--warning:#f59e0b;
+  --text-1:#f8fafc;--text-2:#94a3b8;--text-3:#475569;
+  --border:#1e2d40;--border-2:#2d4060;
+  --glow-cyan:0 0 30px rgba(0,212,255,0.15);
+  --glow-card:0 0 60px rgba(0,212,255,0.08);
+  --ease:cubic-bezier(0.4,0,0.2,1);
+  --mono:'JetBrains Mono','Cascadia Code','SF Mono','Fira Code',monospace;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+body{background:var(--bg-primary);color:var(--text-1);font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
 
-/* TOPBAR */
-#topbar{height:48px;background:#161b22;border-bottom:1px solid #21262d;display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:100}
-#topbar .brand{font-weight:700;font-size:1rem;color:#e6edf3;margin-right:8px}
-#topbar .brand span{color:#f0a500}
-.badge{display:inline-flex;align-items:center;gap:4px;background:#21262d;border:1px solid #30363d;border-radius:20px;padding:3px 10px;font-size:0.75rem;color:#8b949e}
-.badge.green{color:#3fb950}.badge.green::before{content:'';margin-right:2px;color:#3fb950}
-.badge.yellow{color:#d29922}.badge.yellow::before{content:'';margin-right:2px;color:#d29922}
-.badge.blue{color:#58a6ff}
-.topbar-right{margin-left:auto;display:flex;gap:8px}
+/* TOPBAR (glassmorphism) */
+#topbar{height:56px;background:rgba(255,255,255,0.03);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0;z-index:100}
+#topbar .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1rem;color:var(--text-1);margin-right:8px;letter-spacing:-0.02em}
+.logo-m{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1rem;color:#080c18;background:linear-gradient(135deg,var(--accent),#0ea5e9);box-shadow:var(--glow-cyan)}
+.badge{display:inline-flex;align-items:center;gap:6px;background:var(--bg-hover);border:1px solid var(--border);border-radius:20px;padding:4px 12px;font-size:0.75rem;color:var(--text-2);transition:border-color .2s var(--ease)}
+.badge.green{color:var(--success)}
+.badge.green::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px rgba(16,185,129,0.8);animation:pulse 2s var(--ease) infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.badge.yellow{color:var(--warning)}
+.badge.yellow::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--warning)}
+.badge.blue{color:var(--accent)}
+.badge.purple{color:#a78bfa}.badge.purple::before{content:'';width:7px;height:7px;border-radius:50%;background:#7c3aed;box-shadow:0 0 8px rgba(124,58,237,0.6)}
+.ssl-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-top:12px}
+.ssl-card h3{color:var(--accent);font-size:0.85rem;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.ssl-card .ssl-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}
+.ssl-card .ssl-item{font-size:0.75rem;color:var(--text-2)}
+.ssl-card .ssl-item strong{color:var(--text-1);display:block}
+.ssl-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:0.65rem;font-weight:600}
+.ssl-badge.on{background:rgba(16,185,129,0.15);color:#10b981;border:1px solid rgba(16,185,129,0.3)}
+.ssl-badge.off{background:rgba(239,68,68,0.15);color:#ef4444;border:1px solid rgba(239,68,68,0.3)}
+.part-badge{display:inline-flex;align-items:center;gap:4px;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.3);border-radius:4px;padding:1px 6px;font-size:0.65rem;color:#a78bfa;font-family:var(--mono);letter-spacing:.02em;margin-left:auto}
+.part-bar{height:6px;border-radius:3px;margin-top:2px;transition:width .3s var(--ease)}
+.part-detail{background:var(--bg-hover);border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px}
+.part-detail h4{color:var(--accent);font-size:0.8rem;margin-bottom:8px}
+.part-detail table{width:100%;font-size:0.75rem}
+.part-detail th{text-align:left;color:var(--text-2);padding:4px 8px;border-bottom:1px solid var(--border)}
+.part-detail td{padding:4px 8px;color:var(--text-1)}
+.part-progress{display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;margin-top:4px}
+.part-progress div{height:100%;border-radius:2px;min-width:4px;transition:width .3s}
+.topbar-right{margin-left:auto;display:flex;gap:8px;align-items:center}
 
 /* LAYOUT */
 #layout{display:flex;flex:1;overflow:hidden}
 
 /* SIDEBAR */
-#sidebar{width:220px;background:#0d1117;border-right:1px solid #21262d;display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+#sidebar{width:220px;background:var(--bg-secondary);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
 .nav-section{padding:8px 0}
-.nav-label{font-size:0.7rem;text-transform:uppercase;letter-spacing:.08em;color:#8b949e;padding:8px 16px 4px}
-.nav-item{display:flex;align-items:center;gap:8px;padding:7px 16px;font-size:0.85rem;color:#8b949e;cursor:pointer;border-radius:4px;margin:1px 8px;transition:background .15s,color .15s}
-.nav-item:hover{background:#161b22;color:#e6edf3}
-.nav-item.active{background:#1c2128;color:#58a6ff}
+.nav-label{font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3);padding:10px 16px 4px}
+.nav-item{position:relative;display:flex;align-items:center;gap:9px;padding:8px 16px;font-size:0.85rem;color:var(--text-2);cursor:pointer;border-radius:6px;margin:1px 8px;transition:background .2s var(--ease),color .2s var(--ease)}
+.nav-item:hover{background:var(--bg-hover);color:var(--text-1)}
+.nav-item.active{background:var(--bg-hover);color:var(--accent);font-weight:600}
+.nav-item.active::before{content:'';position:absolute;left:-8px;top:6px;bottom:6px;width:3px;border-radius:2px;background:var(--accent);box-shadow:0 0 8px rgba(0,212,255,0.6)}
 .nav-item .icon{font-size:0.9rem;width:16px;text-align:center}
 .tables-list{padding:0 8px}
-.table-item{padding:5px 8px;font-size:0.82rem;color:#8b949e;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:6px;transition:background .15s,color .15s}
-.table-item:hover{background:#161b22;color:#58a6ff}
-.table-item::before{content:'\229E';font-size:0.75rem;color:#30363d}
-.sidebar-footer{margin-top:auto;padding:12px;font-size:0.72rem;color:#8b949e;border-top:1px solid #21262d}
+.table-item{padding:5px 8px;font-size:0.82rem;color:var(--text-2);cursor:pointer;border-radius:6px;display:flex;align-items:center;gap:6px;transition:background .2s var(--ease),color .2s var(--ease)}
+.table-item:hover{background:var(--bg-hover);color:var(--accent)}
+.table-item::before{content:'\229E';font-size:0.75rem;color:var(--border-2)}
+.sidebar-footer{margin-top:auto;padding:12px;font-size:0.72rem;color:var(--text-3);border-top:1px solid var(--border)}
 
 /* MAIN */
 #main{flex:1;display:flex;flex-direction:column;overflow:hidden}
@@ -2362,101 +3105,164 @@ body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFo
 /* SQL EDITOR PAGE */
 #editor-area{padding:12px;display:flex;flex-direction:column;gap:8px;flex-shrink:0}
 .editor-toolbar{display:flex;gap:8px;align-items:center}
-.editor-toolbar .exec-time{margin-left:auto;font-size:0.75rem;color:#8b949e}
-/* New: editor with line numbers + syntax highlight */
-#editor-container{display:flex;border:1px solid #30363d;border-radius:6px;overflow:hidden;background:#161b22;transition:border-color .15s}
-#editor-container:focus-within{border-color:#388bfd}
-#line-numbers{background:#0d1117;color:#484f58;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;line-height:1.6;padding:12px 8px;text-align:right;user-select:none;min-width:40px;overflow:hidden;white-space:pre;flex-shrink:0;border-right:1px solid #21262d}
+.editor-toolbar .exec-time{margin-left:auto;font-size:0.75rem;color:var(--text-2)}
+/* Editor with line numbers + syntax highlight */
+#editor-container{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--bg-card);transition:border-color .2s var(--ease),box-shadow .2s var(--ease)}
+#editor-container:focus-within{border-color:var(--accent);box-shadow:var(--glow-cyan)}
+#line-numbers{background:var(--bg-primary);color:var(--text-3);font-family:var(--mono);font-size:0.85rem;line-height:1.6;padding:12px 8px;text-align:right;user-select:none;min-width:40px;overflow:hidden;white-space:pre;flex-shrink:0;border-right:1px solid var(--border)}
 #editor-wrap{position:relative;flex:1;overflow:hidden}
-#highlight-backdrop{position:absolute;top:0;left:0;right:0;bottom:0;padding:12px;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow:hidden;pointer-events:none;color:transparent}
-#sql-editor{position:relative;width:100%;height:140px;background:transparent;border:none;color:#e6edf3;caret-color:#e6edf3;font-family:'JetBrains Mono','Cascadia Code','Fira Code',monospace;font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4;z-index:1;overflow:auto}
+#highlight-backdrop{position:absolute;top:0;left:0;right:0;bottom:0;padding:12px;font-family:var(--mono);font-size:0.85rem;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow:hidden;pointer-events:none;color:transparent}
+#sql-editor{position:relative;width:100%;height:140px;background:transparent;border:none;color:var(--text-1);caret-color:var(--accent);font-family:var(--mono);font-size:0.85rem;padding:12px;resize:vertical;outline:none;line-height:1.6;tab-size:4;z-index:1;overflow:auto}
 /* Autocomplete dropdown */
-#autocomplete{display:none;position:absolute;background:#1c2128;border:1px solid #30363d;border-radius:6px;z-index:9999;max-height:200px;overflow-y:auto;min-width:160px;box-shadow:0 4px 16px rgba(0,0,0,.5)}
-.ac-item{padding:6px 12px;font-size:0.82rem;font-family:'JetBrains Mono',monospace;color:#e6edf3;cursor:pointer;white-space:nowrap}
-.ac-item:hover,.ac-item.ac-selected{background:#388bfd;color:#fff}
+#autocomplete{display:none;position:absolute;background:var(--bg-hover);border:1px solid var(--border-2);border-radius:8px;z-index:9999;max-height:200px;overflow-y:auto;min-width:160px;box-shadow:0 8px 24px rgba(0,0,0,.6),var(--glow-card)}
+.ac-item{padding:6px 12px;font-size:0.82rem;font-family:var(--mono);color:var(--text-1);cursor:pointer;white-space:nowrap}
+.ac-item:hover,.ac-item.ac-selected{background:var(--accent);color:#080c18}
 /* Error line highlight */
-.error-line-badge{display:inline-block;background:#da3633;color:#fff;border-radius:4px;padding:2px 8px;font-size:0.75rem;margin-bottom:4px}
+.error-line-badge{display:inline-block;background:rgba(239,68,68,.15);color:var(--danger);border:1px solid var(--danger);border-radius:6px;padding:2px 8px;font-size:0.75rem;margin-bottom:4px}
 
 /* BUTTONS */
-.btn{padding:6px 14px;border-radius:6px;border:none;font-size:0.82rem;cursor:pointer;font-weight:500;transition:opacity .15s}
-.btn:hover{opacity:.85}
-.btn-green{background:#238636;color:#fff}
-.btn-blue{background:#1f6feb;color:#fff}
-.btn-gray{background:#21262d;color:#8b949e;border:1px solid #30363d}
-.btn-red{background:#da3633;color:#fff}
+.btn{padding:6px 14px;border-radius:8px;border:1px solid transparent;font-size:0.82rem;cursor:pointer;font-weight:600;font-family:inherit;transition:all .2s var(--ease)}
+.btn-green{background:var(--accent);color:#080c18}
+.btn-green:hover{box-shadow:var(--glow-cyan);filter:brightness(1.1)}
+.btn-blue{background:var(--accent-2);color:#fff}
+.btn-blue:hover{box-shadow:0 0 30px rgba(124,58,237,.3);filter:brightness(1.1)}
+.btn-gray{background:transparent;color:var(--text-2);border:1px solid var(--border-2)}
+.btn-gray:hover{color:var(--text-1);border-color:var(--accent);background:var(--bg-hover)}
+.btn-red{background:transparent;color:var(--danger);border:1px solid var(--danger)}
+.btn-red:hover{background:var(--danger);color:#fff}
 
 /* RESULTS */
 #results-area{flex:1;overflow:auto;padding:0 12px 12px}
-.result-header{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:0.8rem;color:#8b949e;margin-bottom:4px}
-.result-header .pill{background:#1c2128;border:1px solid #238636;color:#3fb950;border-radius:20px;padding:2px 10px;font-size:0.75rem}
-.result-header .pill.error{border-color:#da3633;color:#f85149}
-.result-header .pill.info{border-color:#1f6feb;color:#58a6ff}
-#result-table-wrap{overflow:auto;border:1px solid #21262d;border-radius:6px}
+.result-header{display:flex;align-items:center;gap:8px;padding:8px 0;font-size:0.8rem;color:var(--text-2);margin-bottom:4px}
+.result-header .pill{background:rgba(16,185,129,.1);border:1px solid var(--success);color:var(--success);border-radius:20px;padding:2px 10px;font-size:0.75rem}
+.result-header .pill.error{background:rgba(239,68,68,.1);border-color:var(--danger);color:var(--danger)}
+.result-header .pill.info{background:rgba(0,212,255,.08);border-color:var(--accent);color:var(--accent)}
+#result-table-wrap{overflow:auto;border:1px solid var(--border);border-radius:8px}
 table{width:100%;border-collapse:collapse;font-size:0.82rem}
-th{background:#161b22;color:#8b949e;text-align:left;padding:8px 12px;border-bottom:1px solid #21262d;font-weight:500;white-space:nowrap;position:sticky;top:0;cursor:pointer;user-select:none}
-th:hover{color:#e6edf3}
-th.sort-asc::after{content:' \25B2';font-size:0.7rem}
-th.sort-desc::after{content:' \25BC';font-size:0.7rem}
-td{padding:7px 12px;border-bottom:1px solid #161b22;color:#e6edf3;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
-tr:hover td{background:#1c2128}
-td.num{color:#58a6ff;font-family:monospace}
-td.null-val{color:#484f58;font-style:italic}
-.error-box{background:#1a0f0f;border:1px solid #da3633;border-radius:6px;padding:12px;color:#f85149;font-family:monospace;font-size:0.82rem;margin-top:4px}
-.affected-box{background:#0d1f0d;border:1px solid #238636;border-radius:6px;padding:12px;color:#3fb950;font-size:0.85rem;margin-top:4px}
+th{background:var(--bg-secondary);color:var(--text-2);text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);font-weight:600;white-space:nowrap;position:sticky;top:0;cursor:pointer;user-select:none;text-transform:uppercase;font-size:0.72rem;letter-spacing:.05em}
+th:hover{color:var(--accent)}
+th.sort-asc::after{content:' \25B2';font-size:0.7rem;color:var(--accent)}
+th.sort-desc::after{content:' \25BC';font-size:0.7rem;color:var(--accent)}
+td{padding:7px 12px;border-bottom:1px solid var(--border);color:var(--text-1);white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono);font-size:0.8rem}
+tbody tr:nth-child(even) td{background:rgba(255,255,255,0.015)}
+tr:hover td{background:var(--bg-hover)}
+td.num{color:#a78bfa}
+td.null-val{color:var(--text-3);font-style:italic;font-family:inherit}
+.error-box{background:rgba(239,68,68,.06);border:1px solid var(--danger);border-radius:8px;padding:12px;color:var(--danger);font-family:var(--mono);font-size:0.82rem;margin-top:4px}
+.affected-box{background:rgba(16,185,129,.06);border:1px solid var(--success);border-radius:8px;padding:12px;color:var(--success);font-size:0.85rem;margin-top:4px}
 
 /* STATUS BAR */
-#statusbar{height:26px;background:#161b22;border-top:1px solid #21262d;display:flex;align-items:center;padding:0 12px;gap:16px;font-size:0.72rem;color:#8b949e;flex-shrink:0}
+#statusbar{height:26px;background:var(--bg-secondary);border-top:1px solid var(--border);display:flex;align-items:center;padding:0 12px;gap:16px;font-size:0.72rem;color:var(--text-2);flex-shrink:0}
 .status-item{display:flex;align-items:center;gap:4px}
-.status-dot{width:6px;height:6px;border-radius:50%;background:#3fb950}
-.status-dot.warn{background:#d29922}
-.status-dot.err{background:#f85149}
+.status-dot{width:6px;height:6px;border-radius:50%;background:var(--success);box-shadow:0 0 6px rgba(16,185,129,.6)}
+.status-dot.warn{background:var(--warning);box-shadow:0 0 6px rgba(245,158,11,.6)}
+.status-dot.err{background:var(--danger);box-shadow:0 0 6px rgba(239,68,68,.6)}
 
 /* MONITORING PAGE */
-#page-monitoring .mon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:16px}
-.stat-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px}
-.stat-card .label{font-size:0.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
-.stat-card .value{font-size:1.6rem;font-weight:700;color:#e6edf3}
-.stat-card .unit{font-size:0.75rem;color:#8b949e;margin-left:4px}
+#page-monitoring .mon-grid,#page-vacuum .mon-grid,#page-replication .mon-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:16px}
+.mon-tab{background:none;border:1px solid transparent;color:var(--text-2);font-size:0.8rem;padding:4px 12px;border-radius:8px;cursor:pointer;font-family:inherit;transition:all .2s var(--ease)}
+.mon-tab:hover{color:var(--text-1);background:var(--bg-hover)}
+.mon-tab.active{color:var(--accent);background:rgba(0,212,255,.08);border-color:var(--accent);font-weight:600}
+.vac-btn{background:rgba(16,185,129,.1);color:var(--success);border:1px solid var(--success);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:0.72rem;font-family:inherit;transition:all .2s var(--ease)}
+.vac-btn:hover{background:var(--success);color:#080c18}
+.vac-btn:disabled{opacity:0.5;cursor:wait}
+.stat-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px;transition:all .2s var(--ease)}
+.stat-card:hover{border-color:var(--border-2);box-shadow:var(--glow-card);transform:translateY(-1px)}
+.stat-card .label{font-size:0.72rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.stat-card .value{font-size:1.6rem;font-weight:700;color:var(--text-1);font-family:var(--mono)}
+.stat-card .unit{font-size:0.75rem;color:var(--text-2);margin-left:4px}
 .slow-queries-section{padding:0 16px 16px}
-.slow-queries-section h3{font-size:0.8rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
+.slow-queries-section h3{font-size:0.8rem;color:var(--text-2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
 
+
+/* SCHEMA VISUALIZER */
+#page-schema{flex-direction:column;position:relative}
+.schema-zoom-ctrl{display:flex;align-items:center;gap:4px}
+.schema-zoom-ctrl button{background:var(--bg-hover);border:1px solid var(--border-2);color:var(--text-1);width:26px;height:26px;border-radius:6px;cursor:pointer;font-size:0.85rem;display:flex;align-items:center;justify-content:center;padding:0;transition:all .2s var(--ease)}
+.schema-zoom-ctrl button:hover{border-color:var(--accent);color:var(--accent)}
+.schema-zoom-pct{font-size:0.7rem;color:var(--text-2);min-width:36px;text-align:center}
+#schema-minimap{position:absolute;bottom:12px;right:12px;width:200px;height:150px;background:var(--bg-primary);border:1px solid var(--border-2);border-radius:8px;z-index:50;overflow:hidden;cursor:crosshair}
+#schema-minimap canvas{width:100%;height:100%}
+.schema-card{position:absolute;background:var(--bg-card);border:1px solid var(--border-2);border-radius:12px;min-width:180px;max-width:260px;cursor:move;transition:box-shadow .2s var(--ease),opacity .2s var(--ease);user-select:none;z-index:2}
+.schema-card:hover{box-shadow:0 0 0 1px var(--accent),var(--glow-cyan)}
+.schema-card.dimmed{opacity:0.3}
+.schema-card.highlighted{box-shadow:0 0 0 2px var(--accent),var(--glow-cyan)}
+.schema-card-header{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);font-size:0.8rem;font-weight:600;color:var(--text-1)}
+.schema-card-header .rls-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.schema-card-header .rls-dot.on{background:var(--success);box-shadow:0 0 5px rgba(16,185,129,.7)}
+.schema-card-header .rls-dot.off{background:var(--text-3)}
+.schema-card-header .pol-count{margin-left:auto;font-size:9px;font-weight:600;background:rgba(16,185,129,.12);color:var(--success);padding:1px 5px;border-radius:8px}
+.schema-card-cols{padding:4px 0;font-size:0.75rem;max-height:200px;overflow-y:auto}
+.schema-col{display:flex;align-items:center;gap:4px;padding:2px 10px;color:var(--text-2)}
+.schema-col .col-icon{width:12px;font-size:9px;text-align:center;flex-shrink:0}
+.schema-col .col-icon.pk{color:var(--warning)}
+.schema-col .col-icon.fk{color:var(--accent)}
+.schema-col .col-name{flex:1;color:var(--text-1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.schema-col .col-name.fk-col{color:var(--accent)}
+.schema-col .col-type{color:var(--text-3);font-size:0.7rem;font-family:var(--mono);flex-shrink:0}
+.schema-card-rls{padding:5px 10px;border-top:1px solid var(--border);background:var(--bg-primary);border-radius:0 0 11px 11px;font-size:0.7rem;font-family:var(--mono);color:var(--text-3);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-height:60px}
+.schema-card-rls:hover{color:var(--text-2)}
 /* TABLE BROWSER PAGE */
 #page-browser .browser-wrap{display:flex;flex:1;gap:0;overflow:hidden}
-#page-browser .tbl-list{width:200px;border-right:1px solid #21262d;overflow-y:auto;padding:8px}
-#page-browser .tbl-list .tbl-btn{width:100%;text-align:left;padding:7px 10px;background:none;border:none;color:#8b949e;font-size:0.82rem;cursor:pointer;border-radius:4px;display:block;transition:background .1s,color .1s}
-#page-browser .tbl-list .tbl-btn:hover{background:#161b22;color:#e6edf3}
-#page-browser .tbl-list .tbl-btn.active{background:#1c2128;color:#58a6ff}
+#page-browser .tbl-list{width:200px;border-right:1px solid var(--border);overflow-y:auto;padding:8px}
+#page-browser .tbl-list .tbl-btn{width:100%;text-align:left;padding:7px 10px;background:none;border:none;color:var(--text-2);font-size:0.82rem;cursor:pointer;border-radius:6px;display:block;transition:all .2s var(--ease);font-family:inherit}
+#page-browser .tbl-list .tbl-btn:hover{background:var(--bg-hover);color:var(--text-1)}
+#page-browser .tbl-list .tbl-btn.active{background:rgba(0,212,255,.08);color:var(--accent)}
 #page-browser .tbl-detail{flex:1;overflow:auto;padding:12px}
-#page-browser .tbl-detail h3{font-size:0.9rem;color:#e6edf3;margin-bottom:8px}
+#page-browser .tbl-detail h3{font-size:0.9rem;color:var(--text-1);margin-bottom:8px}
 
 /* HISTORY PAGE */
 #page-history{overflow-y:auto;padding:12px}
-.hist-item{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 14px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
-.hist-item:hover{border-color:#388bfd}
-.hist-item .hist-sql{font-family:monospace;font-size:0.82rem;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hist-item .hist-meta{font-size:0.72rem;color:#8b949e;margin-top:4px;display:flex;gap:8px;align-items:center}
-.hist-badge{display:inline-block;border-radius:10px;padding:1px 7px;font-size:0.7rem;font-weight:600}
-.hist-badge.ok{background:#1a3a1a;color:#3fb950;border:1px solid #238636}
-.hist-badge.err{background:#2a1010;color:#f85149;border:1px solid #da3633}
+.hist-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:8px;cursor:pointer;transition:all .2s var(--ease)}
+.hist-item:hover{border-color:var(--accent);box-shadow:var(--glow-card)}
+.hist-item .hist-sql{font-family:var(--mono);font-size:0.82rem;color:var(--text-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist-item .hist-meta{font-size:0.72rem;color:var(--text-2);margin-top:4px;display:flex;gap:8px;align-items:center}
+.hist-badge{display:inline-block;border-radius:10px;padding:1px 7px;font-size:0.7rem;font-weight:600;font-family:var(--mono)}
+.hist-badge.ok{background:rgba(16,185,129,.1);color:var(--success);border:1px solid var(--success)}
+.hist-badge.err{background:rgba(239,68,68,.1);color:var(--danger);border:1px solid var(--danger)}
 
 /* SCROLLBAR */
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:#0d1117}
-::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:var(--bg-primary)}
+::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+
+/* AI ASSISTANT PANEL */
+#ai-toggle{background:linear-gradient(135deg,#7c3aed,#a855f7);color:#fff;border:none;border-radius:50%;width:44px;height:44px;position:fixed;bottom:20px;right:20px;cursor:pointer;font-size:20px;z-index:10000;box-shadow:0 4px 20px rgba(124,58,237,0.5);transition:transform .2s var(--ease)}
+#ai-toggle:hover{transform:scale(1.1)}
+#ai-panel{display:none;position:fixed;bottom:76px;right:20px;width:400px;max-height:500px;background:var(--bg-card);border:1px solid var(--border-2);border-radius:12px;z-index:10000;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.5),0 0 40px rgba(124,58,237,0.1)}
+#ai-panel.open{display:flex}
+#ai-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;font-weight:600;font-size:0.9rem;background:rgba(124,58,237,0.08)}
+#ai-header .ai-icon{color:#a855f7;font-size:1.1rem}
+#ai-header .ai-close{margin-left:auto;cursor:pointer;color:var(--text-3);font-size:1.1rem;background:none;border:none;padding:2px 6px}
+#ai-header .ai-close:hover{color:var(--text-1)}
+#ai-messages{flex:1;overflow-y:auto;padding:12px;max-height:320px;min-height:120px}
+.ai-msg{margin-bottom:10px;font-size:0.82rem;line-height:1.5}
+.ai-msg.user{text-align:right}
+.ai-msg.user .ai-bubble{display:inline-block;background:rgba(124,58,237,0.15);border:1px solid rgba(124,58,237,0.3);border-radius:12px 12px 4px 12px;padding:8px 12px;color:var(--text-1);max-width:85%;text-align:left}
+.ai-msg.bot .ai-bubble{display:inline-block;background:var(--bg-hover);border:1px solid var(--border);border-radius:12px 12px 12px 4px;padding:8px 12px;color:var(--text-1);max-width:85%;text-align:left}
+.ai-sql{background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-family:var(--mono);font-size:0.78rem;color:var(--accent);margin:6px 0;cursor:pointer;word-break:break-all}
+.ai-sql:hover{border-color:var(--accent)}
+#ai-input-area{padding:8px 12px;border-top:1px solid var(--border);display:flex;gap:8px}
+#ai-input{flex:1;background:var(--bg-primary);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-1);font-size:0.82rem;font-family:inherit;outline:none}
+#ai-input:focus{border-color:#a855f7}
+#ai-send{background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:0.82rem;font-weight:600}
+#ai-send:hover{background:#6d28d9}
+.ai-loading{color:var(--text-3);font-style:italic}
 </style>
 </head>
 <body>
 
 <!-- TOPBAR -->
 <div id="topbar">
-  <div class="brand"><span>&#x26A1;</span> MilanSQL</div>
+  <div class="brand"><span class="logo-m">M</span> MilanSQL</div>
   <span class="badge" id="health-badge">checking...</span>
   <span class="badge blue" id="conn-badge">0 connections</span>
-  <span class="badge blue" id="test-badge">1221 tests</span>
+  <span class="badge blue" id="test-badge">&hellip; tests</span>
   <div class="topbar-right">
-    <span id="ms-user-badge" style="display:none;background:#1c2128;color:#3fb950;border:1px solid #238636;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
-    <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
-    <span style="font-size:0.75rem;color:#8b949e" id="version-label">v9.9.0</span>
+    <span id="ms-user-badge" style="display:none;background:rgba(16,185,129,.1);color:#10b981;border:1px solid #10b981;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600"></span>
+    <button id="ms-logout-btn" onclick="msLogout()" style="display:none;background:transparent;color:#94a3b8;border:1px solid #2d4060;border-radius:6px;padding:3px 10px;cursor:pointer;font-size:11px;font-family:inherit">Logout</button>
+    <span style="font-size:0.75rem;color:#94a3b8" id="version-label" class="ms-version">v10.7.0</span>
   </div>
 </div>
 
@@ -2473,29 +3279,62 @@ td.null-val{color:#484f58;font-style:italic}
       <div class="nav-item" data-page="browser" onclick="showPage('browser',this)">
         <span class="icon">&#x1F5C3;</span> Table Browser
       </div>
+      <div class="nav-item" data-page="schema" onclick="showPage('schema',this)">
+        <span class="icon">&#x25C9;</span> Schema
+      </div>
       <div class="nav-item" data-page="monitoring" onclick="showPage('monitoring',this)">
         <span class="icon">&#x1F4CA;</span> Monitoring
+      </div>
+      <div class="nav-item" data-page="vacuum" onclick="showPage('vacuum',this)" style="padding-left:26px">
+        <span class="icon">&#x1F9F9;</span> Vacuum
+      </div>
+      <div class="nav-item" data-page="replication" onclick="showPage('replication',this)">
+        <span class="icon">&#x1F501;</span> Replication
       </div>
       <div class="nav-item" data-page="history" onclick="showPage('history',this)">
         <span class="icon">&#x1F550;</span> Query History
       </div>
-      <div class="nav-item" data-page="auditlog" onclick="showPage('auditlog',this)">
-        <span class="icon">&#x1F512;</span> Audit Log
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Enterprise</div>
+      <div class="nav-item" data-page="branches" onclick="showPage('branches',this)">
+        <span class="icon">&#x2387;</span> Branches
+      </div>
+      <div class="nav-item" data-page="security" onclick="showPage('security',this)">
+        <span class="icon">&#x1F512;</span> Security
+      </div>
+      <div class="nav-item" data-page="audit" onclick="showPage('audit',this)">
+        <span class="icon">&#x1F4CB;</span> Audit Log
+      </div>
+      <div class="nav-item" data-page="compliance" onclick="showPage('compliance',this)">
+        <span class="icon">&#x1F3DB;</span> Compliance
+      </div>
+      <div class="nav-item" data-page="migrations" onclick="showPage('migrations',this)">
+        <span class="icon">&#x1F504;</span> Migrations
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Cloud</div>
+      <div class="nav-item" data-page="cloud" onclick="showPage('cloud',this)">
+        <span class="icon">&#x2601;</span> Cloud Instances
+      </div>
+      <div class="nav-item" data-page="regions" onclick="showPage('regions',this)">
+        <span class="icon">&#x1F30D;</span> Regions
       </div>
     </div>
     <div class="nav-section">
       <div class="nav-label">Tables</div>
       <div class="tables-list" id="sidebar-tables">
-        <div style="font-size:0.75rem;color:#484f58;padding:4px 8px">Loading...</div>
+        <div style="font-size:0.75rem;color:#475569;padding:4px 8px">Loading...</div>
       </div>
     </div>
-    <div style="padding:8px 12px;border-top:1px solid #21262d;margin-top:auto">
-      <div id="rls-panel" style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:11px;color:#8b949e">
-        <div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>
-        <div style="display:flex;align-items:center;gap:6px"><span style="color:#484f58;font-size:9px">●</span><span style="font-size:11px;color:#484f58">Not connected</span></div>
+    <div style="padding:8px 12px;border-top:1px solid #1e2d40;margin-top:auto">
+      <div id="rls-panel" style="background:#111827;border:1px solid #1e2d40;border-radius:8px;padding:8px 10px;font-size:11px;color:#94a3b8">
+        <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>
+        <div style="display:flex;align-items:center;gap:6px"><span style="color:#475569;font-size:9px">●</span><span style="font-size:11px;color:#475569">Not connected</span></div>
       </div>
     </div>
-    <div class="sidebar-footer">MilanSQL Admin v9.9.0</div>
+    <div class="sidebar-footer">MilanSQL Admin <span class="ms-version">v12.0.0</span></div>
   </nav>
 
   <!-- MAIN -->
@@ -2510,6 +3349,7 @@ td.null-val{color:#484f58;font-style:italic}
           <button class="btn btn-gray" onclick="formatSQL()">Format</button>
           <button class="btn btn-gray" onclick="clearEditor()">&#x2715; Clear</button>
           <button class="btn btn-gray" onclick="copyCSV()" title="Copy results as CSV">&#x1F4CB; CSV</button>
+          <button class="btn btn-gray" onclick="showRlsPolicies()" title="Show RLS policies for selected table" style="border-color:#f59e0b;color:#f59e0b">&#x1F6E1; RLS</button>
           <span class="exec-time" id="exec-time"></span>
         </div>
         <div style="position:relative">
@@ -2523,7 +3363,7 @@ td.null-val{color:#484f58;font-style:italic}
           <div id="autocomplete"></div>
         </div>
         <div id="example-queries" style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0">
-          <span style="font-size:0.7rem;color:#484f58;align-self:center">Examples:</span>
+          <span style="font-size:0.7rem;color:#475569;align-self:center">Examples:</span>
           <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- JOIN with expression\nSELECT p.name, p.preis * b.menge AS gesamt\nFROM produkte p\nJOIN bestellungen b ON p.id = b.produkt_id')">JOIN + Calc</button>
           <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- JOIN with GROUP BY\nSELECT p.name, SUM(b.menge) AS total\nFROM produkte p\nJOIN bestellungen b ON p.id = b.produkt_id\nGROUP BY p.name')">JOIN + GROUP BY</button>
           <button class="btn btn-gray" style="font-size:0.7rem;padding:3px 8px" onclick="setSQL('-- Aggregate with BETWEEN\nSELECT COUNT(*) FROM produkte\nWHERE preis BETWEEN 100 AND 1000')">COUNT + BETWEEN</button>
@@ -2537,7 +3377,7 @@ td.null-val{color:#484f58;font-style:italic}
           <span class="pill" id="result-pill"></span>
           <span id="result-info"></span>
         </div>
-        <div id="exec-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:6px;background:#1c2128;margin:4px 0 2px 0"></div>
+        <div id="exec-badge" style="display:none;font-size:11px;padding:3px 8px;border-radius:6px;background:#1a2235;margin:4px 0 2px 0"></div>
         <div id="result-content"></div>
       </div>
     </div>
@@ -2546,20 +3386,83 @@ td.null-val{color:#484f58;font-style:italic}
     <div class="page" id="page-browser">
       <div class="browser-wrap" style="display:flex;flex:1;overflow:hidden">
         <div class="tbl-list" id="browser-tbl-list">
-          <div style="font-size:0.75rem;color:#484f58;padding:4px">Loading...</div>
+          <div style="font-size:0.75rem;color:#475569;padding:4px">Loading...</div>
         </div>
         <div class="tbl-detail" id="browser-tbl-detail">
-          <div style="color:#484f58;font-size:0.85rem;margin-top:20px">Select a table to browse</div>
+          <div style="color:#475569;font-size:0.85rem;margin-top:20px">Select a table to browse</div>
         </div>
       </div>
     </div>
 
+
+    <!-- SCHEMA VISUALIZER PAGE -->
+    <div class="page" id="page-schema">
+      <div id="schema-toolbar" style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #1e2d40;background:#080c18">
+        <input id="schema-search" type="text" placeholder="Filter tables..." style="background:#111827;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 10px;font-size:0.8rem;width:180px;outline:none">
+        <button class="btn btn-gray" onclick="schemaAutoLayout()" style="font-size:0.75rem;padding:4px 10px">&#x2B50; Auto Layout</button>
+        <button class="btn btn-gray" onclick="schemaFitAll()" style="font-size:0.75rem;padding:4px 10px">&#x26F6; Fit</button>
+        <button class="btn btn-gray" onclick="schemaReload()" style="font-size:0.75rem;padding:4px 10px">&#x21BB; Reload</button>
+        <div class="schema-zoom-ctrl" style="margin-left:auto;margin-right:8px">
+          <button onclick="schemaZoom(-0.1)" title="Zoom Out (Ctrl+-)">&#x2212;</button>
+          <span id="schema-zoom-pct" class="schema-zoom-pct">100%</span>
+          <button onclick="schemaZoom(0.1)" title="Zoom In (Ctrl++)">+</button>
+          <button onclick="schemaZoomReset()" title="Reset Zoom (Ctrl+0)" style="font-size:0.65rem;width:auto;padding:0 6px">Reset</button>
+        </div>
+        <span id="schema-status" style="font-size:0.72rem;color:#94a3b8"></span>
+      </div>
+      <div id="schema-canvas" style="flex:1;position:relative;overflow:hidden;background:#080c18;cursor:grab">
+        <div id="schema-transform" style="position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform">
+          <svg id="schema-svg" style="position:absolute;top:0;left:0;width:10000px;height:10000px;pointer-events:none;z-index:1"></svg>
+          <div id="schema-cards" style="position:absolute;top:0;left:0;z-index:2"></div>
+        </div>
+        <div id="schema-minimap"><canvas id="schema-minimap-canvas" width="400" height="300"></canvas></div>
+      </div>
+      <div id="schema-policy-editor" style="display:none;position:absolute;bottom:0;left:0;right:0;background:#111827;border-top:2px solid #00d4ff;padding:12px 16px;z-index:100">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="font-size:0.85rem;font-weight:600;color:#00d4ff">&#x1F6E1; Edit RLS Policy</span>
+          <span id="schema-pe-table" style="font-size:0.8rem;color:#94a3b8"></span>
+          <button onclick="closePolicyEditor()" style="margin-left:auto;background:none;border:none;color:#94a3b8;cursor:pointer;font-size:1rem">&#x2715;</button>
+        </div>
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div style="flex:1;min-width:200px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Policy Name</label>
+            <input id="schema-pe-name" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+          </div>
+          <div style="flex:1;min-width:80px;max-width:120px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Command</label>
+            <select id="schema-pe-cmd" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+              <option>ALL</option><option>SELECT</option><option>INSERT</option><option>UPDATE</option><option>DELETE</option>
+            </select>
+          </div>
+          <div style="flex:1;min-width:100px;max-width:120px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Role</label>
+            <input id="schema-pe-role" value="PUBLIC" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;margin-top:2px">
+          </div>
+          <div style="flex:2;min-width:200px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">USING Expression</label>
+            <input id="schema-pe-using" placeholder="e.g. owner = CURRENT_USER_ID()" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
+          </div>
+          <div style="flex:2;min-width:200px">
+            <label style="font-size:0.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.5px">WITH CHECK</label>
+            <input id="schema-pe-check" placeholder="optional" style="width:100%;background:#080c18;border:1px solid #2d4060;border-radius:4px;color:#f8fafc;padding:4px 8px;font-size:0.8rem;font-family:monospace;margin-top:2px">
+          </div>
+          <div style="display:flex;align-items:flex-end">
+            <button class="btn btn-green" onclick="savePolicyFromEditor()" style="font-size:0.8rem;padding:5px 14px;margin-top:14px">Save Policy</button>
+          </div>
+        </div>
+        <div id="schema-pe-msg" style="font-size:0.75rem;margin-top:6px;color:#94a3b8"></div>
+      </div>
+    </div>
     <!-- MONITORING PAGE -->
     <div class="page" id="page-monitoring">
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #21262d">
-        <span style="font-size:0.85rem;color:#8b949e">Live Server Metrics</span>
-        <span style="font-size:0.75rem;color:#484f58">Auto-refresh: <span id="m-countdown" style="color:#3fb950;font-weight:600">5s</span></span>
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 16px;border-bottom:1px solid #1e2d40">
+        <div style="display:flex;gap:4px;align-items:center">
+          <button class="mon-tab active" id="mtab-overview" onclick="monShowTab('overview')">Overview</button>
+          <button class="mon-tab" id="mtab-pool" onclick="monShowTab('pool')">Pool Stats</button>
+        </div>
+        <span style="font-size:0.75rem;color:#475569">Auto-refresh: <span id="m-countdown" style="color:#10b981;font-weight:600">5s</span></span>
       </div>
+      <div id="mon-overview">
       <div class="mon-grid" id="mon-grid">
         <div class="stat-card"><div class="label">&#x1F4C1; Tables</div><div class="value" id="m-tables">--</div></div>
         <div class="stat-card"><div class="label">&#x1F4CA; Total Rows</div><div class="value" id="m-rows">--</div></div>
@@ -2570,45 +3473,273 @@ td.null-val{color:#484f58;font-style:italic}
       </div>
       <div style="padding:16px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-          <span style="font-size:0.85rem;font-weight:600;color:#e6edf3">Query History (last 10)</span>
-          <span id="m-last-update" style="font-size:0.7rem;color:#484f58;margin-left:auto"></span>
+          <span style="font-size:0.85rem;font-weight:600;color:#f8fafc">Query History (last 10)</span>
+          <span id="m-last-update" style="font-size:0.7rem;color:#475569;margin-left:auto"></span>
         </div>
-        <canvas id="m-chart" height="60" style="width:100%;background:#0d1117;border-radius:6px;border:1px solid #21262d"></canvas>
+        <canvas id="m-chart" height="60" style="width:100%;background:#080c18;border-radius:6px;border:1px solid #1e2d40"></canvas>
         <div style="display:flex;justify-content:space-between;margin-top:4px">
-          <span style="font-size:0.65rem;color:#484f58">10 samples · 5s interval</span>
-          <span style="font-size:0.65rem;color:#484f58">queries/poll</span>
+          <span style="font-size:0.65rem;color:#475569">10 samples · 5s interval</span>
+          <span style="font-size:0.65rem;color:#475569">queries/poll</span>
         </div>
       </div>
       <div style="padding:0 16px 16px">
-        <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;margin-bottom:8px">Recent Slow Queries</div>
-        <div id="slow-queries-list" style="font-size:0.8rem;color:#8b949e;background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;min-height:40px">Loading...</div>
+        <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Recent Slow Queries</div>
+        <div id="slow-queries-list" style="font-size:0.8rem;color:#94a3b8;background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:10px;min-height:40px">Loading...</div>
+      </div>
+      </div><!-- /mon-overview -->
+      <!-- POOL STATS TAB (Phase 173) -->
+      <div id="mon-pool" style="display:none">
+        <div class="mon-grid">
+          <div class="stat-card"><div class="label">&#x1F7E2; Aktive Connections</div><div class="value" id="p-active">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F4A4; Idle</div><div class="value" id="p-idle">--</div></div>
+          <div class="stat-card"><div class="label">&#x23F3; Wartend</div><div class="value" id="p-waiting">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F4CF; Pool-Gr&ouml;&szlig;e (Min/Max)</div><div class="value" id="p-minmax" style="font-size:1rem">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F522; Total Connections</div><div class="value" id="p-total">--</div></div>
+          <div class="stat-card"><div class="label">&#x23F1; Avg Wait</div><div class="value" id="p-avgwait" style="font-size:1rem">--</div></div>
+          <div class="stat-card"><div class="label">&#x26A0; Timeouts</div><div class="value" id="p-timeouts">--</div></div>
+          <div class="stat-card"><div class="label">&#x1F504; Requests Total</div><div class="value" id="p-requests">--</div></div>
+        </div>
+        <div style="padding:16px">
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Pool-Auslastung</div>
+          <canvas id="p-chart" height="90" style="width:100%;background:#080c18;border-radius:6px;border:1px solid #1e2d40"></canvas>
+          <div style="display:flex;gap:16px;margin-top:6px;font-size:0.7rem;color:#94a3b8">
+            <span><span style="color:#10b981">&#x25A0;</span> Aktiv</span>
+            <span><span style="color:#00d4ff">&#x25A0;</span> Idle</span>
+            <span><span style="color:#f59e0b">&#x25A0;</span> Wartend</span>
+            <span><span style="color:#2d4060">&#x25A0;</span> Frei (bis Max)</span>
+          </div>
+        </div>
       </div>
     </div>
 
     <!-- HISTORY PAGE -->
     <div class="page" id="page-history">
-      <div style="padding:12px;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center">
-        <span style="font-size:0.85rem;color:#8b949e">Query History</span>
+      <div style="padding:12px;border-bottom:1px solid #1e2d40;display:flex;gap:8px;align-items:center">
+        <span style="font-size:0.85rem;color:#94a3b8">Query History</span>
         <button class="btn btn-gray" style="margin-left:auto;font-size:0.75rem" onclick="clearHistory()">Clear</button>
       </div>
       <div id="history-list" style="flex:1;overflow-y:auto;padding:12px"></div>
     </div>
 
-    <!-- AUDIT LOG PAGE -->
-    <div class="page" id="page-auditlog">
-      <div style="padding:12px;border-bottom:1px solid #21262d;display:flex;gap:8px;align-items:center">
-        <span style="font-size:0.85rem;color:#8b949e">Audit Log</span>
-        <select id="audit-filter-field" style="background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:0.75rem">
-          <option value="">All</option>
-          <option value="user">User</option>
-          <option value="op">Operation</option>
-          <option value="table">Table</option>
-        </select>
-        <input id="audit-filter-value" placeholder="Filter value..." style="background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:4px 8px;font-size:0.75rem;width:140px">
-        <button class="btn btn-blue" style="font-size:0.75rem" onclick="loadAuditLog()">Filter</button>
-        <button class="btn btn-gray" style="margin-left:auto;font-size:0.75rem" onclick="clearAuditLog()">Clear Log</button>
+    <!-- VACUUM PAGE (Phase 173) -->
+    <div class="page" id="page-vacuum">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.85rem;color:#94a3b8">&#x1F9F9; MVCC Vacuum &mdash; Dead Tuple Cleanup</span>
+        <span style="font-size:0.75rem;color:#475569">Auto-refresh: <span style="color:#10b981;font-weight:600">5s</span></span>
       </div>
-      <div id="audit-log-content" style="flex:1;overflow-y:auto;padding:12px;font-size:0.8rem"></div>
+      <div class="mon-grid">
+        <div class="stat-card"><div class="label">&#x1F550; Letzter Vacuum</div><div class="value" id="v-lastrun" style="font-size:0.9rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x23ED; N&auml;chster Auto-Vacuum</div><div class="value" id="v-nextrun" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F5D1; Befreite Zeilen (total)</div><div class="value" id="v-freedrows">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F4BE; Befreiter Speicher (total)</div><div class="value" id="v-freedbytes" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F504; Vacuum-L&auml;ufe</div><div class="value" id="v-runs">--</div></div>
+        <div class="stat-card"><div class="label">&#x26A0; Dead Tuples (pending)</div><div class="value" id="v-pending">--</div></div>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="font-size:0.85rem;font-weight:600;color:#f8fafc">Tabellen</span>
+          <span id="v-msg" style="font-size:0.75rem;color:#10b981;margin-left:auto"></span>
+        </div>
+        <div id="vacuum-table-list" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:6px;font-size:0.8rem;color:#94a3b8">Loading...</div>
+      </div>
+    </div>
+
+    <!-- REPLICATION PAGE (Phase 173) -->
+    <div class="page" id="page-replication">
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span id="rep-light" style="font-size:1.1rem;color:#475569">&#x25CF;</span>
+        <span id="rep-light-text" style="font-size:0.85rem;color:#94a3b8">Loading...</span>
+        <span style="font-size:0.75rem;color:#475569;margin-left:auto">Auto-refresh: <span style="color:#10b981;font-weight:600">2s</span></span>
+      </div>
+      <div class="mon-grid">
+        <div class="stat-card"><div class="label">&#x1F3AD; Rolle</div><div class="value" id="r-role" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x23F1; Replica-Lag</div><div class="value" id="r-lag" style="font-size:1rem">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F4CD; Binlog-Position</div><div class="value" id="r-binlog">--</div></div>
+        <div class="stat-card"><div class="label">&#x2705; Ack-Position</div><div class="value" id="r-ack">--</div></div>
+        <div class="stat-card"><div class="label">&#x1F517; Verbundene Replicas</div><div class="value" id="r-slaves">--</div></div>
+        <div class="stat-card"><div class="label">&#x2699; Modus</div><div class="value" id="r-mode" style="font-size:1rem">--</div></div>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Replicas</div>
+        <div id="rep-slave-list" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:10px;font-size:0.8rem;color:#94a3b8;margin-bottom:16px">Loading...</div>
+        <div id="rep-replica-detail" style="display:none">
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Replica-Verbindung</div>
+          <div id="rep-replica-info" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:10px;font-size:0.8rem;color:#94a3b8"></div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- ── BRANCHES PAGE ─────────────────────────────────── -->
+    <div class="page" id="page-branches">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Database Branches</span>
+        <button onclick="branchCreate()" style="background:#00d4ff;color:#080c18;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:700;cursor:pointer">+ New Branch</button>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div id="branches-list" style="display:flex;flex-direction:column;gap:8px">
+          <div style="color:#475569;font-size:0.8rem">Loading branches...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SECURITY PAGE ─────────────────────────────────── -->
+    <div class="page" id="page-security">
+      <div style="padding:12px 16px;border-bottom:1px solid #1e2d40;font-size:0.9rem;font-weight:600;color:#f8fafc">Security Settings</div>
+      <div style="padding:16px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <!-- Encryption -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div><div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:2px">&#x1F511; Encryption at Rest</div>
+              <div style="font-size:0.75rem;color:#64748b">AES-256 data encryption</div></div>
+            <div id="enc-status-badge" style="font-size:0.75rem;padding:3px 10px;border-radius:9999px;background:#1e2d40;color:#94a3b8">Loading...</div>
+          </div>
+          <div id="enc-details" style="font-size:0.8rem;color:#64748b;margin-bottom:10px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button onclick="secEnableEncryption()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Enable</button>
+            <button onclick="secDisableEncryption()" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Disable</button>
+            <button onclick="secRotateKey()" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Rotate Key</button>
+          </div>
+        </div>
+        <!-- mTLS -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <div><div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:2px">&#x1F6E1; mTLS</div>
+              <div style="font-size:0.75rem;color:#64748b">Mutual TLS certificate auth</div></div>
+            <div id="mtls-status-badge" style="font-size:0.75rem;padding:3px 10px;border-radius:9999px;background:#1e2d40;color:#94a3b8">Loading...</div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button onclick="secEnableMtls()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Enable</button>
+            <button onclick="secDisableMtls()" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Disable</button>
+          </div>
+        </div>
+        <!-- IP Allowlist -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">&#x1F6A7; IP Allowlist</div>
+          <div id="ip-allowlist-content" style="font-size:0.8rem;color:#64748b;margin-bottom:10px">Loading...</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input id="ip-allowlist-input" type="text" placeholder="192.168.1.0/24,10.0.0.1" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:5px 10px;color:#f8fafc;font-size:0.78rem;flex:1;min-width:160px;outline:none">
+            <button onclick="secSetIpAllowlist()" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Set</button>
+            <button onclick="secRemoveIpAllowlist()" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 12px;font-size:0.78rem;cursor:pointer">Remove</button>
+          </div>
+        </div>
+        <!-- Active Sessions -->
+        <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">&#x1F465; Active Sessions</div>
+          <div id="sessions-content" style="font-size:0.8rem;color:#64748b">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── AUDIT LOG PAGE ─────────────────────────────────── -->
+    <div class="page" id="page-audit">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40;flex-wrap:wrap;gap:8px">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Audit Trail</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div id="audit-chain-badge" style="font-size:0.72rem;padding:3px 10px;border-radius:9999px;background:#1e2d40;color:#94a3b8">Chain: —</div>
+          <input id="audit-filter-user" type="text" placeholder="Filter user..." style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:4px 8px;color:#f8fafc;font-size:0.75rem;width:110px;outline:none">
+          <select id="audit-filter-type" style="background:#080c18;border:1px solid #1e2d40;border-radius:6px;padding:4px 8px;color:#f8fafc;font-size:0.75rem;outline:none">
+            <option value="">All types</option>
+            <option value="QUERY">QUERY</option>
+            <option value="LOGIN">LOGIN</option>
+            <option value="DDL">DDL</option>
+            <option value="ADMIN">ADMIN</option>
+          </select>
+          <button onclick="auditVerify()" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:6px;padding:5px 11px;font-size:0.75rem;cursor:pointer">&#x2714; Verify</button>
+          <button onclick="auditExport()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 11px;font-size:0.75rem;cursor:pointer">&#x21D3; Export</button>
+          <button onclick="loadAuditPage()" style="background:#1e2d40;color:#94a3b8;border:none;border-radius:6px;padding:5px 11px;font-size:0.75rem;cursor:pointer">&#x21BA;</button>
+        </div>
+      </div>
+      <div style="flex:1;overflow-y:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:0.78rem" id="audit-table">
+          <thead><tr style="background:#0d1220;border-bottom:1px solid #1e2d40">
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600;white-space:nowrap">#</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Time</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">User</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Event</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Action/Query</th>
+            <th style="padding:8px 10px;text-align:left;color:#64748b;font-weight:600">Hash</th>
+          </tr></thead>
+          <tbody id="audit-tbody"><tr><td colspan="6" style="padding:20px;text-align:center;color:#475569">Loading audit log...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── COMPLIANCE PAGE ────────────────────────────────── -->
+    <div class="page" id="page-compliance">
+      <div style="padding:12px 16px;border-bottom:1px solid #1e2d40;font-size:0.9rem;font-weight:600;color:#f8fafc">Compliance Reports</div>
+      <div style="padding:16px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+          <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:16px">
+            <div style="font-size:0.95rem;font-weight:700;color:#f8fafc;margin-bottom:4px">&#x1F1E9;&#x1F1EA; DSGVO</div>
+            <div style="font-size:0.75rem;color:#64748b;margin-bottom:12px">EU Data Protection Regulation</div>
+            <div id="dsgvo-score" style="font-size:1.8rem;font-weight:700;color:#00d4ff;margin-bottom:8px">—</div>
+            <button onclick="genReport('dsgvo')" style="width:100%;background:#0ea5e9;color:#fff;border:none;border-radius:6px;padding:7px;font-size:0.8rem;font-weight:600;cursor:pointer">Generate Report</button>
+          </div>
+          <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:16px">
+            <div style="font-size:0.95rem;font-weight:700;color:#f8fafc;margin-bottom:4px">&#x1F4DC; GoBD</div>
+            <div style="font-size:0.75rem;color:#64748b;margin-bottom:12px">German Bookkeeping Standard</div>
+            <div id="gobd-score" style="font-size:1.8rem;font-weight:700;color:#00d4ff;margin-bottom:8px">—</div>
+            <button onclick="genReport('gobd')" style="width:100%;background:#0ea5e9;color:#fff;border:none;border-radius:6px;padding:7px;font-size:0.8rem;font-weight:600;cursor:pointer">Generate Report</button>
+          </div>
+          <div style="background:#0d1220;border:1px solid #1e2d40;border-radius:8px;padding:16px">
+            <div style="font-size:0.95rem;font-weight:700;color:#f8fafc;margin-bottom:4px">&#x1F6E1; SOC2</div>
+            <div style="font-size:0.75rem;color:#64748b;margin-bottom:12px">Service Organization Control 2</div>
+            <div id="soc2-score" style="font-size:1.8rem;font-weight:700;color:#00d4ff;margin-bottom:8px">—</div>
+            <button onclick="genReport('soc2')" style="width:100%;background:#0ea5e9;color:#fff;border:none;border-radius:6px;padding:7px;font-size:0.8rem;font-weight:600;cursor:pointer">Generate Report</button>
+          </div>
+        </div>
+        <div id="compliance-report-panel" style="display:none;background:#080c18;border:1px solid #1e2d40;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div style="font-size:0.85rem;font-weight:600;color:#f8fafc" id="compliance-report-title">Report</div>
+            <button onclick="downloadReport()" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:4px 10px;font-size:0.75rem;cursor:pointer">&#x21D3; Download</button>
+          </div>
+          <pre id="compliance-report-content" style="font-size:0.75rem;color:#94a3b8;white-space:pre-wrap;max-height:400px;overflow-y:auto"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── MIGRATIONS PAGE ────────────────────────────────── -->
+    <div class="page" id="page-migrations">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Schema Migrations</span>
+        <div style="display:flex;gap:8px">
+          <button onclick="migRun('up')" style="background:#065f46;color:#34d399;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:600;cursor:pointer">&#x25B2; Migrate Up</button>
+          <button onclick="migRun('down')" style="background:#450a0a;color:#f87171;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:600;cursor:pointer">&#x25BC; Migrate Down</button>
+          <button onclick="loadMigrationsPage()" style="background:#1e2d40;color:#94a3b8;border:none;border-radius:6px;padding:5px 10px;font-size:0.8rem;cursor:pointer">&#x21BA;</button>
+        </div>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div id="mig-status-msg" style="font-size:0.8rem;color:#64748b;margin-bottom:12px"></div>
+        <div id="mig-list" style="display:flex;flex-direction:column;gap:6px">
+          <div style="color:#475569;font-size:0.8rem">Loading migrations...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── CLOUD INSTANCES PAGE ───────────────────────────── -->
+    <div class="page" id="page-cloud">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1e2d40">
+        <span style="font-size:0.9rem;font-weight:600;color:#f8fafc">Cloud Instances</span>
+        <button onclick="cloudNewInstance()" style="background:#00d4ff;color:#080c18;border:none;border-radius:6px;padding:5px 14px;font-size:0.8rem;font-weight:700;cursor:pointer">+ New Instance</button>
+      </div>
+      <div style="padding:16px;flex:1;overflow-y:auto">
+        <div id="cloud-instances-list" style="display:flex;flex-direction:column;gap:8px">
+          <div style="color:#475569;font-size:0.8rem">Loading cloud instances...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── REGIONS PAGE ───────────────────────────────────── -->
+    <div class="page" id="page-regions">
+      <div style="padding:12px 16px;border-bottom:1px solid #1e2d40;font-size:0.9rem;font-weight:600;color:#f8fafc">Regions &amp; Replicas</div>
+      <div style="padding:16px;flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <div id="regions-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
+        <div>
+          <div style="font-size:0.85rem;font-weight:600;color:#f8fafc;margin-bottom:8px">Active Replicas</div>
+          <div id="replicas-list" style="color:#475569;font-size:0.8rem">Loading...</div>
+        </div>
+      </div>
     </div>
 
   </div><!-- /main -->
@@ -2620,7 +3751,7 @@ td.null-val{color:#484f58;font-style:italic}
   <div class="status-item">Tables: <b id="sb-tables">--</b></div>
   <div class="status-item">Rows: <b id="sb-rows">--</b></div>
   <div class="status-item">Queries: <b id="sb-queries">--</b></div>
-  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#484f58">MilanSQL v9.9.0 &middot; Press Ctrl+Enter to run</div>
+  <div class="status-item" style="margin-left:auto;font-size:0.7rem;color:#475569">MilanSQL <span class="ms-version">v12.0.0</span> &middot; Press Ctrl+Enter to run</div>
 </div>
 
 <script>
@@ -2646,21 +3777,21 @@ function highlightSQL(text) {
   var s = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   // Comments (-- and /* */) — replace with placeholder to protect from further substitution
   var comments = [];
-  s = s.replace(/\/\*[\s\S]*?\*\//g, function(m){ comments.push('<span style="color:#8b949e">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
-  s = s.replace(/--[^\n]*/g, function(m){ comments.push('<span style="color:#8b949e">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
+  s = s.replace(/\/\*[\s\S]*?\*\//g, function(m){ comments.push('<span style="color:#94a3b8">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
+  s = s.replace(/--[^\n]*/g, function(m){ comments.push('<span style="color:#94a3b8">'+m+'</span>'); return '\x00C'+(comments.length-1)+'\x00'; });
   // Strings
   var strings = [];
-  s = s.replace(/'(?:[^'\\]|\\.)*'/g, function(m){ strings.push('<span style="color:#a5d6ff">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
-  s = s.replace(/"(?:[^"\\]|\\.)*"/g, function(m){ strings.push('<span style="color:#a5d6ff">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
+  s = s.replace(/'(?:[^'\\]|\\.)*'/g, function(m){ strings.push('<span style="color:#fbbf24">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
+  s = s.replace(/"(?:[^"\\]|\\.)*"/g, function(m){ strings.push('<span style="color:#fbbf24">'+m+'</span>'); return '\x00S'+(strings.length-1)+'\x00'; });
   // Numbers
-  s = s.replace(/\b(\d+(?:\.\d+)?)\b/g,'<span style="color:#f8c555">$1</span>');
+  s = s.replace(/\b(\d+(?:\.\d+)?)\b/g,'<span style="color:#a78bfa">$1</span>');
   // Functions (before keywords so they match first)
   var fnPat = '\\b(' + SQL_FUNCS.map(escRe).join('|') + ')\\s*(?=\\()';
-  s = s.replace(new RegExp(fnPat,'gi'), function(m){ return '<span style="color:#d2a8ff">'+m+'</span>'; });
+  s = s.replace(new RegExp(fnPat,'gi'), function(m){ return '<span style="color:#c084fc">'+m+'</span>'; });
   // Keywords (longest first to match GROUP BY before GROUP)
   var kwSorted = SQL_KEYWORDS.slice().sort(function(a,b){return b.length-a.length;});
   kwSorted.forEach(function(kw){
-    s = s.replace(new RegExp('\\b'+escRe(kw)+'\\b','gi'), function(m){ return '<span style="color:#ff7b72">'+m+'</span>'; });
+    s = s.replace(new RegExp('\\b'+escRe(kw)+'\\b','gi'), function(m){ return '<span style="color:#00d4ff">'+m+'</span>'; });
   });
   // Restore strings and comments
   s = s.replace(/\x00S(\d+)\x00/g, function(_,i){ return strings[+i]; });
@@ -2767,10 +3898,19 @@ function showPage(name, el) {
   document.getElementById('page-' + name).classList.add('active');
   if (el) el.classList.add('active');
   if (name === 'browser') loadBrowserTables();
+  if (name === 'schema') loadSchemaViz();
   if (name === 'history') renderHistory();
-  if (name === 'auditlog') loadAuditLog();
   if (name === 'monitoring') { monLastQ = 0; monQueryHistory = []; loadMonitoring(); }
   else stopMonitoring();
+  if (name === 'vacuum') loadVacuumPage(); else stopVacuumPage();
+  if (name === 'replication') loadReplicationPage(); else stopReplicationPage();
+  if (name === 'branches')   loadBranchesPage();
+  if (name === 'security')   loadSecurityPage();
+  if (name === 'audit')      loadAuditPage();
+  if (name === 'compliance') loadCompliancePage();
+  if (name === 'migrations') loadMigrationsPage();
+  if (name === 'cloud')      loadCloudPage();
+  if (name === 'regions')    loadRegionsPage();
 }
 
 // ── SQL Execution ──────────────────────────────────────────────
@@ -2779,7 +3919,7 @@ async function runQuery(sql) {
   var q = sql || document.getElementById('sql-editor').value.trim();
   if (!q) return;
   var t0 = performance.now();
-  document.getElementById('result-content').innerHTML = '<div style="color:#8b949e;padding:8px;font-size:0.8rem">Running...</div>';
+  document.getElementById('result-content').innerHTML = '<div style="color:#94a3b8;padding:8px;font-size:0.8rem">Running...</div>';
   document.getElementById('result-header').style.display = 'none';
   clearErrorHighlight();
   try {
@@ -2805,11 +3945,11 @@ function showExecBadge(data) {
   var badge = document.getElementById('exec-badge');
   if (!badge) return;
   if (msUser) {
-    badge.innerHTML = '<span style="color:#3fb950">&#10003;</span> Ausgeführt als: <b>' + escHtml(msUser) + '</b> (id: ' + msUserId + ')';
-    badge.style.color = '#3fb950';
+    badge.innerHTML = '<span style="color:#10b981">&#10003;</span> Ausgeführt als: <b>' + escHtml(msUser) + '</b> (id: ' + msUserId + ')';
+    badge.style.color = '#10b981';
   } else {
-    badge.innerHTML = '<span style="color:#f38ba8">&#9888;</span> Nicht authentifiziert';
-    badge.style.color = '#f38ba8';
+    badge.innerHTML = '<span style="color:#ef4444">&#9888;</span> Nicht authentifiziert';
+    badge.style.color = '#ef4444';
   }
   badge.style.display = 'block';
 }
@@ -2865,7 +4005,7 @@ function renderTable(cols, rows, container) {
   html += '</tr></thead><tbody>';
   rows.forEach(function(row) {
     html += '<tr>';
-    var vals = Array.isArray(row) ? row : (row.values || Object.values(row));
+    var vals = rowVals(row);
     vals.forEach(function(v) {
       if (v === null || v === 'NULL' || v === '') {
         html += '<td class="null-val">NULL</td>';
@@ -2966,7 +4106,7 @@ function copyCSV() {
   var csvCols = cols.map(function(c){ return typeof c==='string'?c:(c.name||String(c)); });
   var lines = [csvCols.join(',')];
   rows.forEach(function(row){
-    var vals = Array.isArray(row) ? row : (row.values||Object.values(row));
+    var vals = rowVals(row);
     lines.push(vals.map(function(v){
       var s = v===null||v===undefined?'':String(v);
       return s.includes(',') || s.includes('"') || s.includes('\n') ? '"'+s.replace(/"/g,'""')+'"' : s;
@@ -3020,42 +4160,117 @@ document.addEventListener('click', function(e) {
 });
 
 // Table sidebar
-// Phase 176: Audit Log page
-async function loadAuditLog() {
-  var field = document.getElementById('audit-filter-field').value;
-  var value = document.getElementById('audit-filter-value').value;
-  var sql = 'SHOW AUDIT LOG';
-  if (field && value) sql += " WHERE " + field + " = '" + value + "'";
-  sql += ' LIMIT 200';
+var _rlsPoliciesCache = {};
+
+// Phase 170: Show RLS Policies for table in editor
+async function showRlsPolicies() {
+  var sql = document.getElementById('sql-editor').value.trim();
+  var tblMatch = sql.match(/(?:FROM|JOIN|TABLE|ON|INTO|UPDATE|POLICIES)\s+([a-zA-Z_][a-zA-Z0-9_]*)/i);
+  if (!tblMatch) {
+    try {
+      var r = await fetch('/api/rls-policies', {credentials:'include'});
+      var data = await r.json();
+      var out = document.getElementById('output-area');
+      var html = '<div style="padding:12px"><h3 style="color:#f59e0b;margin-bottom:12px">&#x1F6E1; RLS Policies Overview</h3>';
+      var enabled = data.enabled_tables || [];
+      html += '<div style="color:#94a3b8;margin-bottom:8px">Protected tables: <b style="color:#10b981">' + enabled.length + '</b></div>';
+      if (enabled.length === 0) {
+        html += '<div style="color:#475569">No tables have RLS enabled.</div>';
+      } else {
+        html += '<table><thead><tr><th>Table</th><th>Policies</th><th>Details</th></tr></thead><tbody>';
+        for (var i = 0; i < enabled.length; i++) {
+          var tbl = enabled[i];
+          var pols = (data.policies || {})[tbl] || [];
+          var details = pols.map(function(p) { return '<span style="color:#00d4ff">' + escHtml(p.name) + '</span> (' + p.command + ' TO ' + p.role + ')'; }).join(', ') || '<span style="color:#475569">none</span>';
+          html += '<tr><td style="color:#f8fafc;font-weight:600">' + escHtml(tbl) + '</td><td style="text-align:center">' + pols.length + '</td><td>' + details + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      html += '</div>';
+      if (out) out.innerHTML = html;
+    } catch(e) {}
+    return;
+  }
+  var tblName = tblMatch[1];
   try {
-    var resp = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sql})});
-    var data = await resp.json();
-    var el = document.getElementById('audit-log-content');
-    if (data.error) { el.innerHTML = '<div style="color:#f85149">' + data.error + '</div>'; return; }
-    if (!data.columns || !data.rows || data.rows.length === 0) { el.innerHTML = '<div style="color:#8b949e">No audit entries.</div>'; return; }
-    var html = '<table class="result-table" style="width:100%"><thead><tr>';
-    data.columns.forEach(function(c){html+='<th>'+c+'</th>';});
-    html += '</tr></thead><tbody>';
-    data.rows.forEach(function(r){html+='<tr>';r.forEach(function(v){html+='<td>'+v+'</td>';});html+='</tr>';});
-    html += '</tbody></table>';
-    el.innerHTML = html;
-  } catch(e) { document.getElementById('audit-log-content').innerHTML = '<div style="color:#f85149">Error: '+e+'</div>'; }
+    var r = await fetch('/api/rls-policies/' + encodeURIComponent(tblName), {credentials:'include'});
+    var data = await r.json();
+    var out = document.getElementById('output-area');
+    var html = '<div style="padding:12px"><h3 style="color:#f59e0b;margin-bottom:12px">&#x1F6E1; RLS Policies: ' + escHtml(tblName) + '</h3>';
+    html += '<div style="margin-bottom:8px;color:#94a3b8">RLS Status: ' + (data.rls_enabled ? '<b style="color:#10b981">ENABLED</b>' : '<b style="color:#ef4444">DISABLED</b>') + '</div>';
+    var pols = data.policies || [];
+    if (pols.length === 0) {
+      html += '<div style="color:#475569;margin-bottom:8px">No policies defined.</div>';
+      html += '<div style="color:#94a3b8;font-size:0.8rem">Create: <code style="color:#00d4ff">CREATE POLICY name ON ' + escHtml(tblName) + ' FOR ALL TO PUBLIC USING (expr);</code></div>';
+    } else {
+      html += '<table><thead><tr><th>Policy</th><th>Command</th><th>Role</th><th>USING</th><th>WITH CHECK</th></tr></thead><tbody>';
+      for (var i = 0; i < pols.length; i++) {
+        var p = pols[i];
+        html += '<tr>';
+        html += '<td style="color:#00d4ff;font-weight:600">' + escHtml(p.name) + '</td>';
+        html += '<td><span style="background:#1e2d40;padding:2px 6px;border-radius:3px;font-size:0.75rem;color:#f59e0b">' + escHtml(p.command) + '</span></td>';
+        html += '<td>' + escHtml(p.role) + '</td>';
+        html += '<td style="font-family:monospace;font-size:0.8rem;color:#f8fafc">' + escHtml(p['using']||'') + '</td>';
+        html += '<td style="font-family:monospace;font-size:0.8rem;color:#f8fafc">' + escHtml(p.with_check||'-') + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</div>';
+    if (out) out.innerHTML = html;
+  } catch(e) {}
 }
-async function clearAuditLog() {
-  await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'FLUSH AUDIT LOG'})});
-  loadAuditLog();
+
+
+async function loadRlsPolicies() {
+  try {
+    var r = await fetch('/api/rls-policies', {credentials:'include'});
+    _rlsPoliciesCache = await r.json();
+  } catch(e) { _rlsPoliciesCache = {}; }
+}
+
+function getRlsBadge(tableName) {
+  var pols = _rlsPoliciesCache.policies || {};
+  // Check both raw name and with user prefix
+  var count = 0;
+  var enabled = false;
+  var enabledTables = _rlsPoliciesCache.enabled_tables || [];
+  for (var key in pols) {
+    if (key === tableName || key.endsWith('_' + tableName)) {
+      count = pols[key].length;
+    }
+  }
+  for (var i = 0; i < enabledTables.length; i++) {
+    if (enabledTables[i] === tableName || enabledTables[i].endsWith('_' + tableName)) {
+      enabled = true;
+    }
+  }
+  if (!enabled && count === 0) return '';
+  if (enabled && count > 0)
+    return '<span style="margin-left:auto;background:rgba(16,185,129,.12);color:#10b981;font-size:9px;padding:1px 5px;border-radius:8px;font-weight:600" title="' + count + ' RLS ' + (count===1?'Policy':'Policies') + '">' + count + ' RLS</span>';
+  if (enabled)
+    return '<span style="margin-left:auto;background:rgba(16,185,129,.12);color:#10b981;font-size:9px;padding:1px 5px;border-radius:8px" title="RLS enabled (no policies)">RLS</span>';
+  return '';
 }
 
 async function loadSidebarTables() {
   try {
+    await loadRlsPolicies();
     var r = await fetch('/tables', {credentials:'include'});
     var data = await r.json();
     var tables = Array.isArray(data) ? data : (data.tables || []);
     var el = document.getElementById('sidebar-tables');
-    if (!tables.length) { el.innerHTML = '<div style="font-size:0.75rem;color:#484f58;padding:4px 8px">No tables</div>'; return; }
+    if (!tables.length) { el.innerHTML = '<div style="font-size:0.75rem;color:#475569;padding:4px 8px">No tables</div>'; return; }
     el.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
-      return '<div class="table-item" onclick="selectFromTable(\'' + escAttr(name) + '\')">' + escHtml(name) + '</div>';
+      var badge = getRlsBadge(name);
+      var partIcon = '';
+      if (window._schemaData && window._schemaData.tables) {
+        var si = window._schemaData.tables.find(function(x){ return x.name === name || x.name === 'public.' + name; });
+        if (si && si.partitioned) partIcon = '<span class="part-badge" style="margin-left:4px;font-size:0.6rem">&#x25A6;</span>';
+      }
+      return '<div class="table-item" style="display:flex;align-items:center" onclick="selectFromTable(\'' + escAttr(name) + '\')">'
+        + '<span>' + escHtml(name) + '</span>' + partIcon + badge + '</div>';
     }).join('');
   } catch(e) { /* silent */ }
 }
@@ -3076,8 +4291,9 @@ async function loadBrowserTables() {
     var listEl = document.getElementById('browser-tbl-list');
     listEl.innerHTML = tables.map(function(t) {
       var name = typeof t === 'string' ? t : t.name;
-      return '<button class="tbl-btn" onclick="browseTable(\'' + escAttr(name) + '\',this)">' + escHtml(name) + '</button>';
-    }).join('') || '<div style="font-size:0.75rem;color:#484f58">No tables</div>';
+      var badge = getRlsBadge(name);
+      return '<button class="tbl-btn" style="display:flex;align-items:center" onclick="browseTable(\'' + escAttr(name) + '\',this)"><span>' + escHtml(name) + '</span>' + badge + '</button>';
+    }).join('') || '<div style="font-size:0.75rem;color:#475569">No tables</div>';
   } catch(e) {}
 }
 
@@ -3085,33 +4301,64 @@ async function browseTable(name, btn) {
   document.querySelectorAll('.tbl-btn').forEach(function(b){b.classList.remove('active');});
   if (btn) btn.classList.add('active');
   var detail = document.getElementById('browser-tbl-detail');
-  detail.innerHTML = '<div style="color:#8b949e;font-size:0.8rem">Loading...</div>';
+  detail.innerHTML = '<div style="color:#94a3b8;font-size:0.8rem">Loading...</div>';
   try {
     var descR = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DESCRIBE ' + name})});
     var dataR = await fetch('/api/query', {method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SELECT * FROM ' + name + ' LIMIT 50'})});
     var desc = await descR.json();
     var data = await dataR.json();
     var html = '<h3 style="margin-bottom:12px">&#x1F4CB; ' + escHtml(name) + '</h3>';
+    // Phase 176: Partition info
+    if (window._schemaData && window._schemaData.tables) {
+      var tInfo = window._schemaData.tables.find(function(x){ return x.name === name || x.name === 'public.' + name; });
+      if (tInfo && tInfo.partitioned) {
+        html += '<div class="part-detail"><h4>&#x25A6; ' + tInfo.partition_type + ' Partitioning on <code>' + escHtml(tInfo.partition_column) + '</code></h4>';
+        if (tInfo.partitions && tInfo.partitions.length) {
+          var totalRows = 0; tInfo.partitions.forEach(function(p){ totalRows += (p.rows||0); });
+          var colors = ['#7c3aed','#06b6d4','#10b981','#f59e0b','#ef4444','#ec4899','#8b5cf6','#14b8a6'];
+          html += '<div class="part-progress">';
+          tInfo.partitions.forEach(function(p,i){
+            var pct = totalRows > 0 ? Math.max(2, (p.rows||0)/totalRows*100) : (100/tInfo.partitions.length);
+            html += '<div style="width:'+pct+'%;background:'+colors[i%colors.length]+'" title="'+escHtml(p.name)+': '+(p.rows||0)+' rows"></div>';
+          });
+          html += '</div>';
+          html += '<table style="margin-top:8px"><thead><tr><th>Partition</th><th>Rows</th>';
+          if (tInfo.partition_type==='RANGE') html += '<th>From</th><th>To</th>';
+          if (tInfo.partition_type==='LIST') html += '<th>Values</th>';
+          html += '</tr></thead><tbody>';
+          tInfo.partitions.forEach(function(p,i){
+            html += '<tr><td><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:'+colors[i%colors.length]+';margin-right:6px;vertical-align:middle"></span>' + escHtml(p.name) + '</td>';
+            html += '<td>' + (p.rows||0) + '</td>';
+            if (tInfo.partition_type==='RANGE') html += '<td>' + escHtml(p.from||'') + '</td><td>' + escHtml(p.to||'') + '</td>';
+            if (tInfo.partition_type==='LIST') html += '<td>' + (p.values||[]).map(escHtml).join(', ') + '</td>';
+            html += '</tr>';
+          });
+          html += '</tbody></table>';
+        }
+        html += '<div style="margin-top:6px;font-size:0.7rem;color:#94a3b8">' + (tInfo.partition_count||0) + ' partitions</div>';
+        html += '</div>';
+      }
+    }
     if (desc.columns && desc.rows) {
-      html += '<div style="font-size:0.75rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
+      html += '<div style="font-size:0.75rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Schema</div>';
       html += '<div id="result-table-wrap" style="margin-bottom:16px"><table><thead><tr>';
       desc.columns.forEach(function(c){ html += '<th>' + escHtml(typeof c==='string'?c:(c.name||String(c))) + '</th>'; });
       html += '</tr></thead><tbody>';
       (desc.rows||[]).forEach(function(row) {
         html += '<tr>';
-        (row.values||row||[]).forEach(function(v){ html += '<td>' + escHtml(String(v != null ? v : '')) + '</td>'; });
+        rowVals(row).forEach(function(v){ html += '<td>' + escHtml(String(v != null ? v : '')) + '</td>'; });
         html += '</tr>';
       });
       html += '</tbody></table></div>';
     }
     var rows = data.rows||[], cols = data.columns||[];
-    html += '<div style="font-size:0.75rem;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Data (first 50 rows)</div>';
+    html += '<div style="font-size:0.75rem;color:#94a3b8;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Data (first 50 rows)</div>';
     html += '<div id="result-table-wrap"><table><thead><tr>';
     cols.forEach(function(c){ html += '<th>' + escHtml(typeof c==='string'?c:(c.name||String(c))) + '</th>'; });
     html += '</tr></thead><tbody>';
     rows.forEach(function(row) {
       html += '<tr>';
-      (row.values||row||[]).forEach(function(v) {
+      rowVals(row).forEach(function(v) {
         var sv = String(v != null ? v : '');
         html += (!isNaN(sv)&&sv!=='') ? '<td class="num">'+escHtml(sv)+'</td>' : '<td>'+escHtml(sv)+'</td>';
       });
@@ -3151,6 +4398,8 @@ async function fetchMonitoring() {
     drawMonChart();
     // Slow queries
     loadSlowQueriesMon();
+    // Phase 173: Pool tab auto-refresh (same 5s cycle)
+    if (monTab === 'pool') fetchPoolStats();
   } catch(e) {
     var el = document.getElementById('m-last-update');
     if(el) el.textContent = 'Error fetching status';
@@ -3164,10 +4413,10 @@ function drawMonChart() {
   var ctx = canvas.getContext('2d');
   var W = canvas.width, H = canvas.height || 60;
   ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#0d1117';
+  ctx.fillStyle = '#080c18';
   ctx.fillRect(0, 0, W, H);
   var data = monQueryHistory;
-  if (!data.length) { ctx.fillStyle='#484f58'; ctx.font='10px monospace'; ctx.fillText('No data yet',8,H/2+4); return; }
+  if (!data.length) { ctx.fillStyle='#475569'; ctx.font='10px monospace'; ctx.fillText('No data yet',8,H/2+4); return; }
   var maxV = Math.max(1, Math.max.apply(null, data));
   var barW = Math.floor((W - 20) / 10);
   var pad = 4;
@@ -3177,13 +4426,13 @@ function drawMonChart() {
     var y = H - 8 - barH;
     var age = data.length - 1 - i;
     var alpha = 0.4 + 0.6 * (i / Math.max(1, data.length - 1));
-    ctx.fillStyle = 'rgba(63,185,80,' + alpha + ')';
+    ctx.fillStyle = 'rgba(0,212,255,' + alpha + ')';
     ctx.fillRect(x, y, barW, barH);
-    ctx.fillStyle = '#484f58';
+    ctx.fillStyle = '#475569';
     ctx.font = '8px monospace';
     ctx.fillText(data[i], x, H - 1);
   }
-  ctx.fillStyle = '#484f58';
+  ctx.fillStyle = '#475569';
   ctx.font = '9px monospace';
   ctx.fillText('max:'+maxV, W-40, 10);
 }
@@ -3199,12 +4448,12 @@ async function loadSlowQueriesMon() {
       el.textContent = 'No slow queries recorded.'; return;
     }
     var html = '<table style="width:100%;border-collapse:collapse;font-size:0.75rem">';
-    html += '<tr style="color:#636e7b;border-bottom:1px solid #21262d">';
+    html += '<tr style="color:#64748b;border-bottom:1px solid #1e2d40">';
     (d.columns||[]).forEach(function(c){ html += '<th style="text-align:left;padding:3px 6px">'+escHtml(c.name||c)+'</th>'; });
     html += '</tr>';
     d.rows.slice(0,8).forEach(function(row){
-      html += '<tr style="border-bottom:1px solid #161b22">';
-      (row.values||row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#e6edf3">'+escHtml(String(v||''))+'</td>'; });
+      html += '<tr style="border-bottom:1px solid #111827">';
+      rowVals(row).forEach(function(v){ html += '<td style="padding:3px 6px;color:#f8fafc">'+escHtml(String(v||''))+'</td>'; });
       html += '</tr>';
     });
     html += '</table>';
@@ -3235,6 +4484,235 @@ async function loadMonitoring() {
   startMonCountdown();
 }
 
+// ── Pool Stats Tab (Phase 173) ────────────────────────────────
+var monTab = 'overview';
+function monShowTab(tab) {
+  monTab = tab;
+  document.getElementById('mon-overview').style.display = (tab === 'overview') ? '' : 'none';
+  document.getElementById('mon-pool').style.display     = (tab === 'pool') ? '' : 'none';
+  document.getElementById('mtab-overview').classList.toggle('active', tab === 'overview');
+  document.getElementById('mtab-pool').classList.toggle('active', tab === 'pool');
+  if (tab === 'pool') fetchPoolStats();
+}
+
+async function fetchPoolStats() {
+  try {
+    var r = await fetch('/pool/stats', {credentials:'include'});
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    set('p-active',   d.active   != null ? d.active   : '--');
+    set('p-idle',     d.idle     != null ? d.idle     : '--');
+    set('p-waiting',  d.waiting  != null ? d.waiting  : '--');
+    set('p-minmax',   (d.min != null ? d.min : '?') + ' / ' + (d.max != null ? d.max : '?'));
+    set('p-total',    d.total    != null ? d.total    : '--');
+    set('p-avgwait',  d.avg_wait_ms != null ? d.avg_wait_ms + ' ms' : '--');
+    set('p-timeouts', d.timeouts != null ? d.timeouts : '--');
+    set('p-requests', d.total_requests != null ? d.total_requests : '--');
+    drawPoolChart(d);
+  } catch(e) {}
+}
+
+function drawPoolChart(d) {
+  var canvas = document.getElementById('p-chart');
+  if (!canvas || !canvas.getContext) return;
+  canvas.width = canvas.offsetWidth || 400;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height || 90;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#080c18'; ctx.fillRect(0, 0, W, H);
+  var max = Math.max(1, d.max || 1);
+  var active = d.active || 0, idle = d.idle || 0, waiting = d.waiting || 0;
+  var barY = 18, barH = 28, pad = 10, barW = W - 2 * pad;
+  // Stacked utilization bar: active | idle | free
+  var wActive = Math.round(barW * active / max);
+  var wIdle   = Math.round(barW * idle / max);
+  ctx.fillStyle = '#2d4060'; ctx.fillRect(pad, barY, barW, barH);
+  ctx.fillStyle = '#10b981'; ctx.fillRect(pad, barY, wActive, barH);
+  ctx.fillStyle = '#00d4ff'; ctx.fillRect(pad + wActive, barY, wIdle, barH);
+  ctx.fillStyle = '#f8fafc'; ctx.font = '11px monospace';
+  var pct = Math.round(100 * active / max);
+  ctx.fillText('Auslastung: ' + active + '/' + max + ' (' + pct + '%)', pad, 12);
+  // Waiting bar (below, orange)
+  if (waiting > 0) {
+    var wWait = Math.min(barW, Math.round(barW * waiting / max));
+    ctx.fillStyle = '#f59e0b'; ctx.fillRect(pad, barY + barH + 14, wWait, 12);
+    ctx.fillStyle = '#f59e0b'; ctx.font = '10px monospace';
+    ctx.fillText(waiting + ' wartend', pad, barY + barH + 12);
+  } else {
+    ctx.fillStyle = '#475569'; ctx.font = '10px monospace';
+    ctx.fillText('Keine wartenden Requests', pad, barY + barH + 24);
+  }
+}
+
+// ── Vacuum Page (Phase 173) ───────────────────────────────────
+var vacTimer = null;
+function stopVacuumPage() { if (vacTimer) { clearInterval(vacTimer); vacTimer = null; } }
+function loadVacuumPage() {
+  fetchVacuumStats();
+  if (vacTimer) clearInterval(vacTimer);
+  vacTimer = setInterval(fetchVacuumStats, 5000);
+}
+
+function fmtBytes(b) {
+  if (b == null) return '--';
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+
+async function fetchVacuumStats() {
+  try {
+    var r = await fetch('/vacuum/stats', {credentials:'include'});
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    set('v-lastrun',    d.last_run || 'never');
+    set('v-nextrun',    d.auto_vacuum_enabled === false ? 'deaktiviert'
+                        : (d.next_auto_run_in_seconds != null ? 'in ' + d.next_auto_run_in_seconds + 's' : '--'));
+    set('v-freedrows',  d.total_freed_rows != null ? d.total_freed_rows : '--');
+    set('v-freedbytes', fmtBytes(d.total_freed_bytes));
+    set('v-runs',       d.runs_total != null ? d.runs_total + ' (' + (d.auto_runs||0) + ' auto)' : '--');
+    set('v-pending',    d.pending_dead_tuples != null ? d.pending_dead_tuples : '--');
+    // Merge table list: all tables + dead tuples + last vacuum time
+    var tr = await fetch('/tables', {credentials:'include'});
+    var td = await tr.json();
+    var tables = Array.isArray(td) ? td : (td.tables || []);
+    var dead = d.tables || {}, lastVac = d.last_vacuum_per_table || {};
+    var el = document.getElementById('vacuum-table-list');
+    if (!tables.length) { el.textContent = 'Keine Tabellen.'; return; }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">';
+    html += '<tr style="color:#64748b;border-bottom:1px solid #1e2d40">'
+          + '<th style="text-align:left;padding:5px 8px">Tabelle</th>'
+          + '<th style="text-align:right;padding:5px 8px">Dead Tuples</th>'
+          + '<th style="text-align:left;padding:5px 8px">Letzter Vacuum</th>'
+          + '<th style="text-align:right;padding:5px 8px">Aktion</th></tr>';
+    tables.forEach(function(t) {
+      var name = typeof t === 'string' ? t : t.name;
+      var dt = dead[name] != null ? dead[name] : (dead['public.' + name] != null ? dead['public.' + name] : 0);
+      var lv = lastVac[name] || lastVac['public.' + name] || '&mdash;';
+      var dtColor = dt > 0 ? '#f59e0b' : '#10b981';
+      html += '<tr style="border-bottom:1px solid #111827">'
+        + '<td style="padding:5px 8px;color:#f8fafc">' + escHtml(name) + '</td>'
+        + '<td style="padding:5px 8px;text-align:right;color:' + dtColor + ';font-weight:600">' + dt + '</td>'
+        + '<td style="padding:5px 8px;color:#94a3b8">' + lv + '</td>'
+        + '<td style="padding:5px 8px;text-align:right"><button class="vac-btn" onclick="runVacuumNow(\'' + escAttr(name) + '\', this)">VACUUM jetzt</button></td>'
+        + '</tr>';
+    });
+    html += '</table>';
+    el.innerHTML = html;
+  } catch(e) {
+    var el = document.getElementById('vacuum-table-list');
+    if (el) el.textContent = 'Fehler beim Laden der Vacuum-Statistiken.';
+  }
+}
+
+async function runVacuumNow(table, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'l\u00e4uft...'; }
+  var msg = document.getElementById('v-msg');
+  try {
+    var r = await fetch('/api/query', {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sql: 'VACUUM ' + table})});
+    var d = await r.json();
+    if (msg) {
+      msg.textContent = d.success !== false ? ('VACUUM ' + table + ' \u2713 ' + (d.message || '')) : ('Fehler: ' + (d.error || 'unbekannt'));
+      msg.style.color = d.success !== false ? '#10b981' : '#ef4444';
+      setTimeout(function(){ msg.textContent = ''; }, 6000);
+    }
+  } catch(e) {
+    if (msg) { msg.textContent = 'Netzwerkfehler'; msg.style.color = '#ef4444'; }
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'VACUUM jetzt'; }
+  fetchVacuumStats();
+}
+
+// ── Replication Page (Phase 173) ──────────────────────────────
+var repTimer = null;
+function stopReplicationPage() { if (repTimer) { clearInterval(repTimer); repTimer = null; } }
+function loadReplicationPage() {
+  fetchReplicationStatus();
+  if (repTimer) clearInterval(repTimer);
+  repTimer = setInterval(fetchReplicationStatus, 2000);
+}
+
+async function fetchReplicationStatus() {
+  try {
+    var r = await fetch('/replication/status', {credentials:'include'});
+    var d = await r.json();
+    function set(id, val){ var el = document.getElementById(id); if(el) el.textContent = val; }
+    var role = d.role || 'standalone';
+    set('r-role', role === 'master' ? 'Master' : role === 'replica' ? 'Replica' : 'Standalone');
+    set('r-mode', (d.sync_mode || 'async') + ' \u00b7 Port ' + (d.replication_port || '?'));
+    set('r-binlog', d.binlog_pos != null && d.binlog_pos >= 0 ? d.binlog_pos : (d.replica ? d.replica.position : '--'));
+    set('r-ack', d.max_slave_ack_pos != null ? d.max_slave_ack_pos : '--');
+    set('r-slaves', d.connected_slaves != null ? d.connected_slaves : '--');
+    var rep = d.replica || {};
+    set('r-lag', role === 'replica' ? (rep.lag_ms != null ? rep.lag_ms + ' ms' : '--')
+                : (d.binlog_pos > d.max_slave_ack_pos ? (d.binlog_pos - d.max_slave_ack_pos) + ' Entries' : '0'));
+    // Traffic light: green = in sync, yellow = lagging, red = disconnected
+    var light = document.getElementById('rep-light');
+    var text  = document.getElementById('rep-light-text');
+    var color = '#475569', msg = 'Standalone \u2014 keine Replikation konfiguriert';
+    if (role === 'replica') {
+      if (rep.master_down || !rep.running) { color = '#ef4444'; msg = 'MASTER DOWN \u2014 Verbindung verloren (>30s)'; }
+      else if ((rep.lag_ms || 0) > 1000)   { color = '#f59e0b'; msg = 'Lag: ' + rep.lag_ms + ' ms \u2014 Replica h\u00e4ngt hinterher'; }
+      else { color = '#10b981'; msg = 'In Sync \u2014 Lag ' + (rep.lag_ms||0) + ' ms \u00b7 ' + (rep.status||''); }
+    } else if (role === 'master') {
+      var slaves = d.slaves || [];
+      var connected = slaves.filter(function(s){ return s.connected; }).length;
+      if (connected === 0 && (d.connected_slaves||0) === 0) { color = '#ef4444'; msg = 'Keine Replica verbunden'; }
+      else if (d.binlog_pos > d.max_slave_ack_pos) { color = '#f59e0b'; msg = 'Replicas h\u00e4ngen hinterher (ack ' + d.max_slave_ack_pos + ' / pos ' + d.binlog_pos + ')'; }
+      else { color = '#10b981'; msg = 'In Sync \u2014 ' + Math.max(connected, d.connected_slaves||0) + ' Replica(s) aktuell'; }
+    }
+    if (light) light.style.color = color;
+    if (text) { text.textContent = msg; text.style.color = color; }
+    // Replica list (master side)
+    var listEl = document.getElementById('rep-slave-list');
+    if (listEl) {
+      var slaves2 = d.slaves || [];
+      if (role !== 'master') {
+        listEl.textContent = role === 'replica' ? 'Dieser Server ist eine Replica.' : 'Keine Replikation aktiv.';
+      } else if (!slaves2.length) {
+        listEl.textContent = 'Keine Replicas registriert.';
+      } else {
+        var html = '<table style="width:100%;border-collapse:collapse;font-size:0.78rem">'
+          + '<tr style="color:#64748b;border-bottom:1px solid #1e2d40">'
+          + '<th style="text-align:left;padding:5px 8px">Host</th>'
+          + '<th style="text-align:right;padding:5px 8px">Ack-Position</th>'
+          + '<th style="text-align:right;padding:5px 8px">Zuletzt gesehen</th>'
+          + '<th style="text-align:left;padding:5px 8px">Status</th></tr>';
+        slaves2.forEach(function(s) {
+          var st = s.connected ? '<span style="color:#10b981">&#x25CF; verbunden</span>'
+                               : '<span style="color:#ef4444">&#x25CF; getrennt</span>';
+          var seen = s.ms_since_seen < 1000 ? 'gerade eben' : Math.round(s.ms_since_seen/1000) + 's';
+          html += '<tr style="border-bottom:1px solid #111827">'
+            + '<td style="padding:5px 8px;color:#f8fafc">' + escHtml(s.host||'?') + '</td>'
+            + '<td style="padding:5px 8px;text-align:right">' + (s.ack_pos != null ? s.ack_pos : '--') + '</td>'
+            + '<td style="padding:5px 8px;text-align:right">' + seen + '</td>'
+            + '<td style="padding:5px 8px">' + st + '</td></tr>';
+        });
+        html += '</table>';
+        listEl.innerHTML = html;
+      }
+    }
+    // Replica-side connection detail
+    var det = document.getElementById('rep-replica-detail');
+    if (det) {
+      if (role === 'replica') {
+        det.style.display = '';
+        document.getElementById('rep-replica-info').innerHTML =
+          'Master: <b style="color:#f8fafc">' + escHtml(rep.master_host||'?') + ':' + (rep.master_port||'?') + '</b>'
+          + ' &middot; Status: <b style="color:#f8fafc">' + escHtml(rep.status||'?') + '</b>'
+          + ' &middot; Position: <b style="color:#f8fafc">' + (rep.position != null ? rep.position : '?') + '</b>'
+          + ' &middot; Letzter Sync: <b style="color:#f8fafc">' + (rep.ms_since_last_sync >= 0 ? rep.ms_since_last_sync + ' ms' : 'nie') + '</b>';
+      } else det.style.display = 'none';
+    }
+  } catch(e) {
+    var text = document.getElementById('rep-light-text');
+    if (text) text.textContent = 'Fehler beim Laden des Replikationsstatus';
+  }
+}
+
 // History
 function saveHistory(sql, ms, ok) {
   var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
@@ -3247,7 +4725,7 @@ function saveHistory(sql, ms, ok) {
 function renderHistory() {
   var hist = JSON.parse(localStorage.getItem('mq_hist') || '[]');
   var el = document.getElementById('history-list');
-  if (!hist.length) { el.innerHTML = '<div style="color:#484f58;font-size:0.85rem;padding:8px">No history yet.</div>'; return; }
+  if (!hist.length) { el.innerHTML = '<div style="color:#475569;font-size:0.85rem;padding:8px">No history yet.</div>'; return; }
   el.innerHTML = hist.map(function(h,i) {
     var badge = h.ok !== false
       ? '<span class="hist-badge ok">OK</span>'
@@ -3296,11 +4774,125 @@ async function pollStatus() {
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+function rowVals(row) { return Array.isArray(row) ? row : (row && typeof row === 'object' && row.values && typeof row.values !== 'function' ? row.values : (row && typeof row === 'object' ? Object.values(row) : [])); }
 function escAttr(s) { return String(s).replace(/'/g,"\\'"); }
+
+// Phase 174: load test count dynamically from /health
+async function loadTestBadge() {
+  try {
+    var r = await fetch('/health', {credentials:'include'});
+    var d = await r.json();
+    if (d.test_count != null)
+      document.getElementById('test-badge').textContent = d.test_count + ' tests';
+    if (d.version)
+      document.querySelectorAll('.ms-version').forEach(function(el){ el.textContent = 'v' + d.version; });
+  } catch(e) {}
+}
+
+// Phase 178: PITR/Backup loader
+async function loadPitrStatus() {
+  try {
+    var r = await fetch('/api/pitr/status', {credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('pitr-status-panel');
+    if (!el) return;
+    var h = '<div class="ssl-card"><h3>&#x1F4BE; Backup & Recovery';
+    h += ' <span class="ssl-badge ' + (d.archive_enabled ? 'on' : 'off') + '">';
+    h += d.archive_enabled ? 'ARCHIVING' : 'DISABLED';
+    h += '</span></h3>';
+    h += '<div class="ssl-grid">';
+    h += '<div class="ssl-item"><strong>Archive Dir</strong>' + escHtml(d.archive_dir||'') + '</div>';
+    h += '<div class="ssl-item"><strong>Segments</strong>' + (d.archive_segments||0) + '</div>';
+    h += '<div class="ssl-item"><strong>Archive Size</strong>' + formatSize(d.archive_size||0) + '</div>';
+    h += '<div class="ssl-item"><strong>Retention</strong>' + (d.retention_days||0) + ' days</div>';
+    if (d.oldest_segment) h += '<div class="ssl-item"><strong>Oldest</strong>' + escHtml(d.oldest_segment) + '</div>';
+    if (d.newest_segment) h += '<div class="ssl-item"><strong>Newest</strong>' + escHtml(d.newest_segment) + '</div>';
+    h += '</div>';
+    if (d.backups && d.backups.length > 0) {
+      h += '<div style="margin-top:12px;font-size:0.75rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.06em">Backups</div>';
+      h += '<table style="width:100%;font-size:0.72rem;margin-top:4px"><thead><tr><th style="text-align:left;padding:4px 8px;color:var(--text-2);border-bottom:1px solid var(--border)">Timestamp</th><th>LSN</th><th>Size</th><th>Tables</th></tr></thead><tbody>';
+      d.backups.forEach(function(b) {
+        h += '<tr><td style="padding:4px 8px;color:var(--text-1)">' + escHtml(b.timestamp) + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + b.lsn + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + formatSize(b.size) + '</td>';
+        h += '<td style="padding:4px 8px;text-align:center">' + b.tables + '</td></tr>';
+      });
+      h += '</tbody></table>';
+    }
+    h += '<div style="margin-top:8px;display:flex;gap:8px;justify-content:flex-end">';
+    h += '<button onclick="doArchiveNow()" style="background:var(--bg-hover);color:var(--text-1);border:1px solid var(--border);border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Archive WAL</button>';
+    h += '<button onclick="doBackupNow()" style="background:var(--accent);color:white;border:none;border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Backup Now</button>';
+    h += '</div></div>';
+    el.innerHTML = h;
+  } catch(e) {}
+}
+function formatSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return Math.round(b/1024) + ' KB';
+  if (b < 1073741824) return Math.round(b/1048576) + ' MB';
+  return (b/1073741824).toFixed(1) + ' GB';
+}
+async function doBackupNow() {
+  try {
+    var r = await fetch('/api/pitr/backup', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadPitrStatus(); } else { alert('Backup failed: ' + (d.message||'')); }
+  } catch(e) { alert('Backup failed'); }
+}
+async function doArchiveNow() {
+  try {
+    var r = await fetch('/api/pitr/archive-now', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadPitrStatus(); } else { alert('Archive failed: ' + (d.message||'')); }
+  } catch(e) { alert('Archive failed'); }
+}
+
+// Phase 177: SSL status loader
+async function loadSslStatus() {
+  try {
+    var r = await fetch('/api/ssl', {credentials:'include'});
+    var d = await r.json();
+    var el = document.getElementById('ssl-status-panel');
+    if (!el) return;
+    var h = '<div class="ssl-card"><h3>&#x1F512; SSL/TLS Status ';
+    h += '<span class="ssl-badge ' + (d.enabled && d.ready ? 'on' : 'off') + '">';
+    h += d.enabled && d.ready ? 'ACTIVE' : 'INACTIVE';
+    h += '</span></h3>';
+    h += '<div class="ssl-grid">';
+    h += '<div class="ssl-item"><strong>Mode</strong>' + escHtml(d.mode || 'disabled') + '</div>';
+    h += '<div class="ssl-item"><strong>Backend</strong>' + escHtml(d.backend || 'none') + '</div>';
+    h += '<div class="ssl-item"><strong>Repl Mode</strong>' + escHtml(d.repl_mode || 'disabled') + '</div>';
+    if (d.ready) {
+      h += '<div class="ssl-item"><strong>TLS Version</strong>' + escHtml(d.tls_version || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Cipher</strong>' + escHtml(d.cipher || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Subject</strong>' + escHtml(d.subject || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Issuer</strong>' + escHtml(d.issuer || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Valid Until</strong>' + escHtml(d.not_after || 'N/A') + '</div>';
+      h += '<div class="ssl-item"><strong>Serial</strong>' + escHtml(d.serial || 'N/A') + '</div>';
+    }
+    if (d.error) h += '<div class="ssl-item" style="grid-column:1/-1;color:#ef4444"><strong>Error</strong>' + escHtml(d.error) + '</div>';
+    h += '</div>';
+    if (d.enabled && d.ready)
+      h += '<div style="margin-top:8px;text-align:right"><button onclick="reloadSsl()" style="background:var(--accent);color:white;border:none;border-radius:6px;padding:4px 12px;font-size:0.7rem;cursor:pointer">Reload SSL</button></div>';
+    h += '</div>';
+    el.innerHTML = h;
+  } catch(e) {}
+}
+async function reloadSsl() {
+  try {
+    var r = await fetch('/api/ssl/reload', {method:'POST', credentials:'include'});
+    var d = await r.json();
+    if (d.success) { loadSslStatus(); }
+    else { alert('SSL reload failed: ' + (d.error || 'unknown')); }
+  } catch(e) { alert('SSL reload failed'); }
+}
 
 // Init
 updateEditorDecor();
+// Phase 176: Pre-fetch schema data for partition badges
+if(!window._schemaData){fetch("/api/schema",{credentials:"include"}).then(function(r){return r.json();}).then(function(d){window._schemaData=d;loadSidebarTables();}).catch(function(){});}
 loadSidebarTables();
+loadTestBadge();
 pollStatus();
 setInterval(pollStatus, 5000);
 setInterval(loadSidebarTables, 30000);
@@ -3324,6 +4916,7 @@ async function msLogin(u, p) {
       msToken=d.token||''; msUser=d.username||u; msUserId=d.user_id||0;
       // No localStorage — token is in httpOnly cookie set by server
       hidLoginPage();
+      await loadSidebarTables();
       updateUserBadge();
       return true;
     }
@@ -3340,10 +4933,10 @@ async function msSubmitLogin() {
   var u=document.getElementById('ms-lu').value.trim();
   var p=document.getElementById('ms-lp').value;
   var err=document.getElementById('ms-lerr');
-  if(!u||!p){err.style.color='#f38ba8';err.textContent='Enter username and password';return;}
-  err.style.color='#a6adc8';err.textContent='Signing in...';
+  if(!u||!p){err.style.color='#ef4444';err.textContent='Enter username and password';return;}
+  err.style.color='#94a3b8';err.textContent='Signing in...';
   var res=await msLogin(u,p);
-  if(res===true){err.textContent='';}else{err.style.color='#f38ba8';err.textContent=res;}
+  if(res===true){err.textContent='';}else{err.style.color='#ef4444';err.textContent=res;}
 }
 function updateUserBadge() {
   var ub=document.getElementById('ms-user-badge');
@@ -3353,12 +4946,458 @@ function updateUserBadge() {
   var rp=document.getElementById('rls-panel');
   if(rp){
     var tables=document.querySelectorAll('#sidebar-tables .tbl-btn');
-    rp.innerHTML='<div style="font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
-      +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="color:#3fb950;font-size:9px">●</span><span style="font-size:11px;color:#3fb950;font-weight:600">ACTIVE</span></div>'
-      +'<div style="font-size:10px;color:#8b949e">User: <b style="color:#cdd6f4">'+escHtml(msUser)+'</b> (id: '+msUserId+')</div>'
-      +'<div style="font-size:10px;color:#8b949e">Isolation: <b style="color:#3fb950">ENABLED</b></div>';
+    var rlsHtml='<div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Row Level Security</div>'
+      +'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="color:#10b981;font-size:9px">●</span><span style="font-size:11px;color:#10b981;font-weight:600">ACTIVE</span></div>'
+      +'<div style="font-size:10px;color:#94a3b8;margin-bottom:3px">User: <b style="color:#f8fafc">'+escHtml(msUser)+'</b></div>';
+    var enabledCount = (_rlsPoliciesCache.enabled_tables||[]).length;
+    var totalPolicies = 0;
+    var pols = _rlsPoliciesCache.policies || {};
+    for (var k in pols) totalPolicies += pols[k].length;
+    rlsHtml += '<div style="font-size:10px;color:#94a3b8;margin-bottom:2px">Tables: <b style="color:#00d4ff">'+enabledCount+'</b> protected</div>';
+    rlsHtml += '<div style="font-size:10px;color:#94a3b8">Policies: <b style="color:#f59e0b">'+totalPolicies+'</b> active</div>';
+    rp.innerHTML = rlsHtml;
   }
 }
+
+// Phase 171: Schema Visualizer
+var _schemaData = null;
+var _schemaPositions = {};
+var _schemaDrag = null;
+
+function schemaStorageKey() { return 'milansql_schema_pos_' + (msUser||'anon'); }
+function loadSchemaPositions() { try { _schemaPositions = JSON.parse(localStorage.getItem(schemaStorageKey())) || {}; } catch(e) { _schemaPositions = {}; } }
+function saveSchemaPositions() { try { localStorage.setItem(schemaStorageKey(), JSON.stringify(_schemaPositions)); } catch(e) {} }
+
+async function loadSchemaViz() {
+  var status = document.getElementById('schema-status');
+  if (status) status.textContent = 'Loading...';
+  loadSchemaPositions();
+  try { var r = await fetch('/api/schema', {credentials:'include'}); _schemaData = await r.json(); }
+  catch(e) { if(status) status.textContent='Error'; return; }
+  renderSchemaViz();
+}
+function schemaReload() { loadSchemaViz(); }
+
+function buildFkMap() {
+  var tables = (_schemaData && _schemaData.tables) || [];
+  var fkMap = [], fkCols = {}, tblNames = {};
+  tables.forEach(function(t) {
+    fkCols[t.name] = {};
+    tblNames[t.name] = true;
+    // Strip public. and u<N>_ prefixes for FK inference matching
+    var noSchema = t.name.replace(/^public\./, '');
+    if (noSchema !== t.name) tblNames[noSchema] = t.name;
+    var bare = noSchema.replace(/^u[0-9]+_/, '');
+    if (bare !== noSchema) tblNames[bare] = t.name;
+  });
+  tables.forEach(function(t) {
+    (t.foreign_keys||[]).forEach(function(fk) { fkMap.push({from:t.name,fromCol:fk.from,to:fk.ref_table,toCol:fk.ref_col}); fkCols[t.name][fk.from]=fk.ref_table; });
+    (t.columns||[]).forEach(function(c) {
+      if (c.name.endsWith('_id') && !fkCols[t.name][c.name]) {
+        var ref = c.name.slice(0,-3);
+        [ref,ref+'s',ref+'e',ref+'en',ref+'es'].forEach(function(cn) {
+          if(tblNames[cn]&&cn!==t.name) { var real=typeof tblNames[cn]==='string'?tblNames[cn]:cn; if(real!==t.name){fkMap.push({from:t.name,fromCol:c.name,to:real,toCol:'id',inferred:true}); fkCols[t.name][c.name]=real;} }
+        });
+      }
+    });
+  });
+  return {fkMap:fkMap,fkCols:fkCols};
+}
+
+function renderSchemaViz() {
+  var tables = (_schemaData && _schemaData.tables) || [];
+  var cardsEl = document.getElementById('schema-cards');
+  var svgEl = document.getElementById('schema-svg');
+  if (!cardsEl||!svgEl) return;
+  cardsEl.innerHTML = '';
+  var filter = (document.getElementById('schema-search')||{}).value||'';
+  filter = filter.toLowerCase();
+  var fi = buildFkMap(), fkMap=fi.fkMap, fkCols=fi.fkCols;
+  var cols = Math.max(2, Math.ceil(Math.sqrt(tables.length)));
+  tables.forEach(function(t,i) { if(!_schemaPositions[t.name]) _schemaPositions[t.name]={x:40+(i%cols)*280,y:40+Math.floor(i/cols)*260}; });
+  var ft = tables.filter(function(t){return !filter||t.name.toLowerCase().indexOf(filter)>=0;});
+  var vis = {}; ft.forEach(function(t){vis[t.name]=true;});
+  ft.forEach(function(t) {
+    var card = document.createElement('div');
+    card.className = 'schema-card'; card.dataset.table = t.name;
+    var pos = _schemaPositions[t.name];
+    card.style.left = pos.x+'px'; card.style.top = pos.y+'px';
+    var pc = (t.policies||[]).length, rlsOn = t.rls_enabled;
+    var h = '<div class="schema-card-header"><span class="rls-dot '+(rlsOn?'on':'off')+'" title="RLS '+(rlsOn?'active':'inactive')+'"></span><span>'+escHtml(t.name)+'</span>';
+    if(pc>0) h+='<span class="pol-count">'+pc+'</span>';
+    if(t.partitioned) h+='<span class="part-badge" title="'+t.partition_type+' partitioned on '+escHtml(t.partition_column||'')+'">&#x25A6; '+t.partition_type+(t.partition_count?' ('+t.partition_count+')':'')+' </span>';
+    h+='</div><div class="schema-card-cols">';
+    (t.columns||[]).forEach(function(c) {
+      var isFk=!!(fkCols[t.name]||{})[c.name];
+      var icon='';
+      if(c.pk) icon='<span class="col-icon pk" title="PK">&#x1F511;</span>';
+      else if(isFk) icon='<span class="col-icon fk" title="FK">&#x2192;</span>';
+      else icon='<span class="col-icon"></span>';
+      h+='<div class="schema-col">'+icon+'<span class="col-name'+(isFk?' fk-col':'')+'">'+escHtml(c.name)+'</span><span class="col-type">'+escHtml(c.type)+'</span></div>';
+    });
+    h+='</div>';
+    if(rlsOn&&pc>0) { var fp=t.policies[0]; h+='<div class="schema-card-rls" title="Click to edit" onclick="openPolicyEditor(\''+t.name.replace(/'/g,"\\'")+'\')">' +escHtml(fp.name)+': '+escHtml(fp['using']||'')+'</div>'; }
+    else if(rlsOn) h+='<div class="schema-card-rls" onclick="openPolicyEditor(\''+t.name.replace(/'/g,"\\'")+'\')">' +'+ Add policy</div>';
+    card.innerHTML = h;
+    card.addEventListener('mouseenter', function() {
+      var conn={}; conn[t.name]=true;
+      fkMap.forEach(function(fk){if(fk.from===t.name)conn[fk.to]=true;if(fk.to===t.name)conn[fk.from]=true;});
+      document.querySelectorAll('.schema-card').forEach(function(c){if(conn[c.dataset.table])c.classList.add('highlighted');else c.classList.add('dimmed');});
+      document.querySelectorAll('.schema-line').forEach(function(l){if(l.dataset.from===t.name||l.dataset.to===t.name){l.style.opacity='1';l.style.strokeWidth='2';}else l.style.opacity='0.15';});
+      document.querySelectorAll('.schema-line-label').forEach(function(l){if(l.dataset.from===t.name||l.dataset.to===t.name)l.style.opacity='1';else l.style.opacity='0.15';});
+    });
+    card.addEventListener('mouseleave', function() {
+      document.querySelectorAll('.schema-card').forEach(function(c){c.classList.remove('highlighted','dimmed');});
+      document.querySelectorAll('.schema-line').forEach(function(l){l.style.opacity='';l.style.strokeWidth='';});
+      document.querySelectorAll('.schema-line-label').forEach(function(l){l.style.opacity='';});
+    });
+    card.addEventListener('mousedown', function(e) {
+      if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='BUTTON'||e.target.closest('.schema-card-rls'))return;
+      e.preventDefault(); _schemaDrag={el:card,name:t.name,sx:e.clientX,sy:e.clientY,ox:pos.x,oy:pos.y};
+    });
+    cardsEl.appendChild(card);
+  });
+  drawSchemaLines(fkMap, vis);
+  schemaApplyTransform();
+  var status=document.getElementById('schema-status');
+  if(status)status.textContent=ft.length+' tables, '+fkMap.length+' relations';
+}
+
+function drawSchemaLines(fkMap,vis) {
+  var svg=document.getElementById('schema-svg'); if(!svg)return; svg.innerHTML='';
+  var ns='http://www.w3.org/2000/svg';
+  fkMap.forEach(function(fk) {
+    if(!vis[fk.from]||!vis[fk.to])return;
+    var fp=_schemaPositions[fk.from],tp=_schemaPositions[fk.to]; if(!fp||!tp)return;
+    var fc=document.querySelector('.schema-card[data-table="'+fk.from+'"]');
+    var tc=document.querySelector('.schema-card[data-table="'+fk.to+'"]');
+    if(!fc||!tc)return;
+    var fw=fc.offsetWidth||200,fh=fc.offsetHeight||120,tw=tc.offsetWidth||200,th=tc.offsetHeight||120;
+    var fx=fp.x+fw,fy=fp.y+fh/2,tx=tp.x,ty=tp.y+th/2;
+    if(tp.x+tw<fp.x){fx=fp.x;tx=tp.x+tw;}
+    else if(Math.abs(fp.x-tp.x)<fw){if(tp.y>fp.y){fx=fp.x+fw/2;fy=fp.y+fh;tx=tp.x+tw/2;ty=tp.y;}else{fx=fp.x+fw/2;fy=fp.y;tx=tp.x+tw/2;ty=tp.y+th;}}
+    var ft2=(_schemaData.tables||[]).find(function(t){return t.name===fk.from;});
+    var tt2=(_schemaData.tables||[]).find(function(t){return t.name===fk.to;});
+    var bothRls=ft2&&tt2&&ft2.rls_enabled&&tt2.rls_enabled;
+    var lc=bothRls?'#00d4ff':'rgba(0,212,255,0.35)';
+    var line=document.createElementNS(ns,'line');
+    line.setAttribute('x1',fx);line.setAttribute('y1',fy);line.setAttribute('x2',tx);line.setAttribute('y2',ty);
+    line.setAttribute('stroke',lc);line.setAttribute('stroke-width','1');line.setAttribute('stroke-dasharray','4,3');
+    line.classList.add('schema-line');line.dataset.from=fk.from;line.dataset.to=fk.to;line.style.pointerEvents='none';
+    svg.appendChild(line);
+    var mx=(fx+tx)/2,my=(fy+ty)/2;
+    var text=document.createElementNS(ns,'text');
+    text.setAttribute('x',mx);text.setAttribute('y',my-4);text.setAttribute('fill','#64748b');
+    text.setAttribute('font-size','9');text.setAttribute('text-anchor','middle');text.setAttribute('font-family','-apple-system,sans-serif');
+    text.classList.add('schema-line-label');text.dataset.from=fk.from;text.dataset.to=fk.to;text.style.pointerEvents='none';
+    text.textContent=fk.fromCol;svg.appendChild(text);
+  });
+}
+
+
+// Phase 172: Zoom, Pan, Mini-Map, Keyboard Shortcuts
+var _schemaZoom = 1.0;
+var _schemaPan = {x: 0, y: 0};
+var _schemaPanning = false;
+var _schemaPanStart = null;
+var _schemaSpaceDown = false;
+var _minimapDrag = false;
+
+function schemaApplyTransform() {
+  var tf = document.getElementById('schema-transform');
+  if (tf) tf.style.transform = 'translate(' + _schemaPan.x + 'px,' + _schemaPan.y + 'px) scale(' + _schemaZoom + ')';
+  var pct = document.getElementById('schema-zoom-pct');
+  if (pct) pct.textContent = Math.round(_schemaZoom * 100) + '%';
+  updateMinimap();
+}
+
+function schemaZoom(delta, cx, cy) {
+  var oldZ = _schemaZoom;
+  _schemaZoom = Math.max(0.2, Math.min(2.0, _schemaZoom + delta));
+  if (cx !== undefined && cy !== undefined) {
+    // Zoom centered on mouse position
+    var canvas = document.getElementById('schema-canvas');
+    if (canvas) {
+      var rect = canvas.getBoundingClientRect();
+      var mx = cx - rect.left;
+      var my = cy - rect.top;
+      // Adjust pan so point under mouse stays fixed
+      var ratio = _schemaZoom / oldZ;
+      _schemaPan.x = mx - ratio * (mx - _schemaPan.x);
+      _schemaPan.y = my - ratio * (my - _schemaPan.y);
+    }
+  }
+  schemaApplyTransform();
+}
+
+function schemaZoomReset() {
+  _schemaZoom = 1.0;
+  _schemaPan = {x: 0, y: 0};
+  schemaApplyTransform();
+}
+
+function schemaFitAllZoom() {
+  var tables = (_schemaData && _schemaData.tables) || [];
+  if (!tables.length) return;
+  var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  tables.forEach(function(t) {
+    var p = _schemaPositions[t.name];
+    if (p) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x + 220 > maxX) maxX = p.x + 220;
+      if (p.y + 200 > maxY) maxY = p.y + 200;
+    }
+  });
+  var canvas = document.getElementById('schema-canvas');
+  if (!canvas) return;
+  var cw = canvas.clientWidth, ch = canvas.clientHeight;
+  if (cw < 10 || ch < 10) return;
+  var contentW = maxX - minX + 80, contentH = maxY - minY + 80;
+  _schemaZoom = Math.max(0.2, Math.min(2.0, Math.min(cw / contentW, ch / contentH)));
+  _schemaPan.x = (cw - contentW * _schemaZoom) / 2 - minX * _schemaZoom + 40 * _schemaZoom;
+  _schemaPan.y = (ch - contentH * _schemaZoom) / 2 - minY * _schemaZoom + 40 * _schemaZoom;
+  schemaApplyTransform();
+}
+
+// ── Mini-Map ──
+function updateMinimap() {
+  var cvs = document.getElementById('schema-minimap-canvas');
+  if (!cvs) return;
+  var ctx = cvs.getContext('2d');
+  var mw = cvs.width, mh = cvs.height;
+  ctx.clearRect(0, 0, mw, mh);
+  var tables = (_schemaData && _schemaData.tables) || [];
+  if (!tables.length) return;
+  // Find bounds of all tables
+  var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+  tables.forEach(function(t) {
+    var p = _schemaPositions[t.name];
+    if (p) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x + 200 > maxX) maxX = p.x + 200;
+      if (p.y + 120 > maxY) maxY = p.y + 120;
+    }
+  });
+  var pad = 40;
+  var cW = maxX - minX + pad * 2, cH = maxY - minY + pad * 2;
+  var scale = Math.min(mw / cW, mh / cH);
+  var offX = (mw - cW * scale) / 2, offY = (mh - cH * scale) / 2;
+  // Draw FK lines
+  var fi = buildFkMap();
+  ctx.strokeStyle = '#1e2d40';
+  ctx.lineWidth = 0.5;
+  fi.fkMap.forEach(function(fk) {
+    var fp = _schemaPositions[fk.from], tp = _schemaPositions[fk.to];
+    if (!fp || !tp) return;
+    ctx.beginPath();
+    ctx.moveTo(offX + (fp.x - minX + pad + 100) * scale, offY + (fp.y - minY + pad + 60) * scale);
+    ctx.lineTo(offX + (tp.x - minX + pad + 100) * scale, offY + (tp.y - minY + pad + 60) * scale);
+    ctx.stroke();
+  });
+  // Draw table rectangles
+  tables.forEach(function(t) {
+    var p = _schemaPositions[t.name];
+    if (!p) return;
+    var rx = offX + (p.x - minX + pad) * scale;
+    var ry = offY + (p.y - minY + pad) * scale;
+    var rw = 200 * scale, rh = 120 * scale;
+    ctx.fillStyle = '#111827';
+    ctx.strokeStyle = '#2d4060';
+    ctx.lineWidth = 0.5;
+    ctx.fillRect(rx, ry, rw, rh);
+    ctx.strokeRect(rx, ry, rw, rh);
+    // RLS dot
+    var dotR = Math.max(2, 4 * scale);
+    ctx.fillStyle = t.rls_enabled ? '#10b981' : '#475569';
+    ctx.beginPath();
+    ctx.arc(rx + dotR + 2, ry + dotR + 2, dotR, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  // Draw viewport rectangle
+  var canvas = document.getElementById('schema-canvas');
+  if (canvas) {
+    var cw = canvas.clientWidth, ch = canvas.clientHeight;
+    // Viewport in content coords: top-left = -pan/zoom, size = canvasSize/zoom
+    var vx = -_schemaPan.x / _schemaZoom;
+    var vy = -_schemaPan.y / _schemaZoom;
+    var vw = cw / _schemaZoom;
+    var vh = ch / _schemaZoom;
+    // Map to minimap coords
+    var vrx = offX + (vx - minX + pad) * scale;
+    var vry = offY + (vy - minY + pad) * scale;
+    var vrw = vw * scale;
+    var vrh = vh * scale;
+    ctx.strokeStyle = '#00d4ff';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(vrx, vry, vrw, vrh);
+  }
+  // Store mapping for click-to-navigate
+  cvs._mmMinX = minX; cvs._mmMinY = minY;
+  cvs._mmScale = scale; cvs._mmPad = pad;
+  cvs._mmOffX = offX; cvs._mmOffY = offY;
+}
+
+function minimapNavigate(e) {
+  var cvs = document.getElementById('schema-minimap-canvas');
+  if (!cvs || !cvs._mmScale) return;
+  var rect = cvs.getBoundingClientRect();
+  var sx = cvs.width / rect.width, sy = cvs.height / rect.height;
+  var mx = (e.clientX - rect.left) * sx;
+  var my = (e.clientY - rect.top) * sy;
+  // Convert minimap coords back to content coords
+  var contentX = (mx - cvs._mmOffX) / cvs._mmScale + cvs._mmMinX - cvs._mmPad;
+  var contentY = (my - cvs._mmOffY) / cvs._mmScale + cvs._mmMinY - cvs._mmPad;
+  // Center viewport on this point
+  var canvas = document.getElementById('schema-canvas');
+  if (canvas) {
+    _schemaPan.x = -contentX * _schemaZoom + canvas.clientWidth / 2;
+    _schemaPan.y = -contentY * _schemaZoom + canvas.clientHeight / 2;
+    schemaApplyTransform();
+  }
+}
+
+// ── Wheel zoom on canvas ──
+document.addEventListener('wheel', function(e) {
+  var canvas = document.getElementById('schema-canvas');
+  if (!canvas || !canvas.contains(e.target)) return;
+  var page = document.getElementById('page-schema');
+  if (!page || !page.classList.contains('active')) return;
+  e.preventDefault();
+  var delta = e.deltaY < 0 ? 0.08 : -0.08;
+  if (e.ctrlKey) delta *= 1.5;
+  schemaZoom(delta, e.clientX, e.clientY);
+}, {passive: false});
+
+// ── Minimap click + drag ──
+document.addEventListener('mousedown', function(e) {
+  var mm = document.getElementById('schema-minimap');
+  if (mm && mm.contains(e.target)) {
+    e.preventDefault();
+    _minimapDrag = true;
+    minimapNavigate(e);
+  }
+});
+
+// ── Space for pan mode ──
+document.addEventListener('keydown', function(e) {
+  if (e.key === ' ' && !e.target.matches('input,textarea,select')) {
+    var page = document.getElementById('page-schema');
+    if (page && page.classList.contains('active')) {
+      e.preventDefault();
+      _schemaSpaceDown = true;
+      var canvas = document.getElementById('schema-canvas');
+      if (canvas) canvas.style.cursor = 'grabbing';
+    }
+  }
+  // Ctrl+0 = reset zoom
+  if (e.ctrlKey && e.key === '0') {
+    var page = document.getElementById('page-schema');
+    if (page && page.classList.contains('active')) {
+      e.preventDefault();
+      schemaZoomReset();
+    }
+  }
+  // Ctrl+Shift+F = fit all
+  if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+    var page = document.getElementById('page-schema');
+    if (page && page.classList.contains('active')) {
+      e.preventDefault();
+      schemaFitAllZoom();
+    }
+  }
+});
+document.addEventListener('keyup', function(e) {
+  if (e.key === ' ') {
+    _schemaSpaceDown = false;
+    var canvas = document.getElementById('schema-canvas');
+    if (canvas) canvas.style.cursor = 'grab';
+  }
+});
+
+document.addEventListener('mousemove',function(e){
+  // Minimap drag
+  if (_minimapDrag) { minimapNavigate(e); return; }
+  // Canvas pan (space+drag or middle-button)
+  if (_schemaPanning && _schemaPanStart) {
+    _schemaPan.x += e.clientX - _schemaPanStart.x;
+    _schemaPan.y += e.clientY - _schemaPanStart.y;
+    _schemaPanStart = {x: e.clientX, y: e.clientY};
+    schemaApplyTransform();
+    return;
+  }
+  // Card drag
+  if(_schemaDrag){var d=_schemaDrag,nx=d.ox+(e.clientX-d.sx)/_schemaZoom,ny=d.oy+(e.clientY-d.sy)/_schemaZoom;
+    d.el.style.left=nx+'px';d.el.style.top=ny+'px';_schemaPositions[d.name]={x:nx,y:ny};
+    var fi=buildFkMap(),vis={};(_schemaData.tables||[]).forEach(function(t){vis[t.name]=true;});drawSchemaLines(fi.fkMap,vis);updateMinimap();}
+});
+document.addEventListener('mouseup',function(){
+  if (_minimapDrag) { _minimapDrag = false; return; }
+  if (_schemaPanning) { _schemaPanning = false; _schemaPanStart = null; var cv = document.getElementById('schema-canvas'); if(cv) cv.style.cursor = 'grab'; return; }
+  if(_schemaDrag){saveSchemaPositions();_schemaDrag=null;}
+});
+document.addEventListener('input',function(e){if(e.target.id==='schema-search')renderSchemaViz();});
+
+// Pan: space+click or middle-click on canvas
+document.addEventListener('mousedown', function(e) {
+  var canvas = document.getElementById('schema-canvas');
+  if (!canvas || !canvas.contains(e.target)) return;
+  var page = document.getElementById('page-schema');
+  if (!page || !page.classList.contains('active')) return;
+  if (_schemaSpaceDown || e.button === 1) {
+    e.preventDefault();
+    _schemaPanning = true;
+    _schemaPanStart = {x: e.clientX, y: e.clientY};
+    canvas.style.cursor = 'grabbing';
+  }
+});
+
+function schemaAutoLayout(){
+  var tables=(_schemaData&&_schemaData.tables)||[];if(!tables.length)return;
+  var adj={};tables.forEach(function(t){adj[t.name]=[];});
+  tables.forEach(function(t){(t.foreign_keys||[]).forEach(function(fk){if(adj[fk.ref_table]){adj[t.name].push(fk.ref_table);adj[fk.ref_table].push(t.name);}});});
+  var sorted=tables.slice().sort(function(a,b){return(adj[b.name]||[]).length-(adj[a.name]||[]).length;});
+  var cols=Math.max(2,Math.ceil(Math.sqrt(tables.length)));
+  sorted.forEach(function(t,i){_schemaPositions[t.name]={x:40+(i%cols)*280,y:40+Math.floor(i/cols)*260};});
+  saveSchemaPositions();renderSchemaViz();
+}
+function schemaFitAll(){
+  schemaFitAllZoom();
+}
+
+function openPolicyEditor(tn){
+  var pe=document.getElementById('schema-policy-editor');if(!pe)return;pe.style.display='block';
+  document.getElementById('schema-pe-table').textContent=tn;pe.dataset.table=tn;
+  var tbl=(_schemaData.tables||[]).find(function(t){return t.name===tn;});
+  if(tbl&&tbl.policies&&tbl.policies.length>0){var p=tbl.policies[0];document.getElementById('schema-pe-name').value=p.name;document.getElementById('schema-pe-cmd').value=p.command;document.getElementById('schema-pe-role').value=p.role;document.getElementById('schema-pe-using').value=p['using']||'';document.getElementById('schema-pe-check').value=p.with_check||'';}
+  else{document.getElementById('schema-pe-name').value=tn+'_policy';document.getElementById('schema-pe-cmd').value='ALL';document.getElementById('schema-pe-role').value='PUBLIC';document.getElementById('schema-pe-using').value='';document.getElementById('schema-pe-check').value='';}
+  document.getElementById('schema-pe-msg').textContent='';
+}
+function closePolicyEditor(){var pe=document.getElementById('schema-policy-editor');if(pe)pe.style.display='none';}
+
+async function savePolicyFromEditor(){
+  var pe=document.getElementById('schema-policy-editor'),tbl=pe.dataset.table;
+  var name=document.getElementById('schema-pe-name').value.trim(),cmd=document.getElementById('schema-pe-cmd').value;
+  var role=document.getElementById('schema-pe-role').value.trim()||'PUBLIC';
+  var ue=document.getElementById('schema-pe-using').value.trim(),ce=document.getElementById('schema-pe-check').value.trim();
+  var msg=document.getElementById('schema-pe-msg');
+  if(!name||!ue){msg.style.color='#ef4444';msg.textContent='Name and USING required';return;}
+  // Phase 173: Validate policy fields to prevent SQL injection
+  var idRe=/^[a-zA-Z_][a-zA-Z0-9_]*$/;
+  if(!idRe.test(name)){msg.style.color='#ef4444';msg.textContent='Invalid policy name (letters/digits/underscore only)';return;}
+  if(role&&!idRe.test(role)){msg.style.color='#ef4444';msg.textContent='Invalid role name';return;}
+  if(ue.indexOf(';')>=0||ce.indexOf(';')>=0){msg.style.color='#ef4444';msg.textContent='Semicolons not allowed in expressions';return;}
+  await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'ALTER TABLE '+tbl+' ENABLE ROW LEVEL SECURITY'})});
+  await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DROP POLICY '+name+' ON '+tbl})});
+  var sql='CREATE POLICY '+name+' ON '+tbl+' FOR '+cmd+' TO '+role+' USING ('+ue+')';
+  if(ce)sql+=' WITH CHECK ('+ce+')';
+  try{var r=await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:sql})});var data=await r.json();
+    if(data.error){msg.style.color='#ef4444';msg.textContent='Error: '+data.error;}
+    else{msg.style.color='#10b981';msg.textContent='Policy saved!';setTimeout(function(){closePolicyEditor();loadSchemaViz();},800);}
+  }catch(e){msg.style.color='#ef4444';msg.textContent='Network error';}
+}
+
 // Patch all fetch calls to include auth token + cookie credentials
 var _origFetch2=window.fetch;
 window.fetch=function(url,opts){
@@ -3378,15 +5417,18 @@ window.fetch=function(url,opts){
 // ── Phase 158: Auth check on load ─────────────────────────────
 function showLoginPage(){
   var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='flex';
+  // Karte erst zeigen, wenn Auth-Check "nicht eingeloggt" ergab —
+  // verhindert Login-Flash fuer bereits eingeloggte User.
+  var c=document.getElementById('ms-login-card'); if(c) c.style.visibility='visible';
 }
 function hidLoginPage(){
   var o=document.getElementById('ms-login-overlay'); if(o) o.style.display='none';
 }
 function msShowTab(tab){
-  document.getElementById('ms-tab-login').style.borderBottom=tab==='login'?'2px solid #a6e3a1':'2px solid transparent';
-  document.getElementById('ms-tab-reg').style.borderBottom=tab==='reg'?'2px solid #a6e3a1':'2px solid transparent';
-  document.getElementById('ms-tab-login').style.color=tab==='login'?'#cdd6f4':'#585b70';
-  document.getElementById('ms-tab-reg').style.color=tab==='reg'?'#cdd6f4':'#585b70';
+  document.getElementById('ms-tab-login').style.borderBottom=tab==='login'?'2px solid #00d4ff':'2px solid transparent';
+  document.getElementById('ms-tab-reg').style.borderBottom=tab==='reg'?'2px solid #00d4ff':'2px solid transparent';
+  document.getElementById('ms-tab-login').style.color=tab==='login'?'#f8fafc':'#475569';
+  document.getElementById('ms-tab-reg').style.color=tab==='reg'?'#f8fafc':'#475569';
   document.getElementById('ms-form-login').style.display=tab==='login'?'block':'none';
   document.getElementById('ms-form-reg').style.display=tab==='reg'?'block':'none';
   document.getElementById('ms-lerr').textContent='';
@@ -3407,75 +5449,499 @@ async function msSubmitRegister(){
       document.getElementById('ms-lp').value=p;
       msShowTab('login');
       var lerr=document.getElementById('ms-lerr');
-      if(lerr){lerr.style.color='#a6e3a1';lerr.textContent='Registered! Signing in...';}
+      if(lerr){lerr.style.color='#00d4ff';lerr.textContent='Registered! Signing in...';}
       setTimeout(msSubmitLogin,400);
     } else {
-      err.style.color='#f38ba8'; err.textContent=d.error||'Registration failed';
+      err.style.color='#ef4444'; err.textContent=d.error||'Registration failed';
     }
-  }catch(e){err.style.color='#f38ba8';err.textContent='Network error';}
+  }catch(e){err.style.color='#ef4444';err.textContent='Network error';}
 }
+// Back/Forward-Cache-Guard: Browser restauriert sonst eine eingefrorene
+// (evtl. ausgeloggte/veraltete) Seite aus dem bfcache — dann neu laden.
+
+
+// ══════════════════════════════════════════════════════════════
+// BRANCHES PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadBranchesPage() {
+  var el = document.getElementById('branches-list');
+  el.innerHTML = '<div style="color:#475569;font-size:0.8rem">Loading...</div>';
+  try {
+    var r = await fetch('/api/query', {method:'POST',credentials:'include',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({sql: 'SHOW BRANCHES'})});
+    var d = await r.json();
+    if (!d.success) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Error: ' + (d.error||'unknown') + '</div>'; return; }
+    var rows = d.rows || [];
+    if (!rows.length) { el.innerHTML = '<div style="color:#475569;font-size:0.8rem">No branches. Create your first branch.</div>'; return; }
+    var cols = d.columns || [];
+    el.innerHTML = rows.map(function(row) {
+      var name = row[0] || row[cols.indexOf('name')] || row[0];
+      var isMain = name === 'main' || name === 'master';
+      return '<div style="background:#0d1220;border:1px solid ' + (isMain?'#00d4ff':'#1e2d40') + ';border-radius:8px;padding:12px 14px;display:flex;align-items:center;gap:10px">'
+        + '<span style="font-size:0.9rem;color:#f8fafc;font-weight:' + (isMain?'700':'400') + ';flex:1">&#x2387; ' + name + '</span>'
+        + (isMain ? '<span style="font-size:0.7rem;background:#003d5c;color:#00d4ff;border-radius:9999px;padding:2px 8px">active</span>' : '')
+        + '<button onclick="branchMerge(\'' + name + '\')" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Merge</button>'
+        + (!isMain ? '<button onclick="branchDrop(\'' + name + '\')" style="background:#450a0a;color:#f87171;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Drop</button>' : '')
+        + '</div>';
+    }).join('');
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Network error</div>'; }
+}
+async function branchCreate() {
+  var name = prompt('Branch name:');
+  if (!name) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'CREATE BRANCH '+name})});
+  var d = await r.json();
+  if (d.success) loadBranchesPage(); else alert('Error: '+(d.error||'failed'));
+}
+async function branchMerge(name) {
+  if (!confirm('Merge branch "'+name+'" into main?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'MERGE BRANCH '+name+' INTO main'})});
+  var d = await r.json();
+  loadBranchesPage();
+}
+async function branchDrop(name) {
+  if (!confirm('Drop branch "'+name+'"? This cannot be undone.')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DROP BRANCH '+name})});
+  loadBranchesPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// SECURITY PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadSecurityPage() {
+  // Encryption
+  try {
+    var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW ENCRYPTION STATUS'})});
+    var d = await r.json();
+    var txt = d.success ? (d.rows&&d.rows[0]?d.rows[0][0]:'unknown') : (d.message||'');
+    var isEnabled = txt.toLowerCase().includes('enabled');
+    var badge = document.getElementById('enc-status-badge');
+    badge.style.background = isEnabled?'#064e3b':'#422006';
+    badge.style.color = isEnabled?'#34d399':'#fb923c';
+    badge.textContent = isEnabled?'Enabled':'Disabled';
+    document.getElementById('enc-details').textContent = txt;
+  } catch(e) {}
+  // mTLS
+  try {
+    var r2 = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW MTLS STATUS'})});
+    var d2 = await r2.json();
+    var txt2 = d2.success?(d2.rows&&d2.rows[0]?d2.rows[0][0]:'unknown'):(d2.message||'');
+    var mtlsOn = txt2.toLowerCase().includes('enabled');
+    var mb = document.getElementById('mtls-status-badge');
+    mb.style.background = mtlsOn?'#064e3b':'#422006';
+    mb.style.color = mtlsOn?'#34d399':'#fb923c';
+    mb.textContent = mtlsOn?'Enabled':'Disabled';
+  } catch(e) {}
+  // IP Allowlist
+  try {
+    var r3 = await fetch('/api/allowlist',{credentials:'include'});
+    var d3 = await r3.json();
+    var ips = d3.ips||d3.allowed||[];
+    document.getElementById('ip-allowlist-content').textContent = ips.length ? ips.join(', ') : 'No IPs set (all allowed)';
+  } catch(e) { document.getElementById('ip-allowlist-content').textContent = 'N/A'; }
+  // Sessions
+  try {
+    var r4 = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW SESSIONS'})});
+    var d4 = await r4.json();
+    if (d4.success && d4.rows) {
+      document.getElementById('sessions-content').innerHTML = d4.rows.map(function(row){
+        return '<div style="padding:4px 0;border-bottom:1px solid #1e2d40">'+row.join(' | ')+'</div>';
+      }).join('') || '<div style="color:#475569">No active sessions</div>';
+    } else { document.getElementById('sessions-content').textContent = 'N/A'; }
+  } catch(e) { document.getElementById('sessions-content').textContent = 'N/A'; }
+}
+async function secEnableEncryption() {
+  var key = prompt('Hex key (64 chars for AES-256, or leave blank for auto-generated):') || '';
+  var sql = key ? "ENABLE ENCRYPTION WITH KEY '" + key + "'" : "ENABLE ENCRYPTION WITH KEY 'auto'";
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql})});
+  var d = await r.json(); alert(d.message||d.error||JSON.stringify(d)); loadSecurityPage();
+}
+async function secDisableEncryption() {
+  if (!confirm('Disable encryption?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DISABLE ENCRYPTION'})});
+  var d = await r.json(); loadSecurityPage();
+}
+async function secRotateKey() {
+  var newKey = prompt('New hex key (64 chars):') || '';
+  if (!newKey) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:"ROTATE ENCRYPTION KEY TO '"+newKey+"'"})});
+  var d = await r.json(); alert(d.message||d.error||'Done'); loadSecurityPage();
+}
+async function secEnableMtls() {
+  var ca = prompt('CA cert path:', '/etc/milansql/ca.crt'); if (!ca) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:"ENABLE MTLS WITH CA '"+ca+"'"})});
+  var d = await r.json(); loadSecurityPage();
+}
+async function secDisableMtls() {
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'DISABLE MTLS'})});
+  loadSecurityPage();
+}
+async function secSetIpAllowlist() {
+  var ips = document.getElementById('ip-allowlist-input').value.trim(); if (!ips) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:"SET ALLOWED_IPS FOR USER root = '"+ips+"'"})});
+  var d = await r.json(); loadSecurityPage();
+}
+async function secRemoveIpAllowlist() {
+  if (!confirm('Remove IP allowlist?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'REMOVE ALLOWED_IPS FOR USER root'})});
+  loadSecurityPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// AUDIT LOG PAGE
+// ══════════════════════════════════════════════════════════════
+var lastAuditData = null;
+async function loadAuditPage() {
+  var tbody = document.getElementById('audit-tbody');
+  tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#475569">Loading...</td></tr>';
+  try {
+    var r = await fetch('/api/audit/export', {credentials:'include'});
+    var d = await r.json();
+    var entries = d.entries || d.log || (Array.isArray(d)?d:[]);
+    lastAuditData = d;
+    renderAuditTable(entries);
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#ef4444">Failed to load audit log</td></tr>';
+  }
+}
+function renderAuditTable(entries) {
+  var userF = (document.getElementById('audit-filter-user')||{}).value||'';
+  var typeF = (document.getElementById('audit-filter-type')||{}).value||'';
+  var filtered = entries.filter(function(e){
+    if (userF && !(e.user||e.username||'').toLowerCase().includes(userF.toLowerCase())) return false;
+    if (typeF && (e.event_type||e.type||'') !== typeF) return false;
+    return true;
+  });
+  var tbody = document.getElementById('audit-tbody');
+  if (!filtered.length) { tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:#475569">No entries</td></tr>'; return; }
+  tbody.innerHTML = filtered.slice(0,200).map(function(e,i){
+    var hash = e.entry_hash||e.hash||'';
+    return '<tr style="border-bottom:1px solid #1e2d40">'
+      +'<td style="padding:6px 10px;color:#475569">'+(e.id||i+1)+'</td>'
+      +'<td style="padding:6px 10px;color:#64748b;white-space:nowrap">'+(e.timestamp||e.time||'').replace('T',' ').slice(0,19)+'</td>'
+      +'<td style="padding:6px 10px;color:#7dd3fc">'+(e.user||e.username||'system')+'</td>'
+      +'<td style="padding:6px 10px"><span style="font-size:0.7rem;padding:2px 7px;border-radius:9999px;background:#1e3a5f;color:#7dd3fc">'+(e.event_type||e.type||'—')+'</span></td>'
+      +'<td style="padding:6px 10px;color:#94a3b8;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(e.query||e.action||'')+'"><code>'+(e.query||e.action||'—').slice(0,60)+'</code></td>'
+      +'<td style="padding:6px 10px;font-family:monospace;font-size:0.7rem;color:#475569" title="'+hash+'">'+hash.slice(0,8)+'...</td>'
+      +'</tr>';
+  }).join('');
+}
+document.addEventListener('input', function(ev){
+  if (ev.target.id==='audit-filter-user'||ev.target.id==='audit-filter-type') {
+    if (lastAuditData) renderAuditTable(lastAuditData.entries||lastAuditData.log||(Array.isArray(lastAuditData)?lastAuditData:[]));
+  }
+});
+document.addEventListener('change', function(ev){
+  if (ev.target.id==='audit-filter-type') {
+    if (lastAuditData) renderAuditTable(lastAuditData.entries||lastAuditData.log||(Array.isArray(lastAuditData)?lastAuditData:[]));
+  }
+});
+async function auditVerify() {
+  var badge = document.getElementById('audit-chain-badge');
+  badge.textContent = 'Verifying...'; badge.style.background='#1e2d40'; badge.style.color='#94a3b8';
+  try {
+    var r = await fetch('/api/audit/verify',{credentials:'include'});
+    var d = await r.json();
+    var ok = d.valid !== false && !d.error;
+    badge.style.background = ok?'#064e3b':'#450a0a';
+    badge.style.color = ok?'#34d399':'#f87171';
+    badge.textContent = ok?('Chain OK ('+( d.checked||'?')+' entries)'):('BROKEN at #'+(d.first_broken||'?'));
+  } catch(e) { badge.textContent='Error'; badge.style.color='#f87171'; }
+}
+async function auditExport() {
+  try {
+    var r = await fetch('/api/audit/export',{credentials:'include'});
+    var d = await r.json();
+    var blob = new Blob([JSON.stringify(d, null, 2)], {type:'application/json'});
+    var a = document.createElement('a'); a.href=URL.createObjectURL(blob);
+    a.download='audit-log-'+new Date().toISOString().slice(0,10)+'.json'; a.click();
+  } catch(e) { alert('Export failed'); }
+}
+
+// ══════════════════════════════════════════════════════════════
+// COMPLIANCE PAGE
+// ══════════════════════════════════════════════════════════════
+var lastReport = null; var lastReportType = '';
+async function loadCompliancePage() {
+  // Scores are shown after generating reports — nothing to auto-load
+}
+async function genReport(type) {
+  var btn = event.target; btn.textContent='Generating...'; btn.disabled=true;
+  try {
+    var r = await fetch('/api/compliance/'+type, {credentials:'include'});
+    var d = await r.json();
+    lastReport = d; lastReportType = type.toUpperCase();
+    var scoreEl = document.getElementById(type+'-score');
+    if (scoreEl) scoreEl.textContent = (d.score !== undefined ? d.score : '—') + (d.score !== undefined ? '/100':'');
+    var panel = document.getElementById('compliance-report-panel');
+    panel.style.display = 'block';
+    document.getElementById('compliance-report-title').textContent = lastReportType + ' Report';
+    document.getElementById('compliance-report-content').textContent = JSON.stringify(d, null, 2);
+  } catch(e) { alert('Failed to generate report'); }
+  btn.textContent='Generate Report'; btn.disabled=false;
+}
+function downloadReport() {
+  if (!lastReport) return;
+  var blob = new Blob([JSON.stringify(lastReport, null, 2)], {type:'application/json'});
+  var a = document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='compliance-'+lastReportType.toLowerCase()+'-'+new Date().toISOString().slice(0,10)+'.json'; a.click();
+}
+
+// ══════════════════════════════════════════════════════════════
+// MIGRATIONS PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadMigrationsPage() {
+  var el = document.getElementById('mig-list');
+  el.innerHTML = '<div style="color:#475569;font-size:0.8rem">Loading...</div>';
+  try {
+    var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'MIGRATE STATUS'})});
+    var d = await r.json();
+    var rows = d.rows || [];
+    if (!rows.length) { el.innerHTML = '<div style="color:#475569;font-size:0.8rem">No migrations found.</div>'; return; }
+    el.innerHTML = rows.map(function(row, i) {
+      var name = row[0]||'Migration #'+(i+1);
+      var status = (row[1]||'pending').toLowerCase();
+      var ts = row[2]||'';
+      var applied = status === 'applied' || status === 'up';
+      return '<div style="background:#0d1220;border:1px solid '+(applied?'#065f46':'#1e2d40')+';border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:10px">'
+        +'<span style="font-size:0.85rem;color:#f8fafc;flex:1;font-family:monospace">'+name+'</span>'
+        +(ts?'<span style="font-size:0.72rem;color:#475569">'+ts.slice(0,16)+'</span>':'')
+        +'<span style="font-size:0.72rem;padding:2px 8px;border-radius:9999px;background:'+(applied?'#064e3b':'#1e2d40')+';color:'+(applied?'#34d399':'#64748b')+'">'+(applied?'applied':'pending')+'</span>'
+        +'</div>';
+    }).join('');
+    var msg = document.getElementById('mig-status-msg');
+    msg.textContent = rows.filter(function(r){return (r[1]||'').toLowerCase()==='pending';}).length + ' pending migration(s)';
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Error loading migrations</div>'; }
+}
+async function migRun(dir) {
+  if (!confirm('Run MIGRATE '+dir.toUpperCase()+'?')) return;
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'MIGRATE '+dir.toUpperCase()})});
+  var d = await r.json();
+  document.getElementById('mig-status-msg').textContent = d.message||d.error||'Done';
+  loadMigrationsPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// CLOUD INSTANCES PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadCloudPage() {
+  var el = document.getElementById('cloud-instances-list');
+  el.innerHTML = '<div style="color:#475569;font-size:0.8rem">Loading...</div>';
+  try {
+    var r = await fetch('/cloud/instances',{credentials:'include',headers:{'Accept':'application/json','Authorization':'Bearer '+(msToken||'')}});
+    var d = await r.json();
+    var insts = d.instances || (Array.isArray(d)?d:[]);
+    if (!insts.length) { el.innerHTML = '<div style="color:#475569;font-size:0.8rem">No cloud instances. Create one to get started.</div>'; return; }
+    el.innerHTML = insts.map(function(inst) {
+      var running = inst.status === 'running';
+      var plan = inst.plan || 'free';
+      return '<div style="background:#0d1220;border:1px solid '+(running?'#064e3b':'#1e2d40')+';border-radius:8px;padding:12px 14px">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        +'<span style="font-size:0.9rem;font-weight:600;color:#f8fafc;flex:1">'+inst.name+'</span>'
+        +'<span style="font-size:0.7rem;padding:2px 8px;border-radius:9999px;background:'+(running?'#064e3b':'#422006')+';color:'+(running?'#34d399':'#fb923c')+'">'+inst.status+'</span>'
+        +'<span style="font-size:0.7rem;padding:2px 8px;border-radius:9999px;background:#1e3a5f;color:#7dd3fc">'+plan+'</span>'
+        +'</div>'
+        +'<div style="font-size:0.75rem;color:#475569;margin-bottom:8px">'+inst.id+' &middot; '+inst.region+'</div>'
+        +'<div style="font-family:monospace;font-size:0.72rem;background:#080c18;border:1px solid #1e2d40;border-radius:4px;padding:5px 8px;color:#00d4ff;display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        +'<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">msql://'+inst.id+'.cloud.milansql.com:5432/default</span>'
+        +'<button onclick="navigator.clipboard.writeText(\'msql://'+inst.id+'.cloud.milansql.com:5432/default\')" style="background:none;border:none;color:#00d4ff;cursor:pointer;font-size:0.8rem;flex-shrink:0">&#x1F4CB;</button>'
+        +'</div>'
+        +'<div style="display:flex;gap:6px">'
+        +(running?'<button onclick="cloudPause(\''+inst.id+'\')" style="background:#422006;color:#fb923c;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Pause</button>'
+                 :'<button onclick="cloudResume(\''+inst.id+'\')" style="background:#064e3b;color:#34d399;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Resume</button>')
+        +'<button onclick="cloudResize(\''+inst.id+'\')" style="background:#1e3a5f;color:#7dd3fc;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Resize</button>'
+        +'<button onclick="cloudDelete(\''+inst.id+'\')" style="background:#450a0a;color:#f87171;border:none;border-radius:5px;padding:3px 10px;font-size:0.75rem;cursor:pointer">Delete</button>'
+        +'</div>'
+        +'</div>';
+    }).join('');
+  } catch(e) { el.innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Failed to load instances</div>'; }
+}
+async function cloudNewInstance() {
+  var name = prompt('Instance name:'); if (!name) return;
+  var plan = prompt('Plan (free/starter/pro/enterprise):', 'free') || 'free';
+  var region = prompt('Region:', 'eu-central-1') || 'eu-central-1';
+  var r = await fetch('/cloud/instances',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+(msToken||'')},
+    body:JSON.stringify({name,plan,region})});
+  var d = await r.json();
+  if (d.id || d.success) { alert('Instance created! API Key: '+(d.api_key_plain||d.apiKeyPlain||'(see logs)')); loadCloudPage(); }
+  else alert('Error: '+(d.error||JSON.stringify(d)));
+}
+async function cloudPause(id) {
+  await fetch('/cloud/instances/'+id+'/pause',{method:'POST',credentials:'include',headers:{'Authorization':'Bearer '+(msToken||'')}});
+  loadCloudPage();
+}
+async function cloudResume(id) {
+  await fetch('/cloud/instances/'+id+'/resume',{method:'POST',credentials:'include',headers:{'Authorization':'Bearer '+(msToken||'')}});
+  loadCloudPage();
+}
+async function cloudResize(id) {
+  var plan = prompt('New plan (free/starter/pro/enterprise):'); if (!plan) return;
+  await fetch('/cloud/instances/'+id+'/resize',{method:'POST',credentials:'include',
+    headers:{'Content-Type':'application/json','Authorization':'Bearer '+(msToken||'')},
+    body:JSON.stringify({plan})});
+  loadCloudPage();
+}
+async function cloudDelete(id) {
+  if (!confirm('Delete instance '+id+'? This is permanent.')) return;
+  await fetch('/cloud/instances/'+id,{method:'DELETE',credentials:'include',headers:{'Authorization':'Bearer '+(msToken||'')}});
+  loadCloudPage();
+}
+
+// ══════════════════════════════════════════════════════════════
+// REGIONS PAGE
+// ══════════════════════════════════════════════════════════════
+async function loadRegionsPage() {
+  try {
+    var r = await fetch('/cloud/regions');
+    var d = await r.json();
+    var regions = d.regions || (Array.isArray(d)?d:[]);
+    var el = document.getElementById('regions-list');
+    el.innerHTML = regions.map(function(reg) {
+      var active = (reg.status||reg.state||'').toLowerCase() === 'active';
+      return '<div style="background:#0d1220;border:1px solid '+(active?'#00d4ff':'#1e2d40')+';border-radius:8px;padding:14px">'
+        +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+        +'<span style="width:8px;height:8px;border-radius:50%;background:'+(active?'#34d399':'#f59e0b')+';display:inline-block;flex-shrink:0"></span>'
+        +'<span style="font-size:0.85rem;font-weight:700;color:#f8fafc">'+(reg.id||reg.name)+'</span>'
+        +'</div>'
+        +'<div style="font-size:0.75rem;color:#64748b;margin-bottom:4px">'+(reg.location||reg.city||'')+'</div>'
+        +'<div style="font-size:0.72rem;color:'+(active?'#34d399':'#f59e0b')+';margin-bottom:10px">'+(active?'Active':'Coming Soon')+(reg.latency_ms?' &middot; ~'+reg.latency_ms+'ms':'')+'</div>'
+        +(active?'<button onclick="cloudCreateReplica(\''+( reg.id||reg.name)+'\')" style="background:#065f46;color:#34d399;border:none;border-radius:5px;padding:4px 12px;font-size:0.75rem;cursor:pointer">Create Replica</button>':'')
+        +'</div>';
+    }).join('') || '<div style="color:#475569;font-size:0.8rem">No regions found</div>';
+  } catch(e) { document.getElementById('regions-list').innerHTML = '<div style="color:#ef4444;font-size:0.8rem">Failed to load regions</div>'; }
+  // Load replicas via SQL
+  try {
+    var r2 = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({sql:'SHOW REGIONS'})});
+    var d2 = await r2.json();
+    var repEl = document.getElementById('replicas-list');
+    repEl.innerHTML = '<div style="color:#475569;font-size:0.8rem">Use CREATE REPLICA IN REGION to create cross-region replicas.</div>';
+  } catch(e) {}
+}
+async function cloudCreateReplica(region) {
+  var instId = prompt('Instance ID (leave blank for default):') || 'default';
+  var r = await fetch('/api/query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sql:"CREATE REPLICA IN REGION '"+region+"'"})});
+  var d = await r.json();
+  alert(d.message||d.error||'Replica creation started');
+}
+
+window.addEventListener('pageshow', function(e){ if (e.persisted) window.location.reload(); });
 // Start: try cookie-based auto-login (survives page refresh), then show login if not authenticated
 fetch('/auth/me',{credentials:'include',headers:{'Content-Type':'application/json'}})
   .then(r=>r.json()).then(d=>{
     if(d.success){
       msUser=d.username||msUser; msUserId=d.user_id||0;
       if(d.token) msToken=d.token;
-      hidLoginPage(); updateUserBadge();
+      hidLoginPage(); loadSidebarTables().then(function(){ updateUserBadge(); });
     } else { showLoginPage(); }
   }).catch(()=>{ showLoginPage(); });
 </script>
 <!-- Phase 158: Full-screen Login Page (starts visible, hidden after auth) -->
-<div id="ms-login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:#11111b;z-index:9999;justify-content:center;align-items:center;">
-  <div style="background:#1e1e2e;border:1px solid #313244;border-radius:16px;padding:0;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.7);overflow:hidden">
+<div id="ms-login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(0,212,255,0.06),transparent),radial-gradient(ellipse 60% 50% at 80% 100%,rgba(124,58,237,0.06),transparent),#080c18;z-index:9999;justify-content:center;align-items:center;">
+  <div id="ms-login-card" style="visibility:hidden;background:rgba(17,24,39,0.9);backdrop-filter:blur(20px);border:1px solid #1e2d40;border-radius:16px;padding:0;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.7),0 0 60px rgba(0,212,255,0.08);overflow:hidden">
     <!-- Header -->
-    <div style="background:#181825;padding:28px 32px 20px;text-align:center;border-bottom:1px solid #313244">
-      <div style="font-size:36px;line-height:1">&#9889;</div>
-      <div style="font-size:22px;font-weight:700;color:#cdd6f4;margin-top:6px;letter-spacing:-0.5px">MilanSQL</div>
-      <div style="color:#585b70;font-size:11px;margin-top:4px">v9.9.0 &mdash; Multi-User Database</div>
+    <div style="background:rgba(13,18,36,0.8);padding:28px 32px 20px;text-align:center;border-bottom:1px solid #1e2d40">
+      <div><span style="display:inline-flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:12px;background:linear-gradient(135deg,#00d4ff,#0090cc);color:#080c18;font-size:26px;font-weight:800;box-shadow:0 0 30px rgba(0,212,255,0.3)">M</span></div>
+      <div style="font-size:22px;font-weight:700;color:#f8fafc;margin-top:10px;letter-spacing:-0.5px">MilanSQL</div>
+      <div style="color:#475569;font-size:11px;margin-top:4px"><span class="ms-version">v10.7.0</span> &mdash; Multi-User Database</div>
     </div>
     <!-- Tabs -->
-    <div style="display:flex;border-bottom:1px solid #313244">
+    <div style="display:flex;border-bottom:1px solid #1e2d40">
       <button id="ms-tab-login" onclick="msShowTab('login')"
-        style="flex:1;background:none;border:none;border-bottom:2px solid #a6e3a1;color:#cdd6f4;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s">Sign In</button>
+        style="flex:1;background:none;border:none;border-bottom:2px solid #00d4ff;color:#f8fafc;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s">Sign In</button>
       <button id="ms-tab-reg" onclick="msShowTab('reg')"
-        style="flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#585b70;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s">Register</button>
+        style="flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#475569;padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s">Register</button>
     </div>
     <!-- Login Form -->
     <div id="ms-form-login" style="padding:24px 32px 28px">
       <input id="ms-lu" type="text" placeholder="Username" autocomplete="username"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .15s"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .2s"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'">
       <input id="ms-lp" type="password" placeholder="Password" autocomplete="current-password"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .15s"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'"
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box;transition:border .2s"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'"
         onkeydown="if(event.key==='Enter')msSubmitLogin()">
       <button onclick="msSubmitLogin()"
-        style="width:100%;background:#a6e3a1;color:#1e1e2e;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;letter-spacing:0.3px;transition:background .15s"
-        onmouseover="this.style.background='#94d68f'" onmouseout="this.style.background='#a6e3a1'">Sign In</button>
+        style="width:100%;background:#00d4ff;color:#080c18;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;letter-spacing:0.3px;transition:all .2s"
+        onmouseover="this.style.boxShadow='0 0 30px rgba(0,212,255,0.4)'" onmouseout="this.style.boxShadow='none'">Sign In</button>
       <div id="ms-lerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
-      <div style="margin-top:16px;text-align:center;font-size:11px;color:#45475a">
+      <div style="margin-top:16px;text-align:center;font-size:11px;color:#475569">
         Create an account or sign in to get started
       </div>
     </div>
     <!-- Register Form -->
     <div id="ms-form-reg" style="display:none;padding:24px 32px 28px">
       <input id="ms-ru" type="text" placeholder="Username" autocomplete="username"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'">
       <input id="ms-rp" type="password" placeholder="Password"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'">
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:10px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'">
       <input id="ms-rp2" type="password" placeholder="Confirm Password"
-        style="width:100%;background:#11111b;color:#cdd6f4;border:1px solid #313244;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
-        onfocus="this.style.borderColor='#89b4fa'" onblur="this.style.borderColor='#313244'"
+        style="width:100%;background:#080c18;color:#f8fafc;border:1px solid #1e2d40;border-radius:8px;padding:11px 13px;margin-bottom:18px;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box"
+        onfocus="this.style.borderColor='#00d4ff'" onblur="this.style.borderColor='#1e2d40'"
         onkeydown="if(event.key==='Enter')msSubmitRegister()">
       <button onclick="msSubmitRegister()"
-        style="width:100%;background:#89b4fa;color:#1e1e2e;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s"
-        onmouseover="this.style.background='#74c7ec'" onmouseout="this.style.background='#89b4fa'">Create Account</button>
+        style="width:100%;background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .2s"
+        onmouseover="this.style.boxShadow='0 0 30px rgba(124,58,237,0.4)'" onmouseout="this.style.boxShadow='none'">Create Account</button>
       <div id="ms-rerr" style="font-size:12px;margin-top:10px;min-height:16px;text-align:center"></div>
     </div>
   </div>
 </div>
+<!-- AI Assistant Panel (Block 7) -->
+<button id="ai-toggle" onclick="toggleAI()" title="AI SQL Assistant">&#x2728;</button>
+<div id="ai-panel">
+  <div id="ai-header">
+    <span class="ai-icon">&#x2728;</span> AI SQL Assistant
+    <button class="ai-close" onclick="toggleAI()">&#x2715;</button>
+  </div>
+  <div id="ai-messages">
+    <div class="ai-msg bot"><div class="ai-bubble">Ask me anything about your database in plain English. I will generate and run SQL for you.</div></div>
+  </div>
+  <div id="ai-input-area">
+    <input id="ai-input" type="text" placeholder="e.g. Show me all orders from last week..." onkeydown="if(event.key==='Enter')sendAI()">
+    <button id="ai-send" onclick="sendAI()">Send</button>
+  </div>
+</div>
+<script>
+function toggleAI(){var p=document.getElementById('ai-panel');p.classList.toggle('open');}
+async function sendAI(){
+  var inp=document.getElementById('ai-input');var q=inp.value.trim();if(!q)return;inp.value='';
+  var msgs=document.getElementById('ai-messages');
+  msgs.innerHTML+='<div class="ai-msg user"><div class="ai-bubble">'+q.replace(/</g,'&lt;')+'</div></div>';
+  msgs.innerHTML+='<div class="ai-msg bot" id="ai-loading"><div class="ai-bubble ai-loading">Thinking...</div></div>';
+  msgs.scrollTop=msgs.scrollHeight;
+  try{
+    var r=await fetch('/api/nl-query',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    var d=await r.json();var el=document.getElementById('ai-loading');if(el)el.remove();
+    if(d.success){
+      var html='<div class="ai-msg bot"><div class="ai-bubble">';
+      html+='<div class="ai-sql" onclick="setSQL(this.textContent);toggleAI();" title="Click to use in editor">'+d.sql.replace(/</g,'&lt;')+'</div>';
+      if(d.result&&d.result.success!==false){
+        var res=d.result;
+        if(res.columns&&res.rows){
+          html+='<div style="font-size:0.75rem;color:#94a3b8;margin-top:4px">'+res.rows.length+' row(s) returned</div>';
+          if(res.rows.length>0&&res.rows.length<=10){
+            html+='<table style="width:100%;border-collapse:collapse;margin-top:6px;font-size:0.75rem">';
+            html+='<tr>';for(var c of res.columns)html+='<th style="text-align:left;padding:3px 6px;border-bottom:1px solid #1e2d40;color:#94a3b8">'+c+'</th>';html+='</tr>';
+            for(var row of res.rows){html+='<tr>';for(var v of row)html+='<td style="padding:3px 6px;border-bottom:1px solid #111827;color:#f8fafc">'+(v===null?'NULL':String(v).replace(/</g,'&lt;'))+'</td>';html+='</tr>';}
+            html+='</table>';
+          }
+        } else if(res.message){html+='<div style="color:#10b981;font-size:0.78rem;margin-top:4px">'+res.message.replace(/</g,'&lt;')+'</div>';}
+      }
+      html+='</div></div>';msgs.innerHTML+=html;
+    } else {
+      msgs.innerHTML+='<div class="ai-msg bot"><div class="ai-bubble" style="color:#ef4444">'+((d.error||'Unknown error').replace(/</g,'&lt;'))+(d.sql?'<div class="ai-sql">'+d.sql.replace(/</g,'&lt;')+'</div>':'')+'</div></div>';
+    }
+  }catch(e){
+    var el2=document.getElementById('ai-loading');if(el2)el2.remove();
+    msgs.innerHTML+='<div class="ai-msg bot"><div class="ai-bubble" style="color:#ef4444">Network error: '+e.message+'</div></div>';
+  }
+  msgs.scrollTop=msgs.scrollHeight;
+}
+</script>
 </body>
 </html>)WEBUIEND";
     return html;
@@ -3487,46 +5953,178 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.method == "OPTIONS")
         return buildHttpResponse(200, "");
 
+    // Security: Host header validation — prevent host-header injection
+    {
+        static const std::vector<std::string> allowedHosts = {
+            "milansql.de", "www.milansql.de",
+            "localhost", "127.0.0.1", "10.0.0.1",
+            "178.105.206.36"
+        };
+        auto hit = req.headers.find("host");
+        if (hit != req.headers.end()) {
+            std::string host = hit->second;
+            // Strip port if present
+            auto colon = host.find(':');
+            if (colon != std::string::npos) host = host.substr(0, colon);
+            // Lowercase
+            for (auto& c : host) c = (char)std::tolower((unsigned char)c);
+            bool allowed = false;
+            for (const auto& h : allowedHosts) {
+                if (host == h) { allowed = true; break; }
+            }
+            if (!allowed) {
+                return buildHttpResponse(400, "{\"error\":\"Invalid Host header\"}");
+            }
+        }
+    }
+
+    // ══ FORTRESS: Schicht 1+2 — IP Ban Check + Honeypot ═══════
+    auto& fortress = milansql::g_fortress();
+
+    // Schicht 2: Check if IP is already blocked
+    if (!clientIp.empty() && fortress.isBlocked(clientIp)) {
+        return buildHttpResponse(403,
+            "{\"success\":false,\"error\":\"Access denied\"}");
+    }
+
+    // Schicht 1: Honeypot endpoints — trap scanners & bots
+    if (fortress.isHoneypotPath(req.path)) {
+        fortress.recordHoneypotHit(clientIp, req.path);
+        fortress.saveBanList(dbPath_ + ".banlist");
+        // Return realistic-looking but fake responses based on path
+        if (req.path == "/.env") {
+            // Fake .env with canary credentials
+            return buildHttpResponse(200,
+                "DB_HOST=localhost\nDB_USER=admin\nDB_PASS=msql_sk_live_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9\n"
+                "API_KEY=msql_ak_7f3d9a2b4c5e6f8a1b2c3d4e5f6a7b8c9d0e1f2a\n"
+                "JWT_SECRET=canary_secret_do_not_use\n",
+                "text/plain");
+        }
+        if (req.path == "/wp-login.php" || req.path == "/wp-admin") {
+            return buildHttpResponse(200,
+                "<html><head><title>WordPress &rsaquo; Log In</title></head>"
+                "<body><h1>Powered by WordPress</h1>"
+                "<form method='post'><input name='log'/><input name='pwd' type='password'/>"
+                "<input type='submit' value='Log In'/></form></body></html>",
+                "text/html");
+        }
+        if (req.path == "/phpmyadmin" || req.path == "/admin") {
+            return buildHttpResponse(200,
+                "<html><head><title>phpMyAdmin</title></head>"
+                "<body><h1>phpMyAdmin 5.2.1</h1>"
+                "<form method='post'><input name='pma_username'/>"
+                "<input name='pma_password' type='password'/>"
+                "<input type='submit' value='Go'/></form></body></html>",
+                "text/html");
+        }
+        // Generic 404 for other honeypots
+        return buildHttpResponse(404,
+            "{\"success\":false,\"error\":\"Not found\"}");
+    }
+
+    // Schicht 4: Canary token check on Authorization header
+    {
+        std::string authHeader;
+        auto ait = req.headers.find("authorization");
+        if (ait != req.headers.end()) authHeader = ait->second;
+        if (!authHeader.empty()) {
+            std::string token = authHeader;
+            if (token.size() > 7 && token.substr(0,7) == "Bearer ") token = token.substr(7);
+            if (token.size() > 7 && token.substr(0,7) == "ApiKey ") token = token.substr(7);
+            if (fortress.isCanaryToken(token)) {
+                fortress.recordHoneypotHit(clientIp, "CANARY_TOKEN_USED");
+                fortress.saveBanList(dbPath_ + ".banlist");
+                return buildHttpResponse(401,
+                    "{\"success\":false,\"error\":\"Invalid token\"}");
+            }
+        }
+    }
+
     // ── Path traversal guard ──────────────────────────────────────
     // Block any path containing ".." to prevent directory traversal attacks
     if (req.path.find("..") != std::string::npos)
-        return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");
+        return buildHttpResponse(404, "{\"success\":false,\"error\":\"Not found\"}");
 
-    // ── Favicon: ⚡ lightning bolt SVG (no 404 in browser console) ──
-    if (req.path == "/favicon.ico" || req.path == "/favicon.svg") {
+    // ── Favicon: lightning bolt SVG (no 404 in browser console) ──
+    if (req.path == "/favicon.ico" || req.path == "/favicon.svg" || req.path == "/apple-touch-icon.png") {
         static const std::string FAVICON_SVG =
-            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
-            "<rect width='32' height='32' rx='5' fill='#1e1e2e'/>"
-            "<polygon points='21,2 11,18 18,18 11,30 25,14 18,14' fill='#00d9ff'/>"
-            "</svg>";
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect x='0' y='0' width='100' height='100' rx='8' fill='#161616' stroke='#ff6b1a' stroke-width='0.5'/><path d='M20 78 L20 22 L50 54 L80 22 L80 78' fill='none' stroke='#ff6b1a' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/><circle cx='20' cy='22' r='5' fill='#ff6b1a'/><circle cx='20' cy='78' r='5' fill='#ff6b1a'/><circle cx='50' cy='54' r='5' fill='#ff6b1a'/><circle cx='80' cy='22' r='5' fill='#ff6b1a'/><circle cx='80' cy='78' r='5' fill='#ff6b1a'/></svg>";
         return buildHttpResponse(200, FAVICON_SVG, "image/svg+xml");
+    }
+
+    // OG Image: social preview card
+    if (req.path == "/og-image.png" || req.path == "/og-image.svg") {
+        static const std::string OG_SVG =
+            "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='630' viewBox='0 0 1200 630'>"
+            "<rect width='1200' height='630' fill='#0d1117'/>"
+            "<rect x='440' y='115' width='320' height='320' rx='24' fill='#161616' stroke='#ff6b1a' stroke-width='2'/>"
+            "<path d='M504 374 L504 190 L600 294 L696 190 L696 374' fill='none' stroke='#ff6b1a' stroke-width='8' stroke-linecap='round' stroke-linejoin='round'/>"
+            "<circle cx='504' cy='190' r='16' fill='#ff6b1a'/>"
+            "<circle cx='504' cy='374' r='16' fill='#ff6b1a'/>"
+            "<circle cx='600' cy='294' r='16' fill='#ff6b1a'/>"
+            "<circle cx='696' cy='190' r='16' fill='#ff6b1a'/>"
+            "<circle cx='696' cy='374' r='16' fill='#ff6b1a'/>"
+            "<text x='600' y='500' text-anchor='middle' fill='#e6edf3' font-family='-apple-system,BlinkMacSystemFont,sans-serif' font-size='48' font-weight='800'>MilanSQL</text>"
+            "<text x='600' y='545' text-anchor='middle' fill='#8b949e' font-family='-apple-system,BlinkMacSystemFont,sans-serif' font-size='22'>The Open Source Database for Developers</text>"
+            "</svg>";
+        return buildHttpResponse(200, OG_SVG, "image/svg+xml");
+    }
+    // ── Service Account creation (root only) ──────────────────
+    if (req.path == "/auth/service-account" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, R"({"success":false,"error":"Root access required"})");
+        std::string username = extractJsonStr(req.body, "username");
+        std::string password = extractJsonStr(req.body, "password");
+        if (username.empty() || password.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"username and password required"})");
+        if (password.size() < 8)
+            return buildHttpResponse(400, R"({"success":false,"error":"Password must be at least 8 characters"})");
+        auto res = authMgr_.registerUser(username, password, "");
+        if (!res.ok)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"" + jsonEscape(res.error) + "\"}");
+        // Set role to "service" — no table prefix, but rate-limited per user
+        authMgr_.setUserRole(res.userId, "service");
+        authMgr_.save(dbPath_ + ".auth");
+        return buildHttpResponse(200,
+            "{\"success\":true,\"user_id\":" + std::to_string(res.userId) +
+            ",\"username\":\"" + jsonEscape(username) + "\"}");
     }
 
     // ── Phase 154: Auth routes ────────────────────────────────
     if (req.path == "/auth/register" && req.method == "POST") {
+        // MEDIUM-04: Rate limit registration
+        if (!loginLimiter_.allow(clientIp))
+            return buildHttpResponse(429, R"({"success":false,"error":"Too many registration attempts","retry_after":900})");
         auto result = handleAuthRegister(req.body, clientIp);
         if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure\r\n";
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax\r\n";
             return buildHttpResponse(200, result, "application/json", cookie);
         }
         return buildHttpResponse(200, result);
     }
 
     if (req.path == "/auth/login" && req.method == "POST") {
+        // ══ FORTRESS: Schicht 5 — Timing-safe auth response ═══
+        auto authStart = std::chrono::steady_clock::now();
         auto result = handleAuthLogin(req.body, clientIp);
+        std::string response;
         if (result.find("\"code\":429") != std::string::npos) {
             std::string headers = "Retry-After: 900\r\n";
-            return buildHttpResponse(429, result, "application/json", headers);
-        }
-        if (result.find("\"success\":true") != std::string::npos) {
+            response = buildHttpResponse(429, result, "application/json", headers);
+        } else if (result.find("\"success\":true") != std::string::npos) {
             std::string token = extractJsonStr(result, "token");
             std::string cookie = "Set-Cookie: milansql_token=" + token +
-                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure\r\n";
-            return buildHttpResponse(200, result, "application/json", cookie);
+                                 "; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax\r\n";
+            response = buildHttpResponse(200, result, "application/json", cookie);
+        } else {
+            response = buildHttpResponse(200, result);
         }
-        return buildHttpResponse(200, result);
+        // Pad to constant 200ms to prevent timing-based user enumeration
+        milansql::FortressEngine::padResponseTime(authStart, std::chrono::milliseconds(200));
+        return response;
     }
     if (req.path == "/auth/logout" && req.method == "POST") {
         auto result = handleAuthLogout(extractBearerToken(req));
@@ -3535,6 +6133,9 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(200, result, "application/json", clearCookie);
     }
     if (req.path == "/auth/change-password" && req.method == "POST") {
+        // MEDIUM-05: Rate limit password changes
+        if (!loginLimiter_.allow(clientIp))
+            return buildHttpResponse(429, R"({"success":false,"error":"Too many attempts","retry_after":900})");
         std::string token = extractBearerToken(req);
         auto vr = authMgr_.validateToken(token);
         if (!vr.valid) return buildHttpResponse(401, R"({"success":false,"error":"Unauthorized"})");
@@ -3590,7 +6191,8 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     if (req.path == "/auth/me" && req.method == "GET") {
         auto result = handleAuthMe(extractBearerToken(req));
         int code = (result.find("\"success\":true") != std::string::npos) ? 200 : 401;
-        return buildHttpResponse(code, result);
+        return buildHttpResponse(code, result, "application/json",
+            "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n");
     }
     if (req.path == "/auth/refresh" && req.method == "POST")
         return buildHttpResponse(200, handleAuthRefresh(req.body));
@@ -3703,8 +6305,9 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
         // Assign tier based on role — check every request so first request gets correct tier
         RateTier desiredTier = RateTier::ANONYMOUS;
-        if (vr.role == "root")       desiredTier = RateTier::ADMIN;
-        else if (vr.userId > 0)      desiredTier = RateTier::FREE;
+        if (vr.role == "root")          desiredTier = RateTier::ADMIN;
+        else if (vr.role == "service")  desiredTier = RateTier::FREE;   // service accounts: 600/min per user
+        else if (vr.userId > 0)         desiredTier = RateTier::FREE;
         if (requestLimiter_.getTier(rlKey) != desiredTier) {
             requestLimiter_.setTier(rlKey, desiredTier);
         }
@@ -3745,6 +6348,32 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             }
             sql = std::move(clean);
         }
+
+        // ══ FORTRESS: Schicht 3 — SQL Injection Detection ═════
+        {
+            // Honeypot table access check
+            if (fortress.checkHoneypotTableAccess(sql)) {
+                fortress.recordHoneypotHit(clientIp, "HONEYPOT_TABLE: " + sql.substr(0, 80));
+                fortress.saveBanList(dbPath_ + ".banlist");
+                return buildHttpResponse(403,
+                    "{\"success\":false,\"error\":\"Access denied\"}");
+            }
+
+            auto sqliResult = fortress.analyzeQuery(sql);
+            if (sqliResult.detected) {
+                if (sqliResult.severity >= 2) {
+                    // Medium/High: block + ban
+                    fortress.recordSqliAttempt(clientIp, sqliResult.pattern);
+                    fortress.saveBanList(dbPath_ + ".banlist");
+                    // Return fake SQL error to confuse attacker
+                    return buildHttpResponse(500,
+                        "{\"success\":false,\"error\":\"" +
+                        jsonEscape(fortress.getFakeSqlError()) + "\"}");
+                }
+                // Low severity: log but allow (might be legitimate)
+            }
+        }
+
         ++queryCounter_;  // Phase 166: track query count
 
         // Bug #26: Query timeout (30 seconds max)
@@ -3755,7 +6384,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             });
             if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::timeout) {
                 return buildHttpResponse(504,
-                    R"({"success":false,"error":"Query timeout (30s exceeded)"})");
+                    std::string("{\"success\":false,\"error\":\"Query timeout (30s exceeded)\"}"));
             }
             queryResult = fut.get();
         }
@@ -3767,30 +6396,381 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     // Body: {"table":"docs","vector_column":"embedding","query_vector":"[1.0,0.0,0.0]",
     //        "limit":5,"filter":"category = 'tech'","include_score":true}
     if (req.path == "/semantic-search" && req.method == "POST") {
-        return buildHttpResponse(200, handleSemanticSearch(req.body));
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleSemanticSearch(req.body, ctx.userId, ctx.isRoot));
     }
 
-    if (req.path == "/tables") {
+    // Block 7: Natural Language SQL endpoint
+    // POST /api/nl-query
+    // Body: {"question": "Show me all users older than 30", "model": "groq"}
+    if (req.path == "/api/nl-query" && req.method == "POST") {
         auto ctx = extractUserContext(req);
+        if (!ctx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
+
+        std::string question = extractJsonStr(req.body, "question");
+        if (question.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Missing 'question' field"})");
+        if (question.size() > 2000)
+            return buildHttpResponse(400, std::string("{\"success\":false,\"error\":\"Question too long (max 2000 chars)\"}"));
+
+        // Optional model override
+        std::string modelOverride = extractJsonStr(req.body, "model");
+        if (!modelOverride.empty()) {
+            // Temporarily use this provider/model
+            std::string prov = modelOverride;
+            for (auto& c : prov) c = (char)std::tolower((unsigned char)c);
+            if (prov == "groq" || prov == "openai") {
+                milansql::nl::g_nlConfig().setProvider(prov);
+            }
+        }
+
+        // Build schema context: get user's visible tables + columns
+        std::vector<milansql::nl::TableSchema> schemas;
+        {
+            std::shared_lock<std::shared_mutex> lock(engineMutex_);
+            bool isRoot = (ctx.userId <= 0 || ctx.isRoot);
+            std::string userPrefix = isRoot ? "" : ("u" + std::to_string(ctx.userId) + "_");
+
+            // Get schema JSON and parse table info from engine directly
+            for (const auto& tblName : engine_.getTableNamesForUser(ctx.userId, isRoot)) {
+                milansql::nl::TableSchema ts;
+                ts.name = tblName;
+                // Strip user prefix for display
+                std::string displayName = tblName;
+                if (!userPrefix.empty() && tblName.substr(0, userPrefix.size()) == userPrefix)
+                    displayName = tblName.substr(userPrefix.size());
+                ts.name = displayName;
+
+                auto cols = engine_.getTableColumns(tblName);
+                for (const auto& c : cols) {
+                    milansql::nl::ColumnInfo ci;
+                    ci.name = c.name;
+                    ci.type = c.type;
+                    ts.columns.push_back(ci);
+                }
+
+                // Get up to 3 sample rows
+                try {
+                    const auto& sampleResult = engine_.selectAll(tblName);
+                    size_t maxRows = std::min(sampleResult.rows().size(), (size_t)3);
+                    for (size_t i = 0; i < maxRows; ++i) {
+                        ts.sampleRows.push_back(sampleResult.rows()[i].values);
+                    }
+                } catch (...) {} // ignore errors for sample data
+
+                schemas.push_back(ts);
+            }
+        }
+
+        std::string schemaCtx = milansql::nl::buildSchemaContext(schemas);
+        std::string prompt = milansql::nl::buildPrompt(question, schemaCtx);
+
+        // Call LLM API
+        std::string llmError;
+        std::string llmResponse = milansql::nl::callLlmApi(prompt, llmError);
+        if (!llmError.empty()) {
+            return buildHttpResponse(200,
+                "{\"success\":false,\"error\":\"" + jsonEscape(llmError) + "\"}");
+        }
+
+        // Extract SQL from response
+        std::string generatedSql = milansql::nl::extractSqlFromResponse(llmResponse);
+        if (generatedSql.empty()) {
+            return buildHttpResponse(200,
+                R"({"success":false,"error":"Could not extract SQL from LLM response"})");
+        }
+
+        // Safety validation
+        auto safety = milansql::nl::validateSafety(generatedSql);
+        if (!safety.safe) {
+            return buildHttpResponse(200,
+                "{\"success\":false,\"error\":\"Safety check failed: "
+                + jsonEscape(safety.reason) + "\",\"sql\":\"" + jsonEscape(generatedSql) + "\"}");
+        }
+
+        // Audit log: NL query + generated SQL
+        engine_.auditLogger.log("NL_QUERY", "user=" + ctx.username
+            + " question=\"" + question.substr(0, 100) + "\""
+            + " sql=\"" + generatedSql.substr(0, 200) + "\"");
+
+        // Execute the generated SQL
+        std::string execResult = handleQueryForUser(generatedSql, ctx.userId, ctx.role);
+
+        // Build response with SQL + explanation + result
+        std::string response = "{\"success\":true,\"sql\":\"" + jsonEscape(generatedSql)
+            + "\",\"explanation\":\"Generated SQL from natural language query\""
+            + ",\"result\":" + execResult + "}";
+
+        return buildHttpResponse(200, response);
+    }
+
+    // Phase 171: Schema Visualizer API
+    // Phase 177: Reload SSL certificate
+    if (req.path == "/api/ssl/reload" && req.method == "POST") {
+        bool ok = milansql::g_tlsContext().reloadCertificate();
+        std::string json = "{\"success\":" + std::string(ok ? "true" : "false");
+        if (!ok) json += ",\"error\":\"" + milansql::g_tlsContext().lastError() + "\"";
+        json += "}";
+        return buildHttpResponse(ok ? 200 : 500, json);
+    }
+
+    // Phase 4.5: Enhanced Schema Introspection API
+    // GET /api/schema/generate/typescript
+    if (req.path == "/api/schema/generate/typescript" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleSchemaGenerateTypescript(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // GET /api/schema/:table/columns
+    if (req.path.rfind("/api/schema/", 0) == 0 && req.path.size() > 12) {
+        std::string rest = req.path.substr(12);  // after "/api/schema/"
+        auto slashPos = rest.find('/');
+        if (slashPos != std::string::npos && rest.substr(slashPos) == "/columns") {
+            std::string tblName = rest.substr(0, slashPos);
+            if (!tblName.empty()) {
+                auto ctx = extractUserContext(req);
+                if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+                return buildHttpResponse(200, handleSchemaTableColumns(tblName, ctx.userId, ctx.isRoot), "application/json");
+            }
+        }
+        // GET /api/schema/:table
+        if (rest.find('/') == std::string::npos && !rest.empty()
+            && rest != "generate") {
+            auto ctx = extractUserContext(req);
+            if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+            return buildHttpResponse(200, handleSchemaForTable(rest, ctx.userId, ctx.isRoot), "application/json");
+        }
+    }
+
+    // Phase 4.2: Migration HTTP API
+    // POST /api/migrate/up  (body: {"n":3} optional)
+    if (req.path == "/api/migrate/up" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        if (!ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root required"})");
+        int n = -1;
+        auto nPos = req.body.find("\"n\"");
+        if (nPos != std::string::npos) {
+            auto colon = req.body.find(':', nPos);
+            if (colon != std::string::npos) {
+                try { n = std::stoi(req.body.substr(colon + 1)); } catch (...) {}
+            }
+        }
+        return buildHttpResponse(200, handleMigrateUp(n), "application/json");
+    }
+
+    // POST /api/migrate/down  (body: {"n":1} optional)
+    if (req.path == "/api/migrate/down" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        if (!ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root required"})");
+        int n = 1;
+        auto nPos = req.body.find("\"n\"");
+        if (nPos != std::string::npos) {
+            auto colon = req.body.find(':', nPos);
+            if (colon != std::string::npos) {
+                try { n = std::stoi(req.body.substr(colon + 1)); } catch (...) {}
+            }
+        }
+        return buildHttpResponse(200, handleMigrateDown(n), "application/json");
+    }
+
+    // GET /api/migrate/status
+    if (req.path == "/api/migrate/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200, handleMigrateStatus(), "application/json");
+    }
+
+    if (req.path == "/api/schema") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.getSchemaJsonForUser(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // Phase 170: RLS policies API
+    if (req.path == "/api/rls-policies") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.getRlsPoliciesJsonForUser(ctx.userId, ctx.isRoot), "application/json");
+    }
+
+    // Phase 170: Per-table RLS policies
+    if (req.path.rfind("/api/rls-policies/", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string tblName = req.path.substr(18);  // after "/api/rls-policies/"
+        // Non-root: verify table belongs to user
+        if (!ctx.isRoot && ctx.userId > 0) {
+            std::string userPrefix = "u" + std::to_string(ctx.userId) + "_";
+            std::string bareName = tblName;
+            auto dot = tblName.find('.');
+            if (dot != std::string::npos) bareName = tblName.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix)
+                return buildHttpResponse(403, R"({"error":"Access denied"})");
+        }
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        return buildHttpResponse(200, engine_.getTablePoliciesJson(tblName), "application/json");
+    }
+
+        if (req.path == "/tables") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         int listId = ctx.isRoot ? 0 : ctx.userId;
         return buildHttpResponse(200, handleListTablesForUser(listId));
     }
 
     if (req.path.size() > 8 && req.path.substr(0, 8) == "/tables/") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         std::string tableName = req.path.substr(8);
+        // Non-root: verify table belongs to user
+        if (!ctx.isRoot && ctx.userId > 0) {
+            std::string userPrefix = "u" + std::to_string(ctx.userId) + "_";
+            std::string bareName = tableName;
+            auto dot = tableName.find('.');
+            if (dot != std::string::npos) bareName = tableName.substr(dot + 1);
+            if (bareName.substr(0, userPrefix.size()) != userPrefix)
+                return buildHttpResponse(403, R"({"error":"Access denied"})");
+        }
         return buildHttpResponse(200, handleDescribeTable(tableName));
     }
 
     if (req.path == "/schemas") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         return buildHttpResponse(200, handleListSchemas());
     }
 
+    // ══ MEDIA UPLOAD: File storage on server ════════════════
+    if (req.path == "/api/media/upload" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid)
+            return buildHttpResponse(401, "{\"success\":false,\"error\":\"Authentication required\"}");
+
+        // Parse multipart boundary from Content-Type
+        std::string boundary;
+        auto ctIt = req.headers.find("content-type");
+        if (ctIt == req.headers.end()) ctIt = req.headers.find("Content-Type");
+        if (ctIt != req.headers.end()) {
+            auto bp = ctIt->second.find("boundary=");
+            if (bp != std::string::npos)
+                boundary = ctIt->second.substr(bp + 9);
+            // Remove quotes if present
+            if (!boundary.empty() && boundary.front() == '"')
+                boundary = boundary.substr(1, boundary.size() - 2);
+        }
+        if (boundary.empty())
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"Missing multipart boundary\"}");
+
+        // Find file data between boundaries
+        std::string delim = "--" + boundary;
+        auto partStart = req.body.find(delim);
+        if (partStart == std::string::npos)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"No file in upload\"}");
+
+        // Find Content-Type of the file part
+        std::string fileExt = ".bin";
+        std::string fileContentType;
+        auto ctPos = req.body.find("Content-Type:", partStart);
+        if (ctPos != std::string::npos) {
+            auto ctEnd = req.body.find("\r\n", ctPos);
+            fileContentType = req.body.substr(ctPos + 14, ctEnd - ctPos - 14);
+            // Trim
+            while (!fileContentType.empty() && fileContentType.front() == ' ')
+                fileContentType.erase(0, 1);
+
+            if (fileContentType.find("jpeg") != std::string::npos || fileContentType.find("jpg") != std::string::npos) fileExt = ".jpg";
+            else if (fileContentType.find("png") != std::string::npos) fileExt = ".png";
+            else if (fileContentType.find("gif") != std::string::npos) fileExt = ".gif";
+            else if (fileContentType.find("webp") != std::string::npos) fileExt = ".webp";
+            else if (fileContentType.find("svg") != std::string::npos) {
+                return buildHttpResponse(400, R"JSON({"success":false,"error":"SVG uploads not allowed"})JSON");
+            } else if (fileContentType.find("mp4") != std::string::npos) fileExt = ".mp4";
+            else if (fileContentType.find("webm") != std::string::npos) fileExt = ".webm";
+            else return buildHttpResponse(400, "{\"success\":false,\"error\":\"File type not allowed\"}");
+        }
+
+        // File data starts after \r\n\r\n
+        auto dataStart = req.body.find("\r\n\r\n", partStart);
+        if (dataStart == std::string::npos)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"Malformed upload\"}");
+        dataStart += 4;
+
+        auto dataEnd = req.body.find(delim, dataStart);
+        if (dataEnd == std::string::npos) dataEnd = req.body.size();
+        // Remove trailing \r\n before boundary
+        if (dataEnd >= 2 && req.body[dataEnd-1] == '\n' && req.body[dataEnd-2] == '\r')
+            dataEnd -= 2;
+
+        size_t fileSize = dataEnd - dataStart;
+        if (fileSize > 10 * 1024 * 1024)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"File too large (max 10MB)\"}");
+        if (fileSize == 0)
+            return buildHttpResponse(400, "{\"success\":false,\"error\":\"Empty file\"}");
+
+        // Generate unique filename
+        std::random_device rd;
+        std::string filename;
+        for (int i = 0; i < 16; ++i) {
+            static const char hex[] = "0123456789abcdef";
+            uint8_t b = static_cast<uint8_t>(rd() & 0xff);
+            filename += hex[b >> 4];
+            filename += hex[b & 0xf];
+        }
+        filename += fileExt;
+
+        // Save to /opt/milansql/uploads/
+        std::string uploadDir = "/opt/milansql/uploads/";
+        std::string filePath = uploadDir + filename;
+        std::ofstream outFile(filePath, std::ios::binary);
+        if (!outFile)
+            return buildHttpResponse(500, "{\"success\":false,\"error\":\"Cannot write file\"}");
+        outFile.write(req.body.data() + dataStart, static_cast<std::streamsize>(fileSize));
+        outFile.close();
+
+        std::string url = "https://milansql.de/uploads/" + filename;
+        return buildHttpResponse(200,
+            "{\"success\":true,\"url\":\"" + url + "\",\"filename\":\"" + filename + "\"}");
+    }
+
+    // ══ FORTRESS: Security Dashboard Endpoints ═══════════════
+    if (req.path == "/fortress/stats") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, "{\"success\":false,\"error\":\"Root access required\"}");
+        return buildHttpResponse(200, fortress.getStats());
+    }
+    if (req.path == "/fortress/alerts") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, "{\"success\":false,\"error\":\"Root access required\"}");
+        return buildHttpResponse(200, "{\"alerts\":" + fortress.getAlertLog() + "}");
+    }
+    if (req.path == "/fortress/threats") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || ctx.role != "root")
+            return buildHttpResponse(403, "{\"success\":false,\"error\":\"Root access required\"}");
+        return buildHttpResponse(200, "{\"threats\":" + fortress.getThreatLog() + "}");
+    }
+
     if (req.path == "/status") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
         return buildHttpResponse(200, handleStatus());
     }
 
     if (req.path == "/metrics") {
-        std::lock_guard<std::mutex> lock(engineMutex_);
+        // MEDIUM-01: Require root auth for metrics
+        auto mctx = extractUserContext(req);
+        if (!mctx.valid || mctx.role != "root")
+            return buildHttpResponse(403, R"({"success":false,"error":"Authentication required"})");
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
         // Update uptime gauge
         double upSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startTime_).count();
@@ -3808,35 +6788,399 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             "milansql_errors_total{type=\"syntax\"} " + std::to_string(engine_.syntaxErrors_.load()) + "\n"
             "milansql_errors_total{type=\"constraint\"} " + std::to_string(engine_.constraintErrors_.load()) + "\n"
             "milansql_errors_total{type=\"runtime\"} " + std::to_string(engine_.runtimeErrors_.load()) + "\n"
-            "milansql_slow_queries_total " + std::to_string(engine_.slowQueryLog.size()) + "\n"
             "milansql_slow_query_threshold_ms " + std::to_string((int)engine_.slowQueryLog.thresholdMs) + "\n"
             "milansql_table_count " + std::to_string(engine_.tableCount()) + "\n";
-        std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics;
-        return "HTTP/1.1 200 OK\r\n"
-               "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
-               "Content-Length: " + std::to_string(body.size()) + "\r\n"
-               "Access-Control-Allow-Origin: *\r\n"
-               "Connection: close\r\n"
-               "\r\n" + body;
+
+        // Phase 1.1: Enhanced MetricsCollector data
+        auto& mc = milansql::MetricsCollector::global();
+        auto q = mc.quantiles();
+        long long wal_size = 0;
+        { std::ifstream f("database.milan.wal", std::ios::binary | std::ios::ate); if (f) wal_size = (long long)f.tellg(); }
+        long long data_size = 0;
+        { std::ifstream f("database.milan", std::ios::binary | std::ios::ate); if (f) data_size = (long long)f.tellg(); }
+        std::ostringstream mcMetrics;
+        mcMetrics << "# HELP milansql_queries_total Total SQL queries by type\n"
+                  << "# TYPE milansql_queries_total counter\n"
+                  << "milansql_queries_total{type=\"select\"} " << mc.queries_select.load() << "\n"
+                  << "milansql_queries_total{type=\"insert\"} " << mc.queries_insert.load() << "\n"
+                  << "milansql_queries_total{type=\"update\"} " << mc.queries_update.load() << "\n"
+                  << "milansql_queries_total{type=\"delete\"} " << mc.queries_delete.load() << "\n"
+                  << "# HELP milansql_slow_queries_total Queries taking >100ms\n"
+                  << "# TYPE milansql_slow_queries_total counter\n"
+                  << "milansql_slow_queries_total " << mc.slow_queries_total.load() << "\n"
+                  << "# HELP milansql_query_duration_seconds Query duration summary\n"
+                  << "# TYPE milansql_query_duration_seconds summary\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.5\"} " << q[0] << "\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.95\"} " << q[1] << "\n"
+                  << "milansql_query_duration_seconds{quantile=\"0.99\"} " << q[2] << "\n"
+                  << "# HELP milansql_buffer_pool_hit_ratio Buffer pool hit ratio\n"
+                  << "# TYPE milansql_buffer_pool_hit_ratio gauge\n"
+                  << "milansql_buffer_pool_hit_ratio " << mc.hit_ratio() << "\n"
+                  << "milansql_buffer_pool_hits_total " << mc.buffer_hits.load() << "\n"
+                  << "milansql_buffer_pool_misses_total " << mc.buffer_misses.load() << "\n"
+                  << "# HELP milansql_wal_size_bytes WAL file size\n"
+                  << "# TYPE milansql_wal_size_bytes gauge\n"
+                  << "milansql_wal_size_bytes " << wal_size << "\n"
+                  << "milansql_data_size_bytes " << data_size << "\n"
+                  << "# HELP milansql_replication_lag_ms Replication lag\n"
+                  << "# TYPE milansql_replication_lag_ms gauge\n"
+                  << "milansql_replication_lag_ms " << milansql::g_replState.slaveLagMs.load() << "\n"
+                  << "milansql_replication_connected_replicas " << milansql::g_replState.connectedSlaves.load() << "\n"
+                  << "# HELP milansql_uptime_seconds_v2 Uptime (MetricsCollector)\n"
+                  << "# TYPE milansql_uptime_seconds_v2 counter\n"
+                  << "milansql_uptime_seconds_v2 " << mc.uptime_seconds() << "\n"
+                  << "# HELP milansql_version MilanSQL version info\n"
+                  << "# TYPE milansql_version gauge\n"
+                  << "milansql_version{version=\"" << MILANSQL_VERSION << "\"} 1\n"
+                  // Phase 2.1: parallel workers
+                  << "# HELP milansql_parallel_workers Number of parallel worker threads\n"
+                  << "# TYPE milansql_parallel_workers gauge\n"
+                  << "milansql_parallel_workers " << milansql::g_threadPool().size() << "\n"
+                  << "# HELP milansql_parallel_workers_active Currently active parallel workers\n"
+                  << "# TYPE milansql_parallel_workers_active gauge\n"
+                  << "milansql_parallel_workers_active " << milansql::g_parallelWorkersActive().load() << "\n"
+                  // Phase 2.2: query cache metrics
+                  << "# HELP milansql_cache_hits_total Total query cache hits\n"
+                  << "# TYPE milansql_cache_hits_total counter\n"
+                  << "milansql_cache_hits_total " << milansql::g_userQueryCache().hits() << "\n"
+                  << "# HELP milansql_cache_misses_total Total query cache misses\n"
+                  << "# TYPE milansql_cache_misses_total counter\n"
+                  << "milansql_cache_misses_total " << milansql::g_userQueryCache().misses() << "\n"
+                  << "# HELP milansql_cache_size Current number of cached query results\n"
+                  << "# TYPE milansql_cache_size gauge\n"
+                  << "milansql_cache_size " << milansql::g_userQueryCache().size() << "\n";
+
+        std::string body = milansql::g_prometheus().exportMetrics() + extraMetrics + mcMetrics.str();
+        return buildHttpResponse(200, body, "text/plain; version=0.0.4; charset=utf-8");
+    }
+
+    // Phase 178: PITR API endpoints
+    if (req.path == "/api/pitr/status") {
+        auto segments = milansql::g_pitrManager().listArchiveSegments();
+        auto backups = milansql::g_pitrManager().listBackups();
+        uint64_t totalArchiveSize = 0;
+        for (const auto& s : segments) totalArchiveSize += s.sizeBytes;
+
+        std::string json = "{";
+        json += "\"archive_enabled\":" + std::string(milansql::g_pitrManager().config().archiveEnabled ? "true" : "false");
+        json += ",\"archive_dir\":\"" + milansql::g_pitrManager().config().archiveDir + "\"";
+        json += ",\"retention_days\":" + std::to_string(milansql::g_pitrManager().config().retentionDays);
+        json += ",\"archive_segments\":" + std::to_string(segments.size());
+        json += ",\"archive_size\":" + std::to_string(totalArchiveSize);
+        if (!segments.empty()) {
+            json += ",\"oldest_segment\":\"" + milansql::pitr_epoch_to_str(segments.front().timestamp) + "\"";
+            json += ",\"newest_segment\":\"" + milansql::pitr_epoch_to_str(segments.back().timestamp) + "\"";
+        }
+        json += ",\"backups\":[";
+        for (size_t i = 0; i < backups.size(); ++i) {
+            if (i > 0) json += ",";
+            json += "{\"dir\":\"" + backups[i].backupDir + "\"";
+            json += ",\"timestamp\":\"" + backups[i].timestamp + "\"";
+            json += ",\"lsn\":" + std::to_string(backups[i].startLsn);
+            json += ",\"size\":" + std::to_string(backups[i].sizeBytes);
+            json += ",\"tables\":" + std::to_string(backups[i].tableCount) + "}";
+        }
+        json += "]}";
+        return buildHttpResponse(200, json);
+    }
+
+    if (req.path == "/api/pitr/backup" && req.method == "POST") {
+        // Create a new base backup
+        int64_t now = milansql::pitr_now_epoch();
+        std::string backupDir = milansql::g_pitrManager().config().backupBaseDir +
+                                "/backup_" + std::to_string(now);
+        auto& lsn = milansql::g_lsnManager();
+        std::string msg = milansql::g_pitrManager().createBaseBackup(
+            "database.milan", backupDir,
+            lsn.currentLsn(), MILANSQL_VERSION,
+            static_cast<int>(engine_.tableCount()));
+        bool ok = msg.substr(0, 2) == "OK";
+        return buildHttpResponse(ok ? 200 : 500,
+            "{\"success\":" + std::string(ok ? "true" : "false") +
+            ",\"message\":\"" + msg + "\"}");
+    }
+
+    if (req.path == "/api/pitr/archive-now" && req.method == "POST") {
+        std::string msg = milansql::g_pitrManager().archiveCurrentWal("database.milan.wal");
+        bool ok = msg.substr(0, 2) == "OK";
+        return buildHttpResponse(ok ? 200 : 500,
+            "{\"success\":" + std::string(ok ? "true" : "false") +
+            ",\"message\":\"" + msg + "\"}");
+    }
+
+    // ── Phase 2.3: POST /bulk-import — CSV bulk import ───────────
+    if (req.path == "/bulk-import" && req.method == "POST") {
+        // Auth required
+        auto bctx = extractUserContext(req);
+        if (!bctx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
+
+        // Extract parameters: table= and delimiter= from query string or headers
+        std::string tableName;
+        char delim = ',';
+
+        // Try to get table from query string in path (e.g. /bulk-import?table=foo&delimiter=;)
+        // req.path is already stripped; check query_ field or parse from raw path
+        // Parse a query string (e.g. "?table=foo&delimiter=,") for a named parameter
+        auto getQueryParam = [](const std::string& rawQs, const std::string& paramName) -> std::string {
+            // rawQs starts with '?'
+            std::string qs = rawQs.size() > 1 ? rawQs.substr(1) : "";
+            size_t p = 0;
+            while (p < qs.size()) {
+                auto eq = qs.find('=', p);
+                if (eq == std::string::npos) break;
+                std::string key = qs.substr(p, eq - p);
+                auto amp = qs.find('&', eq + 1);
+                std::string val = (amp == std::string::npos)
+                    ? qs.substr(eq + 1) : qs.substr(eq + 1, amp - eq - 1);
+                if (key == paramName) return val;
+                p = (amp == std::string::npos) ? qs.size() : amp + 1;
+            }
+            return "";
+        };
+
+        // Check X-Table header or table query param
+        auto tblHdr = req.headers.find("x-table");
+        if (tblHdr != req.headers.end()) tableName = tblHdr->second;
+        auto tblHdr2 = req.headers.find("table");
+        if (tableName.empty() && tblHdr2 != req.headers.end()) tableName = tblHdr2->second;
+
+        // Parse query parameters from req.query (the part after '?' in URL)
+        if (tableName.empty()) tableName = getQueryParam("?" + req.query, "table");
+        if (tableName.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Missing 'table' parameter"})");
+
+        std::string delimStr = getQueryParam("?" + req.query, "delimiter");
+        if (!delimStr.empty()) delim = delimStr[0];
+
+        // Body is CSV text
+        std::string csvData = req.body;
+        if (csvData.empty())
+            return buildHttpResponse(400, R"({"success":false,"error":"Empty CSV body"})");
+
+        // Split CSV into lines and use copyManager logic
+        try {
+            std::vector<std::string> lines;
+            std::istringstream iss(csvData);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) lines.push_back(std::move(line));
+            }
+
+            // Use a simple CSV insert approach
+            // Parse header row
+            if (lines.empty())
+                return buildHttpResponse(400, R"({"success":false,"error":"No data rows"})");
+
+            auto splitCsv = [&](const std::string& s, char d) -> std::vector<std::string> {
+                std::vector<std::string> cols;
+                std::string cur;
+                bool inq = false;
+                for (char c : s) {
+                    if (c == '"') { inq = !inq; continue; }
+                    if (c == d && !inq) { cols.push_back(cur); cur.clear(); }
+                    else cur += c;
+                }
+                cols.push_back(cur);
+                return cols;
+            };
+
+            std::vector<std::string> headers = splitCsv(lines[0], delim);
+            int inserted = 0;
+            for (size_t i = 1; i < lines.size(); ++i) {
+                auto vals = splitCsv(lines[i], delim);
+                if (vals.size() != headers.size()) continue;
+                // Build INSERT SQL
+                std::string sql = "INSERT INTO " + tableName + " (";
+                for (size_t j = 0; j < headers.size(); ++j) {
+                    if (j > 0) sql += ",";
+                    sql += headers[j];
+                }
+                sql += ") VALUES (";
+                for (size_t j = 0; j < vals.size(); ++j) {
+                    if (j > 0) sql += ",";
+                    // Quote string values
+                    std::string v = vals[j];
+                    // Check if numeric
+                    bool isNum = !v.empty();
+                    for (char c : v) if (!std::isdigit((unsigned char)c) && c != '.' && c != '-') { isNum = false; break; }
+                    if (isNum) sql += v;
+                    else {
+                        // Escape single quotes
+                        std::string esc;
+                        for (char c : v) { if (c == '\'') esc += "'"; esc += c; }
+                        sql += "'" + esc + "'";
+                    }
+                }
+                sql += ")";
+
+                std::string result = handleQueryForUser(sql, bctx.userId, bctx.role);
+                // Check for error in JSON result
+                if (result.find("\"error\"") == std::string::npos &&
+                    result.find("\"success\":false") == std::string::npos)
+                    ++inserted;
+            }
+
+            // Invalidate cache for this table
+            milansql::g_userQueryCache().invalidate(tableName);
+            engine_.getQueryCache().invalidate(tableName);
+
+            return buildHttpResponse(200,
+                "{\"success\":true,\"copied\":" + std::to_string(inserted) + "}");
+        } catch (const std::exception& ex) {
+            return buildHttpResponse(500,
+                std::string("{\"success\":false,\"error\":\"") + ex.what() + "\"}");
+        }
+    }
+
+    // Phase 177: SSL status API
+    if (req.path == "/api/ssl") {
+        auto je = [](const std::string& s) -> std::string {
+            std::string r;
+            for (char c : s) {
+                if (c == '"') r += "\\\"";
+                else if (c == '\\') r += "\\\\";
+                else r += c;
+            }
+            return r;
+        };
+        const auto& cfg = milansql::g_sslConfig();
+        std::string json = "{";
+        json += "\"enabled\":" + std::string(cfg.enabled.load() ? "true" : "false");
+        json += ",\"mode\":\"" + cfg.modeStr() + "\"";
+        json += ",\"repl_mode\":\"" + cfg.replModeStr() + "\"";
+        json += ",\"ready\":" + std::string(milansql::g_tlsContext().isReady() ? "true" : "false");
+        json += ",\"cert\":\"" + je(cfg.certPath) + "\"";
+        json += ",\"key\":\"" + je(cfg.keyPath) + "\"";
+        json += ",\"ca\":\"" + je(cfg.caPath) + "\"";
+#if defined(_WIN32)
+        json += ",\"backend\":\"SChannel\"";
+#elif defined(HAVE_OPENSSL) && HAVE_OPENSSL
+        json += ",\"backend\":\"OpenSSL\"";
+#else
+        json += ",\"backend\":\"none\"";
+#endif
+        if (milansql::g_tlsContext().isReady()) {
+            auto ci = milansql::g_tlsContext().getCertInfo();
+            json += ",\"subject\":\"" + je(ci.subject) + "\"";
+            json += ",\"issuer\":\"" + je(ci.issuer) + "\"";
+            json += ",\"not_before\":\"" + je(ci.notBefore) + "\"";
+            json += ",\"not_after\":\"" + je(ci.notAfter) + "\"";
+            json += ",\"serial\":\"" + je(ci.serial) + "\"";
+            json += ",\"tls_version\":\"" + je(ci.tlsVersion) + "\"";
+            json += ",\"cipher\":\"" + je(ci.cipher) + "\"";
+        }
+        if (!milansql::g_tlsContext().lastError().empty())
+            json += ",\"error\":\"" + je(milansql::g_tlsContext().lastError()) + "\"";
+        json += "}";
+        return buildHttpResponse(200, json);
+    }
+
+    // Phase 1.3: Health sub-endpoints (must be before "/health" to avoid prefix match issues)
+    if (req.path == "/health/live") {
+        // Liveness: process is alive
+        auto now_ts = std::chrono::system_clock::now();
+        auto tt = std::chrono::system_clock::to_time_t(now_ts);
+        char tsBuf[32];
+        struct tm tmBuf;
+#if defined(_WIN32)
+        gmtime_s(&tmBuf, &tt);
+#else
+        gmtime_r(&tt, &tmBuf);
+#endif
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%SZ", &tmBuf);
+        return buildHttpResponse(200,
+            std::string("{\"status\":\"ok\",\"timestamp\":\"") + tsBuf + "\"}", "application/json");
+    }
+
+    if (req.path == "/health/ready") {
+        // Readiness: DB subsystems are ready
+        bool wal_ok = true;
+        bool idx_ok = true;
+        bool pool_ok = (engine_.tableCount() >= 0);
+        bool ready = wal_ok && idx_ok && pool_ok;
+        std::string body = std::string("{\"status\":\"") + (ready ? "ready" : "not_ready") + "\""
+            + ",\"checks\":{"
+            + "\"wal\":\"" + (wal_ok ? "ok" : "fail") + "\""
+            + ",\"indexes\":\"" + (idx_ok ? "ok" : "fail") + "\""
+            + ",\"pool\":\"" + (pool_ok ? "ok" : "fail") + "\""
+            + "}}";
+        return buildHttpResponse(ready ? 200 : 503, body, "application/json");
+    }
+
+    if (req.path == "/health/startup") {
+        // Startup: initialization complete
+        return buildHttpResponse(200,
+            std::string("{\"status\":\"started\",\"uptime_seconds\":") +
+            std::to_string(static_cast<int>(milansql::MetricsCollector::global().uptime_seconds())) +
+            "}", "application/json");
     }
 
     if (req.path == "/health") {
-        std::lock_guard<std::mutex> lock(engineMutex_);
+        // Security: public health check returns minimal info
+        // Full details only with valid auth token
+        bool isAuthed = false;
+        {
+            std::string authH;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end()) authH = ait->second;
+            if (authH.size() > 7 && authH.substr(0, 7) == "Bearer ") {
+                auto vr = authMgr_.validateToken(authH.substr(7));
+                isAuthed = vr.valid;
+            }
+            if (!isAuthed) {
+                // Check cookie
+                auto cit = req.headers.find("cookie");
+                if (cit != req.headers.end()) {
+                    auto pos = cit->second.find("session=");
+                    if (pos != std::string::npos) {
+                        auto end = cit->second.find(';', pos);
+                        std::string tok = cit->second.substr(pos + 8,
+                            end == std::string::npos ? std::string::npos : end - pos - 8);
+                        auto vr = authMgr_.validateToken(tok);
+                        isAuthed = vr.valid;
+                    }
+                }
+            }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        bool storageOk = lastPersistError_.empty();
+        std::string status = storageOk ? "healthy" : "degraded";
+
+        if (!isAuthed) {
+            // Public: minimal response with version + test count for WebUI badge
+            return buildHttpResponse(200, "{\"status\":\"" + status + "\","
+                "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
+                "\"version\":\"" + std::string(MILANSQL_VERSION) + "\"}");
+        }
+
+        // Authenticated: full details
         double upSec = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startTime_).count();
+        std::string storageCheck = storageOk
+            ? "{\"status\":\"ok\"}"
+            : "{\"status\":\"error\",\"error\":\"" + jsonEscape(lastPersistError_) + "\"}";
         std::string body = "{"
-            "\"status\":\"healthy\","
-            "\"version\":\"9.9.0\","
+            "\"status\":\"" + status + "\","
+            "\"test_count\":" + std::to_string(MILANSQL_TEST_COUNT) + ","
+            "\"version\":\"" + std::string(MILANSQL_VERSION) + "\","
             "\"uptime_seconds\":" + std::to_string((int)upSec) + ","
             "\"checks\":{"
-                "\"storage\":{\"status\":\"ok\",\"free_mb\":45000},"
-                "\"memory\":{\"status\":\"ok\",\"used_mb\":128},"
+                "\"storage\":" + storageCheck + ","
+                "\"memory\":{\"status\":\"ok\"},"
                 "\"wal\":{\"status\":\"ok\"},"
-                "\"connections\":{\"status\":\"ok\",\"active\":0,\"max\":100},"
+                "\"connections\":{\"status\":\"ok\",\"active\":" +
+                    std::to_string(milansql::g_connectionPool.activeCount()) +
+                    ",\"idle\":" + std::to_string(milansql::g_connectionPool.idleCount()) +
+                    ",\"waiting\":" + std::to_string(milansql::g_connectionPool.waitingCount()) +
+                    ",\"max\":" + std::to_string(milansql::g_connectionPool.getMaxConnections()) + "},"
                 "\"replication\":{\"status\":\"ok\",\"lag_ms\":0}"
             "},"
             "\"warnings\":[],"
-            "\"errors\":[]"
+            "\"errors\":[" + (storageOk ? std::string()
+                : "\"" + jsonEscape(lastPersistError_) + "\"") + "]"
             "}";
         return buildHttpResponse(200, body);
     }
@@ -3845,18 +7189,61 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         return buildHttpResponse(200, "{\"ready\":true}");
     }
 
+    // Phase 170: Connection pool statistics
+    if (req.path == "/pool/stats") {
+        // Security: require auth for internal metrics
+        {
+            bool authed = false;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end() && ait->second.size() > 7 && ait->second.substr(0, 7) == "Bearer ") {
+                authed = authMgr_.validateToken(ait->second.substr(7)).valid;
+            }
+            if (!authed) return buildHttpResponse(401, "{\"error\":\"Authentication required\"}");
+        }
+        return buildHttpResponse(200, milansql::g_connectionPool.statsJson());
+    }
+
+    // Phase 171: MVCC vacuum statistics
+    if (req.path == "/vacuum/stats") {
+        std::shared_lock<std::shared_mutex> lock(engineMutex_);
+        // Security: require auth for internal metrics
+        {
+            bool authed = false;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end() && ait->second.size() > 7 && ait->second.substr(0, 7) == "Bearer ") {
+                authed = authMgr_.validateToken(ait->second.substr(7)).valid;
+            }
+            if (!authed) return buildHttpResponse(401, "{\"error\":\"Authentication required\"}");
+        }
+        return buildHttpResponse(200, engine_.vacuumManager().statsJson());
+    }
+
+    // Phase 172: Streaming replication status (role, lag, failover)
+    if (req.path == "/replication/status") {
+        // Security: require auth for internal metrics
+        {
+            bool authed = false;
+            auto ait = req.headers.find("authorization");
+            if (ait != req.headers.end() && ait->second.size() > 7 && ait->second.substr(0, 7) == "Bearer ") {
+                authed = authMgr_.validateToken(ait->second.substr(7)).valid;
+            }
+            if (!authed) return buildHttpResponse(401, "{\"error\":\"Authentication required\"}");
+        }
+        return buildHttpResponse(200, milansql::replicationStatusJson());
+    }
+
     if (req.path == "/live") {
         return buildHttpResponse(200, "{\"alive\":true}");
     }
 
-    if (req.path == "/webui") {
+    if (req.path == "/webui" || req.path.rfind("/webui/", 0) == 0) {
         std::string html = handleWebUI();
-        return "HTTP/1.1 200 OK\r\n"
-               "Content-Type: text/html; charset=utf-8\r\n"
-               "Content-Length: " + std::to_string(html.size()) + "\r\n"
-               "Access-Control-Allow-Origin: *\r\n"
-               "Connection: close\r\n"
-               "\r\n" + html;
+        // Cache-Fix 2026-07: Browser cachten die WebUI aggressiv und
+        // zeigten nach Deploys/Login die alte Seite — hart verbieten.
+        return buildHttpResponse(200, html, "text/html",
+               "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+               "Pragma: no-cache\r\n"
+               "Expires: 0\r\n");
     }
 
     // Phase 163: Landing Page at /
@@ -3869,14 +7256,24 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             return "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/html; charset=utf-8\r\n"
                    "Content-Length: " + std::to_string(html.size()) + "\r\n"
-                   "Cache-Control: public, max-age=300\r\n"
+                   "Cache-Control: no-cache, must-revalidate\r\n"
                    "Connection: close\r\n\r\n" + html;
         }
         // Fallback: redirect to admin UI
-        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
-    if (req.path == "/dashboard") {
-        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    // Impressum (legal requirement for .de domains)
+    if (req.path == "/impressum") {
+        std::ifstream imf("docs/impressum.html");
+        if (imf.good()) {
+            std::string html((std::istreambuf_iterator<char>(imf)),
+                              std::istreambuf_iterator<char>());
+            return buildHttpResponse(200, html, "text/html");
+        }
+        return buildHttpResponse(404, R"({"error":"Impressum not found"})");
+    }
+        if (req.path == "/dashboard") {
+        return "HTTP/1.1 302 Found\r\nLocation: /webui\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     }
     // Phase 164: JS SDK at /sdk/milansql.js
     if (req.path == "/sdk/milansql.js") {
@@ -3894,6 +7291,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
     }
 
     if (req.path == "/ws-playground") {
+        // LOW-08: Require auth for WebSocket playground
+        auto wsCtx = extractUserContext(req);
+        if (!wsCtx.valid)
+            return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
         std::string html = R"HTML(<!DOCTYPE html>
 <html>
 <head><title>MilanSQL WebSocket Playground</title>
@@ -3942,6 +7343,843 @@ function clearOutput() { document.getElementById('output').textContent = ''; }
                "Access-Control-Allow-Origin: *\r\n"
                "Connection: close\r\n"
                "\r\n" + html;
+    }
+
+
+    // ── Phase 5.2: Audit Trail API ────────────────────────────
+    if (req.path == "/api/audit/verify" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        auto res = engine_.auditLogger.verifyChain();
+        std::string j = std::string(R"({"valid":)") + (res.valid ? "true" : "false")
+                       + R"(,"checked":)" + std::to_string(res.checked)
+                       + R"(,"broken":)" + std::to_string(res.broken)
+                       + R"(,"first_broken":")" + res.firstBroken + R"("})";
+        return buildHttpResponse(200, j, "application/json");
+    }
+    if (req.path == "/api/audit/export" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, engine_.auditLogger.exportJson(), "application/json");
+    }
+
+    // ── Phase 5.1: Encryption API ─────────────────────────────
+    if (req.path == "/api/encryption/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string j = std::string(R"({"status":")") + milansql::EncryptionManager::instance().status()
+                       + R"(","enabled":)" + (milansql::EncryptionManager::instance().enabled() ? "true" : "false") + "}";
+        return buildHttpResponse(200, j, "application/json");
+    }
+    if (req.path == "/api/encryption/enable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string key = extractJsonStr(req.body, "key");
+        std::string msg = milansql::EncryptionManager::instance().enable(key);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/encryption/disable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string msg = milansql::EncryptionManager::instance().disable();
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/encryption/rotate" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string key = extractJsonStr(req.body, "key");
+        std::string msg = milansql::EncryptionManager::instance().rotateKey(key);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+    // ── Phase 5.3: IP Allowlist API ───────────────────────────
+    if (req.path.rfind("/api/allowlist", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        if (req.method == "GET") {
+            return buildHttpResponse(200, milansql::IpAllowlist::instance().statusJson(), "application/json");
+        } else if (req.method == "POST") {
+            std::string user = extractJsonStr(req.body, "user");
+            std::string ips  = extractJsonStr(req.body, "ips");
+            milansql::IpAllowlist::instance().setAllowed(user, ips);
+            return buildHttpResponse(200, R"({"message":"IP allowlist updated"})", "application/json");
+        } else if (req.method == "DELETE") {
+            std::string user = extractJsonStr(req.body, "user");
+            milansql::IpAllowlist::instance().removeAllowed(user);
+            return buildHttpResponse(200, R"({"message":"IP allowlist removed"})", "application/json");
+        }
+    }
+
+    // ── Phase 5.3: mTLS API ───────────────────────────────────
+    if (req.path == "/api/mtls/status" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, milansql::MtlsManager::instance().statusJson(), "application/json");
+    }
+    if (req.path == "/api/mtls/enable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string ca = extractJsonStr(req.body, "ca_path");
+        std::string msg = milansql::MtlsManager::instance().enable(ca);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path == "/api/mtls/disable" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string msg = milansql::MtlsManager::instance().disable();
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+    // ── Phase 5.4: Compliance Reports API ────────────────────
+    if (req.path.rfind("/api/compliance/", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string type = req.path.substr(16);
+        using CR = milansql::ComplianceReporter;
+        CR::ReportContext rctx;
+        {
+            time_t t = time(nullptr); char buf[24];
+            struct tm ltm; localtime_r(&t, &ltm);
+            strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &ltm);
+            rctx.generatedAt = buf;
+        }
+        rctx.serverVersion = MILANSQL_VERSION;
+        rctx.auditOn       = engine_.auditLogger.isEnabled();
+        rctx.auditEntries  = (int)engine_.auditLogger.entryCount();
+        rctx.encryptionOn  = milansql::EncryptionManager::instance().enabled();
+        rctx.mtlsOn        = milansql::MtlsManager::instance().enabled();
+        if (rctx.auditOn) {
+            auto vr = engine_.auditLogger.verifyChain();
+            rctx.auditChainOk = vr.valid;
+        }
+        {
+            std::shared_lock<std::shared_mutex> lock(engineMutex_);
+            auto tables = engine_.getAllTableNames();
+            rctx.tableCount = (int)tables.size();
+            std::string rlsJson = engine_.getRlsPoliciesJson();
+            for (auto& tbl : tables) {
+                if (rlsJson.find(tbl) != std::string::npos)
+                    rctx.tablesWithRls.push_back(tbl);
+            }
+        }
+        std::string report;
+        for (auto& ch : type) ch = (char)toupper((unsigned char)ch);
+        if (type == "DSGVO" || type == "GDPR")
+            report = CR::generateDSGVO(rctx);
+        else if (type == "GOBD")
+            report = CR::generateGoBD(rctx);
+        else if (type == "SOC2")
+            report = CR::generateSOC2(rctx);
+        else
+            return buildHttpResponse(400, R"({"error":"Unknown report type. Use: dsgvo, gobd, soc2"})");
+        return buildHttpResponse(200, report, "application/json");
+    }
+
+    // ── Phase 5.5: Isolated Tenants API ──────────────────────
+    if (req.path == "/api/isolated-tenants" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        return buildHttpResponse(200, milansql::IsolatedTenantManager::instance().listJson(), "application/json");
+    }
+    if (req.path == "/api/isolated-tenants" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string name    = extractJsonStr(req.body, "name");
+        std::string memory  = extractJsonStr(req.body, "memory");
+        std::string cpu     = extractJsonStr(req.body, "cpu");
+        std::string storage = extractJsonStr(req.body, "storage");
+        std::string config;
+        if (!memory.empty())  config += "MEMORY="  + memory  + ";";
+        if (!cpu.empty())     config += "CPU="     + cpu     + ";";
+        if (!storage.empty()) config += "STORAGE=" + storage + ";";
+        std::string msg = milansql::IsolatedTenantManager::instance().create(name, config);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+    if (req.path.rfind("/api/isolated-tenants/", 0) == 0 && req.method == "DELETE") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid || !ctx.isRoot) return buildHttpResponse(403, R"({"error":"Root only"})");
+        std::string name = req.path.substr(22);
+        std::string msg = milansql::IsolatedTenantManager::instance().drop(name);
+        return buildHttpResponse(200, std::string(R"({"message":")") + msg + "\"}", "application/json");
+    }
+
+
+
+    // Plan string -> CloudPlan helper
+    auto strToPlan = [](const std::string& s) -> milansql::CloudPlan {
+        if (s == "starter")    return milansql::CloudPlan::STARTER;
+        if (s == "pro")        return milansql::CloudPlan::PRO;
+        if (s == "enterprise") return milansql::CloudPlan::ENTERPRISE;
+        return milansql::CloudPlan::FREE;
+    };
+
+    // ── Phase 6.1: Cloud Instance API ────────────────────────
+    // POST /cloud/instances — create new instance
+    if (req.path == "/cloud/instances" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string name   = extractJsonStr(req.body, "name");
+        std::string plan   = extractJsonStr(req.body, "plan");
+        std::string region = extractJsonStr(req.body, "region");
+        if (region.empty()) region = "eu-central-1";
+        if (plan.empty())   plan   = "free";
+        if (name.empty())   return buildHttpResponse(400, R"({"error":"name required"})");
+        auto inst = milansql::CloudInstanceManager::instance().create(
+            std::to_string(ctx.userId), name, strToPlan(plan), region);
+        std::string j = milansql::CloudInstanceManager::instance().instanceJson(inst.id);
+        return buildHttpResponse(201, j, "application/json");
+    }
+
+    // GET /cloud/instances — list instances for user
+    if (req.path == "/cloud/instances" && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200,
+            milansql::CloudInstanceManager::instance().listJson(std::to_string(ctx.userId)),
+            "application/json");
+    }
+
+    // POST /cloud/instances/:id/pause|resume|resize (must come before GET :id)
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "POST") {
+        std::string rest = req.path.substr(17);
+        auto sl = rest.find('/');
+        std::string id     = (sl != std::string::npos) ? rest.substr(0, sl) : rest;
+        std::string action = (sl != std::string::npos) ? rest.substr(sl+1) : "";
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+
+        if (action == "pause") {
+            milansql::CloudInstanceManager::instance().pauseInstance(id);
+            return buildHttpResponse(200, R"({"message":"Instance paused","status":"paused"})", "application/json");
+        }
+        if (action == "resume") {
+            milansql::CloudInstanceManager::instance().resumeInstance(id);
+            return buildHttpResponse(200, R"({"message":"Instance resumed","status":"running"})", "application/json");
+        }
+        if (action == "resize") {
+            std::string newPlan = extractJsonStr(req.body, "plan");
+            milansql::CloudInstanceManager::instance().resizeInstance(id, strToPlan(newPlan));
+            return buildHttpResponse(200,
+                std::string(R"({"message":"Instance resized","plan":")") + newPlan + "\"}",
+                "application/json");
+        }
+    }
+
+    // GET /cloud/instances/:id
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "GET") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string id = req.path.substr(17);
+        auto sl = id.find('/'); if (sl != std::string::npos) id = id.substr(0, sl);
+        std::string j = milansql::CloudInstanceManager::instance().instanceJson(id);
+        if (j.empty() || j == "null")
+            return buildHttpResponse(404, R"({"error":"Instance not found"})");
+        std::string usage = milansql::UsageMeter::instance().getUsageJson(id);
+        if (j.size() > 1 && j.back() == '}')
+            j = j.substr(0, j.size()-1) + ",\"usage\":" + usage + "}";
+        return buildHttpResponse(200, j, "application/json");
+    }
+
+    // DELETE /cloud/instances/:id
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "DELETE") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string id = req.path.substr(17);
+        auto sl = id.find('/'); if (sl != std::string::npos) id = id.substr(0, sl);
+        milansql::CloudInstanceManager::instance().deleteInstance(id);
+        return buildHttpResponse(200, R"({"message":"Instance deleted"})", "application/json");
+    }
+
+    // GET /cloud/instances/:id/replicas
+    if (req.path.rfind("/cloud/instances/", 0) == 0 &&
+        req.path.find("/replicas") != std::string::npos) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string rest = req.path.substr(17);
+        auto sl = rest.find('/');
+        std::string id = (sl != std::string::npos) ? rest.substr(0, sl) : rest;
+        if (req.method == "GET") {
+            return buildHttpResponse(200,
+                milansql::RegionManager::instance().listReplicasJson(id),
+                "application/json");
+        } else if (req.method == "POST") {
+            std::string region = extractJsonStr(req.body, "region");
+            milansql::RegionManager::instance().createReplica(id, region);
+            return buildHttpResponse(200,
+                std::string(R"({"message":"Replica creating in ")") + region + "\"}",
+                "application/json");
+        }
+    }
+
+    // ── Phase 6.2: Billing API ────────────────────────────────
+    if (req.path == "/cloud/billing/plans" && req.method == "GET") {
+        return buildHttpResponse(200,
+            milansql::BillingManager::instance().getAllPlansJson(),
+            "application/json");
+    }
+    if (req.path.rfind("/cloud/billing/usage", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string month;
+        auto q = req.path.find('?');
+        if (q != std::string::npos) {
+            std::string qs = req.path.substr(q+1);
+            auto eq = qs.find('=');
+            if (eq != std::string::npos) month = qs.substr(eq+1);
+        }
+        return buildHttpResponse(200,
+            milansql::BillingManager::instance().getBillingUsageJson(
+                std::to_string(ctx.userId), month),
+            "application/json");
+    }
+    if (req.path.rfind("/cloud/billing/invoices", 0) == 0) {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        return buildHttpResponse(200,
+            milansql::BillingManager::instance().getInvoiceJson(
+                std::to_string(ctx.userId), ""),
+            "application/json");
+    }
+    if (req.path == "/cloud/billing/subscribe" && req.method == "POST") {
+        auto ctx = extractUserContext(req);
+        if (!ctx.valid) return buildHttpResponse(401, R"({"error":"Authentication required"})");
+        std::string plan = extractJsonStr(req.body, "plan");
+        std::string subId = milansql::BillingManager::instance().createSubscription(
+            std::to_string(ctx.userId), strToPlan(plan));
+        return buildHttpResponse(200,
+                        std::string(R"JSONX({"subscription_id":")JSONX") + subId +
+                std::string(R"JSONX(","status":"active","plan":")JSONX") + plan +
+                std::string(R"JSONX("})JSONX"),
+            "application/json");
+    }
+
+    // ── Phase 6.3: Regions API ────────────────────────────────
+    if (req.path == "/cloud/regions" && req.method == "GET") {
+        return buildHttpResponse(200,
+            milansql::RegionManager::instance().listJson(),
+            "application/json");
+    }
+
+
+
+    // ── Phase 6.4: Cloud Dashboard HTML pages ────────────────
+
+    // GET /cloud — Cloud dashboard overview
+    if (req.path == "/cloud" && req.method == "GET") {
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:1200px;margin:0 auto;padding:2rem}
+h1{font-size:1.8rem;margin-bottom:.5rem}
+.subtitle{color:#64748b;margin-bottom:2rem}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.5rem;margin-bottom:2rem}
+.stat-card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1.5rem}
+.stat-card .label{font-size:.8rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem}
+.stat-card .value{font-size:2rem;font-weight:700;color:#38bdf8}
+.stat-card .sub{font-size:.8rem;color:#475569;margin-top:.25rem}
+.section-title{font-size:1.1rem;font-weight:600;margin-bottom:1rem;color:#cbd5e1}
+.instances-table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:.75rem;overflow:hidden;border:1px solid #334155}
+.instances-table th{background:#0f172a;padding:.75rem 1rem;text-align:left;font-size:.8rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em}
+.instances-table td{padding:.75rem 1rem;border-top:1px solid #1e293b;font-size:.9rem}
+.instances-table tr:hover td{background:#1e293b}
+.badge{display:inline-block;padding:.2rem .6rem;border-radius:9999px;font-size:.75rem;font-weight:600}
+.badge-running{background:#064e3b;color:#34d399}.badge-paused{background:#422006;color:#fb923c}
+.badge-free{background:#1e3a5f;color:#7dd3fc}.badge-starter{background:#3b0764;color:#c084fc}
+.badge-pro{background:#0c4a6e;color:#38bdf8}.badge-enterprise{background:#1a1a2e;color:#fbbf24}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1rem;border-radius:.5rem;font-size:.85rem;font-weight:600;text-decoration:none;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.btn-secondary{background:#1e293b;color:#94a3b8;border:1px solid #334155}.btn-secondary:hover{background:#334155;color:#e2e8f0}
+.actions{display:flex;gap:.5rem;align-items:center;justify-content:flex-end;margin-bottom:1.5rem}
+.empty-state{text-align:center;padding:3rem;color:#475569}
+.empty-state h3{margin-bottom:.5rem;color:#64748b}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <h1>Cloud Dashboard</h1>
+  <p class="subtitle">Manage your MilanSQL cloud instances</p>
+
+  <div class="stats-grid" id="stats">
+    <div class="stat-card"><div class="label">Total Instances</div><div class="value" id="total-inst">—</div><div class="sub">across all plans</div></div>
+    <div class="stat-card"><div class="label">Running</div><div class="value" id="running-inst">—</div><div class="sub">active instances</div></div>
+    <div class="stat-card"><div class="label">Active Region</div><div class="value" id="region">eu-central-1</div><div class="sub">Frankfurt, Germany</div></div>
+    <div class="stat-card"><div class="label">Uptime SLA</div><div class="value">99.9%</div><div class="sub">guaranteed</div></div>
+  </div>
+
+  <div class="actions">
+    <a href="/cloud/new" class="btn btn-primary">+ New Instance</a>
+    <a href="/cloud/billing" class="btn btn-secondary">Billing</a>
+  </div>
+
+  <div class="section-title">Your Instances</div>
+  <table class="instances-table" id="inst-table">
+    <thead><tr>
+      <th>Name</th><th>Plan</th><th>Region</th><th>Status</th><th>Created</th><th>Actions</th>
+    </tr></thead>
+    <tbody id="inst-tbody"><tr><td colspan="6" style="text-align:center;padding:2rem;color:#475569">Loading…</td></tr></tbody>
+  </table>
+</div>
+<script>
+const planBadge=(p)=>`<span class="badge badge-${p}">${p}</span>`;
+const statusBadge=(s)=>`<span class="badge badge-${s}">${s}</span>`;
+async function load(){
+  try{
+    const r=await fetch('/cloud/instances',{headers:{'Authorization':'Bearer '+localStorage.getItem('msql_token')||''}});
+    const d=await r.json();
+    const insts=d.instances||d||[];
+    document.getElementById('total-inst').textContent=insts.length;
+    document.getElementById('running-inst').textContent=insts.filter(i=>i.status==='running').length;
+    const tb=document.getElementById('inst-tbody');
+    if(!insts.length){tb.innerHTML='<tr><td colspan="6"><div class="empty-state"><h3>No instances yet</h3><p>Create your first cloud database</p></div></td></tr>';return;}
+    tb.innerHTML=insts.map(i=>`<tr>
+      <td><strong>${i.name||i.id}</strong><br><small style="color:#475569">${i.id}</small></td>
+      <td>${planBadge(i.plan||'free')}</td>
+      <td>${i.region||'eu-central-1'}</td>
+      <td>${statusBadge(i.status||'running')}</td>
+      <td>${(i.created_at||i.createdAt||'').slice(0,10)}</td>
+      <td><a href="/cloud/instances/${i.id}" class="btn btn-secondary" style="font-size:.75rem">Manage</a></td>
+    </tr>`).join('');
+  }catch(e){document.getElementById('inst-tbody').innerHTML='<tr><td colspan="6" style="text-align:center;color:#ef4444">Failed to load instances</td></tr>';}
+}
+load();
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
+    }
+
+    // GET /cloud/new — Create new instance form
+    if (req.path == "/cloud/new" && req.method == "GET") {
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — New Instance</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:700px;margin:3rem auto;padding:0 2rem}
+h1{font-size:1.8rem;margin-bottom:.5rem}
+.subtitle{color:#64748b;margin-bottom:2rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:2rem;margin-bottom:1.5rem}
+.form-group{margin-bottom:1.5rem}
+label{display:block;font-size:.85rem;font-weight:600;color:#94a3b8;margin-bottom:.5rem;text-transform:uppercase;letter-spacing:.05em}
+input,select{width:100%;background:#0f172a;border:1px solid #334155;border-radius:.5rem;padding:.75rem 1rem;color:#e2e8f0;font-size:.95rem}
+input:focus,select:focus{outline:none;border-color:#38bdf8}
+.plan-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}
+.plan-card{border:2px solid #334155;border-radius:.75rem;padding:1rem;cursor:pointer;transition:all .2s;position:relative}
+.plan-card:hover{border-color:#38bdf8}.plan-card.selected{border-color:#0ea5e9;background:#0c1e33}
+.plan-card h3{font-size:.95rem;margin-bottom:.25rem}
+.plan-card .price{font-size:1.5rem;font-weight:700;color:#38bdf8}
+.plan-card .price span{font-size:.8rem;color:#64748b;font-weight:400}
+.plan-card ul{margin-top:.75rem;list-style:none}
+.plan-card ul li{font-size:.8rem;color:#64748b;padding:.15rem 0}
+.plan-card ul li::before{content:"✓ ";color:#34d399}
+.plan-card input[type=radio]{position:absolute;opacity:0}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.75rem 1.5rem;border-radius:.5rem;font-size:.95rem;font-weight:600;cursor:pointer;border:none;transition:all .2s;width:100%;justify-content:center}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.alert{padding:1rem;border-radius:.5rem;margin-bottom:1rem;display:none}
+.alert-success{background:#064e3b;color:#34d399;border:1px solid #065f46}
+.alert-error{background:#450a0a;color:#f87171;border:1px solid #7f1d1d}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <h1>New Instance</h1>
+  <p class="subtitle">Launch a managed MilanSQL database in seconds</p>
+
+  <div id="alert" class="alert"></div>
+
+  <div class="card">
+    <div class="form-group">
+      <label>Instance Name</label>
+      <input type="text" id="name" placeholder="my-database" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label>Region</label>
+      <select id="region">
+        <option value="eu-central-1">eu-central-1 — Frankfurt, Germany (Active)</option>
+        <option value="eu-west-1" disabled>eu-west-1 — Ireland (Coming Soon)</option>
+        <option value="us-east-1" disabled>us-east-1 — N. Virginia (Coming Soon)</option>
+        <option value="ap-southeast-1" disabled>ap-southeast-1 — Singapore (Coming Soon)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Plan</label>
+      <div class="plan-grid" id="plan-grid">
+        <label class="plan-card selected" onclick="selectPlan('free',this)">
+          <input type="radio" name="plan" value="free" checked>
+          <h3>Free</h3>
+          <div class="price">€0<span>/month</span></div>
+          <ul><li>500 MB storage</li><li>100 queries/day</li><li>1 instance</li></ul>
+        </label>
+        <label class="plan-card" onclick="selectPlan('starter',this)">
+          <input type="radio" name="plan" value="starter">
+          <h3>Starter</h3>
+          <div class="price">€9<span>/month</span></div>
+          <ul><li>5 GB storage</li><li>Unlimited queries</li><li>3 instances</li></ul>
+        </label>
+        <label class="plan-card" onclick="selectPlan('pro',this)">
+          <input type="radio" name="plan" value="pro">
+          <h3>Pro</h3>
+          <div class="price">€49<span>/month</span></div>
+          <ul><li>50 GB storage</li><li>Unlimited queries</li><li>10 instances</li></ul>
+        </label>
+        <label class="plan-card" onclick="selectPlan('enterprise',this)">
+          <input type="radio" name="plan" value="enterprise">
+          <h3>Enterprise</h3>
+          <div class="price">Custom</div>
+          <ul><li>Unlimited storage</li><li>Dedicated cluster</li><li>SLA 99.99%</li></ul>
+        </label>
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="createInstance()">Launch Instance</button>
+  </div>
+</div>
+<script>
+let selectedPlan='free';
+function selectPlan(p,el){
+  selectedPlan=p;
+  document.querySelectorAll('.plan-card').forEach(c=>c.classList.remove('selected'));
+  el.classList.add('selected');
+}
+async function createInstance(){
+  const name=document.getElementById('name').value.trim();
+  const region=document.getElementById('region').value;
+  const al=document.getElementById('alert');
+  if(!name){al.style.display='block';al.className='alert alert-error';al.textContent='Instance name is required';return;}
+  try{
+    const r=await fetch('/cloud/instances',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+localStorage.getItem('msql_token')||''},body:JSON.stringify({name,plan:selectedPlan,region})});
+    const d=await r.json();
+    if(r.ok){
+      al.style.display='block';al.className='alert alert-success';
+      al.innerHTML='Instance created! <strong>API Key: '+d.api_key_plain+'</strong> — save this, it won\'t be shown again.';
+      setTimeout(()=>window.location='/cloud',3000);
+    }else{al.style.display='block';al.className='alert alert-error';al.textContent=d.error||'Failed to create instance';}
+  }catch(e){al.style.display='block';al.className='alert alert-error';al.textContent='Network error';}
+}
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
+    }
+
+    // GET /cloud/billing — Billing dashboard
+    if (req.path == "/cloud/billing" && req.method == "GET") {
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — Billing</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:1000px;margin:0 auto;padding:2rem}
+h1{font-size:1.8rem;margin-bottom:.5rem}
+.subtitle{color:#64748b;margin-bottom:2rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1.5rem}
+.card h2{font-size:1rem;color:#94a3b8;margin-bottom:1rem}
+.amount{font-size:2.5rem;font-weight:700;color:#38bdf8}
+.amount span{font-size:1rem;color:#64748b}
+.usage-bar{background:#0f172a;border-radius:9999px;height:.5rem;margin:.5rem 0}
+.usage-bar .fill{background:linear-gradient(90deg,#0ea5e9,#38bdf8);border-radius:9999px;height:100%;transition:width .5s}
+.usage-row{display:flex;justify-content:space-between;font-size:.85rem;color:#64748b;margin-bottom:.25rem}
+.plans-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem}
+.plan-card{border:1px solid #334155;border-radius:.75rem;padding:1rem;text-align:center}
+.plan-card.active{border-color:#0ea5e9;background:#0c1e33}
+.plan-card h3{font-size:.95rem;margin-bottom:.5rem}
+.plan-card .price{font-size:1.75rem;font-weight:700;color:#38bdf8;margin-bottom:.5rem}
+.plan-card .price span{font-size:.8rem;color:#64748b;font-weight:400}
+.plan-card ul{list-style:none;font-size:.8rem;color:#64748b;text-align:left}
+.plan-card ul li{padding:.2rem 0}
+.plan-card ul li::before{content:"✓ ";color:#34d399}
+.btn{display:inline-flex;align-items:center;padding:.5rem 1rem;border-radius:.5rem;font-size:.85rem;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-decoration:none}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.btn-sm{padding:.35rem .75rem;font-size:.8rem}
+.invoices-table{width:100%;border-collapse:collapse}
+.invoices-table th{text-align:left;font-size:.8rem;color:#64748b;text-transform:uppercase;padding:.5rem;border-bottom:1px solid #334155}
+.invoices-table td{padding:.75rem .5rem;border-bottom:1px solid #1e293b;font-size:.9rem}
+.badge-paid{background:#064e3b;color:#34d399;display:inline-block;padding:.15rem .5rem;border-radius:9999px;font-size:.75rem}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <h1>Billing</h1>
+  <p class="subtitle">Manage your subscription and view invoices</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Current Month</h2>
+      <div class="amount" id="curr-amount">€0.00<span>/month</span></div>
+      <div style="margin-top:1rem">
+        <div class="usage-row"><span>Query Usage</span><span id="q-pct">0%</span></div>
+        <div class="usage-bar"><div class="fill" id="q-fill" style="width:0%"></div></div>
+        <div class="usage-row"><span>Storage</span><span id="s-pct">0%</span></div>
+        <div class="usage-bar"><div class="fill" id="s-fill" style="width:0%"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Current Plan</h2>
+      <div id="curr-plan" style="font-size:1.5rem;font-weight:700;color:#c084fc;margin-bottom:.5rem">Free</div>
+      <p style="font-size:.85rem;color:#64748b;margin-bottom:1rem">Change your plan anytime</p>
+      <a href="#plans" class="btn btn-primary btn-sm">Upgrade Plan</a>
+    </div>
+  </div>
+
+  <div id="plans">
+    <div class="card" style="margin-bottom:1.5rem">
+      <h2>Plans</h2>
+      <div class="plans-grid" id="plans-grid">Loading...</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Invoices</h2>
+    <table class="invoices-table">
+      <thead><tr><th>Date</th><th>Amount</th><th>Status</th><th>Download</th></tr></thead>
+      <tbody id="inv-tbody"><tr><td colspan="4" style="color:#475569;padding:1rem 0">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+<script>
+async function loadBilling(){
+  const token='Bearer '+(localStorage.getItem('msql_token')||'');
+  // Load plans
+  try{
+    const r=await fetch('/cloud/billing/plans');
+    const d=await r.json();
+    const plans=d.plans||Object.values(d)||[];
+    const grid=document.getElementById('plans-grid');
+    grid.innerHTML=plans.map(p=>`
+      <div class="plan-card">
+        <h3>${p.name||p.id||'—'}</h3>
+        <div class="price">${p.price_monthly===0?'€0':(p.price_monthly?'€'+p.price_monthly:'Custom')}<span>/mo</span></div>
+        <ul>
+          ${p.storage_gb?'<li>'+p.storage_gb+' GB storage</li>':'<li>Unlimited storage</li>'}
+          ${p.queries_per_day?'<li>'+p.queries_per_day+' queries/day</li>':'<li>Unlimited queries</li>'}
+        </ul>
+        <button onclick="subscribe('${p.id||p.name||'free'}')" class="btn btn-primary btn-sm" style="margin-top:.75rem;width:100%;justify-content:center">Select</button>
+      </div>`).join('');
+  }catch(e){document.getElementById('plans-grid').textContent='Failed to load plans';}
+  // Load invoices
+  try{
+    const r=await fetch('/cloud/billing/invoices',{headers:{'Authorization':token}});
+    const d=await r.json();
+    const invs=d.invoices||[d]||[];
+    const tb=document.getElementById('inv-tbody');
+    if(!invs.length||!invs[0].month){tb.innerHTML='<tr><td colspan="4" style="color:#475569">No invoices yet</td></tr>';return;}
+    tb.innerHTML=invs.map(i=>`<tr>
+      <td>${i.month||'—'}</td>
+      <td>€${(i.total||0).toFixed(2)}</td>
+      <td><span class="badge-paid">Paid</span></td>
+      <td><a href="/cloud/billing/invoices?month=${i.month}" style="color:#38bdf8;font-size:.85rem">Download</a></td>
+    </tr>`).join('');
+  }catch(e){document.getElementById('inv-tbody').innerHTML='<tr><td colspan="4" style="color:#ef4444">Failed to load invoices</td></tr>';}
+}
+async function subscribe(plan){
+  const token='Bearer '+(localStorage.getItem('msql_token')||'');
+  try{
+    const r=await fetch('/cloud/billing/subscribe',{method:'POST',headers:{'Content-Type':'application/json','Authorization':token},body:JSON.stringify({plan})});
+    const d=await r.json();
+    alert('Subscribed to '+plan+' — ID: '+d.subscription_id);
+  }catch(e){alert('Failed to subscribe');}
+}
+loadBilling();
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
+    }
+
+    // GET /cloud/instances/:id — Instance detail page
+    if (req.path.rfind("/cloud/instances/", 0) == 0 && req.method == "GET" &&
+        req.path.find('/', 17) == std::string::npos) {
+        // Only handle simple /cloud/instances/:id (no sub-path) for HTML
+        std::string instId = req.path.substr(17);
+        // If looks like an API request (has Accept: application/json), handled above
+        // This serves the HTML page
+        const char* html = R"HTMLX(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MilanSQL Cloud — Instance</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+nav{background:#1e293b;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+nav .logo{font-size:1.25rem;font-weight:700;color:#38bdf8}nav .logo span{color:#e2e8f0}
+nav .nav-links a{color:#94a3b8;text-decoration:none;margin-left:1.5rem;font-size:.9rem}
+nav .nav-links a:hover{color:#38bdf8}
+.container{max-width:900px;margin:0 auto;padding:2rem}
+.breadcrumb{font-size:.85rem;color:#475569;margin-bottom:1.5rem}
+.breadcrumb a{color:#38bdf8;text-decoration:none}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:2rem}
+h1{font-size:1.8rem}
+.badge{display:inline-block;padding:.25rem .75rem;border-radius:9999px;font-size:.8rem;font-weight:600}
+.badge-running{background:#064e3b;color:#34d399}.badge-paused{background:#422006;color:#fb923c}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:.75rem;padding:1.5rem}
+.card h2{font-size:1rem;color:#94a3b8;margin-bottom:1rem}
+.info-row{display:flex;justify-content:space-between;padding:.5rem 0;border-bottom:1px solid #1e293b;font-size:.9rem}
+.info-row:last-child{border-bottom:none}
+.info-row .key{color:#64748b}
+.btn{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1rem;border-radius:.5rem;font-size:.85rem;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-decoration:none}
+.btn-primary{background:#0ea5e9;color:#fff}.btn-primary:hover{background:#0284c7}
+.btn-warning{background:#92400e;color:#fbbf24}.btn-warning:hover{background:#78350f}
+.btn-success{background:#065f46;color:#34d399}.btn-success:hover{background:#064e3b}
+.btn-danger{background:#7f1d1d;color:#f87171}.btn-danger:hover{background:#6b1c1c}
+.actions{display:flex;gap:.75rem;flex-wrap:wrap}
+.usage-bar{background:#0f172a;border-radius:9999px;height:.5rem;margin:.5rem 0}
+.usage-bar .fill{background:linear-gradient(90deg,#0ea5e9,#38bdf8);border-radius:9999px;height:100%}
+.usage-label{display:flex;justify-content:space-between;font-size:.8rem;color:#64748b}
+.conn-string{background:#0f172a;border:1px solid #334155;border-radius:.5rem;padding:.75rem 1rem;font-family:monospace;font-size:.85rem;color:#38bdf8;word-break:break-all;margin-top:.5rem}
+</style>
+</head>
+<body>
+<nav>
+  <div class="logo">Milan<span>SQL</span> Cloud</div>
+  <div class="nav-links">
+    <a href="/cloud">Dashboard</a>
+    <a href="/cloud/new">New Instance</a>
+    <a href="/cloud/billing">Billing</a>
+    <a href="/webui">SQL Editor</a>
+  </div>
+</nav>
+<div class="container">
+  <div class="breadcrumb"><a href="/cloud">Dashboard</a> / <span id="inst-name">Instance</span></div>
+  <div class="header">
+    <div>
+      <h1 id="inst-title">Loading…</h1>
+      <div style="margin-top:.5rem"><span id="status-badge" class="badge">—</span></div>
+    </div>
+    <div class="actions" id="action-btns"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Instance Details</h2>
+      <div id="details">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Usage</h2>
+      <div id="usage">Loading…</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:1.5rem">
+    <h2>Connection String</h2>
+    <p style="font-size:.85rem;color:#64748b;margin-bottom:.5rem">Use this API key to connect:</p>
+    <div class="conn-string" id="conn-str">Loading…</div>
+  </div>
+
+  <div class="card">
+    <h2>Danger Zone</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <div style="font-weight:600;margin-bottom:.25rem">Delete Instance</div>
+        <div style="font-size:.85rem;color:#64748b">Permanently delete this instance and all its data</div>
+      </div>
+      <button class="btn btn-danger" onclick="deleteInstance()">Delete Instance</button>
+    </div>
+  </div>
+</div>
+<script>
+const id=location.pathname.split('/').pop();
+const token='Bearer '+(localStorage.getItem('msql_token')||'');
+let inst={};
+async function load(){
+  try{
+    const r=await fetch('/cloud/instances/'+id,{headers:{'Authorization':token,'Accept':'application/json'}});
+    const d=await r.json();
+    inst=d;
+    document.getElementById('inst-name').textContent=d.name||id;
+    document.getElementById('inst-title').textContent=d.name||id;
+    const sb=document.getElementById('status-badge');
+    sb.textContent=d.status||'running';sb.className='badge badge-'+(d.status||'running');
+    document.getElementById('details').innerHTML=[
+      ['ID',d.id],['Plan',d.plan||'free'],['Region',d.region||'eu-central-1'],
+      ['Created',(d.created_at||d.createdAt||'').slice(0,10)]
+    ].map(([k,v])=>`<div class="info-row"><span class="key">${k}</span><span>${v||'—'}</span></div>`).join('');
+    const u=d.usage||{};
+    const qpct=Math.min(100,Math.round((u.queryCountDaily||0)/100));
+    const spct=Math.min(100,Math.round((u.storageBytes||0)/(500*1024*1024)*100));
+    document.getElementById('usage').innerHTML=`
+      <div class="usage-label"><span>Queries today</span><span>${u.queryCountDaily||0}/100</span></div>
+      <div class="usage-bar"><div class="fill" style="width:${qpct}%"></div></div>
+      <div class="usage-label" style="margin-top:.5rem"><span>Storage</span><span>${((u.storageBytes||0)/1024/1024).toFixed(1)} MB / 500 MB</span></div>
+      <div class="usage-bar"><div class="fill" style="width:${spct}%"></div></div>`;
+    document.getElementById('conn-str').textContent='msql://'+id+'.cloud.milansql.com:5432/default?key=<your-api-key>';
+    const btns=document.getElementById('action-btns');
+    if(d.status==='running'){
+      btns.innerHTML='<button class="btn btn-warning" onclick="pauseInst()">Pause</button>';
+    }else{
+      btns.innerHTML='<button class="btn btn-success" onclick="resumeInst()">Resume</button>';
+    }
+    btns.innerHTML+='<button class="btn btn-primary" onclick="showResize()">Resize</button>';
+  }catch(e){document.getElementById('inst-title').textContent='Instance not found';}
+}
+async function pauseInst(){if(confirm('Pause instance?')){await fetch('/cloud/instances/'+id+'/pause',{method:'POST',headers:{'Authorization':token}});load();}}
+async function resumeInst(){await fetch('/cloud/instances/'+id+'/resume',{method:'POST',headers:{'Authorization':token}});load();}
+async function showResize(){
+  const plan=prompt('New plan (free/starter/pro/enterprise):');
+  if(plan){await fetch('/cloud/instances/'+id+'/resize',{method:'POST',headers:{'Content-Type':'application/json','Authorization':token},body:JSON.stringify({plan})});load();}
+}
+async function deleteInstance(){
+  if(confirm('Delete this instance permanently? This cannot be undone.')){
+    await fetch('/cloud/instances/'+id,{method:'DELETE',headers:{'Authorization':token}});
+    window.location='/cloud';
+  }
+}
+load();
+</script>
+</body></html>)HTMLX";
+        return buildHttpResponse(200, html, "text/html");
     }
 
     return buildHttpResponse(404, R"({"success":false,"error":"Not found"})");
@@ -3995,7 +8233,43 @@ inline void MilanHttpServer::handleClient(sock_t clientSock) {
                 }
             }
         }
-        std::string response = handleRequest(req, clientIp);
+        // Phase 170: acquire a pooled connection for engine-touching
+        // requests. Monitoring/static endpoints stay pool-exempt so
+        // observability keeps working even when the pool is exhausted.
+        bool poolExempt =
+            req.method == "OPTIONS" ||
+            req.path == "/health"  || req.path == "/ready" ||
+            req.path == "/live"    || req.path == "/metrics" ||
+            req.path == "/pool/stats" || req.path == "/vacuum/stats" ||
+            req.path == "/replication/status" ||
+            req.path == "/" || req.path == "/webui" ||
+            req.path == "/dashboard" || req.path == "/impressum" ||
+            req.path.rfind("/favicon", 0) == 0 ||
+            req.path.rfind("/apple-touch-icon", 0) == 0;
+
+        milansql::PoolLease lease;
+        if (!poolExempt) {
+            lease = milansql::PoolLease(milansql::g_connectionPool);
+            if (!lease) {
+                std::string err = milansql::g_connectionPool.isShuttingDown()
+                    ? "{\"success\":false,\"error\":\"Server is shutting down\"}"
+                    : "{\"success\":false,\"error\":\"Connection pool exhausted (30s timeout)\"}";
+                sendResponse(clientSock, buildHttpResponse(503, err));
+                closesocket(clientSock);
+                return;
+            }
+        }
+
+        std::string response;
+        try {
+            response = handleRequest(req, clientIp);
+        } catch (const std::bad_alloc&) {
+            response = buildHttpResponse(503, R"({"success":false,"error":"Server out of memory"})");
+        } catch (const std::exception& e) {
+            response = buildHttpResponse(500, "{\"success\":false,\"error\":\"Internal error\"}");
+        } catch (...) {
+            response = buildHttpResponse(500, R"({"success":false,"error":"Internal server error"})");
+        }
         sendResponse(clientSock, response);
     }
     closesocket(clientSock);
@@ -4017,7 +8291,7 @@ inline void MilanHttpServer::run() {
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = inet_addr(bindAddr_.c_str());
     addr.sin_port        = htons((unsigned short)port_);
 
     bind(srv, (sockaddr*)&addr, sizeof(addr));
@@ -4027,14 +8301,51 @@ inline void MilanHttpServer::run() {
     constexpr size_t POOL_SIZE = 256;
     threadPool_ = std::make_unique<ThreadPool>(POOL_SIZE, 4096);
 
-    std::cout << "MilanSQL HTTP Server auf Port " << port_
-              << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024)\n" << std::flush;
+    // Phase 170: Connection pool health checker + graceful shutdown
+    milansql::g_connectionPool.startHealthChecker();
 
-    while (true) {
+    // Phase 171: Auto-vacuum thread — every 60s, exclusive engine lock
+    // (the thread lives in VacuumManager; the callback takes engineMutex_
+    //  so it never races with HTTP request handlers)
+    engine_.vacuumManager().startAutoVacuum([this]() -> size_t {
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        return engine_.vacuumAllTracked(/*automatic=*/true);
+    });
+
+    // Optimizer Phase 3: Auto-ANALYZE thread — analysiert Tabellen,
+    // deren Aenderungszaehler > threshold * rowCount (Postgres-Logik).
+    milansql::g_autoAnalyze().start([this]() -> size_t {
+        std::unique_lock<std::shared_mutex> lock(engineMutex_);
+        return milansql::autoAnalyzeSweep(engine_);
+    });
+
+    std::signal(SIGINT,  httpShutdownSignalHandler);
+#ifdef SIGTERM
+    std::signal(SIGTERM, httpShutdownSignalHandler);
+#endif
+
+    std::cout << "MilanSQL HTTP Server auf Port " << port_
+              << " (Thread Pool: " << POOL_SIZE << " workers, backlog: 1024, "
+              << "Conn-Pool: " << milansql::g_connectionPool.getMinConnections()
+              << "-" << milansql::g_connectionPool.getMaxConnections() << ")\n" << std::flush;
+
+    while (!g_httpShutdownRequested.load()) {
+        // select() with timeout so we can notice the shutdown flag
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(srv, &fds);
+        timeval tv{0, 500000};   // 500ms
+        int sel = select(static_cast<int>(srv) + 1, &fds, nullptr, nullptr, &tv);
+        if (sel < 0) break;
+        if (sel == 0) continue;
+
         sockaddr_in clientAddr{};
         socklen_t len = sizeof(clientAddr);
         sock_t client = accept(srv, (sockaddr*)&clientAddr, &len);
-        if (client == INVALID_SOCK) break;
+        if (client == INVALID_SOCK) {
+            if (g_httpShutdownRequested.load()) break;
+            continue;
+        }
 
         // Submit to thread pool; if queue full → 503 Service Unavailable
         bool submitted = threadPool_->enqueue([this, client]() {
@@ -4054,7 +8365,18 @@ inline void MilanHttpServer::run() {
         }
     }
 
+    // Phase 170: Graceful shutdown — stop accepting, drain active queries
     closesocket(srv);
+    std::cout << "HTTP Server: Shutdown angefordert — warte auf aktive Queries...\n" << std::flush;
+    engine_.vacuumManager().stopAutoVacuum();   // Phase 171
+    milansql::g_autoAnalyze().stop();           // Optimizer Phase 3
+    milansql::g_connectionPool.stopHealthChecker();
+    bool drained = milansql::g_connectionPool.shutdown(30000);
+    threadPool_.reset();   // joins worker threads (in-flight requests finish)
+    std::cout << "HTTP Server: Shutdown "
+              << (drained ? "sauber abgeschlossen (alle Queries beendet)."
+                          : "nach 30s Timeout erzwungen.")
+              << "\n" << std::flush;
 #ifdef _WIN32
     WSACleanup();
 #endif

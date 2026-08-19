@@ -356,6 +356,11 @@ struct WhereCondition {
     // Phase 119: match mode: "" = natural language, "BOOLEAN" = boolean mode
     std::string              matchMode;
 
+    // Phase 200: Grouped conditions for (A AND B) OR C patterns
+    bool isGroup = false;
+    std::vector<WhereCondition> groupConds;
+    std::string groupLogic = "AND";
+
     // Default constructor (all fields zero-/empty-initialized)
     WhereCondition() = default;
     // Convenience constructor used in parser for simple conditions
@@ -469,6 +474,8 @@ struct SelectItem {
         std::string op;      // =, !=, <, >, <=, >=
         std::string val;     // rechte Seite
         std::string result;  // THEN-Wert
+        bool isScalarSubRhs = false;   // RHS ist eine skalare Subquery
+        ScalarSubSpec scalarSubRhs;    // ... und hier ist ihre Spezifikation
     };
     std::vector<WhenClause> caseWhen;
     std::string             caseElse = "NULL";
@@ -595,6 +602,119 @@ struct ExplainRequest {
     bool isSetOp = false;
     std::string setOp;
 };
+
+// ------------------------------------------------------------
+// Arithmetic expression evaluator (used by Table::project)
+// Handles: col+col*2-col/col, integer/float literals, parens.
+// Column lookup strips "table." prefix for JOIN-qualified names.
+// ------------------------------------------------------------
+namespace milansql_arith {
+
+struct Eval {
+    const std::vector<Column>& cols;
+    const std::vector<std::string>& vals;
+    const std::string& expr;
+    size_t pos = 0;
+
+    static bool isNullVal(const std::string& v) {
+        return v.empty() || v == "NULL" || v == "null";
+    }
+
+    double resolveIdent(const std::string& tok) const {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        // exact match first
+        for (size_t i = 0; i < cols.size() && i < vals.size(); ++i)
+            if (cols[i].name == tok) {
+                if (isNullVal(vals[i])) return nan;
+                try { return std::stod(vals[i]); } catch (...) { return 0.0; }
+            }
+        // suffix match (strip "table.")
+        for (size_t i = 0; i < cols.size() && i < vals.size(); ++i) {
+            auto d = cols[i].name.rfind('.');
+            std::string suf = d != std::string::npos ? cols[i].name.substr(d+1) : cols[i].name;
+            if (suf == tok) {
+                if (isNullVal(vals[i])) return nan;
+                try { return std::stod(vals[i]); } catch (...) { return 0.0; }
+            }
+        }
+        return 0.0;
+    }
+
+    void skipWS() { while (pos < expr.size() && expr[pos] == ' ') ++pos; }
+
+    double factor() {
+        skipWS();
+        if (pos < expr.size() && expr[pos] == '(') {
+            ++pos; double v = sum(); skipWS();
+            if (pos < expr.size() && expr[pos] == ')') ++pos;
+            return v;
+        }
+        size_t start = pos;
+        // optional sign
+        if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
+        // digits
+        while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
+        if (pos > start) {
+            try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
+        }
+        pos = start;
+        // identifier
+        while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
+        if (pos > start) {
+            std::string tok = expr.substr(start, pos - start);
+            try { return std::stod(tok); } catch (...) {}
+            return resolveIdent(tok);
+        }
+        if (pos < expr.size()) ++pos;
+        return 0.0;
+    }
+
+    double term() {
+        double v = factor();
+        while (true) { skipWS();
+            if (pos < expr.size() && expr[pos] == '*') { ++pos; v *= factor(); }
+            else if (pos < expr.size() && expr[pos] == '/') { ++pos; double r = factor(); v = r ? v/r : 0.0; }
+            else break;
+        }
+        return v;
+    }
+
+    double sum() {
+        double v = term();
+        while (true) { skipWS();
+            if (pos < expr.size() && expr[pos] == '+') { ++pos; v += term(); }
+            else if (pos < expr.size() && expr[pos] == '-') { ++pos; v -= term(); }
+            else break;
+        }
+        return v;
+    }
+
+    std::string run() {
+        pos = 0;
+        double r = sum();
+        if (std::isnan(r)) return "NULL";  // NULL propagation
+        if (r == std::floor(r) && std::abs(r) < 1e15)
+            return std::to_string(static_cast<long long>(r));
+        std::ostringstream os; os << r; return os.str();
+    }
+};
+
+inline bool looksArith(const std::string& s) {
+    if (!s.empty() && s[0] == '(') return true;  // parenthesized expression
+    for (char c : s) if (c == '+' || c == '-' || c == '*' || c == '/') return true;
+    // pure numeric literal
+    if (!s.empty()) {
+        bool ok = true; bool dot = false;
+        for (size_t i = (s[0]=='-'?1:0); i < s.size(); ++i) {
+            if (s[i]=='.' && !dot) { dot=true; continue; }
+            if (!std::isdigit((unsigned char)s[i])) { ok=false; break; }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+} // namespace milansql_arith
 
 // ------------------------------------------------------------
 // Table
@@ -928,7 +1048,17 @@ public:
         // Resolve column indices (ignore unknown columns)
         std::vector<std::pair<int,bool>> idxCols;
         for (const auto& p : cols) {
-            int ci = colOf(p.first);
+            int ci = -1;
+            // Support ORDER BY N (1-based column position)
+            if (!p.first.empty()) {
+                bool allDigit = true;
+                for (char ch : p.first) if (ch < '0' || ch > '9') { allDigit = false; break; }
+                if (allDigit) {
+                    int pos = std::stoi(p.first) - 1;  // convert to 0-based
+                    if (pos >= 0 && pos < static_cast<int>(columns_.size())) ci = pos;
+                }
+            }
+            if (ci < 0) ci = colOf(p.first);
             if (ci >= 0) idxCols.push_back({ci, p.second});
         }
         if (idxCols.empty()) return;
@@ -979,25 +1109,44 @@ public:
 
     Table project(const std::vector<std::string>& colNames) const {
         if (colNames.empty()) return clone();
-        std::vector<int> cis;
-        std::vector<Column> newCols;
+        // Classify each requested column: plain index or arithmetic expression
+        std::vector<int>         cis;      // >=0 = column index, -1 = arith expr
+        std::vector<std::string> newColNames;
+        std::vector<std::string> types;
         for (const auto& cname : colNames) {
             int ci = colOf(cname);
-            if (ci < 0)
+            if (ci < 0 && !milansql_arith::looksArith(cname))
                 throw std::runtime_error(
                     "SELECT: Spalte '" + cname + "' nicht gefunden.");
             cis.push_back(ci);
-            newCols.push_back(columns_[static_cast<size_t>(ci)]);
+            if (ci >= 0) {
+                newColNames.push_back(columns_[static_cast<size_t>(ci)].name);
+                types.push_back(columns_[static_cast<size_t>(ci)].type);
+            } else {
+                newColNames.push_back(cname);   // use expression as column header
+                types.push_back("TEXT");
+            }
         }
+        std::vector<Column> newCols;
+        for (size_t i = 0; i < newColNames.size(); ++i)
+            newCols.emplace_back(newColNames[i], types[i]);
         Table result(name_, std::move(newCols));
         for (const auto& row : rows_) {
             if (row.xmax != 0) continue;  // Phase 71: skip dead rows
             std::vector<std::string> vals;
             vals.reserve(cis.size());
-            for (int ci : cis)
-                vals.push_back(
-                    static_cast<size_t>(ci) < row.values.size()
-                    ? row.values[ci] : "");
+            for (size_t i = 0; i < cis.size(); ++i) {
+                int ci = cis[i];
+                if (ci >= 0) {
+                    vals.push_back(
+                        static_cast<size_t>(ci) < row.values.size()
+                        ? row.values[ci] : "");
+                } else {
+                    // Arithmetic expression — evaluate per row
+                    milansql_arith::Eval ev{columns_, row.values, colNames[i], 0};
+                    vals.push_back(ev.run());
+                }
+            }
             result.rows_.push_back(Row(std::move(vals)));
         }
         return result;
@@ -1896,12 +2045,33 @@ public:
         }
 
         // EXISTS/NOT EXISTS + korrelierte Scalar Subqueries + CAST-LHS + MATCH AGAINST brauchen rowMatches
+        // Also: arithmetic/column-ref RHS needs rowMatches for per-row resolution
         bool hasCorrelated = false;
         for (const auto& cond : conds) {
+            if (cond.isGroup)        { hasCorrelated = true; break; }
             if (cond.op == "EXISTS" || cond.op == "NOT EXISTS") { hasCorrelated = true; break; }
             if (cond.isScalarSub)    { hasCorrelated = true; break; }
             if (cond.isFuncLhs)      { hasCorrelated = true; break; }
             if (cond.isMatchAgainst) { hasCorrelated = true; break; }
+            // Arithmetic LHS (e.g. e+d BETWEEN ..., a*2 > b)
+            if (!cond.col.empty() && milansql_arith::looksArith(cond.col))
+                { hasCorrelated = true; break; }
+            // Arithmetic or column-ref RHS (e.g. c<=d-2, a>b)
+            if (!cond.val.empty() && !cond.isScalarSub) {
+                if (milansql_arith::looksArith(cond.val)) { hasCorrelated = true; break; }
+                if (findColIdx(src, cond.val) >= 0)       { hasCorrelated = true; break; }
+            }
+            // BETWEEN with arithmetic or column-ref bounds (e.g. c BETWEEN b-2 AND d+2)
+            if (cond.op == "BETWEEN" || cond.op == "NOT BETWEEN") {
+                auto needsRow = [&](const std::string& b) {
+                    if (b.empty()) return false;
+                    if (milansql_arith::looksArith(b)) return true;
+                    if (findColIdx(src, b) >= 0) return true;
+                    return false;
+                };
+                if (needsRow(cond.betweenLow) || needsRow(cond.betweenHigh))
+                    { hasCorrelated = true; break; }
+            }
         }
 
         if (hasCorrelated) {
@@ -3708,13 +3878,19 @@ public:
                 newCols.emplace_back(cname, "TEXT");
             } else {
                 int ci = findColIdx(src, item.colName);
-                if (ci < 0)
-                    throw std::runtime_error(
-                        "SELECT: Spalte '" + item.colName + "' nicht gefunden.");
-                std::string cname = item.alias.empty()
-                    ? src.columns()[static_cast<size_t>(ci)].name
-                    : item.alias;
-                newCols.emplace_back(cname, src.columns()[static_cast<size_t>(ci)].type);
+                if (ci < 0) {
+                    if (!looksArith(item.colName))
+                        throw std::runtime_error(
+                            "SELECT: Spalte '" + item.colName + "' nicht gefunden.");
+                    // Arithmetic expression: use alias or the expression itself as name
+                    std::string cname = item.alias.empty() ? item.colName : item.alias;
+                    newCols.emplace_back(cname, "TEXT");
+                } else {
+                    std::string cname = item.alias.empty()
+                        ? src.columns()[static_cast<size_t>(ci)].name
+                        : item.alias;
+                    newCols.emplace_back(cname, src.columns()[static_cast<size_t>(ci)].type);
+                }
             }
         }
 
@@ -3757,8 +3933,13 @@ public:
                     vals.push_back(evalScalarSub(item.scalarSub, src.columns(), row));
                 } else {
                     int ci = findColIdx(src, item.colName);
-                    vals.push_back(ci >= 0 && static_cast<size_t>(ci) < row.values.size()
-                                   ? row.values[static_cast<size_t>(ci)] : "");
+                    if (ci >= 0 && static_cast<size_t>(ci) < row.values.size()) {
+                        vals.push_back(row.values[static_cast<size_t>(ci)]);
+                    } else if (looksArith(item.colName)) {
+                        vals.push_back(evalArithExpr(item.colName, src, row));
+                    } else {
+                        vals.push_back("");
+                    }
                 }
             }
             result.insert(Row(vals));
@@ -6311,35 +6492,75 @@ private:
     }
 
     // Phase 31: CASE WHEN-Ausdruck für eine Zeile auswerten
-    static std::string evalCase(const SelectItem& item,
-                                const Table& tbl, const Row& row) {
+    std::string evalCase(const SelectItem& item,
+                         const Table& tbl, const Row& row) const {
+        // Helper: evaluate a result expression (may be a column ref or arithmetic)
+        auto evalResult = [&](const std::string& r) -> std::string {
+            if (r.empty() || r == "NULL") return r;
+            // Check if it's a column reference
+            int rci = findColIdx(tbl, r);
+            if (rci >= 0 && static_cast<size_t>(rci) < row.values.size())
+                return row.values[static_cast<size_t>(rci)];
+            // Check if it's arithmetic
+            if (milansql_arith::looksArith(r)) {
+                try {
+                    return milansql_arith::Eval{tbl.columns(), row.values, r, 0}.run();
+                } catch (...) {}
+            }
+            return r;
+        };
+
         for (const auto& wh : item.caseWhen) {
+            // Evaluate LHS: may be a column ref or arithmetic expression
+            std::string lhsVal;
             int ci = findColIdx(tbl, wh.col);
-            if (ci < 0) continue;
-            const std::string& rv =
-                static_cast<size_t>(ci) < row.values.size()
-                ? row.values[static_cast<size_t>(ci)] : "";
+            if (ci >= 0 && static_cast<size_t>(ci) < row.values.size()) {
+                lhsVal = row.values[static_cast<size_t>(ci)];
+            } else if (milansql_arith::looksArith(wh.col)) {
+                try {
+                    lhsVal = milansql_arith::Eval{tbl.columns(), row.values, wh.col, 0}.run();
+                } catch (...) { continue; }
+            } else {
+                continue;
+            }
+            // Evaluate RHS: may be a scalar subquery, column ref, or arithmetic
+            std::string rhsVal = wh.val;
+            if (wh.isScalarSubRhs) {
+                rhsVal = evalScalarSub(wh.scalarSubRhs, tbl.columns(), row);
+            } else {
+                int rhsCI = findColIdx(tbl, wh.val);
+                if (rhsCI >= 0 && static_cast<size_t>(rhsCI) < row.values.size())
+                    rhsVal = row.values[static_cast<size_t>(rhsCI)];
+                else if (milansql_arith::looksArith(wh.val)) {
+                    try {
+                        rhsVal = milansql_arith::Eval{tbl.columns(), row.values, wh.val, 0}.run();
+                    } catch (...) {}
+                }
+            }
             // Numerischer Vergleich, fallback auf String
             bool match = false;
-            try {
-                double da = std::stod(rv), db = std::stod(wh.val);
-                if      (wh.op == "=")  match = (da == db);
-                else if (wh.op == "!=") match = (da != db);
-                else if (wh.op == "<")  match = (da <  db);
-                else if (wh.op == ">")  match = (da >  db);
-                else if (wh.op == "<=") match = (da <= db);
-                else if (wh.op == ">=") match = (da >= db);
-            } catch (...) {
-                if      (wh.op == "=")  match = (rv == wh.val);
-                else if (wh.op == "!=") match = (rv != wh.val);
-                else if (wh.op == "<")  match = (rv <  wh.val);
-                else if (wh.op == ">")  match = (rv >  wh.val);
-                else if (wh.op == "<=") match = (rv <= wh.val);
-                else if (wh.op == ">=") match = (rv >= wh.val);
-            }
-            if (match) return wh.result;
+            // NULL in either operand -> comparison is NULL (false in CASE WHEN)
+            if (!lhsVal.empty() && lhsVal != "NULL" && !rhsVal.empty() && rhsVal != "NULL") {
+                try {
+                    double da = std::stod(lhsVal), db = std::stod(rhsVal);
+                    if      (wh.op == "=")  match = (da == db);
+                    else if (wh.op == "!=") match = (da != db);
+                    else if (wh.op == "<")  match = (da <  db);
+                    else if (wh.op == ">")  match = (da >  db);
+                    else if (wh.op == "<=") match = (da <= db);
+                    else if (wh.op == ">=") match = (da >= db);
+                } catch (...) {
+                    if      (wh.op == "=")  match = (lhsVal == rhsVal);
+                    else if (wh.op == "!=") match = (lhsVal != rhsVal);
+                    else if (wh.op == "<")  match = (lhsVal <  rhsVal);
+                    else if (wh.op == ">")  match = (lhsVal >  rhsVal);
+                    else if (wh.op == "<=") match = (lhsVal <= rhsVal);
+                    else if (wh.op == ">=") match = (lhsVal >= rhsVal);
+                }
+            } // end NULL guard
+            if (match) return evalResult(wh.result);
         }
-        return item.caseElse;
+        return evalResult(item.caseElse);
     }
 
     // Phase 40: toUpper helper (used by static methods in Engine)
@@ -6387,6 +6608,12 @@ private:
             int ci = findColIdx(tbl, a);
             if (ci >= 0 && static_cast<size_t>(ci) < row.values.size())
                 return row.values[static_cast<size_t>(ci)];
+            // Arithmetic expression without spaces (e.g. "b-c", "a+1")
+            if (milansql_arith::looksArith(a)) {
+                try {
+                    return milansql_arith::Eval{tbl.columns(), row.values, a, 0}.run();
+                } catch (...) {}
+            }
             return a;  // unquoted literal
         };
 
@@ -6449,13 +6676,15 @@ private:
         // ── Phase 33: Math-Funktionen ────────────────────────────
         if (fn == "ABS") {
             if (args.empty()) return "0";
+            { std::string av = resolveArg(args[0]); if (av.empty() || av == "NULL") return "NULL"; }
             try {
                 double v = std::stod(resolveArg(args[0]));
                 return formatNum(std::abs(v));
-            } catch (...) { return "NaN"; }
+            } catch (...) { return "NULL"; }
         }
         if (fn == "ROUND") {
             if (args.empty()) return "0";
+            { std::string av = resolveArg(args[0]); if (av.empty() || av == "NULL") return "NULL"; }
             try {
                 double v = std::stod(resolveArg(args[0]));
                 if (args.size() >= 2) {
@@ -6514,17 +6743,19 @@ private:
         }
         if (fn == "CEIL") {
             if (args.empty()) return "0";
+            { std::string av = resolveArg(args[0]); if (av.empty() || av == "NULL") return "NULL"; }
             try {
                 double v = std::stod(resolveArg(args[0]));
                 return formatNum(std::ceil(v));
-            } catch (...) { return "NaN"; }
+            } catch (...) { return "NULL"; }
         }
         if (fn == "FLOOR") {
             if (args.empty()) return "0";
+            { std::string av = resolveArg(args[0]); if (av.empty() || av == "NULL") return "NULL"; }
             try {
                 double v = std::stod(resolveArg(args[0]));
                 return formatNum(std::floor(v));
-            } catch (...) { return "NaN"; }
+            } catch (...) { return "NULL"; }
         }
         // ── Phase 34: NULL-Behandlung ────────────────────────────
         if (fn == "IFNULL") {
@@ -7178,10 +7409,16 @@ private:
             return evaluateFunc(fn, funcArgs, tmpTbl, row);
         }
 
-        // Fallback: treat as literal (rejoin)
-        std::string result;
-        for (const auto& t : toks) result += t;
-        return result;
+        // Fallback: rejoin tokens and try arithmetic evaluation
+        std::string joined;
+        for (const auto& t : toks) joined += t;
+        if (milansql_arith::looksArith(joined)) {
+            try {
+                milansql_arith::Eval ev{cols, row.values, joined, 0};
+                return ev.run();
+            } catch (...) {}
+        }
+        return joined;
     }
 
     // Exakter Match, dann Suffix-Match. Uses rfind for schema.table.col → col.
@@ -7347,9 +7584,12 @@ private:
             return c.op == "IN" ? found : !found;
         }
         if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+            if (val.empty() || val == "NULL") return false;  // NULL BETWEEN x AND y = NULL (false in WHERE)
             const std::string sv  = milansql::dateutils::stripQuotes(val);
             const std::string slo = milansql::dateutils::stripQuotes(c.betweenLow);
             const std::string shi = milansql::dateutils::stripQuotes(c.betweenHigh);
+            // NULL bound means result is NULL (false in WHERE)
+            if (slo.empty() || slo == "NULL" || shi.empty() || shi == "NULL") return false;
             bool inRange = false;
             try {
                 double v  = std::stod(sv);
@@ -7368,7 +7608,7 @@ private:
     bool evalExists(const Table& outer, const Row& outerRow,
                     const WhereCondition& c) const {
         const ExistsSpec& spec = c.existsSpec;
-        const Table& sub = getTable(spec.subTable);
+        const Table& sub = getTable(resolveTableName(spec.subTable));
 
         // Hilfsfunktion: Spalte in Tabelle suchen (mit/ohne Tabellenpräfix)
         auto findCI = [](const Table& t, const std::string& ref) -> int {
@@ -7452,6 +7692,7 @@ private:
         if (conds.empty()) return true;
 
         auto evalOne = [&](const WhereCondition& c) -> bool {
+            if (c.isGroup) { return rowMatches(src, row, c.groupConds, c.groupLogic); }
             if (c.op == "EXISTS" || c.op == "NOT EXISTS")
                 return evalExists(src, row, c);
             if (c.isScalarSub) {
@@ -7487,8 +7728,51 @@ private:
                 }
                 return false;
             }
-            size_t ci = colIdx(src, c.col);
-            return ci < row.values.size() && evalCond(row.values[ci], c);
+            // LHS may be an arithmetic expression (e.g. e+d, a*2)
+            std::string lhsVal;
+            int lhsCI = findColIdx(src, c.col);
+            if (lhsCI >= 0 && static_cast<size_t>(lhsCI) < row.values.size()) {
+                lhsVal = row.values[static_cast<size_t>(lhsCI)];
+            } else if (milansql_arith::looksArith(c.col)) {
+                try {
+                    lhsVal = milansql_arith::Eval{src.columns(), row.values, c.col, 0}.run();
+                } catch (...) { return false; }
+            } else {
+                // Fall back to strict colIdx (throws on unknown column)
+                size_t ci2 = colIdx(src, c.col);
+                if (ci2 >= row.values.size()) return false;
+                lhsVal = row.values[ci2];
+            }
+            // Resolve RHS: might be a column ref or arithmetic expression
+            std::string rhsVal = c.val;
+            int rhsCI = findColIdx(src, c.val);
+            if (rhsCI >= 0 && static_cast<size_t>(rhsCI) < row.values.size()) {
+                rhsVal = row.values[static_cast<size_t>(rhsCI)];
+            } else if (milansql_arith::looksArith(c.val)) {
+                try {
+                    rhsVal = milansql_arith::Eval{
+                        src.columns(), row.values, c.val, 0}.run();
+                } catch (...) { rhsVal = c.val; }
+            }
+            WhereCondition tmp = c;
+            tmp.val = rhsVal;
+            // Resolve BETWEEN bounds against row (may be column refs or arithmetic)
+            if (tmp.op == "BETWEEN" || tmp.op == "NOT BETWEEN") {
+                auto resolveBound = [&](const std::string& b) -> std::string {
+                    int bCI = findColIdx(src, b);
+                    if (bCI >= 0 && static_cast<size_t>(bCI) < row.values.size())
+                        return row.values[static_cast<size_t>(bCI)];
+                    if (milansql_arith::looksArith(b)) {
+                        try {
+                            return milansql_arith::Eval{src.columns(), row.values, b, 0}.run();
+                        } catch (...) {}
+                    }
+                    return b;
+                };
+                tmp.betweenLow  = resolveBound(tmp.betweenLow);
+                tmp.betweenHigh = resolveBound(tmp.betweenHigh);
+            }
+            return evalCond(lhsVal, tmp);
         };
 
         if (logic == "AND") {
@@ -7722,8 +8006,10 @@ private:
         if (op == "LIKE")
             return likeMatch(milansql::dateutils::stripQuotes(a),
                              milansql::dateutils::stripQuotes(b));
-        if (op == "IS NULL")     return a == "NULL";
-        if (op == "IS NOT NULL") return a != "NULL";
+        if (op == "IS NULL")     return a.empty() || a == "NULL";
+        if (op == "IS NOT NULL") return !a.empty() && a != "NULL";
+        // NULL semantics: comparisons with NULL return NULL (false in WHERE)
+        if (a.empty() || a == "NULL" || b.empty() || b == "NULL") return false;
         // Phase 64: REGEXP / NOT REGEXP
         if (op == "REGEXP" || op == "NOT REGEXP") {
             try {
@@ -7834,9 +8120,12 @@ private:
         size_t pos;
 
         double resolveCol(const std::string& name) const {
+            const double NaN = std::numeric_limits<double>::quiet_NaN();
             for (size_t i = 0; i < cols.size() && i < vals.size(); ++i)
                 if (cols[i].name == name) {
-                    try { return std::stod(vals[i]); } catch (...) { return 0.0; }
+                    const std::string& v = vals[i];
+                    if (v.empty() || v == "NULL" || v == "null") return NaN;
+                    try { return std::stod(v); } catch (...) { return 0.0; }
                 }
             return 0.0;
         }
@@ -7900,12 +8189,60 @@ private:
                                        const std::vector<std::string>& vals) {
         ArithEval ev{cols, vals, expr, 0};
         double result = ev.eval();
+        if (std::isnan(result)) return "NULL";  // NULL propagation
         // Format: if integer, no decimal point; else up to 6 significant digits
         if (result == std::floor(result) && std::abs(result) < 1e15)
             return std::to_string(static_cast<long long>(result));
         std::ostringstream oss;
         oss << result;
         return oss.str();
+    }
+
+    // Returns true when expr looks like an arithmetic expression rather than a
+    // bare column name: must contain an operator, start with '(', or be a numeric literal.
+    static bool looksArith(const std::string& expr) {
+        if (!expr.empty() && expr[0] == '(') return true;  // parenthesized expression
+        for (char c : expr)
+            if (c == '+' || c == '-' || c == '*' || c == '/')
+                return true;
+        // pure numeric literal: "42", "3.14"
+        if (!expr.empty()) {
+            bool allNum = true;
+            bool hasDot = false;
+            for (size_t i = (expr[0] == '-' ? 1 : 0); i < expr.size(); ++i) {
+                if (expr[i] == '.' && !hasDot) { hasDot = true; continue; }
+                if (!std::isdigit((unsigned char)expr[i])) { allNum = false; break; }
+            }
+            if (allNum) return true;
+        }
+        return false;
+    }
+
+    // Evaluate an arithmetic expression against a specific table row.
+    // Uses suffix-aware column lookup (handles "t1.col" qualifiers).
+    static std::string evalArithExpr(const std::string& expr,
+                                     const Table& src,
+                                     const Row& row) {
+        const auto& cols = src.columns();
+        const auto& vals = row.values;
+
+        // Build a flat columns/values view where the name used for lookup
+        // is always the bare (unqualified) name so ArithEval can resolve it.
+        std::vector<Column> flatCols;
+        std::vector<std::string> flatVals;
+        flatCols.reserve(cols.size());
+        flatVals.reserve(cols.size());
+        for (size_t i = 0; i < cols.size(); ++i) {
+            // strip "table." prefix so expressions like "a+b" work after JOIN
+            const std::string& cn = cols[i].name;
+            auto dot = cn.rfind('.');
+            Column bare(dot != std::string::npos ? cn.substr(dot + 1) : cn,
+                        cols[i].type);
+            flatCols.push_back(bare);
+            flatVals.push_back(i < vals.size() ? vals[i] : "");
+        }
+
+        return evaluateGenExpr(expr, flatCols, flatVals);
     }
 
     // Compute all generated columns (STORED + VIRTUAL) for a row of vals.

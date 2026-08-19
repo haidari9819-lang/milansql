@@ -719,8 +719,9 @@ class MilanHttpServer {
 public:
     MilanHttpServer(int port, const std::string& dbPath,
                     int poolMin = milansql::ConnectionPool::DEFAULT_MIN,
-                    int poolMax = milansql::ConnectionPool::DEFAULT_MAX)
-        : port_(port), dbPath_(dbPath), storage_(dbPath_) {
+                    int poolMax = milansql::ConnectionPool::DEFAULT_MAX,
+                    const std::string& bindAddr = "0.0.0.0")
+        : port_(port), dbPath_(dbPath), storage_(dbPath_), bindAddr_(bindAddr) {
         milansql::g_connectionPool.configure(poolMin, poolMax);
         // Phase 1.2: Initialize structured logger
         milansql::StructuredLogger::global().open();
@@ -741,6 +742,7 @@ public:
 private:
     int port_;
     std::string dbPath_;
+    std::string bindAddr_{"0.0.0.0"};
     milansql::Engine engine_;
     milansql::MilanBinaryStorage storage_;
     mutable std::shared_mutex engineMutex_;  // Phase 173: shared for reads, exclusive for writes
@@ -8289,7 +8291,7 @@ inline void MilanHttpServer::run() {
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = inet_addr(bindAddr_.c_str());
     addr.sin_port        = htons((unsigned short)port_);
 
     bind(srv, (sockaddr*)&addr, sizeof(addr));

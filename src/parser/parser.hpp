@@ -1453,21 +1453,45 @@ public:
             if (!st.empty() && toUpper(st[0]) == "SELECT") {
                 bool hasFrom = false;
                 bool hasFuncTok = false;
-                for (const auto& tok : st) {
-                    if (toUpper(tok) == "FROM") { hasFrom = true; break; }
+                // Find FROM position
+                size_t fromPos90 = st.size();
+                for (size_t ti = 1; ti < st.size(); ++ti) {
+                    if (toUpper(st[ti]) == "FROM") { hasFrom = true; fromPos90 = ti; break; }
                 }
-                if (!hasFrom) {
-                    // Check if any token looks like func( or func(...)
-                    for (size_t ti = 1; ti < st.size(); ++ti) {
-                        const std::string& tok = st[ti];
-                        // Token ends with ( or contains (
-                        if (tok.find('(') != std::string::npos) {
+                // Check SELECT list (before FROM) for any '(' token —
+                // catches both func calls AND parenthesized expressions like (a+b)/2
+                // Also detect arithmetic expressions like b-c, a+b*2+c*3 (no parens)
+                for (size_t ti = 1; ti < fromPos90; ++ti) {
+                    const std::string& tok90 = st[ti];
+                    if (tok90.find('(') != std::string::npos || tok90 == "(") {
+                        hasFuncTok = true; break;
+                    }
+                    // Arithmetic operator not at start (not a negative literal like -3)
+                    for (size_t ci90 = 1; ci90 < tok90.size(); ++ci90) {
+                        char ch90 = tok90[ci90];
+                        if (ch90 == '+' || ch90 == '-' || ch90 == '*' || ch90 == '/') {
                             hasFuncTok = true; break;
                         }
                     }
+                    if (hasFuncTok) break;
                 }
                 // Bug Fix: also route any no-FROM SELECT to parseSelectFull
                 // (handles NULL IS NULL, 1+2, -1*-1, string concat, etc.)
+                // Also check WHERE clause for ( tokens (grouped conditions like WHERE (e>a AND e<b))
+                if (!hasFuncTok && hasFrom) {
+                    bool hasGroupedWhere = false;
+                    bool inWhereSection = false;
+                    for (size_t ti = fromPos90 + 1; ti < st.size(); ++ti) {
+                        std::string tu90 = toUpper(st[ti]);
+                        if (tu90 == "WHERE") { inWhereSection = true; continue; }
+                        if (tu90 == "ORDER" || tu90 == "LIMIT" || tu90 == "GROUP" ||
+                            tu90 == "HAVING" || tu90 == "UNION") break;
+                        if (inWhereSection && st[ti].find('(') != std::string::npos) {
+                            hasGroupedWhere = true; break;
+                        }
+                    }
+                    if (hasGroupedWhere) hasFuncTok = true;
+                }
                 if (hasFuncTok || !hasFrom) {
                     parseSelectFull(input, cmd);
                     return cmd;
@@ -5528,8 +5552,25 @@ private:
                 for (const auto& o :
                      std::vector<std::string>{">=", "<=", "!=", "=", "<", ">"}) {
                     if (opStr == o) {
-                        cond = {tokens[i], o, tokens[i + 2]};
-                        i += 3; parsed = true;
+                        cond.col = tokens[i]; cond.op = o;
+                        std::string rhsExpr = tokens[i+2];
+                        size_t j = i + 3;
+                        static const std::set<std::string> ARITH_STOP2 =
+                            {"AND","OR","ORDER","LIMIT","GROUP","HAVING","UNION",
+                             "INTERSECT","EXCEPT","WHERE"};
+                        while (j < tokens.size()) {
+                            std::string tu2 = toUpper(tokens[j]);
+                            if (ARITH_STOP2.count(tu2)) break;
+                            if (tokens[j]=="+"||tokens[j]=="-"||
+                                tokens[j]=="*"||tokens[j]=="/") {
+                                rhsExpr += tokens[j]; ++j;
+                                if (j < tokens.size() &&
+                                    !ARITH_STOP2.count(toUpper(tokens[j])))
+                                    { rhsExpr += tokens[j]; ++j; }
+                            } else break;
+                        }
+                        cond.val = rhsExpr;
+                        i = j; parsed = true;
                         break;
                     }
                 }
@@ -5863,6 +5904,49 @@ private:
             if (u == "AND") { cmd.whereLogic = "AND"; ++i; continue; }
             if (u == "OR")  { cmd.whereLogic = "OR";  ++i; continue; }
             if (u == "ORDER" || u == "LIMIT" || u == "GROUP") break;
+            // Handle grouping parens: (cond1 AND cond2) -> create group WhereCondition
+            if (u == "(") {
+                ++i;  // skip '('
+                // Find matching ')' at this level
+                int depth = 1;
+                size_t grpEnd = i;
+                while (grpEnd < end && depth > 0) {
+                    if (ft[grpEnd] == "(") ++depth;
+                    else if (ft[grpEnd] == ")") { --depth; if (depth == 0) break; }
+                    if (depth > 0) ++grpEnd;
+                }
+                WhereCondition grpCond;
+                grpCond.isGroup = true;
+                grpCond.groupLogic = "AND";
+                size_t k = i;
+                while (k < grpEnd) {
+                    std::string ku = toUpper(ft[k]);
+                    if (ku == "AND") { grpCond.groupLogic = "AND"; ++k; continue; }
+                    if (ku == "OR")  { grpCond.groupLogic = "OR";  ++k; continue; }
+                    if (ku == "(" || ku == ")") { ++k; continue; }
+                    // Try standard 3-token col op val
+                    if (k + 2 < grpEnd) {
+                        const std::string& mop = ft[k+1];
+                        bool isOp = (mop == "=" || mop == "!=" || mop == "<" ||
+                                     mop == ">" || mop == "<=" || mop == ">=");
+                        if (isOp) {
+                            grpCond.groupConds.push_back({ft[k], ft[k+1], ft[k+2]});
+                            k += 3; continue;
+                        }
+                    }
+                    // Try embedded op in single token
+                    std::string gc, go, gv;
+                    if (extractColOpVal(ft[k], gc, go, gv)) {
+                        grpCond.groupConds.push_back({gc, go, gv});
+                        ++k; continue;
+                    }
+                    ++k;
+                }
+                if (!grpCond.groupConds.empty()) cmd.whereConds.push_back(grpCond);
+                i = grpEnd + 1;  // skip past ')'
+                continue;
+            }
+            if (u == ")") { ++i; continue; }
 
             WhereCondition cond;
             bool parsed = false;
@@ -6059,8 +6143,24 @@ private:
                             parseScalarSubFromFull(ft, i, end, cond.scalarSub);
                             parsed = true;
                         } else {
-                            cond = {ft[i], o, ft[i+2]};
-                            i += 3; parsed = true;
+                            cond.col = ft[i]; cond.op = o;
+                            // Collect full RHS: may be arithmetic like d-2 or b+3*c
+                            std::string rhsExpr = ft[i+2];
+                            size_t j = i + 3;
+                            static const std::set<std::string> ARITH_STOP =
+                                {"AND","OR","ORDER","LIMIT","GROUP","HAVING","UNION",
+                                 "INTERSECT","EXCEPT","WHERE"};
+                            while (j < end) {
+                                std::string tu = toUpper(ft[j]);
+                                if (ARITH_STOP.count(tu)) break;
+                                if (ft[j]=="+"||ft[j]=="-"||ft[j]=="*"||ft[j]=="/") {
+                                    rhsExpr += ft[j]; ++j;
+                                    if (j < end && !ARITH_STOP.count(toUpper(ft[j])))
+                                        { rhsExpr += ft[j]; ++j; }
+                                } else break;
+                            }
+                            cond.val = rhsExpr;
+                            i = j; parsed = true;
                         }
                         break;
                     }
@@ -6123,10 +6223,17 @@ private:
         // Tabellenname
         if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE") {
             spec.subTable = ft[i++];
-            // Optional: Sub-Tabellen-Alias überspringen
+            // Optional: Sub-Tabellen-Alias überspringen (AS x → 2 Tokens; implicit → 1 Token)
             if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE" &&
-                ft[i] != "," && ft[i] != "ORDER" && ft[i] != "LIMIT")
-                ++i;
+                ft[i] != "," && ft[i] != "ORDER" && ft[i] != "LIMIT") {
+                if (toUpper(ft[i]) == "AS") {
+                    ++i;  // skip "AS"
+                    if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE")
+                        ++i;  // skip alias name
+                } else {
+                    ++i;  // implicit alias
+                }
+            }
         }
 
         // WHERE
@@ -6145,7 +6252,16 @@ private:
                     cond.val = ft[i+2];
                     i += 3;
                     spec.conds.push_back(std::move(cond));
-                } else { break; }
+                } else {
+                    // Single-token embedded op: "x.b<t1.b"
+                    std::string ec, eo, ev;
+                    if (ft[i] != ")" && extractColOpVal(ft[i], ec, eo, ev)) {
+                        SubCond cond; cond.col = ec; cond.op = eo; cond.val = ev;
+                        spec.conds.push_back(std::move(cond));
+                        ++i; continue;
+                    }
+                    break;
+                }
             }
         }
 
@@ -6220,9 +6336,15 @@ private:
         // Tabellenname
         if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE")
             cond.existsSpec.subTable = ft[i++];
-        // Optionaler Sub-Tabellen-Alias überspringen
-        if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE")
-            ++i;
+        // Optionaler Sub-Tabellen-Alias überspringen (AS x → 2 Tokens; implicit alias → 1 Token)
+        if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE") {
+            if (toUpper(ft[i]) == "AS") {
+                ++i;  // skip "AS"
+                if (i < end && ft[i] != ")" && toUpper(ft[i]) != "WHERE") ++i;  // skip alias name
+            } else {
+                ++i;  // implicit alias (bare name, no AS keyword)
+            }
+        }
 
         // WHERE: mehrere Bedingungen (Phase 37)
         if (i < end && toUpper(ft[i]) == "WHERE") {
@@ -6240,7 +6362,16 @@ private:
                     sc.val = ft[i+2];
                     i += 3;
                     cond.existsSpec.subConds.push_back(std::move(sc));
-                } else { break; }
+                } else {
+                    // Single-token embedded op: "x.b<t1.b", "a=b", "col>=val"
+                    std::string ec, eo, ev;
+                    if (ft[i] != ")" && extractColOpVal(ft[i], ec, eo, ev)) {
+                        SubCond sc; sc.col = ec; sc.op = eo; sc.val = ev;
+                        cond.existsSpec.subConds.push_back(std::move(sc));
+                        ++i; continue;
+                    }
+                    break;
+                }
             }
             // Legacy-Kompatibilität: erste Bedingung auch in alten Feldern
             if (!cond.existsSpec.subConds.empty()) {
@@ -6507,11 +6638,21 @@ private:
                  "UNNEST",
                  // Phase 97: Time-Series
                  "TIME_BUCKET"};
-        bool hasCase = false, hasFunc = false;
+        bool hasCase = false, hasFunc = false, hasArith = false;
         for (size_t i = selStart; i < fromPos && !(hasCase && hasFunc); ++i) {
             std::string u = toUpper(ft[i]);
             if (u == "CASE") { hasCase = true; continue; }
             for (const auto& f : SFUNCS32) if (u == f) { hasFunc = true; break; }
+            // Detect arithmetic expressions like b-c, a+b*2 (operator not at pos 0)
+            if (!hasArith) {
+                const std::string& tok = ft[i];
+                for (size_t ci = 1; ci < tok.size(); ++ci) {
+                    char ch = tok[ci];
+                    if (ch == '+' || ch == '-' || ch == '*' || ch == '/') {
+                        hasArith = true; break;
+                    }
+                }
+            }
         }
 
         // Phase 37: Scalar Subquery in SELECT-Liste?
@@ -6529,12 +6670,14 @@ private:
         }
 
         if (!aggDetected167) {  // Phase 167: skip column parsing for standalone aggregates
-            if (hasCase || hasFunc || hasScalarSub37 || hasWindowFunc) {
+            if (hasCase || hasFunc || hasArith || hasScalarSub37 || hasWindowFunc) {
                 parseCaseSelectItems(ft, selStart, fromPos, cmd);
             } else {
-                // Group tokens between real commas as single column specs
-                // (preserves "t.depth + 1" and "a AS alias" as single entries)
+                // Group tokens between real commas as single column specs.
+                // Commas inside parentheses (depth > 0) are NOT column separators.
+                // Parentheses are kept so arithmetic evaluator handles precedence.
                 std::string cur;
+                int parenDepth = 0;
                 auto pushCur = [&]() {
                     while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
                     while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
@@ -6542,8 +6685,17 @@ private:
                     cur.clear();
                 };
                 for (size_t i = selStart; i < fromPos; ++i) {
-                    if (ft[i] == ",") { pushCur(); }
-                    else if (ft[i] != "(" && ft[i] != ")") {
+                    if (ft[i] == "(") {
+                        ++parenDepth;
+                        if (!cur.empty()) cur += " ";
+                        cur += "(";
+                    } else if (ft[i] == ")") {
+                        --parenDepth;
+                        if (!cur.empty()) cur += " ";
+                        cur += ")";
+                    } else if (ft[i] == "," && parenDepth == 0) {
+                        pushCur();
+                    } else {
                         if (!cur.empty()) cur += " ";
                         cur += ft[i];
                     }
@@ -6576,6 +6728,39 @@ private:
     // ── Phase 31: SELECT-Liste mit CASE WHEN parsen ──────────────
     // Verarbeitet normale Spalten UND CASE-Ausdrücke in der SELECT-Liste.
     // Ergebnis geht in cmd.selectItems; cmd.hasCaseItems wird gesetzt.
+    // Collect a full arithmetic expression starting at ft[i], up to but not
+    // including a top-level comma, unmatched ')', or a keyword that begins a
+    // new SELECT item (CASE, AS, FROM, ORDER, LIMIT, HAVING, UNION, INTERSECT, EXCEPT).
+    static std::string collectArithExpr(const std::vector<std::string>& ft,
+                                        size_t& i, size_t end) {
+        static const std::vector<std::string> STOPWORDS = {
+            "CASE","AS","FROM","ORDER","LIMIT","HAVING","UNION","INTERSECT","EXCEPT",
+            "WHERE","GROUP","OVER","END"};
+        std::string expr;
+        int depth = 0;
+        while (i < end) {
+            const std::string& tok = ft[i];
+            std::string u = toUpper(tok);
+            if (depth == 0) {
+                if (tok == ",") break;
+                if (tok == ")") break;
+                // stop at standalone keywords (but not inside parens)
+                bool isStop = false;
+                for (const auto& s : STOPWORDS) if (u == s) { isStop = true; break; }
+                if (isStop) break;
+            }
+            if (tok == "(") ++depth;
+            else if (tok == ")") --depth;
+            if (!expr.empty()) expr += " ";
+            expr += tok;
+            ++i;
+        }
+        // trim
+        while (!expr.empty() && expr.front() == ' ') expr.erase(expr.begin());
+        while (!expr.empty() && expr.back()  == ' ') expr.pop_back();
+        return expr;
+    }
+
     static void parseCaseSelectItems(const std::vector<std::string>& ft,
                                      size_t start, size_t end,
                                      ParsedCommand& cmd) {
@@ -6597,48 +6782,140 @@ private:
                     cmd.hasCaseItems = true;
                     continue;
                 }
-                ++i; continue;  // gewöhnliche ( überspringen
+                // Parenthesised arithmetic expression: collect it whole
+                {
+                    SelectItem item;
+                    item.colName = collectArithExpr(ft, i, end);
+                    if (i < end && toUpper(ft[i]) == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                    }
+                    cmd.selectItems.push_back(std::move(item));
+                    cmd.hasCaseItems = true;
+                    continue;
+                }
             }
             if (ft[i] == "," || ft[i] == ")") { ++i; continue; }
 
             std::string u = toUpper(ft[i]);
 
             if (u == "CASE") {
-                // ── CASE WHEN col op val THEN res ... [ELSE res] END [AS alias]
+                // ── CASE [expr] WHEN ... THEN ... [ELSE ...] END [AS alias]
+                // Searched: CASE WHEN col op val THEN res ...
+                // Simple:   CASE expr WHEN val THEN res ...
                 SelectItem item;
                 item.isCaseExpr = true;
                 ++i;  // skip CASE
+
+                // Detect simple vs searched CASE
+                bool isSimpleCase = (i < end && toUpper(ft[i]) != "WHEN");
+                std::string caseSubject;
+                if (isSimpleCase) {
+                    // Collect subject expression until first WHEN/END/ELSE
+                    while (i < end) {
+                        std::string su = toUpper(ft[i]);
+                        if (su == "WHEN" || su == "ELSE" || su == "END") break;
+                        caseSubject += ft[i++];
+                    }
+                }
 
                 while (i < end) {
                     std::string wu = toUpper(ft[i]);
 
                     if (wu == "WHEN") {
                         ++i;  // skip WHEN
-                        // col  op  val  THEN  result
-                        if (i + 4 < end && toUpper(ft[i + 3]) == "THEN") {
+                        if (isSimpleCase) {
+                            // Simple CASE: WHEN <val> THEN <result>
+                            std::string whenVal;
+                            while (i < end && toUpper(ft[i]) != "THEN")
+                                { whenVal += ft[i]; ++i; }
+                            if (i < end) ++i;  // skip THEN
+                            std::string res;
+                            while (i < end) {
+                                std::string nu = toUpper(ft[i]);
+                                if (nu=="WHEN"||nu=="ELSE"||nu=="END") break;
+                                res += ft[i++];
+                            }
                             SelectItem::WhenClause wh;
-                            wh.col    = ft[i];
-                            wh.op     = ft[i + 1];
-                            wh.val    = ft[i + 2];
-                            wh.result = ft[i + 4];
-                            i += 5;
+                            wh.col = caseSubject; wh.op = "=";
+                            wh.val = whenVal; wh.result = res;
                             item.caseWhen.push_back(wh);
-                        } else if (i + 2 < end) {
-                            // Kein THEN gefunden — trotzdem partiell lesen
+                        } else {
+                            // Searched CASE: WHEN <col op val> THEN <result>
+                            std::vector<std::string> condToks;
+                            while (i < end && toUpper(ft[i]) != "THEN")
+                                { condToks.push_back(ft[i]); ++i; }
+                            if (i < end) ++i;  // skip THEN
+                            std::string res;
+                            while (i < end) {
+                                std::string nu = toUpper(ft[i]);
+                                if (nu=="WHEN"||nu=="ELSE"||nu=="END") break;
+                                res += ft[i++];
+                            }
                             SelectItem::WhenClause wh;
-                            wh.col = ft[i]; wh.op = ft[i+1]; wh.val = ft[i+2];
-                            i += 3;
+                            // Try extractColOpVal on first token for embedded ops (e.g., "a<b-3", "c>")
+                            bool condFromExtract = false;
+                            if (!condToks.empty()) {
+                                std::string ec, eo, ev;
+                                if (extractColOpVal(condToks[0], ec, eo, ev)) {
+                                    wh.col = ec; wh.op = eo;
+                                    wh.val = ev;
+                                    // Check if RHS is a scalar subquery: condToks[1]=="(" and "SELECT" follows
+                                    bool rhsIsSubquery = (condToks.size() > 2 &&
+                                                          condToks[1] == "(" &&
+                                                          toUpper(condToks[2]) == "SELECT");
+                                    if (rhsIsSubquery) {
+                                        // Parse as scalar subquery
+                                        size_t subStart = 1;  // points to "("
+                                        size_t subEnd   = condToks.size();
+                                        // parseScalarSubFromFull expects i to point at "("
+                                        // it reads "(" SELECT ... ) and leaves i after ")"
+                                        size_t subI = subStart + 1;  // skip "("
+                                        parseScalarSubFromFull(condToks, subI, subEnd, wh.scalarSubRhs);
+                                        wh.isScalarSubRhs = true;
+                                        wh.val = "";  // not used
+                                    } else {
+                                        for (size_t ci2 = 1; ci2 < condToks.size(); ++ci2)
+                                            wh.val += condToks[ci2];
+                                    }
+                                    condFromExtract = true;
+                                }
+                            }
+                            if (!condFromExtract) {
+                                if (condToks.size() >= 3) {
+                                    wh.col = condToks[0]; wh.op = condToks[1];
+                                    // Check if RHS starts with (SELECT ...
+                                    bool rhsIsSubquery = (condToks[2] == "(" &&
+                                                          condToks.size() > 3 &&
+                                                          toUpper(condToks[3]) == "SELECT");
+                                    if (rhsIsSubquery) {
+                                        size_t subI = 3;  // skip "(" → points to SELECT
+                                        parseScalarSubFromFull(condToks, subI, condToks.size(), wh.scalarSubRhs);
+                                        wh.isScalarSubRhs = true;
+                                        wh.val = "";
+                                    } else {
+                                        for (size_t ci2 = 2; ci2 < condToks.size(); ++ci2)
+                                            wh.val += condToks[ci2];
+                                    }
+                                } else if (condToks.size() == 2) {
+                                    wh.col = condToks[0]; wh.op = condToks[1];
+                                } else if (condToks.size() == 1) {
+                                    wh.col = condToks[0]; wh.op = "=";
+                                }
+                            }
+                            wh.result = res;
                             item.caseWhen.push_back(wh);
                         }
 
                     } else if (wu == "ELSE") {
                         ++i;  // skip ELSE
-                        if (i < end && toUpper(ft[i]) != "END")
-                        { item.caseElse = ft[i]; ++i; }
+                        std::string elseVal;
+                        while (i < end && toUpper(ft[i]) != "END")
+                            { elseVal += ft[i++]; }
+                        item.caseElse = elseVal;
 
                     } else if (wu == "END") {
                         ++i;  // skip END
-                        // optionales AS alias
                         if (i < end && toUpper(ft[i]) == "AS") {
                             ++i;
                             if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
@@ -7008,9 +7285,19 @@ private:
                     }
                     cmd.selectItems.push_back(item);
                 } else {
-                    // Normale Spalte, optional mit AS alias
+                    // Plain column or arithmetic expression.
+                    // Peek ahead: if an arithmetic operator follows the first token,
+                    // collect the full expression rather than just one token.
                     SelectItem item;
-                    item.colName = ft[i]; ++i;
+                    // Check if next token (after ft[i]) is an arithmetic operator
+                    bool nextIsOp = (i + 1 < end) &&
+                                    (ft[i+1] == "+" || ft[i+1] == "-" ||
+                                     ft[i+1] == "*" || ft[i+1] == "/");
+                    if (nextIsOp) {
+                        item.colName = collectArithExpr(ft, i, end);
+                    } else {
+                        item.colName = ft[i]; ++i;
+                    }
                     if (i < end && toUpper(ft[i]) == "AS") {
                         ++i;
                         if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }

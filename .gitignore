@@ -41,3 +41,10 @@ uploads/
 *.log
 build_asan/
 *.bak*
+
+# Test-Build-Verzeichnis (analog zu build/) — enthaelt kompilierte Binary,
+# gehoert nicht ins Repo. Ergaenzt 2026-09-24 beim Bugfix-Commit.
+build-test/
+
+# Laufzeit-Zustand des health-monitor Cronjobs, kein Source-Artefakt.
+scripts/.state/

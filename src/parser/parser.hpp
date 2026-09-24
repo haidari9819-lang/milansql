@@ -2607,7 +2607,13 @@ public:
                     nameIdx = 5;
                 }
                 cmd.tableName = tokens[nameIdx];
-                for (const auto& colDef : splitTrim(parenContent, ',')) {
+                // Bug-Fix (Sep 2026): splitTrim() brach an JEDEM Komma,
+                // auch innerhalb verschachtelter Klammern — ein
+                // CHECK (x IN ('a','b','c')) riss die Spaltenliste an der
+                // ersten Kommastelle im IN-Ausdruck auseinander. splitValues()
+                // ist klammer-/quote-bewusst (wird bereits für VALUES(...)
+                // benutzt) und spaltet nur auf Top-Level-Kommas.
+                for (const auto& colDef : splitValues(parenContent)) {
                     auto parts = tokenize(colDef);
                     if (parts.size() < 2) continue;
 
@@ -2700,25 +2706,78 @@ public:
                             }
                             --i; // loop will ++i
                         // Phase 23: CHECK (colname op val)
+                        // Bug-Fix (Sep 2026): CHECK (colname IN (v1, v2, ...))
+                        // wurde bisher nicht erkannt — die Werteliste konnte
+                        // sich über mehrere Tokens erstrecken (Kommas gefolgt
+                        // von Leerzeichen), während der alte Code strikt genau
+                        // 3 Tokens nach "CHECK" erwartete (col, op, val).
                         } else if (u == "CHECK" && i + 3 < parts.size()) {
                             // parts[i+1] = "(colname"  (führende Klammer anhaftend)
-                            // parts[i+2] = op
-                            // parts[i+3] = "val)"      (abschließende Klammer(n) anhaftend)
                             std::string colPart = parts[i + 1];
                             if (!colPart.empty() && colPart.front() == '(')
                                 colPart = colPart.substr(1);
-                            std::string opStr = parts[i + 2];
-                            std::string valPart = parts[i + 3];
-                            while (!valPart.empty() && valPart.back() == ')')
-                                valPart.pop_back();
-                            if (toUpper(colPart) == toUpper(col.name) &&
-                                !opStr.empty() && !valPart.empty()) {
-                                CheckConstraint cc;
-                                cc.op  = opStr;
-                                cc.val = valPart;
-                                col.checks.push_back(cc);
+
+                            size_t opIdx = i + 2;
+                            std::string opTok = toUpper(parts[opIdx]);
+                            bool isNotIn = false;
+                            if (opTok == "NOT" && opIdx + 1 < parts.size() &&
+                                toUpper(parts[opIdx + 1]) == "IN") {
+                                isNotIn = true;
+                                opTok = "IN";
+                                ++opIdx;
                             }
-                            i += 3;
+
+                            if (toUpper(colPart) == toUpper(col.name) &&
+                                opTok == "IN" && opIdx + 1 < parts.size()) {
+                                // Werteliste über mehrere Tokens einsammeln,
+                                // bis die Klammertiefe unter 0 fällt — das
+                                // markiert die schließende Klammer von CHECK
+                                // selbst (nach der schließenden Klammer der
+                                // IN-Liste). Danach klammer-/quote-bewusst
+                                // mit splitValues() aufteilen (dieselbe
+                                // Funktion, die schon VALUES(...) zerlegt).
+                                std::string listText;
+                                int depth = 0;
+                                size_t j = opIdx + 1;
+                                for (; j < parts.size(); ++j) {
+                                    const std::string& tk = parts[j];
+                                    for (char c : tk) {
+                                        if (c == '(') depth++;
+                                        else if (c == ')') depth--;
+                                    }
+                                    if (!listText.empty()) listText += " ";
+                                    listText += tk;
+                                    if (depth < 0) break;
+                                }
+                                std::string lt = trim(listText);
+                                if (!lt.empty() && lt.back() == ')') lt.pop_back();      // CHECK-Klammer zu
+                                lt = trim(lt);
+                                if (!lt.empty() && lt.front() == '(') lt = lt.substr(1); // IN-Klammer auf
+                                if (!lt.empty() && lt.back() == ')') lt.pop_back();      // IN-Klammer zu
+
+                                CheckConstraint cc;
+                                cc.op = isNotIn ? "NOT IN" : "IN";
+                                for (auto& v : splitValues(lt))
+                                    if (!v.empty()) cc.inList.push_back(v);
+                                if (!cc.inList.empty())
+                                    col.checks.push_back(cc);
+
+                                i = j;
+                            } else if (toUpper(colPart) == toUpper(col.name) &&
+                                       !opTok.empty()) {
+                                // Bestehender Pfad: einfacher Vergleich
+                                // CHECK (col op val), z.B. CHECK (price > 0).
+                                std::string valPart = parts[i + 3];
+                                while (!valPart.empty() && valPart.back() == ')')
+                                    valPart.pop_back();
+                                if (!parts[i + 2].empty() && !valPart.empty()) {
+                                    CheckConstraint cc;
+                                    cc.op  = parts[i + 2];
+                                    cc.val = valPart;
+                                    col.checks.push_back(cc);
+                                }
+                                i += 3;
+                            }
                         }
                     }
                     cmd.columns.push_back(std::move(col));

@@ -1512,9 +1512,14 @@ struct ProcExec {
             if (!sc.orderByCols.empty()) dispatch_sortWithVector(result, sc.orderByCols);
             dispatch_printTable(result, sc.limit, sc.limitOffset);
         } else if (sc.type == milansql::CommandType::UPDATE) {
+            // Bug-Fix (Sep 2026): mehrere WHERE-Bedingungen (AND/OR) —
+            // siehe Kommentar bei CommandType::UPDATE weiter unten.
             std::size_t n = 0;
             if (sc.whereColumn.empty())
                 n = engine.updateAll(sc.tableName, sc.updateCols, sc.updateVals);
+            else if (sc.whereConds.size() >= 2)
+                n = engine.updateWhereConds(sc.tableName, sc.updateCols, sc.updateVals,
+                                            sc.whereConds, sc.whereLogic);
             else
                 n = engine.updateWhere(sc.tableName, sc.updateCols, sc.updateVals,
                                        sc.whereColumn, sc.whereValue);
@@ -1529,6 +1534,8 @@ struct ProcExec {
         } else if (sc.type == milansql::CommandType::DELETE) {
             std::size_t n = 0;
             if (sc.whereColumn.empty()) n = engine.deleteAll(sc.tableName);
+            else if (sc.whereConds.size() >= 2)
+                n = engine.deleteWhereConds(sc.tableName, sc.whereConds, sc.whereLogic);
             else n = engine.deleteWhere(sc.tableName, sc.whereColumn, sc.whereValue);
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
             persistFn();
@@ -3787,10 +3794,19 @@ inline bool dispatchCommand(
             std::cout << "  " << n << " Zeile(n) aktualisiert"
                       << " (SET " << setDesc << ")\n\n";
         } else {
-            std::size_t n = engine.updateWhere(
-                cmd.tableName,
-                cmd.updateCols, cmd.updateVals,
-                cmd.whereColumn, cmd.whereValue);
+            // Bug-Fix (Sep 2026): cmd.whereColumn/cmd.whereValue sind nur
+            // die ERSTE WHERE-Bedingung (Backward-Compat, siehe parser.hpp).
+            // Bei mehreren AND/OR-Bedingungen (cmd.whereConds) muss die
+            // volle Liste ausgewertet werden, sonst werden weitere
+            // Bedingungen lautlos ignoriert und zu viele Zeilen geändert.
+            std::size_t n = (cmd.whereConds.size() >= 2)
+                ? engine.updateWhereConds(
+                      cmd.tableName, cmd.updateCols, cmd.updateVals,
+                      cmd.whereConds, cmd.whereLogic)
+                : engine.updateWhere(
+                      cmd.tableName,
+                      cmd.updateCols, cmd.updateVals,
+                      cmd.whereColumn, cmd.whereValue);
             if (n > 0) {
                 persistFn();
                 dispatch_binlogWrite(eingabe);
@@ -3853,8 +3869,11 @@ inline bool dispatchCommand(
             }
             std::cout << "  " << n << " Zeile(n) geloescht.\n\n";
         } else {
-            std::size_t n = engine.deleteWhere(
-                cmd.tableName, cmd.whereColumn, cmd.whereValue);
+            // Bug-Fix (Sep 2026): siehe Kommentar im UPDATE-Fall oben —
+            // mehrere WHERE-Bedingungen brauchen die volle Liste.
+            std::size_t n = (cmd.whereConds.size() >= 2)
+                ? engine.deleteWhereConds(cmd.tableName, cmd.whereConds, cmd.whereLogic)
+                : engine.deleteWhere(cmd.tableName, cmd.whereColumn, cmd.whereValue);
             if (n > 0) {
                 persistFn();
                 dispatch_binlogWrite(eingabe);
@@ -4601,10 +4620,15 @@ inline bool dispatchCommand(
                     dispatch_sortWithVector(result, sc.orderByCols);
                 dispatch_printTable(result, sc.limit, sc.limitOffset);
             } else if (sc.type == milansql::CommandType::UPDATE) {
+                // Bug-Fix (Sep 2026): mehrere WHERE-Bedingungen (AND/OR).
                 std::size_t n = 0;
                 if (sc.whereColumn.empty()) {
                     n = engine.updateAll(sc.tableName,
                         sc.updateCols, sc.updateVals);
+                } else if (sc.whereConds.size() >= 2) {
+                    n = engine.updateWhereConds(sc.tableName,
+                        sc.updateCols, sc.updateVals,
+                        sc.whereConds, sc.whereLogic);
                 } else {
                     n = engine.updateWhere(sc.tableName,
                         sc.updateCols, sc.updateVals,
@@ -4625,6 +4649,9 @@ inline bool dispatchCommand(
                 std::size_t n = 0;
                 if (sc.whereColumn.empty()) {
                     n = engine.deleteAll(sc.tableName);
+                } else if (sc.whereConds.size() >= 2) {
+                    n = engine.deleteWhereConds(sc.tableName,
+                        sc.whereConds, sc.whereLogic);
                 } else {
                     n = engine.deleteWhere(sc.tableName,
                         sc.whereColumn, sc.whereValue);

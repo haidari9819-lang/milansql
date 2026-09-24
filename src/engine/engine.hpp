@@ -157,8 +157,10 @@ constexpr size_t MAX_IN_LIST       = 10000;     // Max elements in IN (...) list
 
 // Phase 23: CHECK Constraint (pro Spalte)
 struct CheckConstraint {
-    std::string op;   // =, !=, <, >, <=, >=
-    std::string val;  // rechte Seite (Literal)
+    std::string op;   // =, !=, <, >, <=, >=, IN, NOT IN
+    std::string val;  // rechte Seite (Literal) — für einfache Vergleiche
+    // Bug-Fix (Sep 2026): Werteliste für CHECK (col IN (v1, v2, ...)).
+    std::vector<std::string> inList;
 };
 
 struct Column {
@@ -1569,15 +1571,15 @@ public:
 
     // Phase 148: PREPARE TRANSACTION
     void prepareTx(const std::string& xid) {
-        if (!inTransaction_)
+        if (!tx().active)
             throw std::runtime_error("PREPARE TRANSACTION: no active transaction.");
         distTxManager.prepare(xid);
-        for (const auto& op : txBuffer_) applyOp(op);
-        txBuffer_.clear();
-        savepointStack_.clear();
+        for (const auto& op : tx().txBuffer) applyOp(op);
+        tx().txBuffer.clear();
+        tx().savepoints.clear();
         g_lockManager.releaseRowLocks(std::this_thread::get_id());
-        if (mvccTxId_ != 0) { txManager_.commitTx(mvccTxId_); mvccTxId_ = 0; }
-        inTransaction_ = false;
+        if (tx().mvccTxId != 0) { txManager_.commitTx(tx().mvccTxId); tx().mvccTxId = 0; }
+        tx().active = false;
         checkpointMgr_.onCommit();
     }
     bool commitPrepared(const std::string& xid) {
@@ -1638,7 +1640,7 @@ public:
 
     // Phase 151: return pending WAL buffer size
     size_t txBufferSize() const {
-        return txBuffer_.size();
+        return tx().txBuffer.size();
     }
 
     // ── Phase 75: Row-Level Security ──────────────────────────
@@ -1799,7 +1801,7 @@ public:
                 throw std::runtime_error(signalMsg);
         }
 
-        if (inTransaction_) {
+        if (tx().active) {
             if (vals.size() != t.columns().size())
                 throw std::invalid_argument(
                     "Zeilenbreite (" + std::to_string(vals.size()) +
@@ -1809,7 +1811,7 @@ public:
             op.tableName = tbl;
             op.values    = std::move(vals);
             appendWal(op);
-            txBuffer_.push_back(std::move(op));
+            tx().txBuffer.push_back(std::move(op));
             return;
         }
         // Phase 176: Route to partition child if table is partitioned
@@ -1882,7 +1884,7 @@ public:
     bool insertOrReplace(const std::string& tblRaw, std::vector<std::string> vals) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
-        if (inTransaction_)
+        if (tx().active)
             throw std::runtime_error("INSERT OR REPLACE nicht innerhalb einer Transaktion.");
         Table& t = getTable(tbl);
         applyDefaults(t, vals);
@@ -1903,7 +1905,7 @@ public:
     bool insertOrIgnore(const std::string& tblRaw, std::vector<std::string> vals) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("INSERT", tbl);  // Phase 46: access control
-        if (inTransaction_)
+        if (tx().active)
             throw std::runtime_error("INSERT OR IGNORE nicht innerhalb einer Transaktion.");
         Table& t = getTable(tbl);
         applyDefaults(t, vals);
@@ -2866,7 +2868,7 @@ public:
                     const std::string& newName,    // nur für RENAME
                     const std::string& defaultValue = "") {  // Phase 146: DEFAULT value for ADD
         auto tblName = resolveTableName(tblNameRaw);
-        if (inTransaction_) {
+        if (tx().active) {
             BufferedOp bufOp;
             bufOp.opType       = BufferedOp::Type::ALTER;
             bufOp.tableName    = tblName;
@@ -2875,7 +2877,7 @@ public:
             bufOp.alterColType = colType;
             bufOp.alterColNew  = newName;
             appendWal(bufOp);
-            txBuffer_.push_back(std::move(bufOp));
+            tx().txBuffer.push_back(std::move(bufOp));
             return;
         }
         Table& t = getTable(tblName);
@@ -2942,14 +2944,14 @@ public:
         }
 
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
-        if (inTransaction_) {
+        if (tx().active) {
             BufferedOp op;
             op.opType    = BufferedOp::Type::UPDATE_WHERE;
             op.tableName = tbl;
             op.setCol    = setCol;  op.setVal  = setVal;
             op.whereCol  = wCol;    op.whereVal = wVal;
             appendWal(op);
-            txBuffer_.push_back(std::move(op));
+            tx().txBuffer.push_back(std::move(op));
             return 0;
         }
         Table& t = getTable(tbl);
@@ -2967,13 +2969,13 @@ public:
             throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
         WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         checkSetConstraints(tbl, {setCol}, {setVal});  // Phase 23
-        if (inTransaction_) {
+        if (tx().active) {
             BufferedOp op;
             op.opType    = BufferedOp::Type::UPDATE_ALL;
             op.tableName = tbl;
             op.setCol    = setCol;  op.setVal = setVal;
             appendWal(op);
-            txBuffer_.push_back(std::move(op));
+            tx().txBuffer.push_back(std::move(op));
             return 0;
         }
         Table& t = getTable(tbl);
@@ -3044,13 +3046,13 @@ public:
                 throw std::runtime_error(signalMsg);
         }
 
-        if (inTransaction_) {
+        if (tx().active) {
             BufferedOp op;
             op.opType    = BufferedOp::Type::DELETE_WHERE;
             op.tableName = tbl;
             op.whereCol  = wCol;  op.whereVal = wVal;
             appendWal(op);
-            txBuffer_.push_back(std::move(op));
+            tx().txBuffer.push_back(std::move(op));
             return 0;
         }
         Table& t = getTable(tbl);
@@ -3154,7 +3156,7 @@ public:
 
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
 
-        if (inTransaction_) {
+        if (tx().active) {
             // In Transaktion: als mehrere Einzel-Ops puffern
             for (size_t k = 0; k < setCols.size() && k < setVals.size(); ++k)
                 updateWhere(tbl, setCols[k], setVals[k], wCol, wVal);
@@ -3241,7 +3243,7 @@ public:
         checkPrivilege("UPDATE", tbl);  // Phase 46: access control
         WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
         checkSetConstraints(tbl, setCols, setVals);  // Phase 23
-        if (inTransaction_) {
+        if (tx().active) {
             for (size_t k = 0; k < setCols.size() && k < setVals.size(); ++k)
                 updateAll(tbl, setCols[k], setVals[k]);
             return 0;
@@ -3259,6 +3261,212 @@ public:
         return n;
     }
 
+    // Bug-Fix (Sep 2026): UPDATE ... WHERE mit mehreren Bedingungen (AND/OR).
+    // dispatch.hpp/der alte updateWhere(...) reichten nur die ERSTE
+    // WHERE-Bedingung durch (cmd.whereColumn/cmd.whereValue); jede weitere
+    // AND-Bedingung wurde lautlos ignoriert, wodurch mehr Zeilen betroffen
+    // waren als die Klausel erlaubte. Diese Variante nimmt die volle
+    // Bedingungsliste (cmd.whereConds/cmd.whereLogic) und wertet sie über
+    // rowMatches() aus — dieselbe Logik, die SELECT für WHERE benutzt.
+    std::size_t updateWhereConds(const std::string& tblRaw,
+                                  const std::vector<std::string>& setCols,
+                                  const std::vector<std::string>& setVals,
+                                  const std::vector<WhereCondition>& conds,
+                                  const std::string& logic) {
+        if (conds.size() <= 1) {
+            // Einzelbedingung (oder keine WHERE) — bestehender Pfad.
+            return updateWhere(tblRaw, setCols, setVals,
+                                conds.empty() ? std::string() : conds[0].col,
+                                conds.empty() ? std::string() : conds[0].val);
+        }
+        if (tx().active)
+            throw std::runtime_error(
+                "UPDATE mit mehreren WHERE-Bedingungen ist innerhalb einer "
+                "expliziten Transaktion (BEGIN) aktuell nicht unterstützt. "
+                "Bitte ohne BEGIN/COMMIT ausführen, oder die laufende "
+                "Transaktion vorher committen/zurückrollen.");
+
+        auto tbl = resolveTableName(tblRaw);
+        checkPrivilege("UPDATE", tbl);  // Phase 46: access control
+        if (!g_lockManager.checkWriteAllowed(tbl))
+            throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
+
+        Table& t = getTable(tbl);
+
+        // Phase 170: RLS enforcement for UPDATE
+        if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+            for (const auto& row : t.rows()) {
+                if (rowMatches(t, row, conds, logic)) {
+                    auto allowed = applyRls_(tbl, {row}, "UPDATE");
+                    if (allowed.empty())
+                        throw std::runtime_error("RLS policy violation: UPDATE denied on " + tbl);
+                }
+            }
+        }
+
+        checkSetConstraints(tbl, setCols, setVals);  // Phase 23
+
+        std::vector<std::size_t> setCIs;
+        for (const auto& col : setCols) setCIs.push_back(colIdx(t, col));
+
+        // Phase 43: collect old rows for BEFORE/AFTER UPDATE triggers
+        std::vector<std::vector<std::string>> oldRows;
+        for (const auto& row : t.rows())
+            if (rowMatches(t, row, conds, logic))
+                oldRows.push_back(row.values);
+
+        for (auto& oldVals : oldRows) {
+            std::vector<std::string> newVals = oldVals;
+            for (size_t k = 0; k < setCIs.size() && k < setVals.size(); ++k)
+                if (setCIs[k] < newVals.size()) newVals[setCIs[k]] = setVals[k];
+            std::string signalMsg;
+            if (!fireAllTriggers("BEFORE", "UPDATE", tbl, newVals, oldVals, signalMsg))
+                throw std::runtime_error(signalMsg);
+        }
+
+        std::size_t n = 0;
+        for (auto& row : t.mutableRows()) {
+            if (rowMatches(t, row, conds, logic)) {
+                for (size_t k = 0; k < setCIs.size() && k < setVals.size(); ++k) {
+                    if (setCIs[k] < row.values.size()) {
+                        std::string resolved = evalSetExpr(setVals[k], t.columns(), row);
+                        row.values[setCIs[k]] = resolved;
+                    }
+                }
+                applyGeneratedCols(t, row.values);  // Phase 68
+                if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+                    if (!checkRlsWithCheck_(tbl, row, "UPDATE"))
+                        throw std::runtime_error("RLS WITH CHECK violation: UPDATE would create row that violates policy on " + tbl);
+                }
+                ++n;
+            }
+        }
+        if (n) {
+            t.rebuildIndexes();
+            bufferPool_.markDirty(tbl);  // Phase 73
+            g_autoAnalyze().recordChange(tbl, n);  // Phase 3 Block 4
+        }
+
+        // Phase 49: Update fulltext indexes for this table
+        for (auto& [fn, fi] : fulltextIndices_)
+            if (fi.tableName == tbl) buildFulltextIndex(fi, tables_[tbl]);
+
+        // Phase 43: AFTER UPDATE triggers + Phase 98: CDC hook
+        bool cdcOn = cdcMgr_.isEnabled(tbl);
+        std::vector<std::string> colNames;
+        if (cdcOn) for (const auto& c : t.columns()) colNames.push_back(c.name);
+        for (auto& oldVals : oldRows) {
+            std::vector<std::string> newVals = oldVals;
+            for (size_t k = 0; k < setCIs.size() && k < setVals.size(); ++k)
+                if (setCIs[k] < newVals.size()) newVals[setCIs[k]] = setVals[k];
+            std::string signalMsg;
+            fireAllTriggers("AFTER", "UPDATE", tbl, newVals, oldVals, signalMsg);
+            if (cdcOn) cdcMgr_.recordUpdate(tbl, colNames, oldVals, newVals);
+        }
+
+        return n;
+    }
+
+    // Bug-Fix (Sep 2026): DELETE ... WHERE mit mehreren Bedingungen (AND/OR).
+    // Gegenstück zu updateWhereConds() oben — siehe dortiger Kommentar.
+    std::size_t deleteWhereConds(const std::string& tblRaw,
+                                  const std::vector<WhereCondition>& conds,
+                                  const std::string& logic) {
+        if (conds.size() <= 1) {
+            return deleteWhere(tblRaw,
+                                conds.empty() ? std::string() : conds[0].col,
+                                conds.empty() ? std::string() : conds[0].val);
+        }
+        if (tx().active)
+            throw std::runtime_error(
+                "DELETE mit mehreren WHERE-Bedingungen ist innerhalb einer "
+                "expliziten Transaktion (BEGIN) aktuell nicht unterstützt. "
+                "Bitte ohne BEGIN/COMMIT ausführen, oder die laufende "
+                "Transaktion vorher committen/zurückrollen.");
+
+        auto tbl = resolveTableName(tblRaw);
+        if (partitionMeta_.count(tbl) && partitionMeta_.at(tbl).physical) {
+            // Partitionierte Tabellen: Mehrfachbedingungen konservativ
+            // ablehnen statt (wie der Einzelbedingungs-Pfad es täte) nur
+            // nach der ersten Bedingung zu löschen.
+            throw std::runtime_error(
+                "DELETE mit mehreren WHERE-Bedingungen wird für "
+                "partitionierte Tabellen aktuell nicht unterstützt.");
+        }
+        checkPrivilege("DELETE", tbl);  // Phase 46: access control
+        if (!g_lockManager.checkWriteAllowed(tbl))
+            throw std::runtime_error("Tabelle '" + tbl + "' ist durch LOCK TABLE READ gesperrt.");
+        WriteScope ws(getOrCreateRwLock(tbl), tbl);  // Phase 112: exclusive write lock
+
+        Table& t = getTable(tbl);
+
+        // Phase 170: RLS enforcement for DELETE
+        if (isRlsEnabled(tbl) && currentUser_ != "root" && !currentUser_.empty()) {
+            for (const auto& row : t.rows()) {
+                if (rowMatches(t, row, conds, logic)) {
+                    auto allowed = applyRls_(tbl, {row}, "DELETE");
+                    if (allowed.empty())
+                        throw std::runtime_error("RLS policy violation: DELETE denied on " + tbl);
+                }
+            }
+        }
+
+        // Phase 43: Collect matched rows for BEFORE/AFTER DELETE triggers
+        std::vector<std::vector<std::string>> matchedRows;
+        for (const auto& row : t.rows())
+            if (rowMatches(t, row, conds, logic))
+                matchedRows.push_back(row.values);
+
+        // Phase 21: CASCADE / SET NULL / RESTRICT für betroffene Zeilen
+        for (const auto& row : t.rows())
+            if (rowMatches(t, row, conds, logic))
+                cascadeDelete(tbl, row);
+
+        // Phase 43: BEFORE DELETE triggers
+        for (auto& rowVals : matchedRows) {
+            std::string signalMsg;
+            std::vector<std::string> emptyNew;
+            if (!fireAllTriggers("BEFORE", "DELETE", tbl, emptyNew, rowVals, signalMsg))
+                throw std::runtime_error(signalMsg);
+        }
+
+        auto& mrows = t.mutableRows();
+        std::size_t before = mrows.size();
+        mrows.erase(std::remove_if(mrows.begin(), mrows.end(),
+                    [&](const Row& r) { return rowMatches(t, r, conds, logic); }),
+                    mrows.end());
+        std::size_t deleted = before - mrows.size();
+        if (deleted) {
+            t.rebuildIndexes();
+            vacuumMgr_.addDeadTuples(tbl, deleted);        // Phase 85
+            g_autoAnalyze().recordChange(tbl, deleted);    // Phase 3 Block 4
+            bufferPool_.markDirty(tbl);                    // Phase 73
+        }
+
+        // Phase 49: Update fulltext indexes for this table
+        for (auto& [fn2, fi] : fulltextIndices_)
+            if (fi.tableName == tbl) buildFulltextIndex(fi, tables_[tbl]);
+
+        // Phase 43: AFTER DELETE triggers
+        for (auto& rowVals : matchedRows) {
+            std::string signalMsg;
+            std::vector<std::string> emptyNew;
+            fireAllTriggers("AFTER", "DELETE", tbl, emptyNew, rowVals, signalMsg);
+        }
+
+        // Phase 98: CDC hook for DELETE
+        if (deleted > 0 && cdcMgr_.isEnabled(tbl)) {
+            const auto& t_ref = getTable(tbl);
+            std::vector<std::string> colNames;
+            for (const auto& c : t_ref.columns()) colNames.push_back(c.name);
+            for (auto& rowVals : matchedRows)
+                cdcMgr_.recordDelete(tbl, colNames, rowVals);
+        }
+
+        return deleted;
+    }
+
     std::size_t deleteAll(const std::string& tblRaw) {
         auto tbl = resolveTableName(tblRaw);
         checkPrivilege("DELETE", tbl);  // Phase 46: access control
@@ -3270,12 +3478,12 @@ public:
             for (const auto& row : rowsCopy)
                 cascadeDelete(tbl, row);
         }
-        if (inTransaction_) {
+        if (tx().active) {
             BufferedOp op;
             op.opType    = BufferedOp::Type::DELETE_ALL;
             op.tableName = tbl;
             appendWal(op);
-            txBuffer_.push_back(std::move(op));
+            tx().txBuffer.push_back(std::move(op));
             return 0;
         }
         std::size_t nDel = getTable(tbl).deleteAll();
@@ -3300,26 +3508,33 @@ public:
 
     // ── Phase 17: Transaktionen ──────────────────────────────
 
-    bool isInTransaction() const { return inTransaction_; }
+    bool isInTransaction() const { return tx().active; }
 
     // BEGIN: WAL-Datei anlegen, Puffer leeren, Transaktion starten
     void beginTransaction(const std::string& walPath) {
-        if (inTransaction_)
+        if (tx().active)
             throw std::runtime_error("Transaktion bereits aktiv.");
-        walPath_ = walPath;
+        // Bug-Fix (Sep 2026): eigene WAL-Datei pro Session. Zwei parallele
+        // Transaktionen dürfen sich keine WAL-Datei teilen — sonst würde
+        // rollbackTransaction()/deleteWal() einer Session die WAL-Datei
+        // einer noch aktiven Transaktion einer anderen Session löschen.
+        std::string sessSuffix = currentSession_.empty()
+            ? std::string("default")
+            : std::to_string(std::hash<std::string>{}(currentSession_));
+        tx().walPath = walPath + ".sess_" + sessSuffix;
         // Phase 71: MVCC — start versioned transaction
         // Phase 72: Write TX_BEGIN marker (WAL cleared at startup by recovery, not here)
-        mvccTxId_ = txManager_.beginTx(isolationLevel_);
+        tx().mvccTxId = txManager_.beginTx(isolationLevel_);
         {
-            std::ofstream wal(walPath_, std::ios::app);
+            std::ofstream wal(tx().walPath, std::ios::app);
             if (wal) {
-                wal << "TX_BEGIN:" << mvccTxId_ << "\n";
+                wal << "TX_BEGIN:" << tx().mvccTxId << "\n";
                 wal << "TS:" << std::time(nullptr) << "\n";  // Phase 178: PITR timestamp
             }
         }
-        inTransaction_ = true;
-        txBuffer_.clear();
-        savepointStack_.clear();         // Phase 64
+        tx().active = true;
+        tx().txBuffer.clear();
+        tx().savepoints.clear();         // Phase 64
     }
 
     // COMMIT: alle gepufferten Ops auf Tabellen anwenden,
@@ -3327,26 +3542,26 @@ public:
     //         Phase 72: TX_COMMIT in WAL schreiben; WAL wird erst nach persist gelöscht.
     //         Persistierung (save) + deleteWal() muss der Aufrufer danach selbst machen.
     void applyAndCommit() {
-        if (!inTransaction_)
+        if (!tx().active)
             throw std::runtime_error("Keine aktive Transaktion.");
-        for (const auto& op : txBuffer_)
+        for (const auto& op : tx().txBuffer)
             applyOp(op);
-        txBuffer_.clear();
-        savepointStack_.clear();         // Phase 64
+        tx().txBuffer.clear();
+        tx().savepoints.clear();         // Phase 64
         g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
         // Phase 71: MVCC commit — mark tx as committed, then clear txId
-        uint64_t commitId = mvccTxId_;
-        if (mvccTxId_ != 0) {
-            txManager_.commitTx(mvccTxId_);
-            mvccTxId_ = 0;
+        uint64_t commitId = tx().mvccTxId;
+        if (tx().mvccTxId != 0) {
+            txManager_.commitTx(tx().mvccTxId);
+            tx().mvccTxId = 0;
         }
-        inTransaction_ = false;
+        tx().active = false;
         // Phase 72: Write TX_COMMIT to WAL so recovery knows this tx was committed.
         // WAL is deleted by caller (dispatch) AFTER successful persist.
         // Bug #20 fix: fsync WAL before acknowledging commit to prevent data loss on crash.
-        if (!walPath_.empty() && commitId != 0) {
+        if (!tx().walPath.empty() && commitId != 0) {
             {
-                std::ofstream wal(walPath_, std::ios::app);
+                std::ofstream wal(tx().walPath, std::ios::app);
                 if (wal) {
                     std::string line = "TX_COMMIT:" + std::to_string(commitId);
                     uint32_t crc = walCrc32(line);
@@ -3357,7 +3572,7 @@ public:
                 }
             }
             // fsync the WAL file to ensure commit record is on disk
-            FILE* wf = std::fopen(walPath_.c_str(), "r");
+            FILE* wf = std::fopen(tx().walPath.c_str(), "r");
             if (wf) {
                 MILAN_FSYNC(fileno(wf));
                 std::fclose(wf);
@@ -3366,7 +3581,7 @@ public:
             // bei TX_BEGIN neu angelegt — ohne Verzeichnis-fsync kann
             // ihr Verzeichniseintrag den Crash nicht überleben und die
             // committete Transaktion wäre trotz Datei-fsync weg.
-            milanFsyncDir(walPath_);
+            milanFsyncDir(tx().walPath);
         }
         // Phase 85: track committed transaction for checkpointing
         checkpointMgr_.onCommit();
@@ -3375,21 +3590,21 @@ public:
     // ROLLBACK: Puffer verwerfen, Transaktion abbrechen, WAL löschen.
     //           Die Tabellen bleiben unverändert.
     void rollbackTransaction() {
-        if (!inTransaction_)
+        if (!tx().active)
             throw std::runtime_error("Keine aktive Transaktion.");
-        txBuffer_.clear();
-        savepointStack_.clear();         // Phase 64
+        tx().txBuffer.clear();
+        tx().savepoints.clear();         // Phase 64
         g_lockManager.releaseRowLocks(std::this_thread::get_id());  // Phase 65
         // Phase 71: MVCC rollback — remove tx from active set (not committed)
-        uint64_t rollbackId = mvccTxId_;
-        if (mvccTxId_ != 0) {
-            txManager_.rollbackTx(mvccTxId_);
-            mvccTxId_ = 0;
+        uint64_t rollbackId = tx().mvccTxId;
+        if (tx().mvccTxId != 0) {
+            txManager_.rollbackTx(tx().mvccTxId);
+            tx().mvccTxId = 0;
         }
-        inTransaction_ = false;
+        tx().active = false;
         // Phase 72: Write TX_ROLLBACK, then clean up WAL
-        if (!walPath_.empty() && rollbackId != 0) {
-            std::ofstream wal(walPath_, std::ios::app);
+        if (!tx().walPath.empty() && rollbackId != 0) {
+            std::ofstream wal(tx().walPath, std::ios::app);
             if (wal) wal << "TX_ROLLBACK:" << rollbackId << "\n";
         }
         deleteWal();
@@ -3398,18 +3613,18 @@ public:
     // ── Phase 64: SAVEPOINT ──────────────────────────────────────
 
     void createSavepoint(const std::string& name) {
-        if (!inTransaction_)
+        if (!tx().active)
             throw std::runtime_error("SAVEPOINT erfordert eine aktive Transaktion (BEGIN).");
-        savepointStack_.push_back({name, txBuffer_.size()});
+        tx().savepoints.push_back({name, tx().txBuffer.size()});
     }
 
     void rollbackToSavepoint(const std::string& name) {
-        if (!inTransaction_)
+        if (!tx().active)
             throw std::runtime_error("Keine aktive Transaktion.");
-        for (int i = static_cast<int>(savepointStack_.size()) - 1; i >= 0; --i) {
-            if (savepointStack_[static_cast<size_t>(i)].name == name) {
-                txBuffer_.resize(savepointStack_[static_cast<size_t>(i)].txSize);
-                savepointStack_.resize(static_cast<size_t>(i));
+        for (int i = static_cast<int>(tx().savepoints.size()) - 1; i >= 0; --i) {
+            if (tx().savepoints[static_cast<size_t>(i)].name == name) {
+                tx().txBuffer.resize(tx().savepoints[static_cast<size_t>(i)].txSize);
+                tx().savepoints.resize(static_cast<size_t>(i));
                 return;
             }
         }
@@ -3417,11 +3632,11 @@ public:
     }
 
     void releaseSavepoint(const std::string& name) {
-        if (!inTransaction_)
+        if (!tx().active)
             throw std::runtime_error("Keine aktive Transaktion.");
-        for (int i = static_cast<int>(savepointStack_.size()) - 1; i >= 0; --i) {
-            if (savepointStack_[static_cast<size_t>(i)].name == name) {
-                savepointStack_.resize(static_cast<size_t>(i));
+        for (int i = static_cast<int>(tx().savepoints.size()) - 1; i >= 0; --i) {
+            if (tx().savepoints[static_cast<size_t>(i)].name == name) {
+                tx().savepoints.resize(static_cast<size_t>(i));
                 return;
             }
         }
@@ -3461,8 +3676,8 @@ public:
 
     // WAL-Datei löschen (wird auch von main.cpp beim Start aufgerufen)
     void deleteWal() {
-        if (!walPath_.empty())
-            std::remove(walPath_.c_str());
+        if (!tx().walPath.empty())
+            std::remove(tx().walPath.c_str());
     }
 
     // ── Metadaten ─────────────────────────────────────────────
@@ -8257,6 +8472,33 @@ private:
     // ── Phase 23: CHECK Constraint Prüfung ───────────────────
 
     // INSERT: prüft alle CHECK-Bedingungen für alle Spalten.
+    // Bug-Fix (Sep 2026): CHECK (col IN (...)) / NOT IN durchsetzen.
+    // compareValues() kennt nur binäre Vergleichsoperatoren (=, !=, <, ...),
+    // deshalb wird IN/NOT IN hier separat gegen cc.inList geprüft.
+    static bool evalCheckConstraint(const std::string& val, const CheckConstraint& cc) {
+        if (cc.op == "IN" || cc.op == "NOT IN") {
+            const std::string vs = milansql::dateutils::stripQuotes(val);
+            bool found = false;
+            for (const auto& lv : cc.inList)
+                if (milansql::dateutils::stripQuotes(lv) == vs) { found = true; break; }
+            return (cc.op == "IN") ? found : !found;
+        }
+        return compareValues(val, cc.op, cc.val);
+    }
+
+    static std::string describeCheck(const CheckConstraint& cc) {
+        if (cc.op == "IN" || cc.op == "NOT IN") {
+            std::string s = cc.op + " (";
+            for (size_t k = 0; k < cc.inList.size(); ++k) {
+                if (k) s += ", ";
+                s += cc.inList[k];
+            }
+            s += ")";
+            return s;
+        }
+        return cc.op + " " + cc.val;
+    }
+
     void checkAllConstraints(const std::string& tblName,
                              const std::vector<std::string>& vals) const {
         const Table& t = getTable(tblName);
@@ -8265,10 +8507,10 @@ private:
             if (col.checks.empty()) continue;
             if (vals[i] == "NULL") continue;   // NULL überspringt CHECK
             for (const auto& cc : col.checks)
-                if (!compareValues(vals[i], cc.op, cc.val))
+                if (!evalCheckConstraint(vals[i], cc))
                     throw std::runtime_error(
                         "CHECK constraint verletzt: " + col.name +
-                        " " + cc.op + " " + cc.val);
+                        " " + describeCheck(cc));
         }
     }
 
@@ -8300,10 +8542,10 @@ private:
             if (col.checks.empty()) continue;
             if (setVals[k] == "NULL") continue;
             for (const auto& cc : col.checks)
-                if (!compareValues(setVals[k], cc.op, cc.val))
+                if (!evalCheckConstraint(setVals[k], cc))
                     throw std::runtime_error(
                         "CHECK constraint verletzt: " + col.name +
-                        " " + cc.op + " " + cc.val);
+                        " " + describeCheck(cc));
         }
     }
 
@@ -8398,8 +8640,8 @@ private:
 
     // Op an WAL-Datei anhängen (append-only, Text-Format)
     void appendWal(const BufferedOp& op) {
-        if (walPath_.empty()) return;
-        std::ofstream wal(walPath_, std::ios::app);
+        if (tx().walPath.empty()) return;
+        std::ofstream wal(tx().walPath, std::ios::app);
         if (!wal) return;
         wal << "OP " << static_cast<int>(op.opType)
             << " " << op.tableName << "\n";
@@ -8440,7 +8682,7 @@ private:
                 Table& t = getTable(op.tableName);
                 t.insert(Row(op.values));
                 // Phase 71: stamp xmin on newly committed row
-                if (mvccTxId_ != 0) t.stampXminLast(mvccTxId_);
+                if (tx().mvccTxId != 0) t.stampXminLast(tx().mvccTxId);
                 break;
             }
             case BufferedOp::Type::UPDATE_WHERE: {
@@ -8465,9 +8707,9 @@ private:
             }
             case BufferedOp::Type::DELETE_WHERE: {
                 Table& t = getTable(op.tableName);
-                if (mvccTxId_ != 0) {
+                if (tx().mvccTxId != 0) {
                     // Phase 71: MVCC logical delete — stamp xmax instead of physical remove
-                    std::size_t stamped = t.stampDeleteWhere(colIdx(t, op.whereCol), op.whereVal, mvccTxId_);
+                    std::size_t stamped = t.stampDeleteWhere(colIdx(t, op.whereCol), op.whereVal, tx().mvccTxId);
                     if (stamped) vacuumMgr_.addDeadTuples(op.tableName, stamped);  // Phase 85
                 } else {
                     std::size_t del = t.deleteWhere(colIdx(t, op.whereCol), op.whereVal);
@@ -8476,11 +8718,11 @@ private:
                 break;
             }
             case BufferedOp::Type::DELETE_ALL: {
-                if (mvccTxId_ != 0) {
+                if (tx().mvccTxId != 0) {
                     // Phase 71: MVCC logical delete all
                     Table& tda = getTable(op.tableName);
                     std::size_t before = tda.rowCount();
-                    tda.stampDeleteAll(mvccTxId_);
+                    tda.stampDeleteAll(tx().mvccTxId);
                     vacuumMgr_.addDeadTuples(op.tableName, before);  // Phase 85
                 } else {
                     getTable(op.tableName).deleteAll();
@@ -8488,7 +8730,7 @@ private:
                 break;
             }
             case BufferedOp::Type::ALTER: {
-                // Direkt ausführen (inTransaction_ ist hier schon false
+                // Direkt ausführen (tx().active ist hier schon false
                 // oder wir rufen den inneren ALTER-Zweig auf)
                 Table& t = getTable(op.tableName);
                 if (op.alterOp == "ADD") {
@@ -8794,21 +9036,51 @@ public:
     std::map<std::string, std::string> views_;   // Phase 24: name → SQL
     std::set<std::string> tempTableNames_;        // Phase 41: CTE-Tabellennamen
 
-    // Transaktionszustand
-    bool                     inTransaction_ = false;
-    std::string              walPath_;
-    std::vector<BufferedOp>  txBuffer_;
-
-    // Phase 64: SAVEPOINT stack
+    // Phase 64: SAVEPOINT stack entry (lives inside per-session TxState below)
     struct SavepointEntry {
         std::string name;
-        std::size_t txSize;  // txBuffer_.size() when savepoint was created
+        std::size_t txSize;  // txBuffer.size() when savepoint was created
     };
-    std::vector<SavepointEntry> savepointStack_;
+
+    // Bug-Fix (Sep 2026): Transaktionszustand war bisher global auf der
+    // Engine (ein einziges tx().active/tx().txBuffer/tx().walPath/tx().mvccTxId für
+    // ALLE Verbindungen/Sessions). Ein ROLLBACK einer Session konnte
+    // dadurch Schreibvorgänge einer völlig anderen, parallelen Session mit
+    // verwerfen, weil beide sich denselben tx().txBuffer teilten. Fix: Zustand
+    // liegt jetzt pro Session (keyed by Bearer-Token, siehe
+    // setCurrentSession()) in sessionTx_ — jede Session hat ihren eigenen
+    // Puffer, ihre eigene WAL-Datei und ihre eigene MVCC-Tx-ID.
+    struct TxState {
+        bool                         active = false;
+        std::string                  walPath;
+        std::vector<BufferedOp>      txBuffer;
+        std::vector<SavepointEntry>  savepoints;
+        uint64_t                     mvccTxId = 0;  // current tx's MVCC ID (0 = none)
+    };
+    std::map<std::string, TxState> sessionTx_;      // key: session/connection id
+    std::string                    currentSession_; // set per-request via setCurrentSession()
+
+    // Bindet den Engine-Aufruf für die Dauer dieses Requests an eine
+    // Session (Bearer-Token o.ä.). Muss von MilanHttpServer VOR jeder
+    // BEGIN/COMMIT/ROLLBACK/Write-Operation gesetzt werden, damit
+    // Transaktionszustand nicht mehr zwischen Sessions leakt. Requests
+    // ohne erkennbare Session landen im ""-Eimer (frühere globale
+    // Semantik, z.B. interne Batch-Restore-Pfade).
+    void setCurrentSession(const std::string& key) { currentSession_ = key; }
+
+    // Liefert den Transaktionszustand der aktuell gebundenen Session.
+    TxState& tx() { return sessionTx_[currentSession_]; }
+    // const-Überladung für const-Methoden (isInTransaction(), txBufferSize()):
+    // legt bei Abfrage keinen neuen Eintrag an, liefert stattdessen einen
+    // statischen "inaktiv"-Default, wenn die Session noch keine Transaktion hat.
+    const TxState& tx() const {
+        static const TxState kEmpty;
+        auto it = sessionTx_.find(currentSession_);
+        return it != sessionTx_.end() ? it->second : kEmpty;
+    }
 
     // Phase 71: MVCC
     TransactionManager txManager_;
-    uint64_t           mvccTxId_      = 0;  // current tx's MVCC ID (0 = none)
     std::string        isolationLevel_ = "REPEATABLE READ";
 
     // Phase 46: User management
@@ -9540,27 +9812,15 @@ public:
             for (size_t ci = 0; ci < cols.size() && ci < row.values.size(); ++ci) {
                 for (const auto& chk : cols[ci].checks) {
                     const std::string& val = row.values[ci];
-                    bool pass = true;
-                    try {
-                        double lv = std::stod(val);
-                        double rv = std::stod(chk.val);
-                        if      (chk.op == ">")  pass = lv >  rv;
-                        else if (chk.op == ">=") pass = lv >= rv;
-                        else if (chk.op == "<")  pass = lv <  rv;
-                        else if (chk.op == "<=") pass = lv <= rv;
-                        else if (chk.op == "=")  pass = lv == rv;
-                        else if (chk.op == "!=") pass = lv != rv;
-                    } catch (...) {
-                        // String comparison
-                        if      (chk.op == "=")  pass = val == chk.val;
-                        else if (chk.op == "!=") pass = val != chk.val;
-                    }
-                    if (!pass) {
+                    // Bug-Fix (Sep 2026): dieselbe Auswertung wie beim
+                    // INSERT/UPDATE (evalCheckConstraint) benutzen, statt
+                    // einer eigenen Kopie, die IN/NOT IN nicht kannte.
+                    if (!evalCheckConstraint(val, chk)) {
                         res.ok = false;
                         res.issues.push_back(
                             "CHECK constraint violated in column '" +
-                            cols[ci].name + "': " + val + " " + chk.op +
-                            " " + chk.val + " is false");
+                            cols[ci].name + "': " + val + " " +
+                            describeCheck(chk) + " is false");
                     }
                 }
             }

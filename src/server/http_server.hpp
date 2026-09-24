@@ -791,7 +791,12 @@ private:
     void handleClient(sock_t clientSock);
     std::string handleRequest(const HttpRequest& req, const std::string& clientIp = "");
     std::string handleQuery(const std::string& sql);
-    std::string handleQueryForUser(const std::string& sql, int userId, const std::string& userRole);
+    // sessionKey: bindet BEGIN/COMMIT/ROLLBACK an die aufrufende Session statt
+    // an die Engine global (Bug-Fix Sep 2026, siehe engine::setCurrentSession).
+    // Default "" nur für interne Batch-Pfade, die keine mehrfach-Request-
+    // Transaktion offenhalten (Restore, NL-SQL, Migrate) — nicht für /query.
+    std::string handleQueryForUser(const std::string& sql, int userId, const std::string& userRole,
+                                    const std::string& sessionKey = "");
     std::string handleListTables();
     std::string handleListTablesForUser(int userId);
     std::string handleDescribeTable(const std::string& tableName);
@@ -1600,8 +1605,16 @@ inline std::string MilanHttpServer::handleRestore(const std::string& token,
 
 // ── MilanHttpServer::handleQueryForUser (Phase 154-155) ───────
 
-inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, int userId, const std::string& userRole) {
+inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, int userId, const std::string& userRole,
+                                                         const std::string& sessionKey) {
     std::unique_lock<std::shared_mutex> lock(engineMutex_);
+
+    // Bug-Fix (Sep 2026): BEGIN/COMMIT/ROLLBACK und alle Schreiboperationen
+    // dieses Requests binden sich an sessionKey statt an einen globalen
+    // Engine-Zustand — siehe Engine::setCurrentSession(). Ohne das hätte ein
+    // ROLLBACK aus Session A auch gepufferte Schreibvorgänge einer parallel
+    // laufenden Session B verworfen, weil beide denselben Puffer teilten.
+    engine_.setCurrentSession(sessionKey);
 
     bool isRoot = (userId <= 0 || userRole == "root");
     bool isService = (userRole == "service");  // service accounts: no table prefix, but rate-limited
@@ -2512,6 +2525,12 @@ inline std::string MilanHttpServer::handleListTablesForUser(int userId) {
 
 inline std::string MilanHttpServer::handleQuery(const std::string& sql) {
     std::unique_lock<std::shared_mutex> lock(engineMutex_);
+
+    // Bug-Fix (Sep 2026): eigener, fixer Session-Key statt eines
+    // stehengebliebenen Werts aus dem vorherigen handleQueryForUser()-Call —
+    // sonst würde z.B. Binlog-Replay in die Transaktion einer fremden
+    // HTTP-Session hineinschreiben (siehe Engine::setCurrentSession()).
+    engine_.setCurrentSession("__internal__");
 
     auto persistFn = [this]() {
         if (engine_.isInTransaction()) return;
@@ -6301,6 +6320,23 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
             return buildHttpResponse(401, R"({"success":false,"error":"Authentication required"})");
         }
 
+        // Bug-Fix (Sep 2026): Session-Key für BEGIN/COMMIT/ROLLBACK-Bindung.
+        // Muss die konkrete Verbindung/den konkreten Login identifizieren,
+        // NICHT nur den userId — zwei parallele Logins desselben Users
+        // (z.B. zwei root-Tokens) sind zwei verschiedene Sessions und dürfen
+        // sich keine Transaktion teilen (siehe Engine::setCurrentSession()).
+        std::string sessionKey;
+        {
+            std::string bearerTok = extractBearerToken(req);
+            if (!bearerTok.empty()) {
+                sessionKey = "B:" + bearerTok;
+            } else {
+                std::string apiKeyTok = extractApiKey(req);
+                if (!apiKeyTok.empty()) sessionKey = "K:" + apiKeyTok;
+                else sessionKey = "U:" + std::to_string(vr.userId) + ":" + vr.username;
+            }
+        }
+
         // Rate limit by userId or IP (tiered)
         std::string rlKey = vr.userId > 0 ? std::to_string(vr.userId) : clientIp;
         // Assign tier based on role — check every request so first request gets correct tier
@@ -6380,7 +6416,7 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         std::string queryResult;
         {
             auto fut = std::async(std::launch::async, [&]() {
-                return handleQueryForUser(sql, vr.userId, vr.role);
+                return handleQueryForUser(sql, vr.userId, vr.role, sessionKey);
             });
             if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::timeout) {
                 return buildHttpResponse(504,

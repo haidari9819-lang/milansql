@@ -646,29 +646,46 @@ struct Eval {
 
     double factor() {
         skipWS();
+
+        // Bug-Fix (Sep 2026): siehe identischer Kommentar bei
+        // ArithEval::parseFactor() weiter oben — dieselbe Vorzeichen-Logik
+        // war hier dupliziert und hatte denselben Bug ("+ 39", "-col0",
+        // "- col0" lieferten 0.0). Schleife statt Einzel-if: der Fuzz-
+        // Testkorpus erzeugt auch MEHRERE aufeinanderfolgende Vorzeichen
+        // ("- - col0", "- + 32"), die ein Einzel-if nicht abdeckt.
+        bool neg = false;
+        while (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) {
+            if (expr[pos] == '-') neg = !neg;
+            ++pos;
+            skipWS();
+        }
+
+        double v;
         if (pos < expr.size() && expr[pos] == '(') {
-            ++pos; double v = sum(); skipWS();
+            ++pos; v = sum(); skipWS();
             if (pos < expr.size() && expr[pos] == ')') ++pos;
-            return v;
+        } else {
+            size_t start = pos;
+            // digits
+            while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
+            if (pos > start) {
+                try { v = std::stod(expr.substr(start, pos - start)); }
+                catch (...) { v = 0.0; }
+            } else {
+                pos = start;
+                // identifier
+                while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
+                if (pos > start) {
+                    std::string tok = expr.substr(start, pos - start);
+                    try { v = std::stod(tok); }
+                    catch (...) { v = resolveIdent(tok); }
+                } else {
+                    if (pos < expr.size()) ++pos;
+                    v = 0.0;
+                }
+            }
         }
-        size_t start = pos;
-        // optional sign
-        if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
-        // digits
-        while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
-        if (pos > start) {
-            try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
-        }
-        pos = start;
-        // identifier
-        while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
-        if (pos > start) {
-            std::string tok = expr.substr(start, pos - start);
-            try { return std::stod(tok); } catch (...) {}
-            return resolveIdent(tok);
-        }
-        if (pos < expr.size()) ++pos;
-        return 0.0;
+        return neg ? -v : v;
     }
 
     double term() {
@@ -8347,31 +8364,54 @@ private:
 
         double parseFactor() {
             while (pos < expr.size() && expr[pos] == ' ') ++pos;
+
+            // Bug-Fix (Sep 2026): optionales Vorzeichen VOR Klammer/Zahl/
+            // Identifier separat behandeln, statt es blind an die Ziffern-
+            // Erkennung anzuhängen. Vorher: "+ 39" (Leerzeichen nach dem
+            // Vorzeichen) und "-col0"/"- col0" (Vorzeichen vor Spaltenname)
+            // lieferten beide 0.0 — stod("+")/stod("-") warf eine Exception,
+            // und der Identifier-Zweig griff nie, weil er ab dem
+            // Vorzeichen-Zeichen (kein Alnum) ansetzte. Schleife statt
+            // Einzel-if: der Fuzz-Testkorpus erzeugt auch MEHRERE
+            // aufeinanderfolgende Vorzeichen ("+ + col0", "- + 32",
+            // "- col2 DIV - 46", ...), was diese Correctness-Sprint-Änderung
+            // faktisch zu einer flächendeckenden Regression machte.
+            bool neg = false;
+            while (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) {
+                if (expr[pos] == '-') neg = !neg;
+                ++pos;
+                while (pos < expr.size() && expr[pos] == ' ') ++pos;  // Whitespace nach Vorzeichen
+            }
+
+            double v;
             if (pos < expr.size() && expr[pos] == '(') {
                 ++pos;
-                double v = parseExpr();
+                v = parseExpr();
                 while (pos < expr.size() && expr[pos] == ' ') ++pos;
                 if (pos < expr.size() && expr[pos] == ')') ++pos;
-                return v;
+            } else {
+                // Read token: number or identifier
+                size_t start = pos;
+                while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
+                if (pos > start) {
+                    try { v = std::stod(expr.substr(start, pos - start)); }
+                    catch (...) { v = 0.0; }
+                } else {
+                    pos = start;
+                    // identifier
+                    while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
+                    if (pos > start) {
+                        std::string tok = expr.substr(start, pos - start);
+                        // check if numeric
+                        try { v = std::stod(tok); }
+                        catch (...) { v = resolveCol(tok); }
+                    } else {
+                        if (pos < expr.size()) ++pos;
+                        v = 0.0;
+                    }
+                }
             }
-            // Read token: number or identifier
-            size_t start = pos;
-            if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
-            while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
-            if (pos > start) {
-                try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
-            }
-            pos = start;
-            // identifier
-            while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
-            if (pos > start) {
-                std::string tok = expr.substr(start, pos - start);
-                // check if numeric
-                try { return std::stod(tok); } catch (...) {}
-                return resolveCol(tok);
-            }
-            ++pos;
-            return 0.0;
+            return neg ? -v : v;
         }
 
         double parseTerm() {

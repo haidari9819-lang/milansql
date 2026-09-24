@@ -688,11 +688,29 @@ struct Eval {
         return neg ? -v : v;
     }
 
+    // Bug-Fix (Sep 2026): DIV (SQL-Integer-Division, Ganzzahl-Trunkierung
+    // Richtung Null) war überhaupt nicht als Operator erkannt — "20 DIV -97"
+    // wurde von term()/parseTerm() nach der "20" einfach abgebrochen (kein
+    // '*'/'/' gefunden), das restliche " DIV -97" nie konsumiert, Ergebnis
+    // war stillschweigend "20" statt des berechneten Werts.
+    bool atDiv() const {
+        if (pos + 3 > expr.size()) return false;
+        if (std::toupper((unsigned char)expr[pos])   != 'D') return false;
+        if (std::toupper((unsigned char)expr[pos+1]) != 'I') return false;
+        if (std::toupper((unsigned char)expr[pos+2]) != 'V') return false;
+        if (pos + 3 < expr.size()) {
+            char after = expr[pos+3];
+            if (std::isalnum((unsigned char)after) || after == '_') return false;
+        }
+        return true;
+    }
+
     double term() {
         double v = factor();
         while (true) { skipWS();
             if (pos < expr.size() && expr[pos] == '*') { ++pos; v *= factor(); }
             else if (pos < expr.size() && expr[pos] == '/') { ++pos; double r = factor(); v = r ? v/r : 0.0; }
+            else if (atDiv()) { pos += 3; double r = factor(); v = r ? std::trunc(v / r) : 0.0; }
             else break;
         }
         return v;
@@ -721,6 +739,21 @@ struct Eval {
 inline bool looksArith(const std::string& s) {
     if (!s.empty() && s[0] == '(') return true;  // parenthesized expression
     for (char c : s) if (c == '+' || c == '-' || c == '*' || c == '/') return true;
+    // Bug-Fix (Sep 2026): DIV ist ein Wort-Operator (kein Symbol) — ohne
+    // diesen Check wurde z.B. "20 DIV 6" (enthält kein +/-/*//) nie als
+    // arithmetischer Ausdruck erkannt, sondern als unbekannter Spaltenname
+    // behandelt ("Spalte '20 DIV 6' nicht gefunden").
+    {
+        std::string up = s;
+        for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        size_t p = 0;
+        while ((p = up.find("DIV", p)) != std::string::npos) {
+            bool leftOk  = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+            bool rightOk = (p + 3 >= up.size()) || !(std::isalnum((unsigned char)up[p+3]) || up[p+3] == '_');
+            if (leftOk && rightOk) return true;
+            p += 3;
+        }
+    }
     // pure numeric literal
     if (!s.empty()) {
         bool ok = true; bool dot = false;
@@ -8414,12 +8447,28 @@ private:
             return neg ? -v : v;
         }
 
+        // Bug-Fix (Sep 2026): siehe identischer Kommentar bei
+        // milansql_arith::Eval::term() weiter oben — DIV war überhaupt
+        // nicht als Operator erkannt.
+        bool atDiv() const {
+            if (pos + 3 > expr.size()) return false;
+            if (std::toupper((unsigned char)expr[pos])   != 'D') return false;
+            if (std::toupper((unsigned char)expr[pos+1]) != 'I') return false;
+            if (std::toupper((unsigned char)expr[pos+2]) != 'V') return false;
+            if (pos + 3 < expr.size()) {
+                char after = expr[pos+3];
+                if (std::isalnum((unsigned char)after) || after == '_') return false;
+            }
+            return true;
+        }
+
         double parseTerm() {
             double lhs = parseFactor();
             while (pos < expr.size()) {
                 while (pos < expr.size() && expr[pos] == ' ') ++pos;
                 if (pos < expr.size() && expr[pos] == '*') { ++pos; lhs *= parseFactor(); }
                 else if (pos < expr.size() && expr[pos] == '/') { ++pos; double r = parseFactor(); lhs = (r != 0.0 ? lhs / r : 0.0); }
+                else if (atDiv()) { pos += 3; double r = parseFactor(); lhs = (r != 0.0) ? std::trunc(lhs / r) : 0.0; }
                 else break;
             }
             return lhs;
@@ -8460,6 +8509,20 @@ private:
         for (char c : expr)
             if (c == '+' || c == '-' || c == '*' || c == '/')
                 return true;
+        // Bug-Fix (Sep 2026): siehe identischer Kommentar bei
+        // milansql_arith::looksArith() weiter oben — DIV ist ein Wort-
+        // Operator ohne Symbol und wurde sonst nie erkannt.
+        {
+            std::string up = expr;
+            for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            size_t p = 0;
+            while ((p = up.find("DIV", p)) != std::string::npos) {
+                bool leftOk  = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+                bool rightOk = (p + 3 >= up.size()) || !(std::isalnum((unsigned char)up[p+3]) || up[p+3] == '_');
+                if (leftOk && rightOk) return true;
+                p += 3;
+            }
+        }
         // pure numeric literal: "42", "3.14"
         if (!expr.empty()) {
             bool allNum = true;

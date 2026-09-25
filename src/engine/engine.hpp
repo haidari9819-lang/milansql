@@ -677,8 +677,16 @@ struct Eval {
                 while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
                 if (pos > start) {
                     std::string tok = expr.substr(start, pos - start);
-                    try { v = std::stod(tok); }
-                    catch (...) { v = resolveIdent(tok); }
+                    // Bug-Fix (Sep 2026): NULL als Literal erkennen (NaN =
+                    // Propagation), statt es als unbekannte Spalte über
+                    // resolveIdent() fälschlich auf 0.0 aufzulösen.
+                    std::string tokUp = tok;
+                    for (char& c2 : tokUp) c2 = static_cast<char>(std::toupper((unsigned char)c2));
+                    if (tokUp == "NULL") { v = std::numeric_limits<double>::quiet_NaN(); }
+                    else {
+                        try { v = std::stod(tok); }
+                        catch (...) { v = resolveIdent(tok); }
+                    }
                 } else {
                     if (pos < expr.size()) ++pos;
                     v = 0.0;
@@ -764,6 +772,210 @@ inline bool looksArith(const std::string& s) {
         if (ok) return true;
     }
     return false;
+}
+
+// ── Bug-Fix (Sep 2026): Aggregatfunktionen/CAST innerhalb arithmetischer
+// SELECT-Ausdrücke (z.B. "COUNT(*) * -46", "CAST(col1 AS INTEGER) * col1") ──
+// Table::project() (unten) ist der Pfad, der für einfache "SELECT ausdruck
+// FROM tabelle"-Queries tatsächlich verwendet wird (nicht Engine::project-
+// WithItems, das nur bei CASE/Funktions-Items greift). Der Parser erkennt
+// COUNT/SUM/AVG/MIN/MAX nur, wenn sie ALLEIN einen SELECT-Eintrag bilden;
+// sobald Arithmetik drumherum steht, landet der gesamte Text als EIN
+// Spaltenname/Ausdruck hier. looksArith() sah das enthaltene +/-/* und
+// evaluierte PRO ZEILE über Eval — das kennt aber keine Funktionsaufrufe,
+// löste "COUNT"/"SUM"/"CAST" als unbekannte Spalte zu 0.0 auf.
+//
+// Diese Funktionen erkennen einen enthaltenen Aggregat-Aufruf, werten sein
+// Argument über ALLE Zeilen aus (Standard-SQL: SUM(67) über N Zeilen =
+// 67*N) und ersetzen den Aufruf im Ausdruckstext durch den berechneten
+// Skalar. Table::project() nutzt das, um für aggregat-haltige Ausdrücke
+// nur EINE Ergebniszeile zu liefern statt einer pro Quellzeile.
+
+inline bool containsAggCall(const std::string& s) {
+    static const char* AGGF[] = {"COUNT", "SUM", "AVG", "MIN", "MAX"};
+    std::string up = s;
+    for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+    for (const char* fnameC : AGGF) {
+        std::string fname = fnameC;
+        size_t p = up.find(fname);
+        while (p != std::string::npos) {
+            bool leftOk = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+            size_t k = p + fname.size();
+            while (k < up.size() && up[k] == ' ') ++k;
+            if (leftOk && k < up.size() && up[k] == '(') return true;
+            p = up.find(fname, p + fname.size());
+        }
+    }
+    return false;
+}
+
+inline std::string formatNumArith(double v) {
+    long long iv = static_cast<long long>(v);
+    if (static_cast<double>(iv) == v) return std::to_string(iv);
+    std::string s = std::to_string(v);
+    auto dot = s.find('.');
+    if (dot != std::string::npos) {
+        size_t last = s.find_last_not_of('0');
+        if (last == dot) return s.substr(0, dot);
+        return s.substr(0, last + 1);
+    }
+    return s;
+}
+
+// CAST(expr AS TYPE) innerhalb eines Ausdrucks durch den pro Zeile
+// berechneten Wert ersetzen (NULL propagiert dank NULL-Literal-Erkennung
+// in Eval::factor() korrekt weiter).
+inline std::string substituteCastCalls(const std::string& exprIn,
+                                        const std::vector<Column>& cols,
+                                        const std::vector<std::string>& vals) {
+    std::string expr = exprIn;
+    for (int iter = 0; iter < 8; ++iter) {
+        std::string up = expr;
+        for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+        size_t p = up.find("CAST");
+        bool replaced = false;
+        while (p != std::string::npos) {
+            bool leftOk = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+            size_t k = p + 4;
+            while (k < up.size() && up[k] == ' ') ++k;
+            if (leftOk && k < up.size() && up[k] == '(') {
+                size_t openPos = k;
+                int depth = 0; size_t q = openPos;
+                for (; q < up.size(); ++q) {
+                    if (up[q] == '(') depth++;
+                    else if (up[q] == ')') { depth--; if (depth == 0) break; }
+                }
+                if (q < up.size() && depth == 0) {
+                    std::string inner = expr.substr(openPos + 1, q - openPos - 1);
+                    std::string innerUp = inner;
+                    for (char& c2 : innerUp) c2 = static_cast<char>(std::toupper((unsigned char)c2));
+                    size_t asPos = innerUp.rfind(" AS ");
+                    std::string valExpr = (asPos != std::string::npos) ? inner.substr(0, asPos) : inner;
+                    size_t a = valExpr.find_first_not_of(" \t");
+                    size_t b = valExpr.find_last_not_of(" \t");
+                    valExpr = (a == std::string::npos) ? "" : valExpr.substr(a, b - a + 1);
+                    std::string valUp = valExpr;
+                    for (char& c2 : valUp) c2 = static_cast<char>(std::toupper((unsigned char)c2));
+                    std::string computed;
+                    if (valUp == "NULL") computed = "NULL";
+                    else { Eval ev{cols, vals, valExpr, 0}; computed = ev.run(); }
+                    expr = expr.substr(0, p) + computed + expr.substr(q + 1);
+                    replaced = true;
+                    break;
+                }
+            }
+            p = up.find("CAST", p + 4);
+        }
+        if (!replaced) break;
+    }
+    return expr;
+}
+
+inline std::string computeAggOverRows(const std::vector<Column>& cols,
+                                       const std::vector<Row>& rows,
+                                       const std::string& func,
+                                       const std::string& argRawIn) {
+    auto trimStr = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t");
+        size_t b = s.find_last_not_of(" \t");
+        return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string argRaw = trimStr(argRawIn);
+    std::string argUp = argRaw;
+    for (char& c : argUp) c = static_cast<char>(std::toupper((unsigned char)c));
+    bool distinct = false;
+    if (argUp.rfind("DISTINCT", 0) == 0)      { distinct = true; argRaw = trimStr(argRaw.substr(8)); }
+    else if (argUp.rfind("ALL", 0) == 0)      { argRaw = trimStr(argRaw.substr(3)); }
+
+    if (func == "COUNT" && argRaw == "*") {
+        std::size_t n = 0;
+        for (const auto& row : rows) if (row.xmax == 0) ++n;
+        return std::to_string(n);
+    }
+
+    int ci = -1;
+    for (size_t i = 0; i < cols.size(); ++i) if (cols[i].name == argRaw) { ci = static_cast<int>(i); break; }
+
+    std::vector<double> nums;
+    std::set<std::string> seen;
+    std::size_t countNonNull = 0;
+    for (const auto& row : rows) {
+        if (row.xmax != 0) continue;
+        std::string valStr;
+        if (ci >= 0) {
+            valStr = (static_cast<size_t>(ci) < row.values.size()) ? row.values[static_cast<size_t>(ci)] : "";
+        } else {
+            // Konstante oder arithmetischer Ausdruck (evtl. mit CAST) — pro Zeile auswerten.
+            std::string sub = substituteCastCalls(argRaw, cols, row.values);
+            Eval ev{cols, row.values, sub, 0};
+            valStr = ev.run();
+        }
+        if (valStr.empty() || valStr == "NULL") continue;
+        if (distinct) { if (seen.count(valStr)) continue; seen.insert(valStr); }
+        ++countNonNull;
+        try { nums.push_back(std::stod(valStr)); } catch (...) {}
+    }
+    if (func == "COUNT") return std::to_string(countNonNull);
+    if (nums.empty()) return "NULL";
+    if (func == "MIN") return formatNumArith(*std::min_element(nums.begin(), nums.end()));
+    if (func == "MAX") return formatNumArith(*std::max_element(nums.begin(), nums.end()));
+    if (func == "SUM") { double s = 0; for (double v : nums) s += v; return formatNumArith(s); }
+    if (func == "AVG") { double s = 0; for (double v : nums) s += v; return formatNumArith(s / static_cast<double>(nums.size())); }
+    return "NULL";
+}
+
+inline std::string substituteAggCalls(const std::string& exprIn,
+                                       const std::vector<Column>& cols,
+                                       const std::vector<Row>& rows) {
+    std::string expr = exprIn;
+    static const char* AGGF[] = {"COUNT", "SUM", "AVG", "MIN", "MAX"};
+    for (int iter = 0; iter < 8; ++iter) {
+        std::string up = expr;
+        for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+        bool replaced = false;
+        for (const char* fnameC : AGGF) {
+            std::string fname = fnameC;
+            size_t p = up.find(fname);
+            while (p != std::string::npos) {
+                bool leftOk = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+                size_t k = p + fname.size();
+                while (k < up.size() && up[k] == ' ') ++k;
+                if (leftOk && k < up.size() && up[k] == '(') {
+                    size_t openPos = k;
+                    int depth = 0; size_t q = openPos;
+                    for (; q < up.size(); ++q) {
+                        if (up[q] == '(') depth++;
+                        else if (up[q] == ')') { depth--; if (depth == 0) break; }
+                    }
+                    if (q < up.size() && depth == 0) {
+                        std::string inner = expr.substr(openPos + 1, q - openPos - 1);
+                        std::string val = computeAggOverRows(cols, rows, fname, inner);
+                        expr = expr.substr(0, p) + val + expr.substr(q + 1);
+                        replaced = true;
+                        break;
+                    }
+                }
+                p = up.find(fname, p + fname.size());
+            }
+            if (replaced) break;
+        }
+        if (!replaced) break;
+    }
+    return expr;
+}
+
+inline std::string evalAggWrappedExpr(const std::string& expr,
+                                       const std::vector<Column>& cols,
+                                       const std::vector<Row>& rows) {
+    std::string substituted = substituteAggCalls(expr, cols, rows);
+    // Bug-Fix (Sep 2026): eine benannte lokale Variable statt eines
+    // temporären std::vector<std::string>() — Eval speichert vals als
+    // Referenz; ein Temporary wäre am Ende DIESER Zeile bereits zerstört
+    // und die Referenz in ev würde beim nächsten Statement (ev.run())
+    // auf bereits freigegebenen Speicher zeigen (dangling reference).
+    static const std::vector<std::string> kEmptyVals;
+    Eval ev{cols, kEmptyVals, substituted, 0};
+    return ev.run();
 }
 
 } // namespace milansql_arith
@@ -1183,6 +1395,44 @@ public:
         for (size_t i = 0; i < newColNames.size(); ++i)
             newCols.emplace_back(newColNames[i], types[i]);
         Table result(name_, std::move(newCols));
+
+        // Bug-Fix (Sep 2026): mindestens einer der Ausdrücke enthält einen
+        // Aggregat-Aufruf (z.B. "COUNT(*) * -46") — das darf NICHT pro
+        // Quellzeile ausgewertet werden (das war der Bug: eine falsche
+        // Ergebniszeile pro Tabellenzeile statt einer echten Aggregatzeile).
+        // Siehe ausführlicher Kommentar bei milansql_arith::containsAggCall().
+        bool anyAggWrapped = false;
+        for (size_t i = 0; i < cis.size(); ++i)
+            if (cis[i] < 0 && milansql_arith::containsAggCall(colNames[i])) { anyAggWrapped = true; break; }
+
+        if (anyAggWrapped) {
+            std::vector<std::string> vals;
+            vals.reserve(cis.size());
+            for (size_t i = 0; i < cis.size(); ++i) {
+                int ci = cis[i];
+                if (ci >= 0) {
+                    // Nackte Spalte gemischt mit Aggregat ohne GROUP BY ist
+                    // eigentlich ungültiges SQL — best effort: erste Zeile.
+                    const Row* firstRow = nullptr;
+                    for (const auto& r : rows_) if (r.xmax == 0) { firstRow = &r; break; }
+                    vals.push_back(firstRow && static_cast<size_t>(ci) < firstRow->values.size()
+                                   ? firstRow->values[static_cast<size_t>(ci)] : "");
+                } else if (milansql_arith::containsAggCall(colNames[i])) {
+                    vals.push_back(milansql_arith::evalAggWrappedExpr(colNames[i], columns_, rows_));
+                } else {
+                    // Reine Konstante/Ausdruck ohne Zeilenbezug — einmal
+                    // auswerten. Benannte statische Variable statt eines
+                    // Temporaries, da Eval::vals eine Referenz ist (siehe
+                    // Kommentar bei milansql_arith::evalAggWrappedExpr()).
+                    static const std::vector<std::string> kEmptyVals;
+                    milansql_arith::Eval ev{columns_, kEmptyVals, colNames[i], 0};
+                    vals.push_back(ev.run());
+                }
+            }
+            result.rows_.push_back(Row(std::move(vals)));
+            return result;
+        }
+
         for (const auto& row : rows_) {
             if (row.xmax != 0) continue;  // Phase 71: skip dead rows
             std::vector<std::string> vals;
@@ -1194,8 +1444,14 @@ public:
                         static_cast<size_t>(ci) < row.values.size()
                         ? row.values[ci] : "");
                 } else {
-                    // Arithmetic expression — evaluate per row
-                    milansql_arith::Eval ev{columns_, row.values, colNames[i], 0};
+                    // Arithmetic expression — evaluate per row. CAST(...) darf
+                    // eingebettet vorkommen (Bug-Fix Sep 2026): vor der
+                    // eigentlichen Auswertung ersetzt substituteCastCalls()
+                    // jeden CAST(...)-Aufruf durch seinen pro Zeile berechneten
+                    // Wert, damit Eval ihn nicht als unbekannte Spalte (0.0)
+                    // fehlinterpretiert.
+                    std::string sub = milansql_arith::substituteCastCalls(colNames[i], columns_, row.values);
+                    milansql_arith::Eval ev{columns_, row.values, sub, 0};
                     vals.push_back(ev.run());
                 }
             }
@@ -4160,6 +4416,58 @@ public:
         }
 
         Table result("", newCols);
+
+        // Bug-Fix (Sep 2026): mindestens ein SELECT-Item enthält einen
+        // Aggregat-Aufruf innerhalb von Arithmetik (z.B. "COUNT(*) * -46"),
+        // den der Parser nicht als isAgg erkannt hat — siehe ausführlicher
+        // Kommentar bei containsAggCall()/evalAggWrappedExpr() oben. Solche
+        // Ausdrücke dürfen NICHT pro Quellzeile ausgewertet werden (das war
+        // der Bug), sondern kollabieren wie ein normales Aggregat auf GENAU
+        // EINE Ergebniszeile.
+        bool anyAggWrapped = false;
+        for (const auto& item : items) {
+            if (item.isUnnest || item.isMatchAgainst || item.isFuncExpr ||
+                item.isCaseExpr || item.isScalarSubquery || item.isAgg) continue;
+            if (findColIdx(src, item.colName) < 0 && containsAggCall(item.colName)) {
+                anyAggWrapped = true;
+                break;
+            }
+        }
+        if (anyAggWrapped) {
+            std::vector<std::string> vals;
+            vals.reserve(items.size());
+            const Row* firstRow = src.rows().empty() ? nullptr : &src.rows()[0];
+            for (const auto& item : items) {
+                if (item.isUnnest || item.isMatchAgainst) {
+                    vals.push_back("");
+                } else if (item.isFuncExpr) {
+                    vals.push_back(firstRow ? evaluateFunc(item.funcName, item.funcArgs, src, *firstRow) : "");
+                } else if (item.isCaseExpr) {
+                    vals.push_back(firstRow ? evalCase(item, src, *firstRow) : "");
+                } else if (item.isScalarSubquery) {
+                    vals.push_back(firstRow ? evalScalarSub(item.scalarSub, src.columns(), *firstRow) : "");
+                } else if (item.isAgg) {
+                    vals.push_back(computeAggOverTable(src, item.aggFunc, item.aggCol));
+                } else {
+                    int ci = findColIdx(src, item.colName);
+                    if (ci >= 0) {
+                        // Mischung aus nackter Spalte und Aggregat ohne GROUP BY
+                        // ist eigentlich ungültiges SQL — best effort: erste Zeile.
+                        vals.push_back(firstRow && static_cast<size_t>(ci) < firstRow->values.size()
+                                       ? firstRow->values[static_cast<size_t>(ci)] : "");
+                    } else if (containsAggCall(item.colName)) {
+                        vals.push_back(evalAggWrappedExpr(item.colName, src));
+                    } else if (looksArith(item.colName)) {
+                        vals.push_back(evaluateGenExpr(item.colName, src.columns(), std::vector<std::string>()));
+                    } else {
+                        vals.push_back("");
+                    }
+                }
+            }
+            result.insert(Row(vals));
+            return result;
+        }
+
         for (const auto& row : src.rows()) {
             std::vector<std::string> vals;
             vals.reserve(items.size());
@@ -8003,10 +8311,23 @@ private:
                     lhsVal = milansql_arith::Eval{src.columns(), row.values, c.col, 0}.run();
                 } catch (...) { return false; }
             } else {
-                // Fall back to strict colIdx (throws on unknown column)
-                size_t ci2 = colIdx(src, c.col);
-                if (ci2 >= row.values.size()) return false;
-                lhsVal = row.values[ci2];
+                // Bug-Fix (Sep 2026): NULL als nackter Literal auf der
+                // LHS-Seite (z.B. "WHERE NULL NOT BETWEEN ...",
+                // "WHERE NOT NULL >= ...") wurde fälschlich als unbekannte
+                // Spalte behandelt und warf über colIdx() eine Exception
+                // ("Spalte 'NULL' nicht gefunden in '...'"), statt den
+                // NULL-Literal-Wert zu verwenden. evalCond() unten kennt
+                // NULL-Semantik bereits (Phase "Correctness Sprint").
+                std::string colUp = c.col;
+                for (char& ch : colUp) ch = static_cast<char>(std::toupper((unsigned char)ch));
+                if (colUp == "NULL") {
+                    lhsVal = "NULL";
+                } else {
+                    // Fall back to strict colIdx (throws on unknown column)
+                    size_t ci2 = colIdx(src, c.col);
+                    if (ci2 >= row.values.size()) return false;
+                    lhsVal = row.values[ci2];
+                }
             }
             // Resolve RHS: might be a column ref or arithmetic expression
             std::string rhsVal = c.val;
@@ -8435,9 +8756,17 @@ private:
                     while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
                     if (pos > start) {
                         std::string tok = expr.substr(start, pos - start);
-                        // check if numeric
-                        try { v = std::stod(tok); }
-                        catch (...) { v = resolveCol(tok); }
+                        // Bug-Fix (Sep 2026): NULL als Literal erkennen —
+                        // siehe identischer Kommentar bei
+                        // milansql_arith::Eval::factor() weiter oben.
+                        std::string tokUp = tok;
+                        for (char& c2 : tokUp) c2 = static_cast<char>(std::toupper((unsigned char)c2));
+                        if (tokUp == "NULL") { v = std::numeric_limits<double>::quiet_NaN(); }
+                        else {
+                            // check if numeric
+                            try { v = std::stod(tok); }
+                            catch (...) { v = resolveCol(tok); }
+                        }
                     } else {
                         if (pos < expr.size()) ++pos;
                         v = 0.0;
@@ -8536,6 +8865,61 @@ private:
         return false;
     }
 
+    // Bug-Fix (Sep 2026): CAST(expr AS TYPE) innerhalb eines arithmetischen
+    // Ausdrucks (z.B. "CAST(col1 AS INTEGER) * col1") wurde von ArithEval
+    // nicht verstanden — "CAST" wurde wie ein unbekannter Spaltenname
+    // behandelt (löste zu 0.0 auf), was den gesamten Ausdruck kontaminierte.
+    // Diese Funktion sucht CAST(...)-Aufrufe, wertet ihr Argument PRO ZEILE
+    // rekursiv über evaluateGenExpr aus und ersetzt den ganzen Aufruf durch
+    // den berechneten Wert (oder "NULL", das dank der NULL-Literal-
+    // Erkennung in ArithEval::parseFactor korrekt weiter propagiert),
+    // bevor der äußere Ausdruck ausgewertet wird.
+    static std::string substituteCastCalls(const std::string& exprIn,
+                                            const std::vector<Column>& cols,
+                                            const std::vector<std::string>& vals) {
+        std::string expr = exprIn;
+        for (int iter = 0; iter < 8; ++iter) {  // Sicherheitslimit gegen Endlosschleifen
+            std::string up = expr;
+            for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+            size_t p = up.find("CAST");
+            bool replaced = false;
+            while (p != std::string::npos) {
+                bool leftOk = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+                size_t k = p + 4;
+                while (k < up.size() && up[k] == ' ') ++k;
+                if (leftOk && k < up.size() && up[k] == '(') {
+                    size_t openPos = k;
+                    int depth = 0; size_t q = openPos;
+                    for (; q < up.size(); ++q) {
+                        if (up[q] == '(') depth++;
+                        else if (up[q] == ')') { depth--; if (depth == 0) break; }
+                    }
+                    if (q < up.size() && depth == 0) {
+                        std::string inner = expr.substr(openPos + 1, q - openPos - 1);
+                        std::string innerUp = inner;
+                        for (char& c2 : innerUp) c2 = static_cast<char>(std::toupper((unsigned char)c2));
+                        size_t asPos = innerUp.rfind(" AS ");
+                        std::string valExpr = (asPos != std::string::npos) ? inner.substr(0, asPos) : inner;
+                        size_t a = valExpr.find_first_not_of(" \t");
+                        size_t b = valExpr.find_last_not_of(" \t");
+                        valExpr = (a == std::string::npos) ? "" : valExpr.substr(a, b - a + 1);
+                        std::string valUp = valExpr;
+                        for (char& c2 : valUp) c2 = static_cast<char>(std::toupper((unsigned char)c2));
+                        std::string computed = (valUp == "NULL")
+                            ? std::string("NULL")
+                            : evaluateGenExpr(valExpr, cols, vals);
+                        expr = expr.substr(0, p) + computed + expr.substr(q + 1);
+                        replaced = true;
+                        break;
+                    }
+                }
+                p = up.find("CAST", p + 4);
+            }
+            if (!replaced) break;
+        }
+        return expr;
+    }
+
     // Evaluate an arithmetic expression against a specific table row.
     // Uses suffix-aware column lookup (handles "t1.col" qualifiers).
     static std::string evalArithExpr(const std::string& expr,
@@ -8560,7 +8944,142 @@ private:
             flatVals.push_back(i < vals.size() ? vals[i] : "");
         }
 
-        return evaluateGenExpr(expr, flatCols, flatVals);
+        std::string substituted = substituteCastCalls(expr, flatCols, flatVals);
+        return evaluateGenExpr(substituted, flatCols, flatVals);
+    }
+
+    // ── Bug-Fix (Sep 2026): Aggregatfunktionen innerhalb arithmetischer
+    // SELECT-Ausdrücke (z.B. "COUNT(*) * -46", "- - SUM(67)") ──────────
+    // Der Parser erkennt COUNT/SUM/AVG/MIN/MAX nur, wenn sie ALLEIN einen
+    // SELECT-Eintrag bilden; sobald zusätzliche Arithmetik drumherum steht,
+    // landet der gesamte Text als "colName" im normalen (Nicht-Aggregat-)
+    // Pfad. Dort sah looksArith() das enthaltene +/-/* und schickte den
+    // Ausdruck PRO ZEILE an ArithEval — das kennt aber keine Funktions-
+    // aufrufe, löste "COUNT"/"SUM"/... als unbekannte Spalte zu 0.0 auf und
+    // lieferte eine falsche Ergebniszeile pro Quellzeile statt einer
+    // einzigen Aggregatzeile.
+    //
+    // Fix (ohne Parser-Änderung): erkennen, ob ein SELECT-Item einen
+    // Aggregat-Aufruf enthält; falls ja, dessen Argument SATZWEISE über
+    // alle Zeilen auswerten und aggregieren (Standard-SQL-Semantik: SUM(67)
+    // über N Zeilen = 67*N), den Aufruf im Ausdruckstext durch den
+    // berechneten Skalar ersetzen, den Rest normal auswerten — und für die
+    // GESAMTE Projektion nur EINE Ergebniszeile liefern statt einer pro
+    // Quellzeile.
+
+    static bool containsAggCall(const std::string& s) {
+        static const char* AGGF[] = {"COUNT", "SUM", "AVG", "MIN", "MAX"};
+        std::string up = s;
+        for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+        for (const char* fnameC : AGGF) {
+            std::string fname = fnameC;
+            size_t p = up.find(fname);
+            while (p != std::string::npos) {
+                bool leftOk = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+                size_t k = p + fname.size();
+                while (k < up.size() && up[k] == ' ') ++k;
+                if (leftOk && k < up.size() && up[k] == '(') return true;
+                p = up.find(fname, p + fname.size());
+            }
+        }
+        return false;
+    }
+
+    // Ein Aggregat (func) über ALLE lebenden Zeilen von src berechnen.
+    // argRaw ist "*", ein Spaltenname, oder ein arithmetischer Ausdruck
+    // (dann pro Zeile über evalArithExpr ausgewertet, z.B. SUM(col*2)).
+    static std::string computeAggOverTable(const Table& src, const std::string& func,
+                                            const std::string& argRawIn) {
+        auto trimStr = [](std::string s) {
+            size_t a = s.find_first_not_of(" \t");
+            size_t b = s.find_last_not_of(" \t");
+            return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
+        };
+        std::string argRaw = trimStr(argRawIn);
+        std::string argUp = argRaw;
+        for (char& c : argUp) c = static_cast<char>(std::toupper((unsigned char)c));
+        bool distinct = false;
+        if (argUp.rfind("DISTINCT", 0) == 0)      { distinct = true; argRaw = trimStr(argRaw.substr(8)); }
+        else if (argUp.rfind("ALL", 0) == 0)      { argRaw = trimStr(argRaw.substr(3)); }
+
+        if (func == "COUNT" && argRaw == "*") {
+            std::size_t n = 0;
+            for (const auto& row : src.rows()) if (row.xmax == 0) ++n;
+            return std::to_string(n);
+        }
+
+        int ci = findColIdx(src, argRaw);
+        std::vector<double> nums;
+        std::set<std::string> seen;
+        std::size_t countNonNull = 0;
+        for (const auto& row : src.rows()) {
+            if (row.xmax != 0) continue;
+            std::string valStr;
+            if (ci >= 0) {
+                valStr = (static_cast<size_t>(ci) < row.values.size()) ? row.values[static_cast<size_t>(ci)] : "";
+            } else {
+                // Konstante oder arithmetischer Ausdruck — pro Zeile auswerten
+                // (für eine reine Konstante wie "67" ist das Ergebnis für
+                // jede Zeile gleich, zählt aber trotzdem einmal pro Zeile).
+                valStr = evalArithExpr(argRaw, src, row);
+            }
+            if (valStr.empty() || valStr == "NULL") continue;
+            if (distinct) { if (seen.count(valStr)) continue; seen.insert(valStr); }
+            ++countNonNull;
+            try { nums.push_back(std::stod(valStr)); } catch (...) {}
+        }
+        if (func == "COUNT") return std::to_string(countNonNull);
+        if (nums.empty()) return "NULL";
+        if (func == "MIN") return formatNum(*std::min_element(nums.begin(), nums.end()));
+        if (func == "MAX") return formatNum(*std::max_element(nums.begin(), nums.end()));
+        if (func == "SUM") { double s = 0; for (double v : nums) s += v; return formatNum(s); }
+        if (func == "AVG") { double s = 0; for (double v : nums) s += v; return formatNum(s / static_cast<double>(nums.size())); }
+        return "NULL";
+    }
+
+    // Ersetzt jeden Aggregat-Aufruf im Ausdruck durch seinen über die ganze
+    // Tabelle berechneten Skalarwert (wiederholt, falls mehrere vorkommen).
+    static std::string substituteAggCalls(const std::string& exprIn, const Table& src) {
+        std::string expr = exprIn;
+        static const char* AGGF[] = {"COUNT", "SUM", "AVG", "MIN", "MAX"};
+        for (int iter = 0; iter < 8; ++iter) {  // Sicherheitslimit
+            std::string up = expr;
+            for (char& c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+            bool replaced = false;
+            for (const char* fnameC : AGGF) {
+                std::string fname = fnameC;
+                size_t p = up.find(fname);
+                while (p != std::string::npos) {
+                    bool leftOk = (p == 0) || !(std::isalnum((unsigned char)up[p-1]) || up[p-1] == '_');
+                    size_t k = p + fname.size();
+                    while (k < up.size() && up[k] == ' ') ++k;
+                    if (leftOk && k < up.size() && up[k] == '(') {
+                        size_t openPos = k;
+                        int depth = 0; size_t q = openPos;
+                        for (; q < up.size(); ++q) {
+                            if (up[q] == '(') depth++;
+                            else if (up[q] == ')') { depth--; if (depth == 0) break; }
+                        }
+                        if (q < up.size() && depth == 0) {
+                            std::string inner = expr.substr(openPos + 1, q - openPos - 1);
+                            std::string val = computeAggOverTable(src, fname, inner);
+                            expr = expr.substr(0, p) + val + expr.substr(q + 1);
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    p = up.find(fname, p + fname.size());
+                }
+                if (replaced) break;
+            }
+            if (!replaced) break;
+        }
+        return expr;
+    }
+
+    static std::string evalAggWrappedExpr(const std::string& expr, const Table& src) {
+        std::string substituted = substituteAggCalls(expr, src);
+        return evaluateGenExpr(substituted, src.columns(), std::vector<std::string>());
     }
 
     // Compute all generated columns (STORED + VIRTUAL) for a row of vals.

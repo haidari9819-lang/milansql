@@ -1973,6 +1973,11 @@ public:
             if (idx < tokens.size() && toUpper(tokens[idx]) == "DISTINCT") {
                 cmd.isDistinct = true; ++idx;
             }
+            // Bug-Fix (Sep 2026): ALL-Modifier ebenso überspringen wie DISTINCT
+            // (siehe ausführlicher Kommentar bei parseSelectFull() weiter unten).
+            if (idx < tokens.size() && toUpper(tokens[idx]) == "ALL") {
+                ++idx;
+            }
 
             // Aggregatfunktion: MIN, MAX, AVG, SUM?
             static const std::vector<std::string> AGGFUNCS =
@@ -6477,6 +6482,10 @@ private:
             if (noFromSelStart < N && toUpper(ft[noFromSelStart]) == "DISTINCT") {
                 cmd.isDistinct = true; ++noFromSelStart;
             }
+            // Bug-Fix (Sep 2026): ALL-Modifier ebenso überspringen wie DISTINCT.
+            if (noFromSelStart < N && toUpper(ft[noFromSelStart]) == "ALL") {
+                ++noFromSelStart;
+            }
             cmd.hasCaseItems = true;
             for (size_t i = noFromSelStart; i < N; ) {
                 if (ft[i] == ",") { ++i; continue; }
@@ -6635,6 +6644,17 @@ private:
             } else {
                 ++selStart; // skip just DISTINCT
             }
+        }
+        // Bug-Fix (Sep 2026): "ALL" ist der SQL-Default-Modifier (Gegenteil
+        // von DISTINCT — alle Zeilen inkl. Duplikate) und muss wie DISTINCT
+        // aus dem Spaltenbereich entfernt werden. Vorher landete "ALL" als
+        // literaler Text im Ausdruck (z.B. cmd.selectColumns[0] =
+        // "ALL 93 + COUNT ( * )"), und der Arithmetik-Evaluator löste "ALL"
+        // als unbekannten Bezeichner zu 0.0 auf UND brach die Auswertung
+        // direkt danach ab (kein Operator zwischen "ALL" und "93") — das
+        // gesamte Ergebnis war dadurch fälschlich 0 statt korrekt berechnet.
+        if (selStart < fromPos && toUpper(ft[selStart]) == "ALL") {
+            ++selStart;
         }
         // Phase 167: Detect standalone aggregates (COUNT/SUM/AVG/MIN/MAX) before column parsing
         bool aggDetected167 = false;
@@ -6825,6 +6845,61 @@ private:
                                      ParsedCommand& cmd) {
         size_t i = start;
         while (i < end) {
+            // Bug-Fix (Sep 2026): Aggregat-/Funktionsaufrufe (COUNT, CAST,
+            // SUM, ...) mit umgebender Arithmetik (z.B.
+            // "+ CAST(col1 AS INTEGER) * col1", "93 + COUNT(*)") wurden
+            // Token für Token in mehrere SELECT-Items zerrissen: die
+            // spezialisierten Zweige unten (Wildcard/Funktionsname/
+            // Aggregat) konsumierten jeweils nur ihren eigenen Aufruf,
+            // der Rest ("*", "col1", ein führendes "+", ...) landete als
+            // eigene, separate Items in derselben Schleife.
+            //
+            // Fix: VOR jeder Spezialbehandlung erst prüfen, ob ab HIER
+            // (über collectArithExpr(), das Klammertiefe respektiert) mehr
+            // als nur der reine Aufruf/Bezeichner zusammengehört —
+            // erkennbar an einem +/-/*// auf TOP-LEVEL (Klammertiefe 0)
+            // irgendwo im eingesammelten Text (Operatoren INNERHALB eines
+            // Funktionsaufrufs, z.B. das "*" in COUNT(*), zählen nicht, da
+            // dort depth>0 ist). Falls ja: den ganzen Ausdruck als EIN Item
+            // (reiner Text, keine isFuncExpr/isAgg-Flags) übernehmen — die
+            // Engine kennt eingebettete Aggregat-/CAST-Aufrufe in solchen
+            // Ausdrücken mittlerweile (containsAggCall()/
+            // substituteCastCalls() in engine.hpp). Bleibt der Aufruf
+            // isoliert (kein umgebender Operator, z.B. reines "COUNT(*)"
+            // oder reines "CAST(x AS INT)"), bleibt das Verhalten
+            // unverändert — die bestehenden, spezialisierten Zweige
+            // greifen wie vorher (kein Risiko für bereits funktionierende
+            // einfache Fälle).
+            if (i < end && ft[i] != "," && ft[i] != ")" && ft[i] != "*" &&
+                toUpper(ft[i]) != "CASE") {
+                size_t iTrial = i;
+                std::string trial = collectArithExpr(ft, iTrial, end);
+                bool hasTopLevelOp = false;
+                {
+                    int depth = 0;
+                    for (char c : trial) {
+                        if (c == '(') ++depth;
+                        else if (c == ')') --depth;
+                        else if (depth == 0 &&
+                                 (c == '+' || c == '-' || c == '*' || c == '/')) {
+                            hasTopLevelOp = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasTopLevelOp) {
+                    SelectItem item;
+                    item.colName = trial;
+                    if (iTrial < end && toUpper(ft[iTrial]) == "AS") {
+                        ++iTrial;
+                        if (iTrial < end && ft[iTrial] != ",") { item.alias = ft[iTrial]; ++iTrial; }
+                    }
+                    cmd.selectItems.push_back(std::move(item));
+                    i = iTrial;
+                    continue;
+                }
+            }
+
             // Phase 37: (SELECT ...) → Skalare Subquery
             if (ft[i] == "(") {
                 if (i + 1 < end && toUpper(ft[i+1]) == "SELECT") {
@@ -7493,6 +7568,10 @@ private:
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
         }
+        // Bug-Fix (Sep 2026): ALL-Modifier ebenso überspringen wie DISTINCT.
+        if (selStart < fromPos && toUpper(ft[selStart]) == "ALL") {
+            ++selStart;
+        }
         // Group tokens between real commas as single column specs (handles "t.depth + 1")
         {
             std::string cur;
@@ -7847,6 +7926,10 @@ private:
         size_t selStart = 1;
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
+        }
+        // Bug-Fix (Sep 2026): ALL-Modifier ebenso überspringen wie DISTINCT.
+        if (selStart < fromPos && toUpper(ft[selStart]) == "ALL") {
+            ++selStart;
         }
         parseSelectItems(ft, selStart, fromPos, cmd);
 

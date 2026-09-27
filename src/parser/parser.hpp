@@ -2020,9 +2020,41 @@ public:
                 cmd.type = CommandType::UNKNOWN;
             } else {
                 std::string colList;
-                for (size_t i = idx; i < fromIdx; ++i) {
-                    if (i > idx) colList += " ";
-                    colList += tokens[i];
+                {
+                    // Bug-Fix (Sep 2026): "AS alias" überspringen statt in
+                    // den Spaltentext zu übernehmen — cmd.selectColumns hat
+                    // kein Alias-Feld, der Rohtext ging bisher 1:1 an
+                    // colOf()/Table::project() weiter ("Spalte 'col2 AS
+                    // col2' nicht gefunden" für JEDEN Alias, nicht nur
+                    // Selbst-Alias). Klammertiefe mitzählen, damit "AS" in
+                    // CAST(x AS INTEGER) nicht fälschlich als Alias-Marker
+                    // gilt.
+                    int parenDepth = 0;
+                    bool sawAs = false;
+                    for (size_t i = idx; i < fromIdx; ++i) {
+                        const std::string& tok = tokens[i];
+                        if (tok == "(") { ++parenDepth; }
+                        else if (tok == ")") { --parenDepth; }
+                        else if (parenDepth == 0 && toUpper(tok) == "AS") {
+                            sawAs = true; continue;
+                        } else if (sawAs) {
+                            sawAs = false;
+                            // Diese tokenize()-Variante splittet NUR auf
+                            // Whitespace — ein Komma direkt nach dem Alias
+                            // ("col0," ohne Leerzeichen davor) ist Teil
+                            // DIESES Tokens. Wird das Alias-Token komplett
+                            // verworfen, geht das Komma (und damit die
+                            // Spaltentrennung zur nächsten Spalte) mit
+                            // verloren. Komma erhalten, Rest verwerfen.
+                            if (!tok.empty() && tok.back() == ',') {
+                                if (!colList.empty()) colList += " ";
+                                colList += ",";
+                            }
+                            continue;
+                        }
+                        if (!colList.empty()) colList += " ";
+                        colList += tok;
+                    }
                 }
                 for (const auto& c : splitTrim(colList, ','))
                     if (c != "*" && !c.empty())
@@ -6757,11 +6789,13 @@ private:
                 // Parentheses are kept so arithmetic evaluator handles precedence.
                 std::string cur;
                 int parenDepth = 0;
+                bool sawAs = false;  // Bug-Fix (Sep 2026), siehe Kommentar unten
                 auto pushCur = [&]() {
                     while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
                     while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
                     if (cur != "*" && !cur.empty()) cmd.selectColumns.push_back(cur);
                     cur.clear();
+                    sawAs = false;
                 };
                 for (size_t i = selStart; i < fromPos; ++i) {
                     if (ft[i] == "(") {
@@ -6774,6 +6808,21 @@ private:
                         cur += ")";
                     } else if (ft[i] == "," && parenDepth == 0) {
                         pushCur();
+                    } else if (parenDepth == 0 && toUpper(ft[i]) == "AS") {
+                        // Bug-Fix (Sep 2026): "AS alias" überspringen statt in
+                        // den Spaltentext zu übernehmen. cmd.selectColumns hat
+                        // kein Alias-Feld — der Rohtext ging bisher 1:1 an
+                        // colOf()/Table::project(), was bei JEDEM Alias
+                        // ("col2 AS col2", "col1 AS a", ...) mit "Spalte '...'
+                        // nicht gefunden" abbrach, weil kein Spaltenname exakt
+                        // "col1 AS a" lautet. Der berechnete WERT ist nach
+                        // dem Fix korrekt; nur die Spaltenüberschrift zeigt
+                        // den echten Namen statt des Alias (SLT vergleicht
+                        // nur Werte, keine Header).
+                        sawAs = true;
+                    } else if (sawAs) {
+                        // Das Alias-Token selbst — verwerfen.
+                        sawAs = false;
                     } else {
                         if (!cur.empty()) cur += " ";
                         cur += ft[i];
@@ -7575,15 +7624,23 @@ private:
         // Group tokens between real commas as single column specs (handles "t.depth + 1")
         {
             std::string cur;
+            bool sawAsJ = false;  // Bug-Fix (Sep 2026), siehe Kommentar bei parseSelectFull()
             auto pushCurJ = [&]() {
                 while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
                 while (!cur.empty() && cur.back()  == ' ') cur.pop_back();
                 if (cur != "*" && !cur.empty()) cmd.selectColumns.push_back(cur);
                 cur.clear();
+                sawAsJ = false;
             };
             for (size_t j = selStart; j < fromPos; ++j) {
                 if (ft[j] == ",") { pushCurJ(); }
-                else if (ft[j] != "(" && ft[j] != ")") {
+                else if (toUpper(ft[j]) == "AS") {
+                    // Bug-Fix (Sep 2026): "AS alias" überspringen — siehe
+                    // ausführlicher Kommentar bei parseSelectFull() weiter oben.
+                    sawAsJ = true;
+                } else if (sawAsJ) {
+                    sawAsJ = false;  // Alias-Token verwerfen
+                } else if (ft[j] != "(" && ft[j] != ")") {
                     if (!cur.empty()) cur += " ";
                     cur += ft[j];
                 }

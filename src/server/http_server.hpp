@@ -2164,6 +2164,10 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                 return *cached;
             }
         }
+        // Snapshot the write generation *before* reading, so we can tell below whether
+        // a concurrent write (running on another pool thread) invalidated something
+        // while this SELECT was executing -- see UserQueryCache::put().
+        uint64_t cacheGenAtStart = milansql::g_userQueryCache().currentGeneration();
         finalResult = execOne(effectiveSql);
         engine_.setCurrentUser(0, true); // reset per-request context
         // Phase 2.2: Store successful SELECT results in cache
@@ -2182,16 +2186,27 @@ inline std::string MilanHttpServer::handleQueryForUser(const std::string& sql, i
                 if (!prefix.empty() && tblHint.rfind(prefix, 0) == 0)
                     tblHint = tblHint.substr(prefix.size());
             }
-            milansql::g_userQueryCache().put(cacheUserKey, effectiveSql, finalResult, tblHint);
+            milansql::g_userQueryCache().put(cacheUserKey, effectiveSql, finalResult, tblHint, cacheGenAtStart);
         }
         // Phase 2.2: Invalidate cache on mutating queries
         if (!isCacheable && finalResult.find("\"success\":true") != std::string::npos) {
-            // Extract table name and invalidate
-            auto mutPos = upper.find(" INTO ");
-            if (mutPos == std::string::npos) mutPos = upper.find(" FROM ");
-            if (mutPos == std::string::npos) mutPos = upper.find(" TABLE ");
-            if (mutPos == std::string::npos) mutPos = upper.find(" UPDATE ");
-            size_t tblStart = (mutPos != std::string::npos) ? mutPos + 7 : std::string::npos;
+            // Extract table name and invalidate.
+            // Bug fix (read-after-write staleness): the offset used to skip past the
+            // matched keyword must match that keyword's own length -- " INTO "/" FROM "
+            // are 6 chars, " TABLE " is 7, " UPDATE " is 8. The old code applied a blanket
+            // +7 to all of them, which only happened to be correct for " TABLE ". For
+            // " INTO "/" FROM " it landed one character INTO the table name (e.g. "blocks"
+            // -> "LOCKS", "sites" -> "ITES"), so invalidate() was called with a name that
+            // never matched any cached entry -- INSERT and DELETE effectively never
+            // invalidated the cache, and stale SELECT results lingered for the full 30s TTL.
+            size_t tblStart = std::string::npos;
+            {
+                size_t p;
+                if ((p = upper.find(" INTO ")) != std::string::npos) tblStart = p + 6;
+                else if ((p = upper.find(" FROM ")) != std::string::npos) tblStart = p + 6;
+                else if ((p = upper.find(" TABLE ")) != std::string::npos) tblStart = p + 7;
+                else if ((p = upper.find(" UPDATE ")) != std::string::npos) tblStart = p + 8;
+            }
             // For UPDATE, table name follows immediately
             if (upper.rfind("UPDATE", 0) == 0) {
                 tblStart = 7;

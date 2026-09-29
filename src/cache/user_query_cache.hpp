@@ -79,11 +79,24 @@ public:
         return it->second->result;
     }
 
+    // Generation at the moment a SELECT started reading, so put() can tell whether
+    // a write raced with it (see put() below).
+    uint64_t currentGeneration() const { return writeGen_.load(std::memory_order_acquire); }
+
     // ── put ───────────────────────────────────────────────────
+    // genAtStart: the generation returned by currentGeneration() right before this
+    // query's data was read from the engine. If a write (and its invalidate()) landed
+    // on ANY table in between -- even one this query doesn't touch, since the caller
+    // doesn't know in advance -- the generation will have moved on and we skip caching.
+    // Without this, a SELECT that started just before a concurrent INSERT/UPDATE/DELETE
+    // can finish (with pre-write data) and call put() *after* that write's invalidate()
+    // already ran, silently re-inserting a stale result that then sits for the full TTL.
     void put(const std::string& user, const std::string& sql,
-             const std::string& result, const std::string& tableName) {
+             const std::string& result, const std::string& tableName,
+             uint64_t genAtStart) {
         if (!enabled_) return;
         std::lock_guard<std::mutex> lk(mutex_);
+        if (genAtStart != writeGen_.load(std::memory_order_acquire)) return;
         std::string key = makeKey(user, sql);
 
         // If already exists, update
@@ -108,6 +121,7 @@ public:
     // Remove all entries whose tableName matches (case-insensitive)
     void invalidate(const std::string& tableName) {
         std::lock_guard<std::mutex> lk(mutex_);
+        writeGen_.fetch_add(1, std::memory_order_acq_rel);
         std::string upper = tableName;
         for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
@@ -126,6 +140,7 @@ public:
     // ── flush all ─────────────────────────────────────────────
     void flush() {
         std::lock_guard<std::mutex> lk(mutex_);
+        writeGen_.fetch_add(1, std::memory_order_acq_rel);
         lru_.clear();
         index_.clear();
     }
@@ -185,6 +200,7 @@ private:
     bool               enabled_    = true;
     std::atomic<long long> hits_{0};
     std::atomic<long long> misses_{0};
+    std::atomic<uint64_t>  writeGen_{0};
 };
 
 // ── Global singleton ──────────────────────────────────────────

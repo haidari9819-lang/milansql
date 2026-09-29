@@ -2705,6 +2705,7 @@ inline bool dispatchCommand(
                 engine.insertOrReplace(cmd.tableName, vals) ? ++replaced : ++inserted;
             persistFn();
             dispatch_binlogWrite(eingabe);
+            engine.invalidateCache(cmd.tableName); // Bug fix: REPLACE never invalidated the cache
             if (replaced > 0 && inserted > 0)
                 std::cout << "  " << replaced << " Zeile(n) ersetzt, "
                           << inserted << " eingefuegt in '"
@@ -2721,6 +2722,7 @@ inline bool dispatchCommand(
                 engine.insertOrIgnore(cmd.tableName, vals) ? ++inserted : ++ignored;
             persistFn();
             dispatch_binlogWrite(eingabe);
+            engine.invalidateCache(cmd.tableName); // Bug fix: IGNORE never invalidated the cache
             if (ignored > 0 && inserted > 0)
                 std::cout << "  " << inserted << " Zeile(n) eingefuegt, "
                           << ignored << " ignoriert (Konflikt) in '"
@@ -3554,6 +3556,10 @@ inline bool dispatchCommand(
         }
 
         // ── Phase 54A: Query Cache check ──────────────────────────
+        // cacheGenAtStart: snapshotted *before* execution, right after the cache-miss
+        // is established -- see QueryCache::put() for why this is needed (bug fix for
+        // read-after-write staleness under concurrent requests).
+        uint64_t cacheGenAtStart = 0;
         {
             auto& qc = engine.getQueryCache();
             if (qc.isEnabled()) {
@@ -3565,6 +3571,7 @@ inline bool dispatchCommand(
                     std::cout << *cached << "  [CACHE HIT]\n\n";
                     break;
                 }
+                cacheGenAtStart = qc.currentGeneration();
             }
         }
 
@@ -3602,7 +3609,7 @@ inline bool dispatchCommand(
                     std::cout.rdbuf(oldBuf);
                     std::string captured = captureStream.str();
                     std::string cacheKey = engine.getCurrentUser() + "\x01" + eingabe;
-                    qc.put(cacheKey, captured, cmd.tableName);
+                    qc.put(cacheKey, captured, cmd.tableName, cacheGenAtStart);
                     std::cout << captured;
                 }
                 if (g_profiler.isEnabled()) g_profiler.endQuery();
@@ -3701,7 +3708,7 @@ inline bool dispatchCommand(
                 std::string captured = captureStream.str();
                 // Phase 75: user-scoped cache key for RLS correctness
                 std::string cacheKey = engine.getCurrentUser() + "\x01" + eingabe;
-                qc.put(cacheKey, captured, cmd.tableName);
+                qc.put(cacheKey, captured, cmd.tableName, cacheGenAtStart);
                 std::cout << captured;
             }
 

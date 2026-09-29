@@ -13239,7 +13239,8 @@ static void testGroup116() {
 
     // 2.3.5: UserQueryCache invalidation works for table
     {
-        milansql::g_userQueryCache().put("root", "SELECT * FROM copy_test", "old_result", "copy_test");
+        milansql::g_userQueryCache().put("root", "SELECT * FROM copy_test", "old_result", "copy_test",
+                                          milansql::g_userQueryCache().currentGeneration());
         milansql::g_userQueryCache().invalidate("copy_test");
         auto cached = milansql::g_userQueryCache().get("root", "SELECT * FROM copy_test");
         check(!cached.has_value(), "116-5: cache invalidated after table modification");

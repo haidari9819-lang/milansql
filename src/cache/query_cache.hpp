@@ -11,6 +11,9 @@
 #include <optional>
 #include <iostream>
 #include <algorithm>
+#include <mutex>
+#include <atomic>
+#include <cstdint>
 
 namespace milansql {
 
@@ -26,9 +29,19 @@ class QueryCache {
 public:
     QueryCache() = default;
 
+    // Bug fix (read-after-write staleness / thread safety): this cache is shared
+    // across the HTTP thread pool (every request runs dispatchCommand on a pool
+    // thread) but originally had no locking at all around `cache_` -- concurrent
+    // get()/put()/invalidate() from different threads is undefined behavior on a
+    // std::map, and independent of that, a SELECT that read data just before a
+    // concurrent write could still call put() *after* that write's invalidate()
+    // already ran, silently re-caching a stale result for the full TTL. Fixed with
+    // a mutex around all access plus a write-generation counter that put() checks.
+
     // ── get ───────────────────────────────────────────────────
     std::optional<std::string> get(const std::string& sql) {
         if (!enabled_) return std::nullopt;
+        std::lock_guard<std::mutex> lock(mu_);
         auto it = cache_.find(sql);
         if (it == cache_.end()) { ++totalMisses_; return std::nullopt; }
 
@@ -48,10 +61,19 @@ public:
         return it->second.renderedOutput;
     }
 
+    // Generation at the moment a query started reading, so put() can detect a
+    // write that raced with it. Call this right before executing the query.
+    uint64_t currentGeneration() const { return writeGen_.load(std::memory_order_acquire); }
+
     // ── put ───────────────────────────────────────────────────
+    // genAtStart: value of currentGeneration() captured before this query ran.
+    // If it no longer matches, some table was written (and invalidated) while we
+    // were reading, so the result we're about to cache may already be stale -- skip.
     void put(const std::string& sql, const std::string& output,
-             const std::string& tableName) {
+             const std::string& tableName, uint64_t genAtStart) {
         if (!enabled_) return;
+        std::lock_guard<std::mutex> lock(mu_);
+        if (genAtStart != writeGen_.load(std::memory_order_acquire)) return;
 
         // LRU eviction if full: remove entry with oldest lastAccess
         if (cache_.size() >= maxSize_) {
@@ -76,6 +98,8 @@ public:
     // ── invalidate ────────────────────────────────────────────
     // Remove all entries that read the given table
     void invalidate(const std::string& tableName) {
+        std::lock_guard<std::mutex> lock(mu_);
+        writeGen_.fetch_add(1, std::memory_order_acq_rel);
         for (auto it = cache_.begin(); it != cache_.end(); ) {
             if (it->second.tableName == tableName)
                 it = cache_.erase(it);
@@ -84,19 +108,24 @@ public:
         }
     }
 
-    void clear() { cache_.clear(); }
+    void clear() {
+        std::lock_guard<std::mutex> lock(mu_);
+        writeGen_.fetch_add(1, std::memory_order_acq_rel);
+        cache_.clear();
+    }
 
     // ── accessors ─────────────────────────────────────────────
     bool   isEnabled()  const { return enabled_; }
     void   setEnabled(bool v) { enabled_ = v; }
-    size_t size()       const { return cache_.size(); }
+    size_t size()       const { std::lock_guard<std::mutex> lock(mu_); return cache_.size(); }
     size_t maxSize()    const { return maxSize_; }
-    size_t hits()       const { return totalHits_; }
-    size_t misses()     const { return totalMisses_; }
+    size_t hits()       const { std::lock_guard<std::mutex> lock(mu_); return totalHits_; }
+    size_t misses()     const { std::lock_guard<std::mutex> lock(mu_); return totalMisses_; }
     int    ttl()        const { return ttlSeconds_; }
 
     // ── showStats ─────────────────────────────────────────────
     void showStats() const {
+        std::lock_guard<std::mutex> lock(mu_);
         size_t total = totalHits_ + totalMisses_;
         std::string hitRate = total > 0
             ? std::to_string(totalHits_ * 100 / total) + "%"
@@ -170,12 +199,14 @@ public:
     }
 
 private:
+    mutable std::mutex mu_;
     std::map<std::string, CacheEntry> cache_;
     size_t maxSize_    = 100;
     int    ttlSeconds_ = 30;
     bool   enabled_    = true;
     size_t totalHits_  = 0;
     size_t totalMisses_ = 0;
+    std::atomic<uint64_t> writeGen_{0};
 };
 
 } // namespace milansql

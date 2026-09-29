@@ -745,6 +745,14 @@ struct Eval {
 };
 
 inline bool looksArith(const std::string& s) {
+    // Bug-Fix (Sep 2026): ein komplett gequotetes String-Literal ('...' oder
+    // "...") ist per SQL-Syntax NIEMALS ein arithmetischer Ausdruck, egal was
+    // darin steht — ohne diesen Check wurde z.B. 'fitzone-studio' wegen des
+    // enthaltenen "-" faelschlich als Arithmetik erkannt; WHERE-Vergleiche
+    // gegen solche Literale scheiterten dadurch (0 Zeilen trotz vorhandener
+    // Zeile). Muss vor allen anderen Checks stehen.
+    if (s.size() >= 2 && (s.front() == '\'' || s.front() == '"') && s.back() == s.front())
+        return false;
     if (!s.empty() && s[0] == '(') return true;  // parenthesized expression
     for (char c : s) if (c == '+' || c == '-' || c == '*' || c == '/') return true;
     // Bug-Fix (Sep 2026): DIV ist ein Wort-Operator (kein Symbol) — ohne
@@ -8834,6 +8842,11 @@ private:
     // Returns true when expr looks like an arithmetic expression rather than a
     // bare column name: must contain an operator, start with '(', or be a numeric literal.
     static bool looksArith(const std::string& expr) {
+        // Bug-Fix (Sep 2026): siehe identischer Kommentar bei
+        // milansql_arith::looksArith() weiter oben — ein komplett gequotetes
+        // String-Literal ist niemals arithmetisch, egal was darin steht.
+        if (expr.size() >= 2 && (expr.front() == '\'' || expr.front() == '"') && expr.back() == expr.front())
+            return false;
         if (!expr.empty() && expr[0] == '(') return true;  // parenthesized expression
         for (char c : expr)
             if (c == '+' || c == '-' || c == '*' || c == '/')

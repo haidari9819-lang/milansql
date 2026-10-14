@@ -7934,7 +7934,8 @@ private:
                     --braceDepth;
                     if (braceDepth == 0) { tokens.push_back(cur); cur.clear(); }
                 }
-            } else if (c == ' ' || c == '\t' || c == '\r') {
+            // Bug-Fix (14.10.2026): siehe tokenize() oben -- '\n' fehlte.
+            } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
             } else if (c == '(' || c == ')' || c == ',') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
@@ -8317,7 +8318,13 @@ private:
                 if (c == strChar) inStr = false;
             } else if (c == '\'' || c == '"') {
                 inStr = true; strChar = c; cur += c;
-            } else if (c == ' ' || c == '\t' || c == '\r') {
+            // Bug-Fix (14.10.2026): '\n' fehlte hier -- ein Zeilenumbruch
+            // direkt nach einem Bezeichner (z.B. "INSERT INTO t\n(...)")
+            // wurde sonst ins laufende Token ("t\n") aufgenommen statt es
+            // zu beenden, wodurch der Tabellenname "t\n" statt "t" war
+            // ("Tabelle nicht gefunden"). Gefunden ueber Velo/marketing_
+            // page_views, siehe testGroup135.
+            } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
                 if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
             } else {
                 cur += c;

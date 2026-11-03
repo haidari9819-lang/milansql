@@ -278,26 +278,15 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         if (!jwtSecret.empty()) jwtSecret_ = jwtSecret;  // tests / explicit
         else resolveJwtSecret();  // production: env → file → legacy → generate
-
-        // Create root user if none exist
-        if (users_.empty()) {
-            AuthUser root;
-            root.id = nextId_++;
-            root.username = "root";
-            root.role = "root";
-            root.isActive = true;
-            root.createdAt = nowStr();
-            std::string salt = generateRandom(32);
-            root.passwordHash = hashPasswordPbkdf2("root", salt);
-            users_[root.id] = root;
-            nameIndex_["root"] = root.id;
-        }
+        // Security fix (Nov 2026 audit): no more hardcoded root/root bootstrap here.
+        // An empty user store is now a fail-closed condition handled by the caller
+        // (see MilanHttpServer::run / --init-admin in main.cpp).
     }
 
     // ── Registration & Login ──────────────────────────────────
 
     AuthResult registerUser(const std::string& username, const std::string& password,
-                            const std::string& email = "") {
+                            const std::string& email = "", const std::string& role = "user") {
         std::lock_guard<std::mutex> lk(mutex_);
         if (username.empty() || password.empty())
             return {false,"","",0,"username and password required"};
@@ -308,7 +297,7 @@ public:
         u.id = nextId_++;
         u.username = username;
         u.email = email;
-        u.role = "user";
+        u.role = role;
         u.isActive = true;
         u.createdAt = nowStr();
         std::string salt = generateRandom(32);

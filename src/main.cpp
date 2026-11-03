@@ -240,6 +240,10 @@ int main(int argc, char* argv[]) {
     bool sentinelMode = false;
     // HTTP bind address (--host); defaults to all interfaces
     std::string httpBindHost = "0.0.0.0";
+    // Security fix (Nov 2026 audit): explicit, one-shot admin bootstrap (replaces hardcoded root/root)
+    std::string initAdminUser;
+    bool        initAdminRequested = false;
+    std::string initAdminPasswordFile;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -319,6 +323,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--pool-max"      && i + 1 < argc) poolMax     = std::stoi(argv[++i]);
         else if (arg == "--max-queue"     && i + 1 < argc) maxQueue    = std::stoi(argv[++i]);
         else if (arg == "--host"          && i + 1 < argc) httpBindHost = argv[++i];
+        else if (arg == "--init-admin"    && i + 1 < argc) { initAdminUser = argv[++i]; initAdminRequested = true; }
+        else if (arg == "--init-admin-password-file" && i + 1 < argc) initAdminPasswordFile = argv[++i];
         else if (arg == "--master-host"   && i + 1 < argc) masterHost  = argv[++i];
         else if (arg == "--master-port"   && i + 1 < argc) masterPort  = std::stoi(argv[++i]);
         else if (arg == "--repl-port"     && i + 1 < argc) replPort    = std::stoi(argv[++i]);
@@ -328,6 +334,37 @@ int main(int argc, char* argv[]) {
             // handled below after engine is constructed
             (void)0;
         }
+    }
+
+    // Security fix (Nov 2026 audit): one-shot admin bootstrap, never starts a server.
+    if (initAdminRequested) {
+        std::string pw;
+        if (const char* envPw = std::getenv("MILANSQL_INIT_ADMIN_PASSWORD")) pw = envPw;
+        if (pw.empty() && !initAdminPasswordFile.empty()) {
+            std::ifstream pf(initAdminPasswordFile);
+            if (pf) std::getline(pf, pw);
+        }
+        if (pw.empty()) {
+            std::cerr << "--init-admin requires MILANSQL_INIT_ADMIN_PASSWORD or --init-admin-password-file\n";
+            return 1;
+        }
+        const std::string authPath = "database.milan.auth";
+        AuthManager initAuth;
+        initAuth.load(authPath);
+        if (initAuth.getUserCount() > 0) {
+            std::cerr << "Refusing --init-admin: " << authPath
+                      << " already has users. Remove/move it first if you really intend to reset it.\n";
+            return 1;
+        }
+        auto res = initAuth.registerUser(initAdminUser, pw, "", "root");
+        if (!res.ok) {
+            std::cerr << "--init-admin failed: " << res.error << "\n";
+            return 1;
+        }
+        initAuth.save(authPath);
+        std::cout << "Admin user '" << initAdminUser << "' created in " << authPath
+                   << ". Start the server normally now.\n";
+        return 0;
     }
 
     // Phase 79: apply DSN to client/server port if given

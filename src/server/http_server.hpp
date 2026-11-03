@@ -929,6 +929,18 @@ inline void MilanHttpServer::initEngine() {
     // Phase 154/169: Init auth system
     // Load first (reads legacy secret + users), then init (resolves JWT secret)
     authMgr_.load(dbPath_ + ".auth");
+    // Security fix (Nov 2026 audit): fail-closed instead of silently bootstrapping
+    // a hardcoded root/root account when the auth store is missing or empty.
+    if (authMgr_.getUserCount() == 0) {
+        std::string authPath = dbPath_ + ".auth";
+        std::ifstream authCheck(authPath);
+        std::cerr << "FATAL: no valid credentials in " << authPath
+                  << (authCheck.good() ? " (file present but empty or unreadable)" : " (file not found)")
+                  << " -- refusing to start (fail-closed).\n"
+                  << "Bootstrap a new install with: --init-admin <user>, with the password in"
+                     " MILANSQL_INIT_ADMIN_PASSWORD or --init-admin-password-file <path>.\n";
+        std::exit(1);
+    }
     authMgr_.init();  // resolves secret: env → file → legacy → generate
 
     // Phase 62+176: Load partition metadata

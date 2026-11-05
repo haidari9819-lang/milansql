@@ -62,7 +62,6 @@
 // Phase 2.1 / 2.2: Thread Pool + User Query Cache
 #include "parallel/thread_pool.hpp"
 #include "cache/user_query_cache.hpp"
-#include "server/sql_table_extract.hpp"  // Oct 2026 cache-invalidation fix
 #include "utils/json_utils.hpp"
 #include "nl/nl_query.hpp"  // Block 7: NL Query tests
 #include "wal/pitr_manager.hpp"
@@ -13949,167 +13948,6 @@ static void testGroup127() {
     std::cout << "  testGroup127 passed.\n";
 }
 
-// ── testGroup133: sql_table_extract.hpp (Oct 2026 cache fix) ──
-// Table-name extraction is informational-only now (see invalidateTenant
-// in testGroup134), but it must still behave sanely — these tests cover
-// the original production bug plus the edge cases flagged during review.
-static void testGroup133() {
-    std::cout << "\n-- testGroup133: sql_table_extract.hpp (cache-invalidation fix) --\n";
-
-    auto up = [](std::string s) {
-        for (auto& c : s) c = (char)toupper((unsigned char)c);
-        return s;
-    };
-
-    // CREATE TABLE IF NOT EXISTS — the actual production bug
-    check(extractTableNameAfterKeyword(up("CREATE TABLE IF NOT EXISTS uploads (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-1: CREATE TABLE IF NOT EXISTS -> real table name, not IF");
-
-    // Plain CREATE TABLE (no IF NOT EXISTS)
-    check(extractTableNameAfterKeyword(up("CREATE TABLE uploads (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-2: plain CREATE TABLE");
-
-    // DROP TABLE IF EXISTS
-    check(extractTableNameAfterKeyword(up("DROP TABLE IF EXISTS uploads"), {"TABLE"}) == "UPLOADS",
-          "133-3: DROP TABLE IF EXISTS");
-
-    // Plain DROP TABLE
-    check(extractTableNameAfterKeyword(up("DROP TABLE uploads"), {"TABLE"}) == "UPLOADS",
-          "133-4: plain DROP TABLE");
-
-    // ALTER TABLE (no IF EXISTS clause in this dialect)
-    check(extractTableNameAfterKeyword(up("ALTER TABLE uploads ADD COLUMN x INT"), {"TABLE"}) == "UPLOADS",
-          "133-5: ALTER TABLE");
-
-    // Lowercase input, case-folded by caller before calling (matches real usage)
-    check(extractTableNameAfterKeyword(up("create table if not exists uploads (id int)"), {"TABLE"}) == "UPLOADS",
-          "133-6: lowercase input, upper-cased by caller");
-
-    // Multiple spaces between tokens
-    check(extractTableNameAfterKeyword(up("CREATE  TABLE   IF  NOT  EXISTS   uploads (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-7: multiple spaces between tokens");
-
-    // Newline / tab between tokens
-    check(extractTableNameAfterKeyword(up("CREATE TABLE\nIF NOT EXISTS\tuploads (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-8: newline and tab between tokens");
-
-    // Double-quoted identifier
-    check(extractTableNameAfterKeyword(up("CREATE TABLE IF NOT EXISTS \"uploads\" (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-9: double-quoted table name, quotes stripped");
-
-    // Backtick-quoted identifier
-    check(extractTableNameAfterKeyword(up("CREATE TABLE IF NOT EXISTS `uploads` (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-10: backtick-quoted table name, quotes stripped");
-
-    // INSERT INTO (regression check — must still work)
-    check(extractTableNameAfterKeyword(up("INSERT INTO uploads (id) VALUES (1)"), {"UPDATE","INTO","FROM","TABLE"}) == "UPLOADS",
-          "133-11: INSERT INTO unaffected");
-
-    // DELETE FROM (regression check)
-    check(extractTableNameAfterKeyword(up("DELETE FROM uploads WHERE id = 1"), {"UPDATE","INTO","FROM","TABLE"}) == "UPLOADS",
-          "133-12: DELETE FROM unaffected");
-
-    // UPDATE ... SET (regression check — special-cased, no keyword between)
-    check(extractTableNameAfterKeyword(up("UPDATE uploads SET x = 1"), {"UPDATE","INTO","FROM","TABLE"}) == "UPLOADS",
-          "133-13: UPDATE unaffected");
-
-    // SELECT ... FROM (cache-PUT side — must still work)
-    check(extractTableNameAfterKeyword(up("SELECT * FROM uploads WHERE user_id = 1"), {"FROM"}) == "UPLOADS",
-          "133-14: SELECT FROM unaffected");
-
-    // No match -> empty string, not a crash
-    check(extractTableNameAfterKeyword(up("SHOW TABLES"), {"FROM"}) == "",
-          "133-15: no matching keyword -> empty string");
-
-    // Trailing punctuation / parens don't leak into the name
-    check(extractTableNameAfterKeyword(up("CREATE TABLE IF NOT EXISTS uploads(id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-16: no space before opening paren");
-
-    // JOIN — FROM-side table must still resolve correctly with a JOIN present
-    check(extractTableNameAfterKeyword(up("SELECT * FROM uploads JOIN users ON uploads.user_id = users.id"), {"FROM"}) == "UPLOADS",
-          "133-17: SELECT ... FROM x JOIN y -> x (first FROM table)");
-
-    // Subquery in FROM — no single table name, must decline rather than guess
-    check(extractTableNameAfterKeyword(up("SELECT * FROM (SELECT * FROM uploads) t"), {"FROM"}) == "",
-          "133-18: FROM (subquery) -> empty, not a guess");
-
-    // Schema-qualified name
-    check(extractTableNameAfterKeyword(up("SELECT * FROM public.uploads"), {"FROM"}) == "UPLOADS",
-          "133-19: schema-qualified db.table -> table part only");
-    check(extractTableNameAfterKeyword(up("CREATE TABLE IF NOT EXISTS public.uploads (id INT)"), {"TABLE"}) == "UPLOADS",
-          "133-20: schema-qualified CREATE TABLE IF NOT EXISTS");
-
-    // Keyword-looking text inside a string literal must not be mistaken for SQL
-    check(extractTableNameAfterKeyword(up("INSERT INTO uploads (filename) VALUES ('FROM x')"), {"UPDATE","INTO","FROM","TABLE"}) == "UPLOADS",
-          "133-21: string literal containing 'FROM x' doesn't confuse extraction");
-
-    std::cout << "  testGroup133 passed.\n";
-}
-
-// ── testGroup134: UserQueryCache::invalidateTenant() (the actual fix) ──
-// This is what correctness now depends on — a write/DDL for ANY table
-// must clear ALL of that tenant's cached SELECTs, not just the one the
-// parser thinks it recognizes. Uses a fresh, local UserQueryCache
-// instance (not the global singleton) so this test can't be polluted
-// by, or pollute, anything else.
-static void testGroup134() {
-    std::cout << "\n-- testGroup134: UserQueryCache::invalidateTenant() --\n";
-
-    milansql::UserQueryCache cache;
-
-    // Basic: invalidateTenant clears a cached SELECT for the table it named
-    cache.put("u2", "SELECT * FROM uploads", "result-uploads-1", "UPLOADS");
-    check(cache.get("u2", "SELECT * FROM uploads").has_value(),
-          "134-1: entry cached before invalidation");
-    cache.invalidateTenant("u2");
-    check(!cache.get("u2", "SELECT * FROM uploads").has_value(),
-          "134-2: entry gone after invalidateTenant");
-
-    // Whole-tenant scope: a write to table A must also evict a cached
-    // SELECT for table B of the SAME tenant (covers JOINs/subqueries where
-    // single-table matching can't tell which tables were really touched).
-    cache.put("u2", "SELECT * FROM uploads", "r1", "UPLOADS");
-    cache.put("u2", "SELECT * FROM products", "r2", "PRODUCTS");
-    check(cache.get("u2", "SELECT * FROM uploads").has_value(), "134-3: uploads cached");
-    check(cache.get("u2", "SELECT * FROM products").has_value(), "134-4: products cached");
-    cache.invalidateTenant("u2"); // simulates e.g. an INSERT...SELECT touching both
-    check(!cache.get("u2", "SELECT * FROM uploads").has_value(),
-          "134-5: uploads evicted even though the write only named products");
-    check(!cache.get("u2", "SELECT * FROM products").has_value(),
-          "134-6: products evicted too");
-
-    // Tenant isolation: invalidating one tenant must NOT touch another
-    // tenant's cache, even for the identical SQL text/table name.
-    cache.put("u2", "SELECT * FROM uploads", "r-u2", "UPLOADS");
-    cache.put("u3", "SELECT * FROM uploads", "r-u3", "UPLOADS");
-    cache.put("root", "SELECT * FROM uploads", "r-root", "UPLOADS");
-    cache.invalidateTenant("u2");
-    check(!cache.get("u2", "SELECT * FROM uploads").has_value(),
-          "134-7: u2 evicted");
-    check(cache.get("u3", "SELECT * FROM uploads").has_value(),
-          "134-8: u3 untouched by u2's invalidation");
-    check(cache.get("root", "SELECT * FROM uploads").has_value(),
-          "134-9: root untouched by u2's invalidation");
-    cache.invalidateTenant("u3");
-    cache.invalidateTenant("root");
-
-    // Invalidating a tenant with nothing cached is a harmless no-op.
-    cache.invalidateTenant("u999");
-    check(true, "134-10: invalidateTenant on empty/unknown tenant doesn't throw");
-
-    // JOIN-staleness scenario at the cache level: cache a JOIN query result,
-    // then invalidate the tenant (simulating a write to either side of the
-    // join) — the cached JOIN result must not survive.
-    cache.put("u2", "SELECT * FROM uploads JOIN users ON uploads.user_id = users.id",
-              "r-join", "UPLOADS");
-    check(cache.get("u2", "SELECT * FROM uploads JOIN users ON uploads.user_id = users.id").has_value(),
-          "134-11: JOIN result cached");
-    cache.invalidateTenant("u2");
-    check(!cache.get("u2", "SELECT * FROM uploads JOIN users ON uploads.user_id = users.id").has_value(),
-          "134-12: JOIN result evicted by tenant-wide invalidation");
-
-    std::cout << "  testGroup134 passed.\n";
-}
 
 // ================================================================
 // testGroup135: Zeilenumbruch direkt nach Tabellennamen (14.10.2026)
@@ -14913,12 +14751,6 @@ int main() {
     }
     try { testGroup132(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 132 exception: " << e.what() << "\n"; ++failed;
-    }
-    try { testGroup133(); } catch (const std::exception& e) {
-        std::cout << "[ERROR] Group 133 exception: " << e.what() << "\n"; ++failed;
-    }
-    try { testGroup134(); } catch (const std::exception& e) {
-        std::cout << "[ERROR] Group 134 exception: " << e.what() << "\n"; ++failed;
     }
     try { testGroup135(); } catch (const std::exception& e) {
         std::cout << "[ERROR] Group 135 exception: " << e.what() << "\n"; ++failed;

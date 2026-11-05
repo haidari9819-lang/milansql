@@ -4690,9 +4690,9 @@ static void testGroup65() {
     { auto enc = AuthManager::base64urlEncode_pub("test");
       check(enc.find('=') == std::string::npos, "Base64URL has no padding chars"); }
 
-    // 6. AuthManager init creates root user
+    // 6. AuthManager init on empty store creates no default account (fail-closed fix)
     { AuthManager am; am.init("test_secret_1234567890");
-      check(am.getUserCount() >= 1, "AuthManager init creates at least root user"); }
+      check(am.getUserCount() == 0, "AuthManager init creates no default account (fail-closed)"); }
 
     // 7. Register new user succeeds
     { AuthManager am; am.init("test_secret");
@@ -4766,9 +4766,9 @@ static void testGroup65() {
     { AuthManager am; am.init("test_secret");
       check(!am.validateApiKey("ms_invalid_key_xyz").valid, "Invalid API key → fails"); }
 
-    // 19. SHOW USERS contains root
+    // 19. SHOW USERS has no default root account after init (fail-closed fix)
     { AuthManager am; am.init("test_secret");
-      check(am.showUsers().find("root") != std::string::npos, "SHOW USERS contains 'root'"); }
+      check(am.showUsers().find("root") == std::string::npos, "SHOW USERS has no default 'root' account after init"); }
 
     // 20. SHOW USERS contains registered user
     { AuthManager am; am.init("test_secret");
@@ -4786,12 +4786,10 @@ static void testGroup65() {
     { AuthManager am; am.init("test_secret");
       check(!am.refreshToken("invalid_refresh").ok, "Refresh invalid token → fails"); }
 
-    // 23. Root user has role root
+    // 23. root/root login is rejected (no default bootstrap account after init)
     { AuthManager am; am.init("test_secret");
       auto lr = am.login("root", "root");
-      check(lr.ok, "Root user can login");
-      if (lr.ok) { auto vr = am.validateToken(lr.token); check(vr.role == "root", "Root token has role 'root'"); }
-      else { ++failed; } }
+      check(!lr.ok, "root/root login is rejected (fail-closed, no default bootstrap)"); }
 
     // 24. Save/load roundtrip
     { AuthManager am1; am1.init("persist_secret");
@@ -4827,12 +4825,13 @@ static void testGroup66() {
         else       { std::cout << "[FAIL] " << msg << "\n"; ++failed; }
     };
 
-    // 1. Root has all permissions by default
+    // 1. An explicitly-created root-role admin has all permissions by default
     { AuthManager am; am.init("secret");
       am.registerUser("alice", "pass");
-      auto lr = am.login("root", "root");
+      am.registerUser("admin66_1", "AdminPass123!", "", "root");
+      auto lr = am.login("admin66_1", "AdminPass123!");
       auto vr = am.validateToken(lr.token);
-      check(am.hasPermission(vr.userId, "orders", "SELECT"), "Root has SELECT permission on any table"); }
+      check(am.hasPermission(vr.userId, "orders", "SELECT"), "Admin (role=root) has SELECT permission on any table"); }
 
     // 2. New user has no permissions on other tables
     { AuthManager am; am.init("secret");
@@ -5051,10 +5050,10 @@ static void testGroup67() {
       check(am.showAllUsers().find("laura") != std::string::npos,
             "SHOW ALL USERS contains 'laura'"); }
 
-    // 13. SHOW ALL USERS contains root
+    // 13. SHOW ALL USERS has no default root account after init (fail-closed fix)
     { AuthManager am; am.init("secret");
-      check(am.showAllUsers().find("root") != std::string::npos,
-            "SHOW ALL USERS contains 'root'"); }
+      check(am.showAllUsers().find("root") == std::string::npos,
+            "SHOW ALL USERS has no default 'root' account after init"); }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -5384,7 +5383,7 @@ static void testGroup69() {
         AuthManager am; am.init("test_security_secret");
         am.registerUser("dana", "Dana5678");
         auto r = am.login("dana", "Dana5678");
-        check(r.ok && !r.token.empty() && r.userId > 1, "Correct password → login OK, token issued");
+        check(r.ok && !r.token.empty() && r.userId >= 1, "Correct password → login OK, token issued");
     }
 
     // 6. AuthManager: token validates correctly
@@ -8331,13 +8330,13 @@ static void testGroup84() {
               "ChangePW #5: short new password rejected");
     }
 
-    // ── 6. adminSetPassword: root can reset others ──────────
+    // ── 6. adminSetPassword: an explicitly-created admin can reset others ──
     {
         AuthManager mgr;
         mgr.init("test_secret_change_pw_62345678");
-        int rootId = mgr.getUserIdByName("root");
+        auto admin = mgr.registerUser("admin_cp6", "AdminPass123!", "", "root");
         auto reg = mgr.registerUser("grace", "oldpass123");
-        auto cp = mgr.adminSetPassword(rootId, reg.userId, "adminset99");
+        auto cp = mgr.adminSetPassword(admin.userId, reg.userId, "adminset99");
         check(cp.ok, "ChangePW #6: admin set-password succeeds");
         auto login = mgr.login("grace", "adminset99");
         check(login.ok, "ChangePW #6b: login with admin-set password");
@@ -8485,24 +8484,23 @@ static void testGroup85() {
               "JWTSec #6: secret string not present in saved file");
     }
 
-    // ── 7. root user NOT recreated after load ────────────────
+    // ── 7. explicitly-created admin NOT recreated/reset by init() after load ──
     {
-        // Save a file with custom root password
+        // Save a file with a custom admin account + password
         AuthManager mgr;
         mgr.init("root_preserve_test_1234567890");
-        // Change root password
-        int rootId = mgr.getUserIdByName("root");
-        mgr.changePassword(rootId, "root", "custom_root_pw");
+        auto admin = mgr.registerUser("admin_jwt7", "InitialPass123!", "", "root");
+        mgr.changePassword(admin.userId, "InitialPass123!", "custom_root_pw");
         std::string tmpPath = "test_auth_rootkeep.tmp";
         mgr.save(tmpPath);
 
-        // Load into new manager — root should keep custom password
+        // Load into new manager — init() must not recreate/reset the loaded admin
         AuthManager mgr2;
         mgr2.load(tmpPath);
         mgr2.init("root_preserve_test_1234567890");
         std::remove(tmpPath.c_str());
-        auto login = mgr2.login("root", "custom_root_pw");
-        check(login.ok, "JWTSec #7: root user preserved after load (not recreated)");
+        auto login = mgr2.login("admin_jwt7", "custom_root_pw");
+        check(login.ok, "JWTSec #7: admin user preserved after load (not recreated by init())");
     }
 
     // ── 8. Empty init() without explicit secret doesn't crash ─

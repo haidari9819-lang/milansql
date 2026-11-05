@@ -3,9 +3,19 @@
 # Usage: bash scripts/chaos_test.sh [host:port]
 set -euo pipefail
 
-SERVER="${1:-178.105.206.36:8080}"
+SERVER="${1:-127.0.0.1:8081}"
 PASS=0
 FAIL=0
+
+# Sicherheits-Guard (2026-11): dieses Skript darf NIEMALS gegen Prod (Port 8080 /
+# /opt/milansql) laufen -- nur gegen die Testinstanz auf Port 8081. Harter Abbruch,
+# wenn das Ziel nicht explizit Port 8081 ist.
+TARGET_PORT="${SERVER##*:}"
+if [ "$TARGET_PORT" != "8081" ]; then
+  echo "ABBRUCH: chaos_test.sh darf nur gegen Port 8081 (milansql-test) laufen." >&2
+  echo "Angegebenes Ziel '$SERVER' hat Port '$TARGET_PORT' -- nicht 8081. Abbruch." >&2
+  exit 1
+fi
 
 ok()  { echo "  PASS: $1"; ((PASS++)); }
 fail(){ echo "  FAIL: $1"; ((FAIL++)); }

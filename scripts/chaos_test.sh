@@ -17,8 +17,8 @@ if [ "$TARGET_PORT" != "8081" ]; then
   exit 1
 fi
 
-ok()  { echo "  PASS: $1"; ((PASS++)); }
-fail(){ echo "  FAIL: $1"; ((FAIL++)); }
+ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
+fail(){ echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 echo "=== MilanSQL Chaos Test ==="
 echo "Target: $SERVER"

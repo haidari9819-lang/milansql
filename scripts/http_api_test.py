@@ -16,7 +16,7 @@ and stops.
 Exit code: 0 if every check() passed (XFAIL is allowed and does not fail the
 build; an unexpected pass of a check_known_failure() does fail the build, the
 same convention as checkKnownFailure() in src/tests/milansql_tests.cpp, see
-docs/milansql-audit.md).
+docs/known-issues.md).
 """
 import json
 import os
@@ -393,7 +393,7 @@ def phase_unknown_column():
             "(the column is only resolved while scanning rows, and an empty "
             "table never scans any)",
             j_empty.get("success") is False,
-            "docs/milansql-audit.md",
+            "docs/known-issues.md",
             f"got {j_empty}",
         )
 
@@ -414,7 +414,7 @@ def phase_unknown_column():
             "unknown column in WHERE on a table WITH rows: HTTP status is 4xx "
             "like other client errors (currently always 200, even on failure)",
             400 <= status < 500,
-            "docs/milansql-audit.md",
+            "docs/known-issues.md",
             f"got HTTP {status}",
         )
     finally:
@@ -455,7 +455,7 @@ def phase_cache_staleness():
             "after an INSERT still returns the pre-insert cached result "
             "instead of the fresh count",
             "COUNT(*) = 1" in after.get("message", ""),
-            "docs/milansql-audit.md",
+            "docs/known-issues.md",
             f"got {after}",
         )
     finally:
@@ -498,7 +498,7 @@ def phase_broken_requests():
             "(the HTTP layer only flags failure by scanning the engine's text output for "
             "keywords like 'FEHLER', which an unrecognized/garbage command doesn't contain)",
             j.get("success") is False,
-            "docs/milansql-audit.md",
+            "docs/known-issues.md",
             f"got {j}",
         )
     finally:

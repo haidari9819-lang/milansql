@@ -6338,7 +6338,10 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         if (req.method == "GET") sql = getQueryParam(req.query, "sql");
         else if (req.method == "POST") {
             sql = extractSqlFromJson(req.body);
-            if (sql.empty()) sql = req.body;
+            // Fallback auf raw body nur wenn kein "sql"-Key im JSON (Rückwärtskompatibilität).
+            // Wenn "sql":"" explizit übergeben wird, soll leere Query als Fehler gemeldet werden.
+            if (sql.empty() && req.body.find("\"sql\"") == std::string::npos)
+                sql = req.body;
             params = extractParamsFromJson(req.body);
         }
         if (sql.empty())
@@ -6351,8 +6354,8 @@ inline std::string MilanHttpServer::handleRequest(const HttpRequest& req, const 
         }
 
         // Input sanitization: length limit + null-byte + control-char removal
-        if (sql.size() > 10000)
-            return buildHttpResponse(400, std::string("{\"success\":false,\"error\":\"SQL too long (max 10000 chars)\"}"));
+        if (sql.size() > 1000000)
+            return buildHttpResponse(400, std::string("{\"success\":false,\"error\":\"SQL too long (max 1000000 chars)\"}"));
         {
             std::string clean;
             clean.reserve(sql.size());

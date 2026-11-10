@@ -622,20 +622,23 @@ struct Eval {
 
     double resolveIdent(const std::string& tok) const {
         const double nan = std::numeric_limits<double>::quiet_NaN();
-        // exact match first
+        // Strip table prefix from token (e.g. "tab1.col0" → "col0")
+        auto td = tok.rfind('.');
+        const std::string bare = (td != std::string::npos) ? tok.substr(td + 1) : tok;
+        auto tryVal = [&](size_t i) -> double {
+            if (isNullVal(vals[i])) return nan;
+            try { return std::stod(vals[i]); } catch (...) { return 0.0; }
+        };
+        // exact match first (full token or bare name)
         for (size_t i = 0; i < cols.size() && i < vals.size(); ++i)
-            if (cols[i].name == tok) {
-                if (isNullVal(vals[i])) return nan;
-                try { return std::stod(vals[i]); } catch (...) { return 0.0; }
-            }
-        // suffix match (strip "table.")
+            if (cols[i].name == tok || (td != std::string::npos && cols[i].name == bare))
+                return tryVal(i);
+        // suffix match: strip "table." from column name
         for (size_t i = 0; i < cols.size() && i < vals.size(); ++i) {
             auto d = cols[i].name.rfind('.');
-            std::string suf = d != std::string::npos ? cols[i].name.substr(d+1) : cols[i].name;
-            if (suf == tok) {
-                if (isNullVal(vals[i])) return nan;
-                try { return std::stod(vals[i]); } catch (...) { return 0.0; }
-            }
+            const std::string& suf = d != std::string::npos ? cols[i].name.substr(d+1) : cols[i].name;
+            if (suf == tok || suf == bare)
+                return tryVal(i);
         }
         return 0.0;
     }
@@ -650,21 +653,42 @@ struct Eval {
             return v;
         }
         size_t start = pos;
-        // optional sign
-        if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
-        // digits
+        // optional sign (applies to both numeric literals and identifiers)
+        bool neg = false;
+        if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) {
+            neg = (expr[pos] == '-');
+            ++pos;
+            skipWS();  // allow space between sign and operand (e.g. "- col0")
+        }
+        size_t afterSign = pos;
+        // digits — numeric literal
         while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
-        if (pos > start) {
-            try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
+        if (pos > afterSign) {
+            try {
+                double v = std::stod(expr.substr(afterSign, pos - afterSign));
+                return neg ? -v : v;
+            } catch (...) {}
         }
-        pos = start;
-        // identifier
+        pos = afterSign;
+        // identifier (column name or bare number), supports "table.col" qualified names
         while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
-        if (pos > start) {
-            std::string tok = expr.substr(start, pos - start);
-            try { return std::stod(tok); } catch (...) {}
-            return resolveIdent(tok);
+        // extend through dot for qualified names like "tab1.col0"
+        if (pos < expr.size() && expr[pos] == '.' && pos + 1 < expr.size() &&
+            (std::isalnum((unsigned char)expr[pos + 1]) || expr[pos + 1] == '_')) {
+            ++pos;  // consume '.'
+            while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
         }
+        if (pos > afterSign) {
+            std::string tok = expr.substr(afterSign, pos - afterSign);
+            // Try as numeric literal first (no dot in pure numerics)
+            if (tok.find('.') == std::string::npos) {
+                try { double v = std::stod(tok); return neg ? -v : v; } catch (...) {}
+            }
+            double v = resolveIdent(tok);
+            return neg ? -v : v;
+        }
+        // Nothing parsed — skip one char and return 0
+        pos = start;
         if (pos < expr.size()) ++pos;
         return 0.0;
     }
@@ -700,6 +724,18 @@ struct Eval {
 };
 
 inline bool looksArith(const std::string& s) {
+    // Bug fix: a fully quoted string literal (e.g. 'burger-house', "2026-09-22")
+    // is a plain value, never an arithmetic expression — even if it contains
+    // '+', '-', '*' or '/' as ordinary characters. Without this check, any
+    // WHERE col = 'a-b' comparison was misdetected as the expression "a - b",
+    // routed through the arithmetic evaluator (which silently resolves unknown
+    // identifiers like "a"/"b" to 0.0 instead of throwing), and always
+    // evaluated to "0" — making exact-match WHERE clauses on hyphenated
+    // strings (slugs, dates, ...) unconditionally return zero rows.
+    if (s.size() >= 2 &&
+        ((s.front() == '\'' && s.back() == '\'') ||
+         (s.front() == '"'  && s.back() == '"')))
+        return false;
     if (!s.empty() && s[0] == '(') return true;  // parenthesized expression
     for (char c : s) if (c == '+' || c == '-' || c == '*' || c == '/') return true;
     // pure numeric literal
@@ -2199,7 +2235,10 @@ public:
                   const std::vector<std::string>& groupCols,
                   const std::vector<SelectItem>& selectItems,
                   const std::vector<HavingCondition>& havingConds,
-                  const std::string& havingLogic) const {
+                  const std::string& havingLogic,
+                  // Phase 185: non-aggregate HAVING conditions (e.g. HAVING col IN (...))
+                  const std::vector<WhereCondition>& havingWhereConds = {},
+                  const std::string& havingWhereLogic = "AND") const {
 
         auto tblName = resolveTableName(tblNameRaw);
         const Table& src = getTable(tblName);
@@ -2279,10 +2318,27 @@ public:
             groupMap[key].push_back(ri);
         }
 
+        // Step 3.5 — Expand SELECT * wildcard to individual columns
+        std::vector<SelectItem> expandedItems;
+        expandedItems.reserve(selectItems.size());
+        for (const auto& item : selectItems) {
+            if (!item.isAgg && !item.isFuncExpr && item.colName == "*") {
+                // Replace * with one item per source column
+                for (const auto& col : src.columns()) {
+                    SelectItem si;
+                    si.colName = col.name;
+                    expandedItems.push_back(si);
+                }
+            } else {
+                expandedItems.push_back(item);
+            }
+        }
+        const std::vector<SelectItem>& effItems = expandedItems;
+
         // Step 4 — Ergebnis-Spalten aus SelectItems ableiten
         std::vector<Column> resultCols;
-        resultCols.reserve(selectItems.size());
-        for (const auto& item : selectItems) {
+        resultCols.reserve(effItems.size());
+        for (const auto& item : effItems) {
             std::string name;
             if (!item.alias.empty()) {
                 name = item.alias;
@@ -2300,9 +2356,9 @@ public:
             const auto& riList = groupMap[key];
 
             std::vector<std::string> vals;
-            vals.reserve(selectItems.size());
+            vals.reserve(effItems.size());
 
-            for (const auto& item : selectItems) {
+            for (const auto& item : effItems) {
                 if (item.isAgg) {
                     vals.push_back(computeAggForGroup(src, item, riList));
                 } else if (item.isFuncExpr) {
@@ -2310,10 +2366,47 @@ public:
                     const Row& firstRow = src.rows()[riList[0]];
                     vals.push_back(evaluateFunc(item.funcName, item.funcArgs, src, firstRow));
                 } else {
-                    size_t ci = colIdx(src, item.colName);
                     const Row& first = src.rows()[riList[0]];
-                    vals.push_back(ci < first.values.size() ? first.values[ci] : "");
+                    // Evaluate arithmetic expressions before column lookup so that
+                    // "- cor0.col0" is not mistaken for column "col0" via dot-suffix match.
+                    if (looksArith(item.colName)) {
+                        vals.push_back(evalArithExpr(item.colName, src, first));
+                    } else {
+                        int ci2 = findColIdx(src, item.colName);
+                        if (ci2 >= 0 && static_cast<size_t>(ci2) < first.values.size()) {
+                            vals.push_back(first.values[static_cast<size_t>(ci2)]);
+                        } else {
+                            vals.push_back("");
+                        }
+                    }
                 }
+            }
+
+            // Phase 185: non-aggregate HAVING conditions evaluated against first group row
+            if (!havingWhereConds.empty() && !riList.empty()) {
+                const Row& firstRow = src.rows()[riList[0]];
+                // Resolve column references / arithmetic expressions in condition RHS/bounds/inList
+                // against the group's first row, so "col0" in inList resolves to its actual value.
+                auto resolveRef = [&](const std::string& s) -> std::string {
+                    if (s.empty() || s == "NULL") return s;
+                    int rc2 = findColIdx(src, s);
+                    if (rc2 >= 0 && static_cast<size_t>(rc2) < firstRow.values.size())
+                        return firstRow.values[static_cast<size_t>(rc2)];
+                    if (looksArith(s)) {
+                        try { return milansql_arith::Eval{src.columns(), firstRow.values, s, 0}.run(); }
+                        catch (...) {}
+                    }
+                    return s;
+                };
+                std::vector<WhereCondition> resolvedHW = havingWhereConds;
+                for (auto& wc2 : resolvedHW) {
+                    wc2.val = resolveRef(wc2.val);
+                    wc2.betweenLow  = resolveRef(wc2.betweenLow);
+                    wc2.betweenHigh = resolveRef(wc2.betweenHigh);
+                    for (auto& v2 : wc2.inList) v2 = resolveRef(v2);
+                }
+                if (!rowMatches(src, firstRow, resolvedHW, havingWhereLogic))
+                    continue;
             }
 
             if (satisfiesHaving(havingConds, havingLogic, selectItems, vals))
@@ -7737,6 +7830,8 @@ private:
                 try {
                     lhsVal = milansql_arith::Eval{src.columns(), row.values, c.col, 0}.run();
                 } catch (...) { return false; }
+            } else if (c.col.empty() || c.col == "NULL") {
+                lhsVal = "NULL";  // literal NULL in HAVING NULL IS NULL etc.
             } else {
                 // Fall back to strict colIdx (throws on unknown column)
                 size_t ci2 = colIdx(src, c.col);
@@ -7891,9 +7986,19 @@ private:
             return formatNum(wsum / totalW);
         }
 
-        size_t ci = colIdx(src, item.aggCol);
-        // Phase 121: Vector AVG — detect if this is a VECTOR column
-        if (item.aggFunc == "AVG" && !riList.empty()) {
+        // Phase 185: aggCol may be an expression like "+ col0" or "- col1"
+        // (from AVG(+ col0) or AVG(DISTINCT + col0) after parser fix).
+        // colIdx throws if the name is not a plain column — fall back to Eval.
+        size_t ci = std::string::npos;
+        bool aggUseExpr = false;
+        try {
+            ci = colIdx(src, item.aggCol);
+        } catch (...) {
+            aggUseExpr = true;
+        }
+
+        // Phase 121: Vector AVG — detect if this is a VECTOR column (plain col only)
+        if (!aggUseExpr && item.aggFunc == "AVG" && !riList.empty()) {
             // Peek at the first non-null value to check if it's a vector
             for (size_t ri : riList) {
                 const Row& row = src.rows()[ri];
@@ -7935,7 +8040,13 @@ private:
         nums.reserve(riList.size());
         for (size_t ri : riList) {
             const Row& row = src.rows()[ri];
-            if (ci < row.values.size()) {
+            if (aggUseExpr) {
+                // Expression aggCol (e.g. "+ col0", "- col1")
+                try {
+                    std::string v = milansql_arith::Eval{src.columns(), row.values, item.aggCol, 0}.run();
+                    if (!v.empty() && v != "NULL") nums.push_back(std::stod(v));
+                } catch (...) {}
+            } else if (ci < row.values.size()) {
                 try { nums.push_back(std::stod(row.values[ci])); }
                 catch (...) {}
             }
@@ -8121,12 +8232,23 @@ private:
 
         double resolveCol(const std::string& name) const {
             const double NaN = std::numeric_limits<double>::quiet_NaN();
+            // Strip table prefix from token for qualified names like "tab1.col0"
+            auto td = name.rfind('.');
+            const std::string bare = (td != std::string::npos) ? name.substr(td + 1) : name;
+            auto tryV = [&](size_t i) -> double {
+                const std::string& v = vals[i];
+                if (v.empty() || v == "NULL" || v == "null") return NaN;
+                try { return std::stod(v); } catch (...) { return 0.0; }
+            };
             for (size_t i = 0; i < cols.size() && i < vals.size(); ++i)
-                if (cols[i].name == name) {
-                    const std::string& v = vals[i];
-                    if (v.empty() || v == "NULL" || v == "null") return NaN;
-                    try { return std::stod(v); } catch (...) { return 0.0; }
-                }
+                if (cols[i].name == name || (td != std::string::npos && cols[i].name == bare))
+                    return tryV(i);
+            // suffix match: strip "table." from column name
+            for (size_t i = 0; i < cols.size() && i < vals.size(); ++i) {
+                auto d = cols[i].name.rfind('.');
+                const std::string& suf = d != std::string::npos ? cols[i].name.substr(d+1) : cols[i].name;
+                if (suf == name || suf == bare) return tryV(i);
+            }
             return 0.0;
         }
 
@@ -8139,20 +8261,33 @@ private:
                 if (pos < expr.size() && expr[pos] == ')') ++pos;
                 return v;
             }
+            // Unary +/- — recursive so that chains like - - x cancel correctly
+            if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) {
+                double sign = (expr[pos] == '-') ? -1.0 : 1.0;
+                ++pos;
+                return sign * parseFactor();
+            }
             // Read token: number or identifier
             size_t start = pos;
-            if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
             while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
             if (pos > start) {
                 try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
             }
             pos = start;
-            // identifier
+            // identifier, supports "table.col" qualified names
             while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
+            // extend through dot for qualified names like "tab1.col0"
+            if (pos < expr.size() && expr[pos] == '.' && pos + 1 < expr.size() &&
+                (std::isalnum((unsigned char)expr[pos + 1]) || expr[pos + 1] == '_')) {
+                ++pos;  // consume '.'
+                while (pos < expr.size() && (std::isalnum((unsigned char)expr[pos]) || expr[pos] == '_')) ++pos;
+            }
             if (pos > start) {
                 std::string tok = expr.substr(start, pos - start);
-                // check if numeric
-                try { return std::stod(tok); } catch (...) {}
+                // check if numeric (only if no dot)
+                if (tok.find('.') == std::string::npos) {
+                    try { return std::stod(tok); } catch (...) {}
+                }
                 return resolveCol(tok);
             }
             ++pos;
@@ -8163,9 +8298,23 @@ private:
             double lhs = parseFactor();
             while (pos < expr.size()) {
                 while (pos < expr.size() && expr[pos] == ' ') ++pos;
-                if (pos < expr.size() && expr[pos] == '*') { ++pos; lhs *= parseFactor(); }
-                else if (pos < expr.size() && expr[pos] == '/') { ++pos; double r = parseFactor(); lhs = (r != 0.0 ? lhs / r : 0.0); }
-                else break;
+                if (pos < expr.size() && expr[pos] == '*') {
+                    ++pos; lhs *= parseFactor();
+                } else if (pos < expr.size() && expr[pos] == '/') {
+                    ++pos;
+                    double r = parseFactor();
+                    if (r != 0.0) {
+                        double q = lhs / r;
+                        // SQL integer division: truncate toward zero when both operands are integers
+                        lhs = (lhs == std::floor(lhs) && r == std::floor(r)) ? std::trunc(q) : q;
+                    } else lhs = 0.0;
+                } else if (pos + 3 <= expr.size() && expr[pos] == 'D' && expr[pos+1] == 'I' && expr[pos+2] == 'V' &&
+                           (pos + 3 == expr.size() || (!std::isalnum((unsigned char)expr[pos+3]) && expr[pos+3] != '_'))) {
+                    // DIV keyword — always integer division (truncate toward zero)
+                    pos += 3;
+                    double r = parseFactor();
+                    lhs = (r != 0.0) ? std::trunc(lhs / r) : 0.0;
+                } else break;
             }
             return lhs;
         }
@@ -8201,10 +8350,18 @@ private:
     // Returns true when expr looks like an arithmetic expression rather than a
     // bare column name: must contain an operator, start with '(', or be a numeric literal.
     static bool looksArith(const std::string& expr) {
+        if (expr == "*") return false;  // SELECT * wildcard, not multiply
         if (!expr.empty() && expr[0] == '(') return true;  // parenthesized expression
         for (char c : expr)
             if (c == '+' || c == '-' || c == '*' || c == '/')
                 return true;
+        // DIV keyword (integer division): e.g. "59 DIV 26"
+        {
+            std::string up = expr;
+            for (char& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (up.find(" DIV ") != std::string::npos || up.find(" MOD ") != std::string::npos)
+                return true;
+        }
         // pure numeric literal: "42", "3.14"
         if (!expr.empty()) {
             bool allNum = true;
@@ -8233,12 +8390,10 @@ private:
         flatCols.reserve(cols.size());
         flatVals.reserve(cols.size());
         for (size_t i = 0; i < cols.size(); ++i) {
-            // strip "table." prefix so expressions like "a+b" work after JOIN
-            const std::string& cn = cols[i].name;
-            auto dot = cn.rfind('.');
-            Column bare(dot != std::string::npos ? cn.substr(dot + 1) : cn,
-                        cols[i].type);
-            flatCols.push_back(bare);
+            // Keep the FULL column name (including table prefix if any) so that
+            // qualified expressions like "cor0.col1" match exactly in resolveCol,
+            // avoiding ambiguity when the same base table appears twice in a join.
+            flatCols.push_back(cols[i]);
             flatVals.push_back(i < vals.size() ? vals[i] : "");
         }
 
@@ -8877,6 +9032,14 @@ public:
 
     // Öffentlicher Zugriff auf evaluateFunc (für SELECT ohne FROM) ──
     // Erstellt eine temporäre leere Tabelle + leere Zeile und ruft evaluateFunc auf.
+    // Evaluate a literal arithmetic expression string (e.g. "1+2*3", "-5*2")
+    // Used by dispatch for FROM-less SELECT projections.
+    std::string evalExprPublic(const std::string& exprStr) {
+        std::vector<Column> noCols;
+        std::vector<std::string> noVals;
+        return evaluateGenExpr(exprStr, noCols, noVals);
+    }
+
     std::string evalFuncPublic(const std::string& fn,
                                const std::vector<std::string>& args) {
         ExtMgrGuard guard(&extensionMgr_);

@@ -472,6 +472,9 @@ struct ParsedCommand {
     std::vector<std::string>      groupByCols;
     std::vector<HavingCondition>  havingConds;
     std::string                   havingLogic = "AND";
+    // Phase 185: non-aggregate HAVING conditions (e.g. HAVING col IN (...), HAVING col BETWEEN ...)
+    std::vector<WhereCondition>   havingWhereConds;
+    std::string                   havingWhereLogic = "AND";
 
     // Phase 136: ROLLUP / CUBE / GROUPING SETS
     std::vector<std::vector<std::string>> groupingSets;  // expanded sets; non-empty → multi-pass
@@ -6576,6 +6579,8 @@ private:
             } else {
                 ++selStart; // skip just DISTINCT
             }
+        } else if (selStart < fromPos && toUpper(ft[selStart]) == "ALL") {
+            ++selStart;  // SELECT ALL ≡ SELECT (no-op quantifier)
         }
         // Phase 167: Detect standalone aggregates (COUNT/SUM/AVG/MIN/MAX) before column parsing
         bool aggDetected167 = false;
@@ -7155,7 +7160,8 @@ private:
                            u != "SELECT" && u != "FROM" && u != "WHERE" &&
                            u != "AND" && u != "OR" && u != "NOT" &&
                            u != "AS" && u != "ON" && u != "IN" &&
-                           u != "NULL" && u != "DISTINCT") {
+                           u != "NULL" && u != "DISTINCT" &&
+                           u != "+" && u != "-") {
                     SelectItem item;
                     item.isFuncExpr = true;
                     item.funcName   = u;
@@ -7289,11 +7295,12 @@ private:
                     // Peek ahead: if an arithmetic operator follows the first token,
                     // collect the full expression rather than just one token.
                     SelectItem item;
-                    // Check if next token (after ft[i]) is an arithmetic operator
+                    // Unary +/- at start, or arithmetic operator following: collect full expression
+                    bool curIsUnary = (ft[i] == "+" || ft[i] == "-");
                     bool nextIsOp = (i + 1 < end) &&
                                     (ft[i+1] == "+" || ft[i+1] == "-" ||
                                      ft[i+1] == "*" || ft[i+1] == "/");
-                    if (nextIsOp) {
+                    if (curIsUnary || nextIsOp) {
                         item.colName = collectArithExpr(ft, i, end);
                     } else {
                         item.colName = ft[i]; ++i;
@@ -7784,10 +7791,12 @@ private:
         // Tabellenname
         cmd.tableName = ft[fromPos + 1];
 
-        // SELECT-Liste (zwischen SELECT/DISTINCT und FROM)
+        // SELECT-Liste (zwischen SELECT/DISTINCT/ALL und FROM)
         size_t selStart = 1;
         if (selStart < fromPos && toUpper(ft[selStart]) == "DISTINCT") {
             cmd.isDistinct = true; ++selStart;
+        } else if (selStart < fromPos && toUpper(ft[selStart]) == "ALL") {
+            ++selStart;  // SELECT ALL ≡ SELECT (no-op quantifier)
         }
         parseSelectItems(ft, selStart, fromPos, cmd);
 
@@ -7989,14 +7998,34 @@ private:
                 }
                 cmd.selectItems.push_back(std::move(item));
                 i = j;
-            // Regular aggregate: FUNC ( col ) [AS alias]
-            } else if (isAgg && i + 3 < end && ft[i + 1] == "(") {
+            // Regular aggregate: FUNC ( [DISTINCT|ALL] col-expr ) [AS alias]
+            } else if (isAgg && i + 2 < end && ft[i + 1] == "(") {
                 SelectItem item;
                 item.isAgg   = true;
                 item.aggFunc = u;
-                item.aggCol  = ft[i + 2];   // z. B. "*" oder "level"
-                // ft[i+3] sollte ")" sein
-                size_t j = i + 4;
+                size_t j = i + 2;  // first token after "("
+                // Skip DISTINCT / ALL keyword (phase 185: support FUNC(DISTINCT expr))
+                if (j < end) {
+                    std::string dkw = toUpper(ft[j]);
+                    if (dkw == "DISTINCT" || dkw == "ALL") ++j;
+                }
+                // Collect all tokens until the matching closing ")"
+                std::string aggColBuf;
+                int depth2 = 0;
+                while (j < end) {
+                    if (ft[j] == "(") {
+                        if (!aggColBuf.empty()) aggColBuf += ' ';
+                        aggColBuf += ft[j]; ++depth2; ++j;
+                    } else if (ft[j] == ")") {
+                        if (depth2 == 0) break;
+                        aggColBuf += ft[j]; --depth2; ++j;
+                    } else {
+                        if (!aggColBuf.empty()) aggColBuf += ' ';
+                        aggColBuf += ft[j]; ++j;
+                    }
+                }
+                item.aggCol = aggColBuf;
+                if (j < end && ft[j] == ")") ++j;
                 // optional AS alias
                 if (j < end && toUpper(ft[j]) == "AS") {
                     ++j;
@@ -8007,6 +8036,7 @@ private:
             // Phase 97: Generic function expression: FUNC ( args... ) [AS alias]
             // Handles TIME_BUCKET and other non-aggregate functions in GROUP BY SELECT
             } else if (!isAgg && !isAgg2 && u != "AS" && u != "," &&
+                       u != "+" && u != "-" &&
                        i + 1 < end && ft[i + 1] == "(") {
                 SelectItem item;
                 item.isFuncExpr = true;
@@ -8042,12 +8072,46 @@ private:
                 cmd.selectItems.push_back(std::move(item));
                 i = j;
             } else {
-                // Normale Spalte (oder *)
+                // Normale Spalte, *, oder arithmetischer Ausdruck [AS alias]
+                // Collect all tokens until comma, end, or AS keyword
                 SelectItem item;
-                item.isAgg   = false;
-                item.colName = t;
+                item.isAgg = false;
+                std::string colBuf;
+                while (i < end) {
+                    std::string ku = toUpper(ft[i]);
+                    if (ft[i] == ",") break;
+                    if (ku == "AS") {
+                        ++i;
+                        if (i < end && ft[i] != ",") { item.alias = ft[i]; ++i; }
+                        break;
+                    }
+                    if (!colBuf.empty()) colBuf += ' ';
+                    colBuf += ft[i]; ++i;
+                }
+                // Detect implicit alias: "expr alias" without AS keyword (e.g., "37 col1")
+                // Only split if the prefix (before the last space) ends with a digit or ')',
+                // meaning it is a complete numeric/paren expression, not a partial one like "- col".
+                {
+                    auto sp = colBuf.rfind(' ');
+                    if (sp != std::string::npos && sp > 0) {
+                        char prefixEnd = colBuf[sp - 1];
+                        std::string lastWord = colBuf.substr(sp + 1);
+                        bool isIdent = !lastWord.empty() &&
+                                       !std::isdigit((unsigned char)lastWord[0]);
+                        for (char c : lastWord)
+                            if (!std::isalnum((unsigned char)c) && c != '_') { isIdent = false; break; }
+                        bool prefixIsComplete = (std::isdigit((unsigned char)prefixEnd) || prefixEnd == ')');
+                        if (isIdent && prefixIsComplete) {
+                            item.alias   = lastWord;
+                            item.colName = colBuf.substr(0, sp);
+                        } else {
+                            item.colName = colBuf;
+                        }
+                    } else {
+                        item.colName = colBuf;
+                    }
+                }
                 cmd.selectItems.push_back(std::move(item));
-                ++i;
             }
         }
     }
@@ -8074,13 +8138,101 @@ private:
             if (isAgg && i + 5 < end && ft[i + 1] == "(") {
                 HavingCondition hc;
                 hc.aggFunc = u;
-                hc.aggCol  = ft[i + 2];   // ft[i+3] = ")"
-                hc.op      = ft[i + 4];
-                hc.val     = ft[i + 5];
+                // Skip DISTINCT/ALL inside aggregate (e.g. AVG(DISTINCT col))
+                size_t colTok = i + 2;
+                if (colTok < end) {
+                    std::string dkw = toUpper(ft[colTok]);
+                    if (dkw == "DISTINCT" || dkw == "ALL") ++colTok;
+                }
+                // Collect aggCol until matching ")"
+                std::string aggColBuf;
+                size_t jh = colTok;
+                int dh = 0;
+                while (jh < end) {
+                    if (ft[jh] == "(")      { if (!aggColBuf.empty()) aggColBuf+=' '; aggColBuf+=ft[jh]; ++dh; ++jh; }
+                    else if (ft[jh] == ")") { if (dh==0) break; aggColBuf+=ft[jh]; --dh; ++jh; }
+                    else                    { if (!aggColBuf.empty()) aggColBuf+=' '; aggColBuf+=ft[jh]; ++jh; }
+                }
+                hc.aggCol = aggColBuf;
+                if (jh < end && ft[jh] == ")") ++jh;  // skip ")"
+                if (jh + 1 < end) { hc.op = ft[jh]; hc.val = ft[jh + 1]; jh += 2; }
                 cmd.havingConds.push_back(std::move(hc));
-                i += 6;
+                i = jh;
+            } else if (!isAgg && u != "AND" && u != "OR") {
+                // Phase 185: Non-aggregate HAVING condition.
+                // Handle outer NOT (e.g. HAVING NOT NULL IS NULL → IS NOT NULL)
+                bool outerNot = (u == "NOT");
+                if (outerNot) { ++i; }  // skip NOT, LHS follows
+                // Collect LHS tokens until a comparison operator keyword
+                static const std::set<std::string> OPS =
+                    {"IN","NOT","BETWEEN","IS","=","!=","<>","<",">","<=",">="};
+                std::string lhsBuf;
+                size_t ki = i;
+                while (ki < end) {
+                    std::string ku = toUpper(ft[ki]);
+                    if (OPS.count(ku)) break;
+                    if (ku == "AND" || ku == "OR") break;
+                    if (!lhsBuf.empty()) lhsBuf += ' ';
+                    lhsBuf += ft[ki]; ++ki;
+                }
+                if (ki < end && !lhsBuf.empty()) {
+                    WhereCondition wc;
+                    // Determine if LHS needs isFuncLhs (arithmetic) or plain col
+                    bool lhsArith = false;
+                    for (char c : lhsBuf) if (c=='+' || c=='-' || c=='*' || c=='/') { lhsArith=true; break; }
+                    if (lhsArith || lhsBuf.find(' ') != std::string::npos) {
+                        wc.isFuncLhs = true; wc.funcLhsExpr = lhsBuf;
+                    } else {
+                        wc.col = lhsBuf;
+                    }
+                    // Parse operator
+                    std::string opKw = toUpper(ft[ki]);
+                    bool innerNot = false;
+                    if (opKw == "NOT") { innerNot = true; ++ki; opKw = (ki<end ? toUpper(ft[ki]) : ""); }
+                    if (opKw == "IN") {
+                        wc.op = innerNot ? "NOT IN" : "IN"; ++ki;
+                        // parse ( item1, item2, ... )
+                        if (ki < end && ft[ki] == "(") {
+                            ++ki;
+                            std::string cur; int dpth = 0;
+                            while (ki < end) {
+                                if (ft[ki] == "(") { dpth++; if (!cur.empty()) cur+=' '; cur+=ft[ki]; ++ki; }
+                                else if (ft[ki] == ")") {
+                                    if (dpth==0) { if (!cur.empty()) wc.inList.push_back(cur); ++ki; break; }
+                                    cur+=ft[ki]; --dpth; ++ki;
+                                } else if (ft[ki]=="," && dpth==0) {
+                                    if (!cur.empty()) { wc.inList.push_back(cur); cur=""; }
+                                    ++ki;
+                                } else { if (!cur.empty()) cur+=' '; cur+=ft[ki]; ++ki; }
+                            }
+                        }
+                    } else if (opKw == "BETWEEN") {
+                        wc.op = innerNot ? "NOT BETWEEN" : "BETWEEN"; ++ki;
+                        if (ki < end) { wc.betweenLow = ft[ki]; ++ki; }
+                        if (ki < end && toUpper(ft[ki]) == "AND") ++ki;
+                        if (ki < end) { wc.betweenHigh = ft[ki]; ++ki; }
+                    } else if (opKw == "IS") {
+                        ++ki;
+                        bool isNotNull = (ki < end && toUpper(ft[ki]) == "NOT");
+                        if (isNotNull) ++ki;
+                        if (ki < end) ++ki;  // skip NULL
+                        // Outer NOT flips: NOT x IS NULL → x IS NOT NULL
+                        bool finalNotNull = outerNot ? !isNotNull : isNotNull;
+                        wc.op = finalNotNull ? "IS NOT NULL" : "IS NULL";
+                    } else if (!opKw.empty() && (opKw=="=" || opKw=="!=" || opKw=="<>" ||
+                                opKw=="<" || opKw==">" || opKw=="<=" || opKw==">=")) {
+                        wc.op = (opKw=="<>") ? "!=" : opKw; ++ki;
+                        if (ki < end) { wc.val = ft[ki]; ++ki; }
+                    } else {
+                        i = ki + 1; continue;
+                    }
+                    cmd.havingWhereConds.push_back(std::move(wc));
+                    i = ki;
+                } else {
+                    ++i;
+                }
             } else {
-                ++i;  // unbekanntes Token überspringen
+                ++i;  // AND / OR handled at top, skip anything else
             }
         }
     }

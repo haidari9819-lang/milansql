@@ -960,7 +960,8 @@ static inline milansql::Table dispatch_executeSelectToTable(
                 } else {
                     grouped = engine.groupBy(tmpName,
                         {}, "", cmd.groupByCols, cmd.selectItems,
-                        cmd.havingConds, cmd.havingLogic);
+                        cmd.havingConds, cmd.havingLogic,
+                        cmd.havingWhereConds, cmd.havingWhereLogic);
                 }
                 engine.dropTempTable(tmpName);
                 if (!cmd.orderByCols.empty()) dispatch_sortWithVector(grouped, cmd.orderByCols);
@@ -1001,7 +1002,8 @@ static inline milansql::Table dispatch_executeSelectToTable(
                 cmd.whereConds, cmd.whereLogic,
                 cmd.groupByCols,
                 cmd.selectItems,
-                cmd.havingConds, cmd.havingLogic);
+                cmd.havingConds, cmd.havingLogic,
+                cmd.havingWhereConds, cmd.havingWhereLogic);
         }
         if (!cmd.orderByCols.empty()) dispatch_sortWithVector(result, cmd.orderByCols);
         if (cmd.limit >= 0) {
@@ -2633,6 +2635,11 @@ inline bool dispatchCommand(
                           << cmd.tableName << "' (COLUMN STORE).\n\n";
             break;
         }
+        // Bug fix: Prüfen ob Tabelle existiert, bevor eingefügt wird
+        if (!engine.tableExists(cmd.tableName)) {
+            std::cout << "  FEHLER: Tabelle '" << cmd.tableName << "' nicht gefunden.\n\n";
+            break;
+        }
         if (cmd.isInsertSelect) {
             if (cmd.insertSelectSql.empty()) {
                 std::cout << "  Fehler: INSERT INTO name SELECT ...\n"; break;
@@ -2817,7 +2824,8 @@ inline bool dispatchCommand(
                 if (item.isFuncExpr) {
                     val = engine.evalFuncPublic(item.funcName, item.funcArgs);
                 } else {
-                    val = item.colName;
+                    // Evaluate literal arithmetic: SELECT 1+2*3, SELECT - -5, etc.
+                    val = engine.evalExprPublic(item.colName);
                 }
                 resVals.push_back(val);
             }
@@ -3412,11 +3420,13 @@ inline bool dispatchCommand(
                     auto result = engine.groupBy(
                         "__cs_tmp__", {}, "AND",
                         cmd.groupByCols, cmd.selectItems,
-                        cmd.havingConds, cmd.havingLogic);
+                        cmd.havingConds, cmd.havingLogic,
+                        cmd.havingWhereConds, cmd.havingWhereLogic);
                     engine.cleanupTempTables();
                     std::cout << "\n";
                     if (!cmd.orderByCols.empty())
                         dispatch_sortWithVector(result, cmd.orderByCols);
+                    if (cmd.isDistinct) result.makeDistinct();
                     dispatch_printTable(result, cmd.limit, cmd.limitOffset);
                 } catch (...) {
                     engine.cleanupTempTables();
@@ -3487,11 +3497,13 @@ inline bool dispatchCommand(
                     } else {
                         grouped = engine.groupBy(tmpName,
                             {}, "", cmd.groupByCols, cmd.selectItems,
-                            cmd.havingConds, cmd.havingLogic);
+                            cmd.havingConds, cmd.havingLogic,
+                            cmd.havingWhereConds, cmd.havingWhereLogic);
                     }
                     engine.dropTempTable(tmpName);
                     std::cout << "\n";
                     if (!cmd.orderByCols.empty()) dispatch_sortWithVector(grouped, cmd.orderByCols);
+                    if (cmd.isDistinct) grouped.makeDistinct();
                     dispatch_printTable(grouped, cmd.limit, cmd.limitOffset);
                 } else {
                     std::cout << "\n";
@@ -3524,10 +3536,12 @@ inline bool dispatchCommand(
                 cmd.whereConds, cmd.whereLogic,
                 cmd.groupByCols,
                 cmd.selectItems,
-                cmd.havingConds, cmd.havingLogic);
+                cmd.havingConds, cmd.havingLogic,
+                cmd.havingWhereConds, cmd.havingWhereLogic);
             std::cout << "\n";
             if (!cmd.orderByCols.empty())
                 dispatch_sortWithVector(result, cmd.orderByCols);
+            if (cmd.isDistinct) result.makeDistinct();
             dispatch_printTable(result, cmd.limit, cmd.limitOffset);
             break;
         }
@@ -7801,8 +7815,11 @@ inline bool dispatchCommand(
 
     case milansql::CommandType::UNKNOWN:
     default:
-        std::cout << "  Unbekannter Befehl: '" << eingabe
-                  << "'\n  Tippe 'help' fuer eine Uebersicht.\n\n";
+        if (eingabe.empty()) {
+            std::cout << "  FEHLER: Leere Query.\n\n";
+        } else {
+            std::cout << "  FEHLER: Unbekannter Befehl: '" << eingabe << "'\n\n";
+        }
         break;
     }
 

@@ -86,7 +86,7 @@ public:
         unsigned char tag[16];
 
         EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        if (!ctx) return plain; // fallback
+        if (!ctx) throw std::runtime_error("Encryption: EVP_CIPHER_CTX_new failed (OpenSSL error)");
         int len = 0, cipherLen = 0;
         EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
         EVP_EncryptInit_ex(ctx, nullptr, nullptr, key_.data(), iv);
@@ -108,11 +108,9 @@ public:
         out.append(cipher);
         return out;
 #else
-        // XOR fallback (no OpenSSL)
-        std::string out(plain.size(), 0);
-        for (size_t i = 0; i < plain.size(); ++i)
-            out[i] = plain[i] ^ key_[i % key_.size()];
-        return out;
+        // XOR-Fallback entfernt: Encryption ohne OpenSSL ist nicht erlaubt.
+        throw std::runtime_error("Encryption requires OpenSSL (MILANSQL_HAS_OPENSSL). "
+                                 "XOR fallback disabled for security.");
 #endif
     }
 
@@ -121,11 +119,9 @@ public:
 #if MILANSQL_HAS_OPENSSL
         // Check magic
         if (enc.size() < 4 + 12 + 16 + 1 || enc.substr(0,4) != "MAES") {
-            // Try XOR fallback for old data
-            std::string out(enc.size(), 0);
-            for (size_t i = 0; i < enc.size(); ++i)
-                out[i] = enc[i] ^ key_[i % key_.size()];
-            return out;
+            // Kein XOR-Fallback mehr — korrupte oder unverschlüsselte Daten
+            throw std::runtime_error("Decryption failed: invalid ciphertext format (MAES magic missing). "
+                                     "XOR fallback disabled for security.");
         }
         const unsigned char* iv  = (const unsigned char*)enc.data() + 4;
         const unsigned char* tag = (const unsigned char*)enc.data() + 4 + 12;
@@ -151,11 +147,9 @@ public:
         plain.resize(plainLen);
         return plain;
 #else
-        // XOR fallback
-        std::string out(enc.size(), 0);
-        for (size_t i = 0; i < enc.size(); ++i)
-            out[i] = enc[i] ^ key_[i % key_.size()];
-        return out;
+        // XOR-Fallback entfernt: Decryption ohne OpenSSL ist nicht erlaubt.
+        throw std::runtime_error("Decryption requires OpenSSL (MILANSQL_HAS_OPENSSL). "
+                                 "XOR fallback disabled for security.");
 #endif
     }
 

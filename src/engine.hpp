@@ -7414,9 +7414,14 @@ private:
                 if (pos < expr.size() && expr[pos] == ')') ++pos;
                 return v;
             }
+            // Unary +/- — recursive so that chains like - - x cancel correctly
+            if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) {
+                double sign = (expr[pos] == '-') ? -1.0 : 1.0;
+                ++pos;
+                return sign * parseFactor();
+            }
             // Read token: number or identifier
             size_t start = pos;
-            if (pos < expr.size() && (expr[pos] == '-' || expr[pos] == '+')) ++pos;
             while (pos < expr.size() && (std::isdigit((unsigned char)expr[pos]) || expr[pos] == '.')) ++pos;
             if (pos > start) {
                 try { return std::stod(expr.substr(start, pos - start)); } catch (...) {}
@@ -7438,9 +7443,23 @@ private:
             double lhs = parseFactor();
             while (pos < expr.size()) {
                 while (pos < expr.size() && expr[pos] == ' ') ++pos;
-                if (pos < expr.size() && expr[pos] == '*') { ++pos; lhs *= parseFactor(); }
-                else if (pos < expr.size() && expr[pos] == '/') { ++pos; double r = parseFactor(); lhs = (r != 0.0 ? lhs / r : 0.0); }
-                else break;
+                if (pos < expr.size() && expr[pos] == '*') {
+                    ++pos; lhs *= parseFactor();
+                } else if (pos < expr.size() && expr[pos] == '/') {
+                    ++pos;
+                    double r = parseFactor();
+                    if (r != 0.0) {
+                        double q = lhs / r;
+                        // SQL integer division: truncate toward zero when both operands are integers
+                        lhs = (lhs == std::floor(lhs) && r == std::floor(r)) ? std::trunc(q) : q;
+                    } else lhs = 0.0;
+                } else if (pos + 3 <= expr.size() && expr[pos] == 'D' && expr[pos+1] == 'I' && expr[pos+2] == 'V' &&
+                           (pos + 3 == expr.size() || (!std::isalnum((unsigned char)expr[pos+3]) && expr[pos+3] != '_'))) {
+                    // DIV keyword — always integer division (truncate toward zero)
+                    pos += 3;
+                    double r = parseFactor();
+                    lhs = (r != 0.0) ? std::trunc(lhs / r) : 0.0;
+                } else break;
             }
             return lhs;
         }

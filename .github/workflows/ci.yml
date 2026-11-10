@@ -36,6 +36,20 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: print_stacktrace=1
 
+  build-and-test-http-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build server binary
+        run: cmake --build build --target milansql
+
+      - name: Run HTTP API tests (Teststrategie Stufe 4 -- real HTTP requests, never port 8080)
+        run: python3 scripts/http_api_test.py build/milansql
+
   build-and-test-windows:
     runs-on: windows-latest
     continue-on-error: true  # TODO: Windows-Build separat reparieren (Server laeuft auf Ubuntu)

@@ -96,6 +96,9 @@ endif()
 if(WIN32)
     target_link_libraries(milansql_tpch_regression PRIVATE ws2_32 secur32 crypt32)
 endif()
+if(OpenSSL_FOUND AND NOT WIN32)
+    target_link_libraries(milansql_tpch_regression PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # ── TPC-H Benchmark (Phase 101) ──────────────────────────────
 add_executable(milansql_tpch src/tests/tpch_benchmark.cpp)
@@ -109,6 +112,9 @@ endif()
 if(WIN32)
     target_link_libraries(milansql_tpch PRIVATE ws2_32)
 endif()
+if(OpenSSL_FOUND AND NOT WIN32)
+    target_link_libraries(milansql_tpch PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # ── Benchmark (Phase 39.5) ───────────────────────────────────
 add_executable(milansql_bench src/tests/benchmark.cpp)
@@ -118,6 +124,9 @@ if(MSVC)
     target_compile_options(milansql_bench PRIVATE /W4)
 else()
     target_compile_options(milansql_bench PRIVATE -Wall -Wextra)
+endif()
+if(OpenSSL_FOUND AND NOT WIN32)
+    target_link_libraries(milansql_bench PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # ── Phase 152: Fuzz Hardening ────────────────────────────────
@@ -131,6 +140,9 @@ else()
 endif()
 if(WIN32)
     target_link_libraries(milansql_fuzz_hardening PRIVATE ws2_32)
+endif()
+if(OpenSSL_FOUND AND NOT WIN32)
+    target_link_libraries(milansql_fuzz_hardening PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
 # ── Phase 117: Embedded Mode ─────────────────────────────────
